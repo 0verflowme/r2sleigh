@@ -21,8 +21,8 @@ use r2types::{
 use super::lower::LowerCtx;
 use super::{
     BaseRef, DecompilerFacts, FlagInfo, NormalizedAddr, PassEnv, SSABlock, ScalarValue,
-    SemanticOwnershipFacts, SemanticValue, StackInfo,
-    StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
+    SemanticValue, StackInfo, StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance,
+    ValueRef,
 };
 use crate::analysis::utils::{
     compare_const_to_expr, compare_const_to_expr_with_width,
@@ -339,25 +339,8 @@ impl PreparedSemanticView {
         self.branch_predicate_expr_by_block.get(&block_addr)
     }
 
-    pub(crate) fn switch_selector_expr_for_block(&self, block_addr: u64) -> Option<&CExpr> {
-        self.switch_selector_expr_by_block.get(&block_addr)
-    }
-
     pub(crate) fn call_view_for_site(&self, site: (u64, usize)) -> Option<&PreparedCallView> {
         self.call_view_by_site.get(&site)
-    }
-
-    pub(crate) fn authoritative_call_arg_expr_for_value(
-        &self,
-        site: (u64, usize),
-        value: ValueId,
-    ) -> Option<CExpr> {
-        let call_view = self.call_view_for_site(site)?;
-        call_view
-            .authoritative_arg_values
-            .iter()
-            .position(|candidate| *candidate == value)
-            .and_then(|index| call_view.authoritative_args.get(index).cloned())
     }
 
     pub(crate) fn call_result_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
@@ -608,7 +591,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     control.poll()?;
     Ok(DecompilerFacts {
         use_info,
-        ownership: SemanticOwnershipFacts::default(),
         flag_info,
         stack_info,
     })
@@ -4350,36 +4332,6 @@ mod tests {
                 args: vec![CExpr::IntLit(7)],
                 site: None,
             })
-        );
-    }
-
-    #[test]
-    fn prepared_view_resolves_authoritative_call_arg_by_value() {
-        let symbols = test_table();
-        let site = (0x1000, 2);
-        let view = PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                site,
-                PreparedCallView {
-                    authoritative_args: vec![crate::symbol::var_ref(&symbols, "n"), CExpr::IntLit(7)],
-                    authoritative_arg_values: vec![ValueId(26), ValueId(27)],
-                    ..PreparedCallView::default()
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        };
-
-        assert_eq!(
-            view.authoritative_call_arg_expr_for_value(site, ValueId(26)),
-            Some(crate::symbol::var_ref(&symbols, "n"))
-        );
-        assert_eq!(
-            view.authoritative_call_arg_expr_for_value(site, ValueId(99)),
-            None
-        );
-        assert_eq!(
-            view.authoritative_call_arg_expr_for_value((0x2000, 0), ValueId(26)),
-            None
         );
     }
 

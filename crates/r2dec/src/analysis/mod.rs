@@ -12,14 +12,10 @@ pub(crate) type SSABlock = FunctionSSABlock;
 // Pass dependency invariant:
 // UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
 pub(crate) mod lower;
-pub(crate) mod ownership;
 pub(crate) mod predicate;
 pub(crate) mod prepared_semantic;
 pub(crate) mod utils;
 
-#[cfg(test)]
-pub(crate) use ownership::{CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId};
-pub(crate) use ownership::SemanticOwnershipFacts;
 pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView,
@@ -47,7 +43,6 @@ pub(crate) struct PtrArith {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {
     pub(crate) use_info: UseInfo,
-    pub(crate) ownership: SemanticOwnershipFacts,
     pub(crate) flag_info: FlagInfo,
     pub(crate) stack_info: StackInfo,
 }
@@ -549,29 +544,6 @@ impl UseInfo {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.ptr_arith_by_value.insert(value_id, ptr.clone());
-        } else {
-            *self.unkeyed_writes.entry("ptr_arith").or_default() += 1;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_forwarded_value_for_var(
-        &mut self,
-        var: &SSAVar,
-        provenance: ValueProvenance,
-    ) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.forwarded_values_by_value
-                .insert(value_id, provenance.clone());
-        } else {
-            *self.unkeyed_writes.entry("forwarded_values").or_default() += 1;
-        }
-    }
-
     /// Record a semantic value against the exact upstream value identity.
     pub(crate) fn insert_semantic_value_for_value_if_absent(
         &mut self,
@@ -585,15 +557,6 @@ impl UseInfo {
                     .or_insert(value);
             }
             None => *self.unkeyed_writes.entry("semantic_values").or_default() += 1,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
-        if let Some(value_id) = self.value_id_for_name_or_bind(name) {
-            self.semantic_values_by_value.insert(value_id, value);
-        } else {
-            *self.unkeyed_writes.entry("semantic_values").or_default() += 1;
         }
     }
 
@@ -623,30 +586,6 @@ impl UseInfo {
     ) {
         if !self.ambiguous_value_ids.contains(&value) {
             self.call_result_source_by_value.insert(value, source_call);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_call_result_source_alias(
-        &mut self,
-        alias: &str,
-        source_call: (u64, usize),
-    ) {
-        // The alias names a value; the call it came from is filed against that
-        // value. There was a second map from the alias itself, read through
-        // `lookup_name_key`, so an alias differing only in case could answer for
-        // a call site that belonged to another value.
-        match self.value_id_for_name_or_bind(alias) {
-            Some(value_id) => {
-                self.call_result_source_by_value
-                    .insert(value_id, source_call);
-            }
-            None => {
-                *self
-                    .unkeyed_writes
-                    .entry("call_result_source")
-                    .or_default() += 1
-            }
         }
     }
 
@@ -699,12 +638,6 @@ impl UseInfo {
         self.use_counts_by_value
             .get(&value)
             .copied()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn use_count_for_var(&self, var: &SSAVar) -> usize {
-        self.exact_value_id_for_var(var)
-            .map(|value| self.use_count_for_value(value))
             .unwrap_or(0)
     }
 

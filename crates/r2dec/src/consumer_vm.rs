@@ -296,7 +296,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, Varnode,
+    };
 
     fn source_owned_vm_facts() -> r2types::SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
@@ -312,6 +315,96 @@ mod tests {
         ] {
             arch.add_register(RegisterDef::new(name, offset, size));
         }
+        let projection = |written: RegisterStorage,
+                          carrier: RegisterStorage,
+                          size_bits: u64| RegisterProjection {
+            written,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits,
+                },
+            },
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 4,
+                },
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Load {
             dst: Varnode::unique(0x100, 1),

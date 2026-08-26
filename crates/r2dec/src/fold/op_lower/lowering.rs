@@ -3,6 +3,10 @@ use super::memory_renderer::CertifiedMemoryAccessExpr;
 use super::projection::{project_machine_use, project_machine_write};
 use super::*;
 
+fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
+    op.dst().is_some()
+}
+
 impl<'a> FoldingContext<'a> {
     fn observation_lowering_refusal(
         error: &crate::observation_journal::LegacyObservationJournalError,
@@ -25,7 +29,6 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-        contains_memory: bool,
     ) -> std::collections::BTreeSet<r2ssa::SemanticObligationId> {
         let mut obligations = self.exact_effect_obligations_for_normalized_value(
             EffectOccurrenceKind::Expression,
@@ -33,26 +36,28 @@ impl<'a> FoldingContext<'a> {
             op_idx,
             op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
         );
-        if contains_memory {
-            let memory = match op {
-                SSAOp::Load { .. } => self
-                    .certified_memory_access_for_current_op(false)
-                    .map(|cert| (EffectOccurrenceKind::MemoryRead, cert)),
-                SSAOp::Store { .. } => self
-                    .certified_memory_access_for_current_op(true)
-                    .map(|cert| (EffectOccurrenceKind::MemoryWrite, cert)),
-                _ => None,
-            };
-            if let Some((kind, cert)) = memory {
-                obligations.extend(self.exact_effect_obligations_for_normalized_memory(
-                    kind,
-                    block_addr,
-                    op_idx,
-                    cert.space,
-                    Some(cert.address),
-                    cert.value,
-                ));
-            }
+        // Memory-effect ownership comes from the exact source operation and its
+        // certified access, not from the finalized C shape. A stack-object
+        // assignment is still the same source Store even though its AST no
+        // longer contains a pointer dereference.
+        let memory = match op {
+            SSAOp::Load { .. } => self
+                .certified_memory_access_for_current_op(false)
+                .map(|cert| (EffectOccurrenceKind::MemoryRead, cert)),
+            SSAOp::Store { .. } => self
+                .certified_memory_access_for_current_op(true)
+                .map(|cert| (EffectOccurrenceKind::MemoryWrite, cert)),
+            _ => None,
+        };
+        if let Some((kind, cert)) = memory {
+            obligations.extend(self.exact_effect_obligations_for_normalized_memory(
+                kind,
+                block_addr,
+                op_idx,
+                cert.space,
+                Some(cert.address),
+                cert.value,
+            ));
         }
         obligations
     }
@@ -122,24 +127,6 @@ impl<'a> FoldingContext<'a> {
             Err(_) => Err(
                 crate::observation_journal::LegacyObservationJournalError::InvalidWrite(output.inst),
             ),
-        }
-    }
-
-    fn project_lowered_assignment(
-        &self,
-        site: Option<crate::normalize::NormalizedOpSite>,
-        lowered: LoweredOp,
-    ) -> OpLoweringResult<LoweredOp> {
-        let LoweredOp::Assign { lhs, rhs } = lowered else {
-            return Ok(lowered);
-        };
-        match self.project_planned_assignment(site, lhs.clone(), rhs.clone()) {
-            Ok((lhs, rhs)) => Ok(LoweredOp::Assign { lhs, rhs }),
-            Err(error) => {
-                let refusal = Self::observation_lowering_refusal(&error);
-                self.retain_first_observation_error(error);
-                Err(refusal)
-            }
         }
     }
 
@@ -641,7 +628,6 @@ impl<'a> FoldingContext<'a> {
             LoweredOp::Assign { lhs, rhs } => self.assign_stmt(lhs, rhs),
             LoweredOp::FinalizedStmt(stmt) => Some(stmt),
             LoweredOp::Expr(expr) => Some(CStmt::Expr(expr)),
-            LoweredOp::Comment(text) => Some(CStmt::Comment(text)),
             LoweredOp::None => None,
         }
     }
@@ -664,6 +650,41 @@ impl<'a> FoldingContext<'a> {
         LoweredOp::Expr(call)
     }
 
+    fn certified_call_target_expr(
+        &self,
+        frame: &LowerFrame,
+        target: &SSAVar,
+        cert: &r2types::CallsiteArgumentFacts,
+        direct: bool,
+    ) -> OpLoweringResult<CExpr> {
+        if self.prepared_value_id_for_var(target) != Some(cert.target) {
+            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+        }
+        let planned = self.planned_input_expr(frame, 0).map_err(|error| {
+            let refusal = Self::observation_lowering_refusal(&error);
+            self.retain_first_observation_error(error);
+            refusal
+        })?;
+        let target = if direct {
+            let address = cert
+                .direct_target
+                .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+            let canonical =
+                self.callee_identity_expr(&self.callee_identity_for_direct_target(address));
+            crate::ast::carry_outer_expr_observations(&planned, canonical)
+        } else {
+            if cert.direct_target.is_some() {
+                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            }
+            Self::indirect_callable_expr(planned)
+        };
+        Ok(self.observe_optional_normalized_input_uses_expr(
+            frame.normalized_site,
+            0,
+            target,
+        ))
+    }
+
     pub(super) fn lower_op(
         &self,
         op: &SSAOp,
@@ -680,42 +701,21 @@ impl<'a> FoldingContext<'a> {
                     match op {
                         SSAOp::Call { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return Ok(LoweredOp::Comment(
-                                    "r2sleigh residual: missing exact source callsite".to_string(),
-                                ));
+                                return Err(
+                                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                                );
                             };
-                            let direct_target = parse_address_from_var_name(&target.name);
-                            let func_expr = self.resolve_call_target_for_site(
-                                source_block,
-                                source_op_idx,
-                                target,
-                            )?;
-                            let func_expr = self.observed_input(frame, 0, func_expr);
-                            let Some(mut certified_args) = self
-                                .certified_call_args_for_site_with_direct_target(
-                                    source_block,
-                                    source_op_idx,
-                                    direct_target,
-                                )
-                            else {
-                                return self.finish_lowering_transaction(LoweredOp::Comment(format!(
-                                    "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
-                                    source_block, source_op_idx
-                                )));
-                            };
-                            let mut args = certified_args.args.clone();
-                            if let Some(max_arity) = self
-                                .non_variadic_call_arity_for_site_with_direct_target(
-                                    source_block,
-                                    source_op_idx,
-                                    direct_target,
-                                )
-                            {
-                                args.truncate(max_arity);
-                                certified_args.values.truncate(max_arity);
-                            }
-                            let call =
-                                CExpr::call_at((source_block, source_op_idx), func_expr, args);
+                            let (cert, _) =
+                                self.admitted_callsite(source_block, source_op_idx)?;
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, true)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                certified_args.args.clone(),
+                            );
                             return self.finish_lowering_transaction(self.lower_certified_statement_call(
                                 source_block,
                                 source_op_idx,
@@ -725,37 +725,20 @@ impl<'a> FoldingContext<'a> {
                         }
                         SSAOp::CallInd { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return Ok(LoweredOp::Comment(
-                                    "r2sleigh residual: missing exact source callsite".to_string(),
-                                ));
+                                return Err(
+                                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                                );
                             };
-                            let resolved_target = self.resolve_call_target_for_site(
-                                source_block,
-                                source_op_idx,
-                                target,
-                            )?;
-                            let resolved_target = self.observed_input(frame, 0, resolved_target);
-                            let func_expr = Self::indirect_callable_expr(resolved_target);
-                            let Some(mut certified_args) = self.certified_call_args_for_site(
-                                source_block,
-                                source_op_idx,
-                            ) else {
-                                return self.finish_lowering_transaction(LoweredOp::Comment(format!(
-                                    "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",
-                                    source_block, source_op_idx
-                                )));
-                            };
-                            let mut args = certified_args.args.clone();
-                            if let Some(max_arity) =
-                                self.non_variadic_call_arity_for_site(source_block, source_op_idx)
-                            {
-                                args.truncate(max_arity);
-                                certified_args.values.truncate(max_arity);
-                            }
+                            let (cert, _) =
+                                self.admitted_callsite(source_block, source_op_idx)?;
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, false)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
                             let call = CExpr::call_at(
                                 (source_block, source_op_idx),
                                 func_expr,
-                                args,
+                                certified_args.args.clone(),
                             );
                             return self.finish_lowering_transaction(self.lower_certified_statement_call(
                                 source_block,
@@ -783,51 +766,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(crate) fn op_to_expr_at(
-        &self,
-        op: &SSAOp,
-        block_addr: u64,
-        op_idx: usize,
-    ) -> OpLoweringResult<LoweredExprAt> {
-        // Operand observations are attached while their exact expression
-        // positions still exist. Wrapping the completed expression once per
-        // input would falsely make every operand own the same aggregate node.
-        let normalized_site = self.normalized_site(block_addr, op_idx);
-        let mut frame = LowerFrame::for_observed_expr(normalized_site);
-        let lowered = self.project_lowered_assignment(
-            normalized_site,
-            self.lower_op(op, &mut frame)?,
-        )?;
-        let lowered = match lowered {
-            LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
-            LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
-            LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => LoweredExprAt::Rendered(expr),
-            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => LoweredExprAt::Rendered(expr),
-            LoweredOp::FinalizedStmt(_) => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
-            LoweredOp::Comment(_) | LoweredOp::None => {
-                return Err(OpLoweringRefusal::UnrepresentableOperation);
-            }
-        };
-        Ok(match lowered {
-            LoweredExprAt::Rendered(expr) => {
-                let obligations = self.exact_normalized_op_effects(
-                    op,
-                    block_addr,
-                    op_idx,
-                    expr_contains_memory_like_access(&expr),
-                );
-                let expr = if op.dst().is_some() {
-                    self.observe_normalized_output_expr(block_addr, op_idx, expr)
-                } else {
-                    expr
-                };
-                LoweredExprAt::Rendered(self.observe_effect_expr(&obligations, expr))
-            }
-        })
-    }
-
     /// Convert an SSA operation to a C statement, with call argument context.
     pub(super) fn op_to_stmt_with_args(
         &self,
@@ -848,14 +786,17 @@ impl<'a> FoldingContext<'a> {
         let Some(stmt) = self.lowered_to_stmt(lowered) else {
             return Ok(None);
         };
-        let stmt = self.project_finalized_assignment_stmt(normalized_site, stmt)?;
+        // Final write projection belongs only to an operation with a typed SSA
+        // output. Calls and stores are source effects with exact input/effect
+        // observations but no destination; asking them for a normalized output
+        // fabricates an assignment contract they do not have.
+        let stmt = if operation_requires_final_write_projection(op) {
+            self.project_finalized_assignment_stmt(normalized_site, stmt)?
+        } else {
+            stmt
+        };
 
-        let obligations = self.exact_normalized_op_effects(
-            op,
-            block_addr,
-            op_idx,
-            stmt_contains_memory_like_access(&stmt),
-                        );
+        let obligations = self.exact_normalized_op_effects(op, block_addr, op_idx);
         let stmt = if op.dst().is_some()
             && !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty)
         {
@@ -873,5 +814,32 @@ impl<'a> FoldingContext<'a> {
             CExpr::Var(_) => resolved_target,
             _ => CExpr::Deref(Box::new(resolved_target)),
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_output_contract_tests {
+    use super::*;
+
+    #[test]
+    fn only_operations_with_typed_outputs_require_final_write_projection() {
+        let dst = r2ssa::SSAVar::new("dst", 1, 8);
+        let input = r2ssa::SSAVar::new("input", 0, 8);
+
+        assert!(operation_requires_final_write_projection(&SSAOp::Copy {
+            dst,
+            src: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(&SSAOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: input.clone(),
+            val: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(&SSAOp::Call {
+            target: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(&SSAOp::CallInd {
+            target: input,
+        }));
     }
 }

@@ -736,6 +736,45 @@ impl SemanticObligationInventory {
             .and_then(|id| self.instructions.get(id))
     }
 
+    /// Values whose exact source instruction is structural, owns no semantic
+    /// obligation, and has no graph occurrence outside its definition.
+    ///
+    /// This is the upstream elision authority for structural outputs such as
+    /// unused call-clobber definitions. Consumers must not reclassify an op by
+    /// matching its spelling or opcode. A used structural result is omitted
+    /// from this set and remains an ordinary value that needs a binding.
+    pub fn structural_unused_values(&self, graph: &SsaGraph) -> Option<BTreeSet<ValueId>> {
+        if !self.is_complete()
+            || self.source_instruction_count != graph.insts.len()
+            || self.by_inst.len() != graph.insts.len()
+        {
+            return None;
+        }
+        let mut values = BTreeSet::new();
+        for instruction in self.instructions.values() {
+            if instruction.state != SemanticInstructionState::StructuralControlOnly
+                || !instruction.obligations.is_empty()
+            {
+                continue;
+            }
+            let inst = instruction.source.graph_inst()?;
+            let graph_inst = graph.inst(inst)?;
+            if self.instruction_for_inst(inst) != Some(instruction) {
+                return None;
+            }
+            let Some(value) = graph_inst.output else {
+                continue;
+            };
+            if graph.def_inst(value) != Some(inst) || graph.value(value).is_none() {
+                return None;
+            }
+            if graph.use_sites(value).is_empty() {
+                values.insert(value);
+            }
+        }
+        Some(values)
+    }
+
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
     }
@@ -1785,6 +1824,66 @@ mod tests {
                 .map(|inst| &inst.payload),
             Some(InstPayload::Op(SSAOp::CallDefine { .. }))
         ));
+    }
+
+    #[test]
+    fn structural_unused_values_distinguish_unused_and_observed_call_defines() {
+        let target = Varnode::ram(0x4200, 8);
+        let mut unused_block = R2ILBlock::new(0x30a0, 4);
+        unused_block.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let unused = SsaArtifact::for_decompile(&[unused_block], Some(&x86_64_call_arch()))
+            .expect("unused call-define artifact");
+        let unused_values = unused
+            .obligations()
+            .structural_unused_values(unused.graph())
+            .expect("complete structural-value inventory");
+        let call_defines = unused
+            .graph()
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.payload, InstPayload::Op(SSAOp::CallDefine { .. })))
+            .filter_map(|inst| inst.output)
+            .collect::<BTreeSet<_>>();
+        assert!(!call_defines.is_empty());
+        assert_eq!(unused_values, call_defines);
+
+        let mut used_block = R2ILBlock::new(0x30a0, 4);
+        used_block.push(R2ILOp::Call { target });
+        used_block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x80, 8),
+            src: Varnode::register(0, 8),
+        });
+        let used = SsaArtifact::for_decompile(&[used_block], Some(&x86_64_call_arch()))
+            .expect("used call-define artifact");
+        let used_values = used
+            .obligations()
+            .structural_unused_values(used.graph())
+            .expect("complete structural-value inventory");
+        let observed_call_result = used
+            .graph()
+            .insts
+            .iter()
+            .find(|inst| {
+                inst.canonical_storage
+                    == Some(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Unique,
+                        offset: 0x80,
+                        size: 8,
+                    })
+            })
+            .and_then(|inst| inst.inputs.first())
+            .copied()
+            .expect("copy consumes the exact post-call result");
+        assert!(matches!(
+            used.graph()
+                .def_inst(observed_call_result)
+                .and_then(|inst| used.graph().inst(inst))
+                .map(|inst| &inst.payload),
+            Some(InstPayload::Op(SSAOp::CallDefine { .. }))
+        ));
+        assert!(!used_values.contains(&observed_call_result));
     }
 
     #[test]

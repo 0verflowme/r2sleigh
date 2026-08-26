@@ -21,7 +21,9 @@ use crate::ast::{
     BinaryOp, CExpr, CFunction, CStmt, RenderObservationId, RenderObservationNode,
     inspect_render_observations,
 };
-use crate::binding_plan::{BindingId, BindingNameResolution, PlacementRefusal, ValueDisposition};
+use crate::binding_plan::{
+    BindingId, BindingNameResolution, PlacementRead, PlacementRefusal, ValueDisposition,
+};
 use crate::structured_region::{RegionId, SealedStructuredRegionArtifact};
 use r2ssa::{InstId, SSAFunction, UseSite};
 
@@ -36,7 +38,7 @@ pub(crate) struct FinalOccurrenceOrder(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FinalBindingRead {
     pub(crate) binding: BindingId,
-    pub(crate) site: UseSite,
+    pub(crate) source: PlacementRead,
     pub(crate) region: RegionId,
     pub(crate) block: u64,
     pub(crate) order: FinalOccurrenceOrder,
@@ -61,6 +63,12 @@ pub(crate) struct FinalBindingWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementObservationTarget {
     Use(UseSite),
+    CertifiedValueRead {
+        value: r2ssa::ValueId,
+        at: InstId,
+        binding: BindingId,
+        symbol: crate::symbol::SymbolId,
+    },
     Write(InstId),
     Other,
 }
@@ -98,6 +106,23 @@ pub(crate) fn collect_final_placement_occurrences(
     inspect_render_observations(function, expected_observations, |id, node| {
         let target = target_for(id)
             .ok_or(PlacementAnalysisError::MissingObservationTarget { observation: id })?;
+        if let PlacementObservationTarget::CertifiedValueRead {
+            value,
+            at,
+            binding,
+            symbol,
+        } = target
+        {
+            if !certified_value_read_matches(source, names, value, at, binding, symbol) {
+                return Err(PlacementAnalysisError::InvalidCertifiedValueRead { value, at });
+            }
+            let RenderObservationNode::Expr(expr) = node else {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            };
+            if !expr_reads_symbol(expr, symbol) {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            }
+        }
         let index = id.index() as usize;
         targets[index] = Some(target);
         statement_assignment[index] = match node {
@@ -124,8 +149,14 @@ pub(crate) fn collect_final_placement_occurrences(
     });
 
     for (index, target) in targets.iter().copied().enumerate() {
-        if matches!(target, Some(PlacementObservationTarget::Use(_)
-            | PlacementObservationTarget::Write(_)))
+        if matches!(
+            target,
+            Some(
+                PlacementObservationTarget::Use(_)
+                    | PlacementObservationTarget::CertifiedValueRead { .. }
+                    | PlacementObservationTarget::Write(_)
+            )
+        )
             && scoped[index].is_none()
         {
             return Err(PlacementAnalysisError::UnscopedObservation {
@@ -158,7 +189,30 @@ pub(crate) fn collect_final_placement_occurrences(
                         .addr;
                     reads.push(FinalBindingRead {
                         binding,
-                        site,
+                        source: PlacementRead::Use(site),
+                        region,
+                        block,
+                        order,
+                    });
+                }
+            }
+            PlacementObservationTarget::CertifiedValueRead {
+                value,
+                at,
+                binding,
+                symbol: _,
+            } => {
+                let inst = graph
+                    .inst(at)
+                    .ok_or(PlacementAnalysisError::InvalidWrite { inst: at })?;
+                if bound_value(names, value)? == Some(binding) {
+                    let block = graph
+                        .block(inst.block)
+                        .ok_or(PlacementAnalysisError::InvalidWrite { inst: at })?
+                        .addr;
+                    reads.push(FinalBindingRead {
+                        binding,
+                        source: PlacementRead::CertifiedValue { value, at },
                         region,
                         block,
                         order,
@@ -194,7 +248,7 @@ pub(crate) fn collect_final_placement_occurrences(
     }
 
     audit_plan_symbols(function, source, names, &targets)?;
-    reads.sort_by_key(|read| (read.order, read.binding, read.site));
+    reads.sort_by_key(|read| (read.order, read.binding, read.source));
     writes.sort_by_key(|write| (write.order, write.binding, write.inst));
     Ok(FinalPlacementOccurrences {
         reads: reads.into_boxed_slice(),
@@ -741,6 +795,25 @@ fn target_authorizes_binding(
             .is_some_and(|disposition| {
                 matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
             }),
+        (
+            PlacementObservationTarget::CertifiedValueRead {
+                value,
+                at,
+                binding: certified_binding,
+                symbol,
+            },
+            SymbolAccess::Read,
+        ) => {
+            certified_binding == binding
+                && certified_value_read_matches(
+                    source,
+                    names,
+                    value,
+                    at,
+                    certified_binding,
+                    symbol,
+                )
+        }
         (PlacementObservationTarget::Write(inst), SymbolAccess::Write) => graph
             .inst(inst)
             .and_then(|inst| inst.output)
@@ -763,7 +836,94 @@ fn target_authorizes_binding(
                 })
         }
         (PlacementObservationTarget::Use(_), SymbolAccess::Write)
+        | (PlacementObservationTarget::CertifiedValueRead { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::Other, _) => false,
+    }
+}
+
+/// Revalidate the complete source-to-render identity chain carried by a
+/// certified value-read marker. The return certificate owns `(ValueId,
+/// InstId)`; the sealed binding plan owns `ValueId -> BindingId`; and name
+/// resolution owns `BindingId -> SymbolId`. No one of those links is a
+/// substitute for the others.
+fn certified_value_read_matches(
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    value: r2ssa::ValueId,
+    at: InstId,
+    binding: BindingId,
+    symbol: crate::symbol::SymbolId,
+) -> bool {
+    let graph = source.graph();
+    let Some(certificate) = source
+        .certificates()
+        .returns_by_inst
+        .get(&at)
+        .and_then(|index| source.certificates().returns.get(*index))
+    else {
+        return false;
+    };
+    certificate.at == at
+        && certificate.value == value
+        && graph.op_site_for_inst(at) == Some((certificate.block_addr, certificate.op_index))
+        && graph.inst(at).is_some_and(|inst| {
+            matches!(inst.payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
+        })
+        && matches!(
+            names.disposition_for_value(value),
+            Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
+        )
+        && names.symbol_for_binding(binding) == Some(symbol)
+}
+
+/// Whether evaluating this expression reads the exact program symbol.
+///
+/// This follows C read semantics closely enough to reject a forged marker on
+/// `symbol = literal`, `&symbol`, or `sizeof(symbol)`, while retaining exact
+/// casts and slice projections produced from the planned value expression.
+pub(crate) fn expr_reads_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -> bool {
+    match expr.unobserved() {
+        CExpr::Var(actual) => *actual == symbol,
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => expr_reads_symbol(operand, symbol),
+        CExpr::Binary { op, left, right } => {
+            expr_reads_symbol(right, symbol)
+                || (!matches!(op, BinaryOp::Assign)
+                    || !matches!(left.unobserved(), CExpr::Var(_)))
+                    && expr_reads_symbol(left, symbol)
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_reads_symbol(cond, symbol)
+                || expr_reads_symbol(then_expr, symbol)
+                || expr_reads_symbol(else_expr, symbol)
+        }
+        CExpr::Call { func, args, .. } => {
+            expr_reads_symbol(func, symbol)
+                || args.iter().any(|arg| expr_reads_symbol(arg, symbol))
+        }
+        CExpr::Subscript { base, index } => {
+            expr_reads_symbol(base, symbol) || expr_reads_symbol(index, symbol)
+        }
+        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
+            expr_reads_symbol(base, symbol)
+        }
+        CExpr::Comma(items) => items.iter().any(|item| expr_reads_symbol(item, symbol)),
+        CExpr::Observed { .. } => unreachable!("unobserved expression returned a wrapper"),
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::External { .. }
+        | CExpr::Sizeof(_)
+        | CExpr::SizeofType(_)
+        | CExpr::AddrOf(_) => false,
     }
 }
 
@@ -820,6 +980,7 @@ pub(crate) enum PlacementAnalysisError {
     MissingObservationTarget { observation: RenderObservationId },
     InvalidUse { site: UseSite },
     InvalidWrite { inst: InstId },
+    InvalidCertifiedValueRead { value: r2ssa::ValueId, at: InstId },
     MissingPlannedValue { value: r2ssa::ValueId },
     RefusedPlannedValue { value: r2ssa::ValueId },
     UnscopedObservation { observation: RenderObservationId },
@@ -1231,7 +1392,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             region: read.region,
             block: read.block,
             order: read.order,
-            kind: OccurrenceKind::Read(read.site),
+            kind: OccurrenceKind::Read(read.source),
         });
     }
     for write in writes {
@@ -1286,11 +1447,11 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
 
-        if let Some(site) =
+        if let Some(read) =
             first_read_before_assignment(binding, binding_occurrences, &must_in, &block_indices)
         {
             decisions[binding_index] = Some(PlacementDecision::Refused(
-                PlacementRefusal::ReadBeforeAssignment { binding, site },
+                PlacementRefusal::ReadBeforeAssignment { binding, read },
             ));
             continue;
         }
@@ -1356,13 +1517,21 @@ struct Occurrence {
 impl Occurrence {
     fn sort_key(&self) -> (FinalOccurrenceOrder, u8, u64, usize, u32, usize) {
         match self.kind {
-            OccurrenceKind::Read(site) => (
+            OccurrenceKind::Read(PlacementRead::Use(site)) => (
                 self.order,
                 0,
                 self.block,
                 self.region.index(),
                 site.inst.0,
                 site.input_idx,
+            ),
+            OccurrenceKind::Read(PlacementRead::CertifiedValue { value, at }) => (
+                self.order,
+                0,
+                self.block,
+                self.region.index(),
+                at.0,
+                value.0 as usize,
             ),
             OccurrenceKind::Write { inst, .. } => {
                 (self.order, 1, self.block, self.region.index(), inst.0, 0)
@@ -1373,7 +1542,7 @@ impl Occurrence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OccurrenceKind {
-    Read(UseSite),
+    Read(PlacementRead),
     Write { inst: InstId, inline_eligible: bool },
 }
 
@@ -1426,7 +1595,7 @@ fn first_read_before_assignment(
     occurrences: &[Occurrence],
     must_in: &[DenseBindingSet],
     block_indices: &BTreeMap<u64, usize>,
-) -> Option<UseSite> {
+) -> Option<PlacementRead> {
     let mut by_rendered_block = BTreeMap::<(u64, RegionId), Vec<&Occurrence>>::new();
     for occurrence in occurrences {
         by_rendered_block
@@ -1441,7 +1610,7 @@ fn first_read_before_assignment(
         let mut assigned = must_in[block_index].contains(binding);
         for occurrence in block_occurrences {
             match occurrence.kind {
-                OccurrenceKind::Read(site) if !assigned => return Some(site),
+                OccurrenceKind::Read(read) if !assigned => return Some(read),
                 OccurrenceKind::Read(_) => {}
                 OccurrenceKind::Write { .. } => assigned = true,
             }
@@ -1747,10 +1916,10 @@ mod tests {
         ];
         let reads = [FinalBindingRead {
             binding,
-            site: UseSite {
+            source: PlacementRead::Use(UseSite {
                 inst: InstId(3),
                 input_idx: 0,
-            },
+            }),
             region: merge_region,
             block: 0x1030,
             order: FinalOccurrenceOrder(3),
@@ -1786,7 +1955,7 @@ mod tests {
         }];
         let reads = [FinalBindingRead {
             binding,
-            site,
+            source: PlacementRead::Use(site),
             region: merge_region,
             block: 0x1030,
             order: FinalOccurrenceOrder(2),
@@ -1796,7 +1965,10 @@ mod tests {
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Refused(
-                PlacementRefusal::ReadBeforeAssignment { binding, site }
+                PlacementRefusal::ReadBeforeAssignment {
+                    binding,
+                    read: PlacementRead::Use(site),
+                }
             ))
         );
     }
@@ -1819,10 +1991,10 @@ mod tests {
             &BTreeSet::new(),
             &[FinalBindingRead {
                 binding,
-                site: UseSite {
+                source: PlacementRead::Use(UseSite {
                     inst: InstId(2),
                     input_idx: 0,
-                },
+                }),
                 region: read_region,
                 block: 0x1010,
                 order: FinalOccurrenceOrder(2),
@@ -1856,10 +2028,10 @@ mod tests {
         let block_region = region_with_entry(&regions, 0x1000, StructuredRegionKind::Block);
         let reads = [FinalBindingRead {
             binding,
-            site: UseSite {
+            source: PlacementRead::Use(UseSite {
                 inst: InstId(0),
                 input_idx: 0,
-            },
+            }),
             region: block_region,
             block: 0x1000,
             order: FinalOccurrenceOrder(0),

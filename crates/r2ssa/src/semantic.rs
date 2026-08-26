@@ -16,7 +16,8 @@ use crate::graph::{InstId, InstPayload, SsaGraph, UseSite, ValueId};
 use crate::machine_context::{
     MachineRegisterGeometryState, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
     SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceCallResult, SourceCallSiteIdentity, SourceCarrierKind,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceTypeKind,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackSlotSpec,
+    SourceTypeKind,
 };
 use crate::obligation::SemanticObligationInventory;
 use crate::op::SSAOp;
@@ -944,9 +945,7 @@ impl StructuredLoopFact {
         machine_context: Option<&SourceMachineContext>,
     ) -> bool {
         if self.carriers.iter().any(|carrier| {
-            carrier.loop_id != self.id
-                || carrier.header != self.header
-                || !carrier.validate(graph)
+            carrier.loop_id != self.id || carrier.header != self.header || !carrier.validate(graph)
         }) {
             return false;
         }
@@ -1058,6 +1057,10 @@ pub struct StackSlotCertificate {
     pub base: StackAddressBase,
     pub offset: i64,
     pub size: Option<u32>,
+    /// Exact source slot identity when the immutable function interface owns a
+    /// unique slot at this base and offset. Absence grants no local or
+    /// parameter-home role downstream.
+    pub source_slot: Option<SourceStackSlotSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1169,6 +1172,10 @@ pub struct ReturnValueCertificate {
     pub value: ValueId,
     pub width: u32,
     pub carrier: Option<ReturnCarrier>,
+    /// Exact logical return projection declared by the immutable source
+    /// interface. `None` preserves the physical ABI-carrier behavior for
+    /// interfaces that carry no logical type graph.
+    pub source_logical_value: Option<SourceLogicalValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1336,6 +1343,7 @@ impl PreparedFunctionFacts {
             &boundaries,
             function,
             graph,
+            machine_context,
             &objects,
             &memory,
             &predicates,
@@ -3366,12 +3374,27 @@ fn collect_prepared_function_certificates(
     boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
     graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
     objects: &ObjectModel,
     memory: &MemorySSAFacts,
     predicates: &PredicateFacts,
     call_sites: &CallSiteFacts,
     structured: &StructuredDataflowFacts,
 ) -> PreparedFunctionCertificates {
+    let mut exact_stack_slots = BTreeMap::new();
+    let mut ambiguous_stack_slots = BTreeSet::new();
+    if let Some(interface) = machine_context.and_then(SourceMachineContext::function_interface) {
+        for slot in interface.stack_slots() {
+            let key = (slot.base(), slot.offset());
+            if exact_stack_slots.insert(key, *slot).is_some() {
+                ambiguous_stack_slots.insert(key);
+            }
+        }
+    }
+    for key in ambiguous_stack_slots {
+        exact_stack_slots.remove(&key);
+    }
+
     let loops = structured
         .loops
         .iter()
@@ -3494,7 +3517,10 @@ fn collect_prepared_function_certificates(
                     space: SpaceId::Ram,
                     base,
                     offset,
-                    size: None,
+                    size: exact_stack_slots
+                        .get(&(base, offset))
+                        .map(SourceStackSlotSpec::size_bytes),
+                    source_slot: exact_stack_slots.get(&(base, offset)).copied(),
                 },
             )),
             ObjectKind::StackSlot { .. }
@@ -3546,7 +3572,7 @@ fn collect_prepared_function_certificates(
     let stack_reloads =
         collect_stack_reload_source_certificates(function, graph, objects, memory, structured);
     let (returns, returns_by_inst) =
-        collect_return_value_certificates(boundaries, graph, &stack_reloads);
+        collect_return_value_certificates(boundaries, graph, machine_context, &stack_reloads);
 
     PreparedFunctionCertificates {
         loops,
@@ -3962,6 +3988,7 @@ fn expression_op_is_pure(op: &SSAOp) -> bool {
 fn collect_return_value_certificates(
     boundaries: &SourceBoundaryFacts,
     graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
     stack_reloads: &BTreeMap<ValueId, StackReloadSourceCertificate>,
 ) -> (Vec<ReturnValueCertificate>, BTreeMap<InstId, usize>) {
     let mut returns = Vec::new();
@@ -3987,7 +4014,9 @@ fn collect_return_value_certificates(
         if !matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. })) {
             continue;
         }
-        let Some(value) = graph.value(boundary_value.value) else {
+        let Some((value, width, source_logical_value)) =
+            exact_logical_return_projection(graph, machine_context, boundary_value)
+        else {
             continue;
         };
         let carrier = return_carrier_for_boundary_value(boundary_value, stack_reloads);
@@ -3996,13 +4025,97 @@ fn collect_return_value_certificates(
             at: boundary.at,
             block_addr,
             op_index,
-            value: boundary_value.value,
-            width: value.var.size,
+            value,
+            width,
             carrier,
+            source_logical_value,
         });
     }
 
     (returns, returns_by_inst)
+}
+
+fn exact_logical_return_projection(
+    graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
+    boundary: &CallBoundaryValueFact,
+) -> Option<(ValueId, u32, Option<SourceLogicalValue>)> {
+    let physical_value = graph.value(boundary.value)?;
+    let Some(interface) = machine_context.and_then(SourceMachineContext::function_interface) else {
+        return Some((boundary.value, physical_value.var.size, None));
+    };
+    let (Some(logical), Some(type_graph)) =
+        (interface.return_logical_value(), interface.type_graph())
+    else {
+        return Some((boundary.value, physical_value.var.size, None));
+    };
+    let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return None;
+    };
+    let CallBoundarySlot::Register {
+        storage: boundary_storage,
+        ..
+    } = boundary.slot
+    else {
+        return None;
+    };
+    let source_type = type_graph
+        .types()
+        .get(usize::try_from(logical.type_id()).ok()?)
+        .filter(|source_type| source_type.id() == logical.type_id())?;
+    let projection = logical.carrier();
+    let physical_bits = u64::from(storage.size).checked_mul(8)?;
+    if boundary_storage != storage
+        || storage.space != CanonicalStorageSpace::Register
+        || storage.size == 0
+        || physical_value.var.size != storage.size
+        || physical_value.canonical_storage != Some(storage)
+        || projection.offset_bits() != 0
+        || projection.size_bits() == 0
+        || projection.size_bits() != source_type.size_bits()
+        || !projection.size_bits().is_multiple_of(8)
+        || projection.size_bits() > physical_bits
+    {
+        return None;
+    }
+    match projection.kind() {
+        SourceCarrierKind::Full if projection.size_bits() == physical_bits => {
+            Some((boundary.value, physical_value.var.size, Some(logical)))
+        }
+        SourceCarrierKind::LowBits
+            if projection.size_bits() < physical_bits
+                && matches!(
+                    source_type.kind(),
+                    SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            let logical_width = u32::try_from(projection.size_bits() / 8).ok()?;
+            let logical_storage = CanonicalStorageId {
+                space: storage.space,
+                offset: storage.offset,
+                size: logical_width,
+            };
+            let producer = graph
+                .def_inst(boundary.value)
+                .and_then(|id| graph.inst(id))?;
+            let [input] = producer.inputs.as_slice() else {
+                return None;
+            };
+            let logical_value = graph.value(*input)?;
+            let InstPayload::Op(SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src }) =
+                &producer.payload
+            else {
+                return None;
+            };
+            (producer.output == Some(boundary.value)
+                && *dst == physical_value.var
+                && *src == logical_value.var
+                && logical_value.var.size == logical_width
+                && logical_value.canonical_storage == Some(logical_storage))
+            .then_some((*input, logical_width, Some(logical)))
+        }
+        _ => None,
+    }
 }
 
 fn return_carrier_for_boundary_value(
@@ -5003,9 +5116,7 @@ fn loop_carrier_facts(
                 .any(|entry| entry.value == edge.value)
                 && function.dominates(edge.predecessor, header)
             {
-                carriers[carrier_index]
-                    .dominating_initializers
-                    .push(edge);
+                carriers[carrier_index].dominating_initializers.push(edge);
             }
         }
         owners_by_value
@@ -5074,30 +5185,14 @@ fn insert_loop_carrier_peer_roles(
     insert_loop_carrier_member_role(rows, peer.phi, LoopCarrierMemberRole::ProjectedPeer);
     for entry in &peer.entries {
         insert_loop_carrier_member_role(rows, entry.value, LoopCarrierMemberRole::Entry);
-        insert_loop_carrier_member_role(
-            rows,
-            entry.value,
-            LoopCarrierMemberRole::ProjectedPeer,
-        );
+        insert_loop_carrier_member_role(rows, entry.value, LoopCarrierMemberRole::ProjectedPeer);
     }
     for update in &peer.updates {
         insert_loop_carrier_member_role(rows, update.value, LoopCarrierMemberRole::LatchUpdate);
-        insert_loop_carrier_member_role(
-            rows,
-            update.value,
-            LoopCarrierMemberRole::ProjectedPeer,
-        );
+        insert_loop_carrier_member_role(rows, update.value, LoopCarrierMemberRole::ProjectedPeer);
         for identity in &update.identity_values {
-            insert_loop_carrier_member_role(
-                rows,
-                *identity,
-                LoopCarrierMemberRole::UpdateIdentity,
-            );
-            insert_loop_carrier_member_role(
-                rows,
-                *identity,
-                LoopCarrierMemberRole::ProjectedPeer,
-            );
+            insert_loop_carrier_member_role(rows, *identity, LoopCarrierMemberRole::UpdateIdentity);
+            insert_loop_carrier_member_role(rows, *identity, LoopCarrierMemberRole::ProjectedPeer);
         }
     }
 }
@@ -5209,12 +5304,7 @@ fn loop_carrier_projection_key(
     storage_spans: &StorageSpans,
     machine_context: &SourceMachineContext,
     candidate: &LoopCarrierPeerCandidate,
-) -> Option<(
-    CanonicalStorageId,
-    crate::span::SpanId,
-    Vec<u64>,
-    Vec<u64>,
-)> {
+) -> Option<(CanonicalStorageId, crate::span::SpanId, Vec<u64>, Vec<u64>)> {
     let carrier = exact_loop_carrier_register_storage(graph, machine_context, candidate.phi)?;
     let state = std::iter::once(candidate.phi)
         .chain(candidate.updates.iter().flat_map(|update| {
@@ -5343,12 +5433,9 @@ fn loop_carrier_member_rows(
     if let Some(machine_context) = machine_context {
         let mut candidates_by_key = BTreeMap::<_, Vec<usize>>::new();
         for (index, candidate) in candidates.iter().enumerate() {
-            let Some(key) = loop_carrier_projection_key(
-                graph,
-                storage_spans,
-                machine_context,
-                candidate,
-            ) else {
+            let Some(key) =
+                loop_carrier_projection_key(graph, storage_spans, machine_context, candidate)
+            else {
                 continue;
             };
             candidates_by_key.entry(key).or_default().push(index);
@@ -5419,11 +5506,7 @@ fn loop_carrier_member_rows(
         .insts
         .iter()
         .filter(|inst| matches!(inst.payload, InstPayload::Phi { .. }))
-        .filter_map(|inst| {
-            graph
-                .block(inst.block)
-                .map(|block| (inst.id, block.addr))
-        })
+        .filter_map(|inst| graph.block(inst.block).map(|block| (inst.id, block.addr)))
         .filter(|(_, block_addr)| *block_addr != header && !loop_body.contains(block_addr))
         .map(|(inst, _)| inst)
         .collect::<BTreeSet<_>>();
@@ -5442,43 +5525,40 @@ fn loop_carrier_member_rows(
             continue;
         };
         let output_width = graph.value(output)?.var.size;
-        let mut matches = candidate_roots
-            .iter()
-            .copied()
-            .filter(|root| {
-                let row = &rows[*root];
-                let all_owned = inst.inputs.iter().all(|input| row.contains_key(input));
-                let has_carried_state = inst.inputs.iter().any(|input| {
-                    row.get(input).is_some_and(|roles| {
-                        roles.contains(&LoopCarrierMemberRole::LatchUpdate)
-                            || roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
-                            || roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
-                    })
-                });
-                let has_other_state = inst.inputs.iter().any(|input| {
-                    row.get(input).is_some_and(|roles| {
-                        !roles.contains(&LoopCarrierMemberRole::LatchUpdate)
-                            && !roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
-                            && !roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
-                    })
-                });
-                let carrier = &carriers[*root];
-                let width_is_exact = output_width == carrier.width;
-                let projected_width_is_exact = !width_is_exact
-                    && machine_context.is_some_and(|context| {
-                        match (
-                            exact_loop_carrier_register_storage(graph, context, output),
-                            exact_loop_carrier_register_storage(graph, context, carrier.phi),
-                        ) {
-                            (Some(output), Some(carrier)) => output == carrier,
-                            _ => false,
-                        }
-                    });
-                all_owned
-                    && has_carried_state
-                    && has_other_state
-                    && (width_is_exact || projected_width_is_exact)
+        let mut matches = candidate_roots.iter().copied().filter(|root| {
+            let row = &rows[*root];
+            let all_owned = inst.inputs.iter().all(|input| row.contains_key(input));
+            let has_carried_state = inst.inputs.iter().any(|input| {
+                row.get(input).is_some_and(|roles| {
+                    roles.contains(&LoopCarrierMemberRole::LatchUpdate)
+                        || roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
+                        || roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
+                })
             });
+            let has_other_state = inst.inputs.iter().any(|input| {
+                row.get(input).is_some_and(|roles| {
+                    !roles.contains(&LoopCarrierMemberRole::LatchUpdate)
+                        && !roles.contains(&LoopCarrierMemberRole::UpdateIdentity)
+                        && !roles.contains(&LoopCarrierMemberRole::PostLoopMerge)
+                })
+            });
+            let carrier = &carriers[*root];
+            let width_is_exact = output_width == carrier.width;
+            let projected_width_is_exact = !width_is_exact
+                && machine_context.is_some_and(|context| {
+                    match (
+                        exact_loop_carrier_register_storage(graph, context, output),
+                        exact_loop_carrier_register_storage(graph, context, carrier.phi),
+                    ) {
+                        (Some(output), Some(carrier)) => output == carrier,
+                        _ => false,
+                    }
+                });
+            all_owned
+                && has_carried_state
+                && has_other_state
+                && (width_is_exact || projected_width_is_exact)
+        });
         let Some(root) = matches.next() else {
             continue;
         };
@@ -7259,11 +7339,15 @@ mod tests {
         AddressProvenanceFacts, AnalysisAssumption, AssumptionProvenance, AssumptionScope,
         AssumptionSet, AssumptionSubject, AssumptionValue, CanonicalStorageId,
         CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp, SSAVar,
-        SemanticObligationKind, SourceAbiParameterSpec, SourceFunctionInterface,
-        SourceFunctionReturn, SourceStackSlotSpec, SsaArtifact, StackAddressBase, StackAddressRoot,
-        ValueId,
+        SemanticObligationKind, SourceAbiParameterSpec, SourceCarrierKind, SourceCarrierProjection,
+        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue, SourceStackSlotSpec,
+        SourceType, SourceTypeGraph, SourceTypeKind, SsaArtifact, StackAddressBase,
+        StackAddressRoot, ValueId,
     };
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
 
     fn test_reg(offset: u64) -> Varnode {
         Varnode::new(SpaceId::Register, offset, 8)
@@ -7558,6 +7642,7 @@ mod tests {
             &facts.boundaries,
             artifact.function(),
             artifact.graph(),
+            Some(artifact.machine_context()),
             &objects,
             &facts.memory,
             &facts.predicates,
@@ -7601,6 +7686,7 @@ mod tests {
             &facts.boundaries,
             artifact.function(),
             artifact.graph(),
+            Some(artifact.machine_context()),
             &mismatched_objects,
             &facts.memory,
             &facts.predicates,
@@ -7901,8 +7987,9 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(0)))
         .expect("exact dual-coordinate interface");
-        let artifact = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
-            .expect("dual-coordinate artifact");
+        let artifact =
+            SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface.clone())
+                .expect("dual-coordinate artifact");
 
         let [save] = artifact
             .memory_defs_for_op_site(0x3600, 1)
@@ -7952,6 +8039,30 @@ mod tests {
                 ..
             })
         ));
+        let local_certificate = artifact
+            .certificates()
+            .stack_slots
+            .get(&local_store.location.object)
+            .expect("the frame-relative local has one prepared certificate");
+        assert_eq!(
+            local_certificate.size,
+            Some(4),
+            "the prepared certificate must retain the exact source stack-slot width"
+        );
+        assert_eq!(
+            local_certificate.source_slot,
+            interface.stack_slots().first().copied(),
+            "the prepared certificate must retain the complete exact source stack-slot identity"
+        );
+        assert_eq!(
+            artifact
+                .certificates()
+                .stack_slots
+                .get(&save.location.object)
+                .and_then(|slot| slot.size),
+            None,
+            "an uncaptured stack resource must not borrow another coordinate's width"
+        );
         assert_eq!(
             artifact
                 .objects()
@@ -8511,6 +8622,95 @@ mod tests {
         .expect("complete return artifact")
     }
 
+    fn exact_signed_low_return_artifact(write_logical_carrier: bool) -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::sub("eax", 0, 4, "rax"));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("sp", 32, 8));
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
+                },
+            }
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 16,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 16,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 32,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 32,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
+        let mut block = R2ILBlock::new(0x2f20, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, if write_logical_carrier { 4 } else { 8 }),
+            src: Varnode::constant(7, if write_logical_carrier { 4 } else { 8 }),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let logical = SourceLogicalValue::new(
+            0,
+            SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
+        );
+        let type_graph = SourceTypeGraph::new(
+            [SourceType::new(0, SourceTypeKind::SignedInteger, 32, 32)],
+            [],
+        )
+        .expect("exact signed return type graph");
+        let interface = SourceFunctionInterface::new_exact_with_logical_types(
+            b"exact-signed-low-return".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: register_storage(0, 8),
+            },
+            [],
+            [],
+            Some(logical),
+            Some(type_graph),
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(32, 8)))
+        .expect("exact signed low return interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("exact signed low return artifact")
+    }
+
     #[test]
     fn return_certificate_requires_one_complete_source_boundary_value() {
         let storage = register_storage(0, 8);
@@ -8537,6 +8737,7 @@ mod tests {
         assert_eq!(certificate.at, boundary.at);
         assert_eq!(certificate.value, boundary_value.value);
         assert_eq!(certificate.width, 8);
+        assert_eq!(certificate.source_logical_value, None);
         assert_eq!(
             certificate.carrier,
             Some(ReturnCarrier::Register { storage })
@@ -8552,6 +8753,7 @@ mod tests {
         let (certificates, by_inst) = super::collect_return_value_certificates(
             &ambiguous,
             artifact.graph(),
+            Some(artifact.machine_context()),
             &artifact.certificates().stack_reloads,
         );
         assert!(certificates.is_empty());
@@ -8580,10 +8782,72 @@ mod tests {
         let (certificates, by_inst) = super::collect_return_value_certificates(
             &composed,
             artifact.graph(),
+            Some(artifact.machine_context()),
             &artifact.certificates().stack_reloads,
         );
         assert!(certificates.is_empty());
         assert!(by_inst.is_empty());
+    }
+
+    #[test]
+    fn low_bit_return_certificate_owns_the_exact_logical_extension_input() {
+        let artifact = exact_signed_low_return_artifact(true);
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        let [boundary_value] = boundary.values.as_slice() else {
+            panic!("exact physical return boundary")
+        };
+        let physical = boundary_value.value;
+        let (block_addr, op_index) = artifact
+            .graph()
+            .op_site_for_inst(boundary.at)
+            .expect("return op site");
+        let certificate = artifact
+            .return_certificate_for_op(block_addr, op_index)
+            .expect("exact logical return certificate");
+        assert_ne!(certificate.value, physical);
+        assert_eq!(certificate.width, 4);
+        assert_eq!(
+            certificate.source_logical_value,
+            artifact
+                .machine_context()
+                .function_interface()
+                .and_then(SourceFunctionInterface::return_logical_value)
+        );
+        assert_eq!(
+            certificate.carrier,
+            Some(ReturnCarrier::Register {
+                storage: register_storage(0, 8),
+            })
+        );
+        assert!(
+            artifact
+                .graph()
+                .value(certificate.value)
+                .is_some_and(|value| {
+                    value.var.size == 4 && value.canonical_storage == Some(register_storage(0, 4))
+                })
+        );
+    }
+
+    #[test]
+    fn low_bit_return_certificate_refuses_a_full_write_without_exact_extension_input() {
+        let artifact = exact_signed_low_return_artifact(false);
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(boundary.complete);
+        assert!(boundary.register_compositions.is_empty());
+        assert!(artifact.certificates().returns.is_empty());
     }
 
     #[test]

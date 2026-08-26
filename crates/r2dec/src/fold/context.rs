@@ -15,8 +15,7 @@ use r2ssa::{
 use r2types::ExternalStackVarSpec;
 use r2types::{
     CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb,
-    FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
-    TypeOracle, VisibleBinding,
+    FunctionFacts, InterprocSummaryView, StackSlotKey, TypeOracle, VisibleBinding,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,9 +24,7 @@ pub(crate) enum ResolutionPhase {
     Definition,
     DefinitionRaw,
     Visible,
-    ImportedArg,
     Memory,
-    Return,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -162,8 +159,6 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
-    pub(crate) hide_stack_frame: bool,
-    pub(crate) signature_registry: SignatureRegistry,
     pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
     pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
     /// Legacy cache retained only as a negative test fixture: production
@@ -279,8 +274,6 @@ impl<'a> FoldingContext<'a> {
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
-            hide_stack_frame: true,
-            signature_registry: SignatureRegistry::from_embedded_json(),
             forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
             load_expr_memo: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
@@ -427,6 +420,40 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    pub(crate) fn observe_certified_value_read_expr(
+        &self,
+        value: r2ssa::ValueId,
+        at: r2ssa::InstId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                    value,
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_value_read_expr(value, at, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     /// Wrap one exact normalized definition that survives as a statement.
     pub(crate) fn observe_normalized_output_stmt(
         &self,
@@ -442,31 +469,6 @@ impl<'a> FoldingContext<'a> {
             journal
                 .borrow_mut()
                 .observe_normalized_output_stmt(site, stmt)
-        });
-        match result {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
-    /// Wrap one exact normalized definition that survives inside a consumer.
-    pub(crate) fn observe_normalized_output_expr(
-        &self,
-        block_addr: u64,
-        op_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let fallback = expr.clone();
-        let result = self.observation_site(block_addr, op_idx).and_then(|site| {
-            journal
-                .borrow_mut()
-                .observe_normalized_output_expr(site, expr)
         });
         match result {
             Ok(marked) => marked,
@@ -778,21 +780,6 @@ impl<'a> FoldingContext<'a> {
                 ),
             None => BTreeSet::new(),
             }
-    }
-
-    pub(crate) fn exact_effect_obligations_for_source_value(
-        &self,
-        kind: EffectOccurrenceKind,
-        block_addr: u64,
-        op_idx: usize,
-        value: Option<ValueId>,
-    ) -> BTreeSet<SemanticObligationId> {
-        self
-            .inputs
-            .prepared_ssa
-            .and_then(|prepared| prepared.graph().inst_id_for_op_site(block_addr, op_idx))
-            .map(|inst| self.exact_value_obligations(kind, inst, value))
-            .unwrap_or_default()
     }
 
     fn exact_effect_obligations_for_inst_memory(

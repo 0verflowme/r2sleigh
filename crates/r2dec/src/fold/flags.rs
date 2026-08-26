@@ -321,33 +321,50 @@ impl<'a> FoldingContext<'a> {
         &self,
         block: &FunctionSSABlock,
     ) -> Option<(CExpr, r2ssa::PredicateId, r2ssa::ValueId)> {
-        let (branch_idx, cond) =
-            block
-                .ops
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(idx, op)| match op {
-                    SSAOp::CBranch { cond, .. } => Some((idx, cond)),
-                    _ => None,
-                })?;
+        let (branch_idx, cond) = Self::unique_terminal_branch_condition(block)?;
         let predicate = self.control_facts()?.branch_for_block(block.addr)?;
         if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
             return None;
         }
         let expr = self.exact_branch_input_expr(block.addr, branch_idx)?;
-        let expr = self.simplify_predicate_expr(expr);
         Some((expr, predicate.id, predicate.condition))
+    }
+
+    fn unique_terminal_branch_condition(
+        block: &FunctionSSABlock,
+    ) -> Option<(usize, &SSAVar)> {
+        let terminal_idx = block.ops.len().checked_sub(1)?;
+        let mut branches = block
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| match op {
+                SSAOp::CBranch { cond, .. } => Some((idx, cond)),
+                _ => None,
+            });
+        let (branch_idx, cond) = branches.next()?;
+        (branches.next().is_none() && branch_idx == terminal_idx).then_some((branch_idx, cond))
     }
 
     pub(super) fn certified_predicate_expr_for_id(
         &self,
-        _predicate_id: r2ssa::PredicateId,
+        predicate_id: r2ssa::PredicateId,
     ) -> Option<CExpr> {
-        // This path has a PredicateId but no normalized branch operation, so
-        // it cannot name the exact source UseSite whose machine projection is
-        // required. Refuse rather than reconstructing the comparison operands.
-        None
+        let predicate = self
+            .control_facts()?
+            .branch_predicates
+            .values()
+            .find(|predicate| predicate.id == predicate_id)?;
+        let block = self
+            .inputs
+            .prepared_ssa?
+            .function()
+            .get_block(predicate.block_addr)?;
+        let (branch_idx, cond) = Self::unique_terminal_branch_condition(block)?;
+        if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
+            return None;
+        }
+        self.exact_branch_input_expr(predicate.block_addr, branch_idx)
     }
 
     pub(super) fn normalize_assignment_predicate_rhs(&self, rhs: CExpr) -> CExpr {
@@ -366,9 +383,8 @@ impl<'a> FoldingContext<'a> {
     }
 
     pub(super) fn predicate_candidate_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        let key = var.display_name();
         let prepared_value_id = self.prepared_value_id_for_var(var);
-        let prepared = self
+        self
             .control_facts()
             .and_then(|facts| {
                 facts
@@ -383,23 +399,7 @@ impl<'a> FoldingContext<'a> {
                     .and_then(|view| view.predicate_expr_for_cond(var).cloned())
                     .map(|expr| self.resolve_predicate_expr_tree(&expr))
             })
-            .or_else(|| self.prepared_predicate_candidate_for_var(var));
-        let legacy = self
-            .lookup_predicate_expr(&key)
-            .or_else(|| {
-                self.lookup_definition(&key)
-                    .filter(|expr| self.is_assignment_predicate_expr(expr))
-            })
-            .or_else(|| {
-                let rendered = self.retain_lowering_result(self.var_name(var))?;
-                if self.is_transient_visible_name(&rendered)
-                    || self.is_low_signal_visible_name(&rendered)
-                {
-                    return None;
-                }
-                self.lookup_predicate_expr(&rendered)
-            });
-        self.choose_preferred_scalar_predicate_expr(prepared, legacy)
+            .or_else(|| self.prepared_predicate_candidate_for_var(var))
     }
 
     pub(super) fn resolve_predicate_rhs_for_var(&self, src: &SSAVar, fallback: CExpr) -> CExpr {
@@ -539,11 +539,6 @@ impl<'a> FoldingContext<'a> {
                 Some(CExpr::binary(BinaryOp::Le, lhs, rhs))
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn resolve_prepared_predicate_operand(&self, var: &SSAVar) -> Option<CExpr> {
-        self.resolve_prepared_predicate_operand_with_width(var, var.size)
     }
 
     fn resolve_prepared_predicate_operand_with_width(
@@ -2655,32 +2650,6 @@ impl<'a> FoldingContext<'a> {
             || lower.contains('.')
     }
 
-    pub(super) fn is_register_like_base_name(&self, name: &str) -> bool {
-        self.inputs.arch.is_register_like_base_name(name)
-    }
-
-    pub(super) fn is_ephemeral_ssa_target(&self, name: &str) -> bool {
-        if Self::is_semantic_binding_name(name) {
-            return false;
-        }
-
-        if self.is_opaque_temp_name(name) {
-            return true;
-        }
-
-        let lower = name.to_ascii_lowercase();
-        let base = match lower.rsplit_once('_') {
-            Some((base, suffix))
-                if !base.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) =>
-            {
-                base
-            }
-            _ => lower.as_str(),
-        };
-
-        self.is_register_like_base_name(base)
-    }
-
     pub(super) fn expr_contains_opaque_temp(&self, expr: &CExpr) -> bool {
         let mut found = false;
         expr.visit(&mut |node| {
@@ -2777,15 +2746,6 @@ impl<'a> FoldingContext<'a> {
             }
             _ => false,
         }
-    }
-
-    /// Extract switch expression from an operation (for switch statement detection).
-    pub fn extract_switch_expr(&self, op: &SSAOp) -> Option<CExpr> {
-        // Look for indirect branch (BranchInd) which typically holds the switch variable
-        if let SSAOp::BranchInd { target } = op {
-            return self.retain_lowering_result(self.get_expr(target));
-        }
-        None
     }
 
     /// Look up the original comparison operands for a flag variable.

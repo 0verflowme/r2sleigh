@@ -133,22 +133,23 @@ impl<'a> FoldingContext<'a> {
             return false;
         };
         let role = self.symbols.borrow().get(*name).role;
-        if let crate::symbol::SymbolRole::Parameter(slot) = role
-            && self
-                .inputs
-                .function_facts
-                .type_facts()
-                .render_authorized_signature()
-                .and_then(|signature| signature.params.get(slot as usize))
-                .and_then(|parameter| parameter.ty.as_ref())
-                .is_some_and(|ty| {
-                    matches!(
-                        crate::type_like_to_ctype(ty),
-                        CType::Pointer(_) | CType::Array(_, _)
-                    )
-                })
-        {
-            return true;
+        if let crate::symbol::SymbolRole::Parameter(slot) = role {
+            return self.inputs.render_facts().is_some_and(|render| {
+                matches!(
+                    render
+                        .certified_entities
+                        .get(&r2ssa::SemanticId::Parameter(slot)),
+                    Some(r2types::CertifiedEntity::Parameter {
+                        slot: entity_slot,
+                        ty: Some(ty),
+                        ..
+                    }) if *entity_slot == slot
+                        && matches!(
+                            crate::type_like_to_ctype(ty),
+                            CType::Pointer(_) | CType::Array(_, _)
+                        )
+                )
+            });
         }
         let Some(names) = self.inputs.binding_names else {
             return false;
@@ -428,8 +429,8 @@ impl<'a> FoldingContext<'a> {
         let slot = usize::try_from(slot).ok()?;
         let base_value = render.parameter_values(slot).next()?;
         if !render
-                .certified_expr_for_value(index)
-                .is_some_and(|expr| expr.fact.renderable)
+            .certified_expr_for_value(index)
+            .is_some_and(|expr| expr.fact.renderable)
         {
             return None;
         }
@@ -461,11 +462,6 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => Self::expr_is_store_target_candidate(inner),
             _ => false,
         }
-    }
-
-    #[cfg(test)]
-    fn byte_indexed_pointer_add_expr(&self, expr: &CExpr) -> Option<CExpr> {
-        self.indexed_pointer_add_expr(expr, &CType::u8())
     }
 
     /// Whether a type says the expression is a pointer, when it says either.
@@ -725,13 +721,6 @@ impl<'a> FoldingContext<'a> {
         if self.expr_contains_raw_stack_base_arithmetic(&expr) {
             return None;
         }
-        if self.certified_return_expr_contains_raw_storage_name(&expr)
-            && self
-                .control_facts()
-                .is_none_or(|facts| facts.loops.is_empty() && facts.switches.is_empty())
-        {
-            return None;
-        }
         Some((addr, expr))
     }
 
@@ -917,9 +906,10 @@ impl<'a> FoldingContext<'a> {
         if let Some(plan) = self
             .certified_render_context()
             .and_then(|proof| self.certified_render_plan(proof))
-            && let Some(expr) = self.inputs.binding_names.and_then(|names| {
-                plan.stack_param_expr_for_memory_fact(fact, names)
-            })
+            && let Some(expr) = self
+                .inputs
+                .binding_names
+                .and_then(|names| plan.stack_param_expr_for_memory_fact(fact, names))
         {
             return Some(expr);
         }
@@ -1165,75 +1155,6 @@ impl<'a> FoldingContext<'a> {
 
         if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
             return Ok(exact);
-        }
-
-        Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
-    }
-
-    #[cfg(test)]
-    pub(super) fn render_canonical_store_target_expr(
-        &self,
-        addr: &SSAVar,
-        value_size: u32,
-        elem_ty: CType,
-    ) -> OpLoweringResult<CExpr> {
-        // One resolver. `get_expr` already tries forwarding, then semantic
-        // values, then the recorded definition, then the name, and the two
-        // lookups that used to run ahead of it are the third and a variant of
-        // it -- so putting them first meant an address was resolved by a rule
-        // that had not been told what the value forwards to, while the decision
-        // to leave that value's statement out was taken by a rule that had.
-        let fallback_addr_expr = self.get_expr(addr)?;
-        let mut semantic_visited = HashSet::new();
-        let mut best = self.render_authoritative_memory_access_by_name(
-            &addr.display_name(),
-            value_size,
-            0,
-            &mut semantic_visited,
-        );
-        let fallback_rendered = self.render_memory_access_from_visible_expr(
-            &fallback_addr_expr,
-            value_size,
-            0,
-            &mut semantic_visited,
-        );
-        if let Some(fallback_structured) = fallback_rendered
-            .as_ref()
-            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
-            .cloned()
-            && !best
-                .as_ref()
-                .is_some_and(Self::expr_is_structured_memory_candidate)
-        {
-            best = Some(fallback_structured);
-        }
-        best = self.choose_preferred_visible_expr(best, fallback_rendered);
-        best = self.choose_preferred_visible_expr(
-            best,
-            self.prepared_named_memory_def_expr_for_current_op(),
-        );
-        if let Some(expr) = best.filter(Self::expr_is_store_target_candidate) {
-            return Ok(expr);
-        }
-
-        if let Some(stack_var) = self.stack_var_expr_for_addr_var(addr) {
-            return Ok(stack_var);
-        }
-
-        if addr.constant_bits().is_some()
-            && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
-        {
-            return Ok(fallback_addr_expr);
-        }
-
-        if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return Ok(exact);
-        }
-
-        if value_size == 1
-            && let Some(indexed) = self.byte_indexed_pointer_add_expr(&fallback_addr_expr)
-        {
-            return Ok(indexed);
         }
 
         Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))

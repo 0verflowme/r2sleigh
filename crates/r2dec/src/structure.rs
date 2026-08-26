@@ -12,7 +12,6 @@ use r2ssa::{CFGEdge, ControlGuard, LoopId, PredicateId, SSAFunction, SSAOp, Valu
 use crate::ast::{BinaryOp, CExpr, CStmt, UnaryOp};
 use crate::control::{DecompileExecutionStop, DecompileWorkControl};
 use crate::fold::FoldingContext;
-use crate::fold::context::EffectOccurrenceKind;
 use crate::fold::op_lower::OpLoweringRefusal;
 use crate::region::{Region, RegionAnalyzer, RegionTransferKind};
 use crate::structured_region::{
@@ -122,7 +121,7 @@ impl ControlRenderProof {
 
     fn switch_proof(
         anchor: u64,
-        switch_selector: Option<ValueId>,
+        switch_selector: ValueId,
         switch_cases: Vec<(u64, u64)>,
         switch_default: Option<u64>,
     ) -> Self {
@@ -136,7 +135,7 @@ impl ControlRenderProof {
             loop_body_blocks: Vec::new(),
             loop_latches: Vec::new(),
             loop_exits: Vec::new(),
-            switch_selector,
+            switch_selector: Some(switch_selector),
             switch_cases,
             switch_default,
         }
@@ -651,7 +650,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn record_switch_render_proof(
         &mut self,
         anchor: u64,
-        selector: Option<ValueId>,
+        selector: ValueId,
         cases: &[(Option<u64>, Box<Region>)],
         default: Option<&Region>,
     ) {
@@ -662,7 +661,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn switch_render_proof(
         &self,
         anchor: u64,
-        selector: Option<ValueId>,
+        selector: ValueId,
         cases: &[(Option<u64>, Box<Region>)],
         default: Option<&Region>,
     ) -> ControlRenderProof {
@@ -928,22 +927,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             } => {
                 let merge_owned_by_ancestor =
                     merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
-                // A speculative attempt must leave no trace when it declines,
-                // deferrals included: it structures a subtree, and a real
-                // structuring of that same subtree nested inside it observes
-                // whatever it left on the stack. `murmur3_32` loses its return
-                // that way.
-                let deferred_before = self.deferred_merge_blocks.len();
-                if !merge_owned_by_ancestor
-                    && let Some(rewritten) = self.try_structure_if_else_with_register_merge_returns(
-                        *cond_block,
-                        then_region,
-                        else_region.as_deref(),
-                        *merge_block,
-                    )?
-                {
-                    return Ok(rewritten);
-                }
                 if let Some(rewritten) = self.try_structure_guarded_switch_with_default(
                     *cond_block,
                     then_region,
@@ -952,7 +935,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 )? {
                     return Ok(rewritten);
                 }
-                self.deferred_merge_blocks.truncate(deferred_before);
                 let (cond, predicate, condition_value) =
                     self.get_branch_condition_with_predicate(*cond_block);
                 let Some(mut cond) = cond else {
@@ -1221,180 +1203,49 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         pred_block: u64,
         region: &Region,
     ) -> ControlFlowStructureResult<CStmt> {
-        let direct_successor = self.func.successors(pred_block).contains(&region.entry());
-        if direct_successor {
-            self.structure_region_from_predecessor(region, pred_block)
-        } else {
-            self.structure_region(region)
-        }
-    }
-
-    fn structure_region_from_predecessor(
-        &mut self,
-        region: &Region,
-        pred_block: u64,
-    ) -> ControlFlowStructureResult<CStmt> {
-        match region {
-            Region::Block(addr) => self.structure_block_from_predecessor(*addr, pred_block),
-            _ => self.structure_region(region),
-        }
-    }
-
-    fn structure_block_from_predecessor(
-        &mut self,
-        addr: u64,
-        pred_block: u64,
-    ) -> ControlFlowStructureResult<CStmt> {
-        // A branch that runs into the merge its own `if` deferred must not print
-        // it: the `if` prints it once the branches are done. Printing it here as
-        // well renders the same statements twice, and the copy inside the branch
-        // reads names the copy after it declares -- murmur3 at arm64 -O1.
-        if self.deferred_merge_blocks.contains(&addr) {
+        if self.func.successors(pred_block).contains(&region.entry())
+            && matches!(region, Region::Block(addr) if self.deferred_merge_blocks.contains(addr))
+        {
             return Ok(CStmt::Empty);
         }
-        let stmt = self.structure_block(addr)?;
-        if !self.block_allows_predecessor_return_register_rewrite(addr) {
-            return Ok(stmt);
-        }
-        let Some((expr, proof_block, proof_op, proof_value)) =
-            self.return_register_candidate_for_merge_predecessor(addr, pred_block)?
+        self.structure_region(region)
+    }
+
+    /// Project the exact selector use of the terminal indirect branch.
+    fn get_switch_expression(
+        &mut self,
+        switch_addr: u64,
+    ) -> ControlFlowStructureResult<Option<(CExpr, ValueId)>> {
+        let Some(block) = self.func.get_block(switch_addr) else {
+            return Ok(None);
+        };
+        let Some(op_idx) = block.ops.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        let SSAOp::BranchInd { target } = &block.ops[op_idx] else {
+            return Ok(None);
+        };
+        let Some(fact) = self
+            .fold_ctx
+            .control_facts()
+            .and_then(|facts| facts.switch_for_block(switch_addr))
         else {
-            return Ok(stmt);
+            return Ok(None);
         };
-        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            Ok(self.observe_return_value_ownership(
-                rewritten,
-                proof_block,
-                proof_op,
-                proof_value,
-            ))
-        } else {
-            Ok(stmt)
-        }
-    }
-
-    fn block_allows_predecessor_return_register_rewrite(&self, addr: u64) -> bool {
-        let Some(block) = self.func.get_block(addr) else {
-            return false;
-        };
-        block.ops.iter().all(|op| {
-            op.dst().is_none_or(|dst| {
-                !self
-                    .fold_ctx
-                    .inputs
-                    .arch
-                    .is_return_register_name(&dst.name.to_ascii_lowercase())
-            })
-        })
-    }
-
-    fn return_register_candidate_for_merge_predecessor(
-        &self,
-        merge_addr: u64,
-        pred_addr: u64,
-    ) -> ControlFlowStructureResult<Option<(CExpr, u64, usize, ValueId)>> {
-        if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
+        if fact.block_addr != switch_addr {
             return Ok(None);
         }
-        let candidate = self
+        let Some(selector) = fact.selector else {
+            return Ok(None);
+        };
+        if self.fold_ctx.prepared_value_id_for_var(target) != Some(selector) {
+            return Ok(None);
+        }
+        let expr = self
             .fold_ctx
-            .merged_return_register_candidate_for_block_predecessor_with_proof(
-                merge_addr, pred_addr,
-            )?;
-        match candidate {
-            Some(candidate) => Ok(Some(candidate)),
-            None => self
-                .fold_ctx
-                .predecessor_return_register_candidate_with_proof(pred_addr)
-                .map_err(ControlFlowStructureError::from),
-        }
-    }
-
-    /// Get the switch expression from a block.
-    fn get_switch_expression(&mut self, addr: u64) -> Option<(CExpr, Option<ValueId>)> {
-        let switch_addr = self.unique_switch_block().unwrap_or(addr);
-        let block = self.func.get_block(switch_addr)?;
-
-        if let Some((expr, selector)) = self
-            .fold_ctx
-            .resolve_switch_expr_for_block_with_selector(switch_addr)
-        {
-            return Some((expr, selector));
-        }
-
-        if let Some(cond) = self.get_branch_condition(switch_addr)
-            && let Some(expr) = Self::selector_expr_from_condition(&cond)
-        {
-            return Some((expr, None));
-        }
-        if let Some(expr) = self.selector_expr_from_switch_predecessors(switch_addr) {
-            return Some((expr, None));
-        }
-
-        // Look for an indirect branch which typically has the switch variable
-        for op in &block.ops {
-            if let Some(expr) = self.fold_ctx.extract_switch_expr(op) {
-                return Some((expr, None));
-            }
-        }
-
-        None
-    }
-
-    fn unique_switch_block(&self) -> Option<u64> {
-        let mut switch_blocks = self.func.cfg().block_addrs().filter(|addr| {
-            self.func
-                .cfg()
-                .get_block(*addr)
-                .is_some_and(|block| matches!(block.terminator, BlockTerminator::Switch { .. }))
-        });
-        let block = switch_blocks.next()?;
-        if switch_blocks.next().is_some() {
-            return None;
-        }
-        Some(block)
-    }
-
-    fn selector_expr_from_switch_predecessors(&mut self, addr: u64) -> Option<CExpr> {
-        let mut candidates = self
-            .func
-            .predecessors(addr)
-            .into_iter()
-            .filter_map(|pred| {
-                self.get_branch_condition(pred)
-                    .and_then(|cond| Self::selector_expr_from_condition(&cond))
-            })
-            .collect::<Vec<_>>();
-        candidates.dedup();
-        (candidates.len() == 1).then(|| candidates.pop()).flatten()
-    }
-
-    fn selector_expr_from_condition(cond: &CExpr) -> Option<CExpr> {
-        match cond {
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                Self::selector_expr_from_condition(inner)
-            }
-            CExpr::Binary {
-                op:
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge,
-                left,
-                right,
-            } => {
-                if matches!(left.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
-                    return Some((**right).clone());
-                }
-                if matches!(right.as_ref(), CExpr::IntLit(_) | CExpr::UIntLit(_)) {
-                    return Some((**left).clone());
-                }
-                None
-            }
-            _ => None,
-        }
+            .planned_input_expr_at(switch_addr, op_idx, 0)
+            .map_err(ControlFlowStructureError::from)?;
+        Ok(Some((expr, selector)))
     }
 
     fn structure_switch_region(
@@ -1406,7 +1257,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     ) -> ControlFlowStructureResult<CStmt> {
         let merge_owned_by_ancestor =
             merge_block.is_some_and(|merge| self.deferred_merge_blocks.contains(&merge));
-        let Some((switch_expr, switch_selector)) = self.get_switch_expression(switch_block) else {
+        let Some((switch_expr, switch_selector)) = self.get_switch_expression(switch_block)? else {
             return Ok(CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: unresolved switch selector at 0x{switch_block:x}"
             ))]));
@@ -1414,6 +1265,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if cases.iter().any(|(case_value, _)| case_value.is_none()) {
             return Ok(CStmt::Block(vec![CStmt::comment(format!(
                 "r2dec residual: unresolved switch case value at 0x{switch_block:x}"
+            ))]));
+        }
+        let Some(control_fact) = self
+            .fold_ctx
+            .control_facts()
+            .and_then(|facts| facts.switch_for_block(switch_block))
+        else {
+            return Ok(CStmt::Block(vec![CStmt::comment(format!(
+                "r2dec residual: unresolved switch control fact at 0x{switch_block:x}"
+            ))]));
+        };
+        let mut rendered_cases = cases
+            .iter()
+            .filter_map(|(value, region)| value.map(|value| (value, region.entry())))
+            .collect::<Vec<_>>();
+        rendered_cases.sort_unstable();
+        let mut certified_cases = control_fact.cases.clone();
+        certified_cases.sort_unstable();
+        if rendered_cases != certified_cases
+            || default.map(Region::entry) != control_fact.default
+        {
+            return Ok(CStmt::Block(vec![CStmt::comment(format!(
+                "r2dec residual: switch control mismatch at 0x{switch_block:x}"
             ))]));
         }
         self.record_switch_render_proof(switch_block, switch_selector, cases, default);
@@ -2492,11 +2366,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Ok(source_formula == rendered_formula)
     }
 
-    /// Get the branch condition from a block.
-    fn get_branch_condition(&mut self, addr: u64) -> Option<CExpr> {
-        self.get_branch_condition_with_predicate(addr).0
-    }
-
     fn get_branch_condition_with_predicate(
         &mut self,
         addr: u64,
@@ -2633,7 +2502,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let stmt = Self::rewrite_if_short_circuit(stmt);
                 let stmt = Self::rewrite_if_condition_inversion(stmt);
                 let stmt = Self::rewrite_empty_if_bodies(stmt);
-                let stmt = Self::rewrite_if_return_ternary(stmt);
                 Self::rewrite_guarded_switch_with_trailing_return(stmt)
             }
             CStmt::While { cond, body } => {
@@ -3003,99 +2871,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn rewrite_if_return_ternary(stmt: CStmt) -> CStmt {
-        let CStmt::If {
-            cond,
-            then_body,
-            else_body: Some(else_body),
-        } = stmt
-        else {
-            return stmt;
-        };
-
-        if let (Some(then_expr), Some(else_expr)) = (
-            Self::single_return_expr(then_body.as_ref()),
-            Self::single_return_expr(else_body.as_ref()),
-        ) && Self::is_zero_guarded_division_return(&cond, &then_expr, &else_expr)
-        {
-            CStmt::Return(Some(CExpr::Ternary {
-                cond: Box::new(cond),
-                then_expr: Box::new(then_expr),
-                else_expr: Box::new(else_expr),
-            }))
-        } else {
-            CStmt::If {
-                cond,
-                then_body,
-                else_body: Some(else_body),
-            }
-        }
-    }
-
-    fn single_return_expr(stmt: &CStmt) -> Option<CExpr> {
-        match stmt.unobserved() {
-            CStmt::Return(Some(expr)) => Some(expr.clone()),
-            CStmt::Block(stmts) if stmts.len() == 1 => Self::single_return_expr(&stmts[0]),
-            _ => None,
-        }
-    }
-
-    fn is_zero_guarded_division_return(cond: &CExpr, then_expr: &CExpr, else_expr: &CExpr) -> bool {
-        let Some((guarded, zero_when_true)) = Self::zero_compare_operand(cond) else {
-            return false;
-        };
-        if zero_when_true {
-            Self::expr_divides_by(else_expr, guarded)
-        } else {
-            Self::expr_divides_by(then_expr, guarded)
-        }
-    }
-
-    fn zero_compare_operand(cond: &CExpr) -> Option<(&CExpr, bool)> {
-        match cond.unobserved() {
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                Self::zero_compare_operand(inner)
-            }
-            CExpr::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
-                let zero_when_true = matches!(op, BinaryOp::Eq);
-                if Self::is_zero_literal(left) {
-                    return Some((right, zero_when_true));
-                }
-                if Self::is_zero_literal(right) {
-                    return Some((left, zero_when_true));
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn is_zero_literal(expr: &CExpr) -> bool {
-        matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
-    }
-
-    fn expr_divides_by(expr: &CExpr, denominator: &CExpr) -> bool {
-        match expr.unobserved() {
-            CExpr::Binary {
-                op: BinaryOp::Div,
-                right,
-                ..
-            } => right.transparently_eq(denominator),
-            CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => {
-                Self::expr_divides_by(inner, denominator)
-            }
-            CExpr::Ternary {
-                then_expr,
-                else_expr,
-                ..
-            } => {
-                Self::expr_divides_by(then_expr, denominator)
-                    || Self::expr_divides_by(else_expr, denominator)
-            }
-            _ => false,
-        }
-    }
-
     fn rewrite_guarded_switch_with_trailing_return(stmt: CStmt) -> CStmt {
         let CStmt::If {
             cond,
@@ -3152,96 +2927,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             rewritten.push(trailing_stmt);
         }
         CStmt::Block(rewritten)
-    }
-
-    fn try_structure_if_else_with_register_merge_returns(
-        &mut self,
-        cond_block: u64,
-        then_region: &Region,
-        else_region: Option<&Region>,
-        merge_block: Option<u64>,
-    ) -> ControlFlowStructureResult<Option<CStmt>> {
-        let Some(merge_block) = merge_block else {
-            return Ok(None);
-        };
-        let Some(else_region) = else_region else {
-            return Ok(None);
-        };
-        let then_pred = self.unique_region_predecessor_to_merge(then_region, merge_block);
-        let else_pred = self.unique_region_predecessor_to_merge(else_region, merge_block);
-        let mut then_can_rewrite = match then_pred {
-            Some(pred) => self.has_merged_register_return_expr(merge_block, pred)?,
-            None => false,
-        };
-        let mut else_can_rewrite = match else_pred {
-            Some(pred) => self.has_merged_register_return_expr(merge_block, pred)?,
-            None => false,
-        };
-        let control_proof_checkpoint = self.control_render_proofs.len();
-
-        let mut then_stmt = self.structure_region(then_region)?;
-        let mut else_stmt = self.structure_region(else_region)?;
-        then_can_rewrite |= then_pred.is_some_and(|pred| {
-            self.stmt_has_predecessor_return_register_certificate(&then_stmt, pred)
-        });
-        else_can_rewrite |= else_pred.is_some_and(|pred| {
-            self.stmt_has_predecessor_return_register_certificate(&else_stmt, pred)
-        });
-        if !then_can_rewrite && !else_can_rewrite {
-            self.control_render_proofs
-                .truncate(control_proof_checkpoint);
-            return Ok(None);
-        }
-        let mut rewrote_any = false;
-
-        if then_can_rewrite
-            && let Some(pred) = then_pred
-            && let Some(rewritten) =
-                self.append_merged_register_return_if_needed(then_stmt.clone(), merge_block, pred)?
-        {
-            then_stmt = rewritten;
-            rewrote_any = true;
-        }
-        if else_can_rewrite
-            && let Some(pred) = else_pred
-            && let Some(rewritten) =
-                self.append_merged_register_return_if_needed(else_stmt.clone(), merge_block, pred)?
-        {
-            else_stmt = rewritten;
-            rewrote_any = true;
-        }
-        if !rewrote_any
-            || !Self::stmt_guarantees_termination(&then_stmt)
-            || !Self::stmt_guarantees_termination(&else_stmt)
-        {
-            self.control_render_proofs
-                .truncate(control_proof_checkpoint);
-            return Ok(None);
-        }
-
-        let (cond, predicate, condition_value) =
-            self.get_branch_condition_with_predicate(cond_block);
-        let Some(cond) = cond else {
-            return Ok(None);
-        };
-        let if_stmt = self.observe_control_ownership(
-            cond_block,
-            CStmt::If {
-            cond,
-            then_body: Box::new(then_stmt),
-            else_body: Some(Box::new(else_stmt)),
-        },
-        );
-        self.note_merge_block_rendered_by_duplication(merge_block);
-        self.record_branch_render_proof(cond_block, predicate, condition_value);
-
-        let mut prefix = self.structure_block_prefix_stmts(cond_block)?;
-        prefix.push(if_stmt);
-        Ok(Some(if prefix.len() == 1 {
-            prefix.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(prefix)
-        }))
     }
 
     fn try_structure_guarded_switch_with_default(
@@ -3328,101 +3013,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn unique_region_predecessor_to_merge(&self, region: &Region, merge_block: u64) -> Option<u64> {
-        let mut candidates = region
-            .blocks()
-            .into_iter()
-            .filter(|addr| self.func.successors(*addr).contains(&merge_block))
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            candidates = region
-                .blocks()
-                .into_iter()
-                .filter_map(|addr| self.transparent_branch_successor_to_merge(addr, merge_block))
-                .collect::<Vec<_>>();
-        }
-        if candidates.is_empty() {
-            candidates = region
-                .blocks()
-                .into_iter()
-                .filter_map(|addr| self.merge_predecessor_through_forwarders(addr, merge_block))
-                .collect::<Vec<_>>();
-        }
-        candidates.sort_unstable();
-        candidates.dedup();
-        match candidates.as_slice() {
-            [pred] => Some(*pred),
-            _ => None,
-        }
-    }
-
-    /// The block that actually reaches `merge_block`, following the empty
-    /// branches a region may leave through.
-    ///
-    /// A region's own blocks do not always name the merge as a successor. A
-    /// compiler will route an arm through a chain of blocks that do nothing
-    /// but branch, and those belong to no arm in particular, so the arm looks
-    /// as though it contributes nothing to the merge and is given no value.
-    /// It contributes whatever the block at the end of that chain stores:
-    /// nothing on the way there can change it, because nothing on the way
-    /// there does anything.
-    ///
-    /// Without this the innermost arm of a nested chain of conditions was left
-    /// with the other arm's value, so `unlock` returned 1 both when its last
-    /// test passed and when it failed.
-    fn merge_predecessor_through_forwarders(&self, addr: u64, merge_block: u64) -> Option<u64> {
-        const MAX_FORWARDERS: usize = 8;
-        let mut current = addr;
-        for _ in 0..MAX_FORWARDERS {
-            let block = self.func.get_block(current)?;
-            if self.func.successors(current).contains(&merge_block) {
-                return Some(current);
-            }
-            let successors = self.transparent_branch_successors(current);
-            let [successor] = successors.as_slice() else {
-                return None;
-            };
-            if !block.ops.iter().enumerate().all(|(op_idx, op)| {
-                self.is_transparent_branch_forwarder_op(op)
-                    || self.is_materialized_phi_edge_copy(current, op_idx, *successor)
-            }) {
-                return None;
-            }
-            if self
-                .region_analyzer
-                .as_ref()
-                .is_some_and(|analyzer| analyzer.block_has_loop_transfer(current))
-            {
-                return None;
-            }
-            current = *successor;
-        }
-        None
-    }
-
-    fn transparent_branch_successor_to_merge(&self, addr: u64, merge_block: u64) -> Option<u64> {
-        let block = self.func.get_block(addr)?;
-        let successors = self.transparent_branch_successors(addr);
-        let [successor] = successors.as_slice() else {
-            return None;
-        };
-        if !block.ops.iter().enumerate().all(|(op_idx, op)| {
-            self.is_transparent_branch_forwarder_op(op)
-                || self.is_materialized_phi_edge_copy(addr, op_idx, *successor)
-        }) {
-            return None;
-        }
-        if self
-            .region_analyzer
-            .as_ref()
-            .is_some_and(|analyzer| analyzer.block_has_loop_transfer(addr))
-        {
-            return None;
-        }
-        self.block_flows_to_merge(*successor, merge_block)
-            .then_some(*successor)
-    }
-
     fn is_materialized_phi_edge_copy(&self, pred_addr: u64, op_idx: usize, successor: u64) -> bool {
         self.fold_ctx
             .is_unconditional_materialized_phi_edge_copy(pred_addr, op_idx, successor)
@@ -3447,191 +3037,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn transparent_branch_successors(&self, addr: u64) -> Vec<u64> {
-        self.func.successors(addr)
-    }
-
-    fn block_flows_to_merge(&self, addr: u64, merge_block: u64) -> bool {
-        if self.func.successors(addr).contains(&merge_block) {
-            return true;
-        }
-        self.func.cfg().get_block(addr).is_some_and(|cfg_block| {
-            matches!(
-                &cfg_block.terminator,
-                BlockTerminator::Branch { target } if *target == merge_block
-            ) || matches!(
-                &cfg_block.terminator,
-                BlockTerminator::Fallthrough { next } if *next == merge_block
-            )
-        })
-    }
-
-    fn append_merged_register_return_if_needed(
-        &self,
-        stmt: CStmt,
-        merge_addr: u64,
-        pred_addr: u64,
-    ) -> ControlFlowStructureResult<Option<CStmt>> {
-        if !self.block_allows_predecessor_return_register_rewrite(merge_addr) {
-            return Ok(None);
-        }
-        let Some((expr, proof_block, proof_op, proof_value)) =
-            self.return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)?
-        else {
-            if Self::single_return_expr(&stmt).is_some()
-                && let Some((proof_block, proof_op, proof_value)) =
-                    self.predecessor_return_register_certificate(pred_addr)
-            {
-                return Ok(Some(self.observe_return_value_ownership(
-                    stmt,
-                    proof_block, proof_op, proof_value,
-                )));
-            }
-            return Ok(None);
-        };
-        if let Some(rewritten) = self.rewrite_trailing_return_with_merged_expr(&stmt, &expr) {
-            return Ok(Some(self.observe_return_value_ownership(
-                rewritten,
-                proof_block, proof_op, proof_value,
-            )));
-        }
-        if Self::single_terminator_stmt(&stmt).is_some() {
-            return Ok(Some(stmt));
-        }
-        let mut stmts = Vec::new();
-        Self::append_stmt_body_flat(&mut stmts, stmt);
-        stmts.push(CStmt::Return(Some(
-            expr.clone_without_render_observations(),
-        )));
-        let rewritten = if stmts.len() == 1 {
-            stmts.into_iter().next().unwrap_or(CStmt::Empty)
-        } else {
-            CStmt::Block(stmts)
-        };
-        Ok(Some(self.observe_return_value_ownership(
-            rewritten,
-            proof_block,
-            proof_op,
-            proof_value,
-        )))
-    }
-
-    fn predecessor_return_register_certificate(
-        &self,
-        pred_addr: u64,
-    ) -> Option<(u64, usize, ValueId)> {
-        self.fold_ctx
-            .inputs
-            .prepared_ssa?
-            .certificates()
-            .returns
-            .iter()
-            .filter(|cert| cert.block_addr == pred_addr)
-            .max_by_key(|cert| cert.op_index)
-            .map(|cert| (cert.block_addr, cert.op_index, cert.value))
-    }
-
-    fn stmt_has_predecessor_return_register_certificate(
-        &self,
-        stmt: &CStmt,
-        pred_addr: u64,
-    ) -> bool {
-        Self::single_return_expr(stmt).is_some()
-            && self
-                .predecessor_return_register_certificate(pred_addr)
-                .is_some()
-    }
-
-    fn has_merged_register_return_expr(
-        &self,
-        merge_addr: u64,
-        pred_addr: u64,
-    ) -> ControlFlowStructureResult<bool> {
-        Ok(self
-            .return_register_candidate_for_merge_predecessor(merge_addr, pred_addr)?
-            .is_some())
-    }
-
-    /// Record that a merge block reached the output through its predecessors.
-    ///
-    /// Rewriting an if/else so both arms end in the merge block's return says
-    /// what that block says, once per arm, and then never emits the block. The
-    /// record of which blocks were folded is what everything downstream reads
-    /// to decide whether the output covers the function, and by that record the
-    /// block went missing. It did not: it is on the page twice.
-    fn note_merge_block_rendered_by_duplication(&self, merge_block: u64) {
-        self.fold_ctx
-            .folded_blocks
-            .borrow_mut()
-            .insert(merge_block);
-    }
-
-    fn observe_return_value_ownership(&self,
-        stmt: CStmt,
-        block_addr: u64, op_idx: usize, value: ValueId,
-    ) -> CStmt {
-        let mut obligations = self.fold_ctx.exact_effect_obligations_for_source_value(
-            EffectOccurrenceKind::Return,
-            block_addr,
-            op_idx,
-            Some(value),
-        );
-        if let Some((read_block, read_op, space, address, read_value)) = self
-            .fold_ctx
-            .certified_memory_read_for_value_dependency(value)
-            .map(|cert| {
-                (
-                    cert.block_addr,
-                    cert.op_index,
-                    cert.space,
-                    cert.address,
-                    cert.value,
-                )
-            })
-        {
-            obligations.extend(self.fold_ctx.exact_effect_obligations_for_source_memory(
-                EffectOccurrenceKind::MemoryRead,
-                read_block,
-                read_op,
-                space,
-                Some(address),
-                read_value,
-            ));
-        }
-        self.fold_ctx.observe_effect_stmt(&obligations, stmt)
-    }
-
-    fn rewrite_trailing_return_with_merged_expr(
-        &self,
-        stmt: &CStmt,
-        merged: &CExpr,
-    ) -> Option<CStmt> {
-        match stmt {
-            // A certified predecessor value is authoritative for this region tail.
-            // Do not let an earlier synthesized return expression beat it.
-            CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(
-                merged.clone_without_render_observations(),
-            ))),
-            CStmt::Comment(reason)
-                if reason.starts_with(
-                    "r2sleigh residual: unresolved value return for control-only exit",
-                ) =>
-            {
-                Some(CStmt::Return(Some(
-                    merged.clone_without_render_observations(),
-                )))
-            }
-            CStmt::Block(stmts) => {
-                let (last, prefix) = stmts.split_last()?;
-                let rewritten_tail = self.rewrite_trailing_return_with_merged_expr(last, merged)?;
-                let mut rebuilt = prefix.to_vec();
-                rebuilt.push(rewritten_tail);
-                Some(CStmt::Block(rebuilt))
-            }
-            _ => None,
-        }
-    }
-
     fn rewrite_block_tail_guard_clauses(stmts: Vec<CStmt>) -> Vec<CStmt> {
         let mut rewritten = Vec::with_capacity(stmts.len());
         let mut i = 0;
@@ -3643,6 +3048,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     else_body: None,
                 } = Self::semantic_stmt(&stmts[i])
                 && let Some(terminator) = Self::single_terminator_stmt(&stmts[i + 1])
+                && !matches!(terminator.unobserved(), CStmt::Return(_))
                 && Self::single_terminator_stmt(then_body.as_ref()).is_none()
                 && !matches!(Self::semantic_stmt(then_body), CStmt::Empty)
             {
@@ -3761,6 +3167,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 .is_some_and(|(then_stmt, else_stmt)| {
                     Self::stmt_transparently_eq(then_stmt, else_stmt)
                 })
+            && !matches!(then_stmts.last().map(CStmt::unobserved), Some(CStmt::Return(_)))
             && !Self::stmt_list_contains_control_transfer(&then_stmts[..then_stmts.len() - 1])
             && !Self::stmt_list_contains_control_transfer(&else_stmts[..else_stmts.len() - 1])
         {
@@ -5388,7 +4795,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 mod tests {
     use super::{
         BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructureError, ControlFlowStructurer,
-        seal_structured_body,
     };
     use crate::ast::{
         BinaryOp, CExpr, CFunction, CStmt, CType, RenderObservationOwner, UnaryOp,
@@ -5396,8 +4802,11 @@ mod tests {
     };
     use crate::fold::FoldingContext;
     use crate::region::Region;
-    use crate::structured_region::{StructuredRegionKind, StructuredRegionMarker};
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use crate::structured_region::StructuredRegionKind;
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, Varnode,
+    };
     use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
@@ -5526,27 +4935,38 @@ mod tests {
 
     fn test_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
-        arch.add_register(RegisterDef::new("RDI", 0x10, 8));
-        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
-        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let registers = [
+            ("RAX", RegisterStorage { offset: 0x00, size: 8 }),
+            ("RDI", RegisterStorage { offset: 0x10, size: 8 }),
+            ("RBP", RegisterStorage { offset: 0x20, size: 8 }),
+            ("RSP", RegisterStorage { offset: 0x28, size: 8 }),
+            ("RIP", RegisterStorage { offset: 0x30, size: 8 }),
+        ];
+        for (name, storage) in registers {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+            arch.register_projections.push(RegisterProjection {
+                written: storage,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: storage,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: u64::from(storage.size) * 8,
+                    },
+                },
+            });
+        }
         arch
     }
 
     #[test]
-    fn sealed_body_resolves_every_emitted_region_anchor() {
-        let body = seal_structured_body(CStmt::structured_region(
-            StructuredRegionMarker::unsealed(
-                0x1000,
-                StructuredRegionKind::FunctionBody,
-            ),
-            CStmt::structured_region(
-                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
-                CStmt::Return(None),
-            ),
-        ))
-        .expect("sealed structured body");
+    fn production_structurer_seals_every_emitted_region_anchor() {
+        let blocks = blocks_with_switch_and_unrelated_sub();
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let body = structurer
+            .structure_with_regions()
+            .expect("exact source-owned structured body");
         let mut visited = Vec::new();
         body.visit_occurrences(|occurrence| {
             visited.push((
@@ -5560,6 +4980,12 @@ mod tests {
         assert_eq!(visited.len(), body.regions().nodes().len());
         assert_eq!(visited[0].2, 0x1000);
         assert_eq!(visited[0].3, StructuredRegionKind::FunctionBody);
+        assert!(
+            visited
+                .iter()
+                .any(|(_, _, _, kind)| *kind == StructuredRegionKind::Switch),
+            "the exact switch fixture must retain a nested switch occurrence"
+        );
         for (id, anchor, entry, kind) in visited {
             let (resolved_id, node) = body
                 .regions()
@@ -5573,27 +4999,36 @@ mod tests {
 
     #[test]
     fn region_markers_are_transparent_to_structurer_cleanup() {
-        let plain = CStmt::Return(None);
-        let marked = seal_structured_body(CStmt::structured_region(
-            StructuredRegionMarker::unsealed(
-                0x1000,
-                StructuredRegionKind::FunctionBody,
-            ),
-            CStmt::structured_region(
-                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
-                plain.clone(),
-            ),
-        ))
-        .expect("marked structured body")
-        .into_stmt();
+        let blocks = blocks_with_switch_and_unrelated_sub();
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let func = facts.source().function();
+        let mut plain_structurer = ControlFlowStructurer::new(func, &ctx);
+        let plain = plain_structurer
+            .structure_preserving_render_proof_identity_impl()
+            .expect("plain exact source-owned structure");
+        assert!(plain_structurer.safety_reason().is_none());
+        let plain = ControlFlowStructurer::cleanup(&ctx.symbols, plain);
+
+        let mut marked_structurer = ControlFlowStructurer::new(func, &ctx);
+        let marked_body = marked_structurer
+            .structure_with_regions()
+            .expect("marked exact source-owned structure");
+        assert!(
+            marked_body.regions().nodes().len() > 1,
+            "the fixture must exercise nested region markers"
+        );
+        let marked = marked_body.into_stmt();
+        assert!(marked_structurer.safety_reason().is_none());
 
         assert_eq!(
-            marked, plain,
+            marked.clone_without_render_observations(),
+            plain.clone_without_render_observations(),
             "region metadata must not alter the cleaned semantic AST"
         );
     }
 
-    fn function_with_switch_block_and_unrelated_sub() -> SSAFunction {
+    fn blocks_with_switch_and_unrelated_sub() -> Vec<R2ILBlock> {
         let mut switch_block = R2ILBlock::new(0x1000, 4);
         switch_block.push(R2ILOp::IntSub {
             dst: Varnode::unique(0x20, 8),
@@ -5626,76 +5061,97 @@ mod tests {
 
         let mut case_zero = R2ILBlock::new(0x1010, 4);
         case_zero.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
+            target: Varnode::register(0x30, 8),
         });
         let mut case_one = R2ILBlock::new(0x1020, 4);
         case_one.push(R2ILOp::Return {
-            target: Varnode::constant(1, 8),
+            target: Varnode::register(0x30, 8),
         });
         let mut case_two = R2ILBlock::new(0x1030, 4);
         case_two.push(R2ILOp::Return {
-            target: Varnode::constant(2, 8),
+            target: Varnode::register(0x30, 8),
         });
 
-        SSAFunction::from_blocks_with_arch(
-            &[switch_block, case_zero, case_one, case_two],
-            Some(&test_arch()),
+        vec![switch_block, case_zero, case_one, case_two]
+    }
+
+    fn source_owned_test_fixture(
+        blocks: &[R2ILBlock],
+    ) -> &'static r2types::SourceOwnedFunctionFacts {
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-structure-source-v1".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
         )
-        .expect("ssa function")
-        .with_name("switch_unrelated_sub_demo")
-    }
-
-    fn function_with_transparent_branch_to_merge() -> SSAFunction {
-        let mut branch = R2ILBlock::new(0x1000, 4);
-        branch.push(R2ILOp::Copy {
-            dst: Varnode::unique(0x2000, 1),
-            src: Varnode::unique(0x1000, 1),
-        });
-        branch.push(R2ILOp::Branch {
-            target: Varnode::constant(0x1010, 8),
-        });
-
-        let mut value_pred = R2ILBlock::new(0x1010, 4);
-        value_pred.push(R2ILOp::Copy {
-            dst: Varnode::register(0x00, 8),
-            src: Varnode::constant(7, 8),
-        });
-        value_pred.push(R2ILOp::Branch {
-            target: Varnode::constant(0x1020, 8),
-        });
-
-        let mut merge = R2ILBlock::new(0x1020, 4);
-        merge.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 8),
-        });
-
-        SSAFunction::from_blocks_with_arch(&[branch, value_pred, merge], Some(&test_arch()))
-            .expect("ssa function")
-            .with_name("transparent_branch_demo")
-    }
-
-    fn function_with_materialized_phi_branch_to_merge() -> SSAFunction {
-        let mut func = function_with_transparent_branch_to_merge();
-        let source = SSAVar::new("x8", 1, 8);
-        let destination = SSAVar::new("x8", 2, 8);
-        let branch = func.get_block_mut(0x1000).expect("branch block");
-        let branch_index = branch.ops.len().saturating_sub(1);
-        branch.ops.insert(
-            branch_index,
-            SSAOp::Copy {
-                dst: destination.clone(),
-                src: source.clone(),
-            },
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .expect("exact source interface");
+        let source = Arc::new(
+            SsaArtifact::for_decompile_with_interface(blocks, Some(&test_arch()), interface)
+                .expect("source-owned SSA artifact"),
         );
-        func.get_block_mut(0x1010)
-            .expect("phi successor")
-            .phis
-            .push(PhiNode {
-                dst: destination,
-                sources: vec![(0x1000, source)],
-                canonical_storage: None,
-            });
-        func
+        let request = r2types::TypeWritebackAnalysisRequest::new(
+            Arc::clone(&source),
+            r2types::ParsedExternalContext::default(),
+        )
+        .expect("exact source-owned type request");
+        let facts = r2types::build_source_owned_type_writeback_analysis(request)
+            .expect("source-owned analysis")
+            .finalize_for_decompile(r2types::DecompileFinalization {
+                kind: r2types::DecompileRouteKind::Standard,
+                reason: "exact structure fixture".to_string(),
+                fallback_comment: None,
+            })
+            .expect("source-owned decompile facts");
+        Box::leak(Box::new(facts))
+    }
+
+    fn exact_structure_context(
+        facts: &'static r2types::SourceOwnedFunctionFacts,
+    ) -> FoldingContext<'static> {
+        let mut ctx = FoldingContext::new(64);
+        ctx.inputs.prepared_ssa = Some(facts.source());
+        ctx.inputs.function_facts = facts.report();
+        ctx.inputs.certified_rendering_required = true;
+        let origins = Box::leak(Box::new(
+            crate::normalize::NormalizationOrigins::for_unchanged(
+                facts.source().function(),
+                facts.source(),
+            ),
+        ));
+        ctx.inputs.normalization_origins = Some(origins);
+        let plan = std::rc::Rc::new(
+            crate::binding_plan::BindingPlan::build_shadow(facts)
+                .expect("exact structure binding plan"),
+        );
+        let names = std::rc::Rc::new(
+            crate::binding_plan::BindingNameResolution::build(
+                facts,
+                std::rc::Rc::clone(&plan),
+                std::rc::Rc::clone(&ctx.symbols),
+            )
+            .expect("exact structure binding names"),
+        );
+        let journal = Box::leak(Box::new(std::cell::RefCell::new(
+            crate::observation_journal::LegacyObservationJournal::new(
+                facts,
+                facts.source().function(),
+                origins,
+                std::rc::Rc::clone(&plan),
+                std::rc::Rc::clone(&ctx.symbols),
+            )
+            .expect("exact structure observation journal"),
+        )));
+        ctx.inputs.binding_names = Some(Box::leak(Box::new(names)));
+        ctx.inputs.observation_journal = Some(journal);
+        ctx
     }
 
     fn function_with_terminating_if_and_shared_merge() -> SSAFunction {
@@ -5789,105 +5245,48 @@ mod tests {
         func
     }
 
+    fn first_switch_case_values(stmt: &CStmt) -> Option<Vec<i64>> {
+        match stmt {
+            CStmt::Switch { cases, .. } => Some(
+                cases
+                    .iter()
+                    .map(|case| match &case.value {
+                        CExpr::IntLit(value) => *value,
+                        other => panic!("expected literal switch case, got {other:?}"),
+                    })
+                    .collect(),
+            ),
+            CStmt::Block(stmts) => stmts.iter().find_map(first_switch_case_values),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => first_switch_case_values(then_body)
+                .or_else(|| else_body.as_deref().and_then(first_switch_case_values)),
+            CStmt::While { body, .. } | CStmt::For { body, .. } | CStmt::DoWhile { body, .. } => {
+                first_switch_case_values(body)
+            }
+            _ => None,
+        }
+    }
+
     #[test]
-    fn switch_region_keeps_canonical_case_values_despite_unrelated_sub() {
-        let func = function_with_switch_block_and_unrelated_sub();
-        let region = crate::region::RegionAnalyzer::new(&func).analyze();
-        let Region::Switch { cases, .. } = region else {
-            panic!("canonical switch metadata must produce a switch region");
-        };
-        let values = cases
-            .iter()
-            .map(|(value, _)| value.expect("canonical switch case value"))
-            .collect::<Vec<_>>();
+    fn switch_render_keeps_canonical_case_values_despite_unrelated_sub() {
+        let blocks = blocks_with_switch_and_unrelated_sub();
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let rendered = structurer
+            .structure()
+            .expect("certified switch rendering")
+            .clone_without_render_observations();
+        let values = first_switch_case_values(&rendered).expect("rendered switch");
 
         assert_eq!(
             values,
             vec![0, 1, 2],
             "switch rendering must not bias canonical case values from nearby arithmetic"
         );
-    }
-
-    #[test]
-    fn cleanup_rewrites_pure_if_else_returns_to_ternary_return() {
-        let symbols = test_table();
-        let input = CStmt::If {
-            cond: CExpr::binary(BinaryOp::Eq, v(&symbols, "b"), CExpr::IntLit(0)),
-            then_body: Box::new(CStmt::Return(Some(CExpr::IntLit(-1)))),
-            else_body: Some(Box::new(CStmt::Return(Some(CExpr::binary(
-                BinaryOp::Div,
-                v(&symbols, "a"),
-                v(&symbols, "b"),
-            ))))),
-        };
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(
-            cleaned,
-            CStmt::Return(Some(CExpr::Ternary {
-                cond: Box::new(CExpr::binary(BinaryOp::Eq, v(&symbols, "b"), CExpr::IntLit(0))),
-                then_expr: Box::new(CExpr::IntLit(-1)),
-                else_expr: Box::new(CExpr::binary(BinaryOp::Div, v(&symbols, "a"), v(&symbols, "b"))),
-            }))
-        );
-    }
-
-    #[test]
-    fn merge_predecessor_follows_transparent_branch_only_region() {
-        let func = function_with_transparent_branch_to_merge();
-        let ctx = FoldingContext::new(64);
-        let structurer = ControlFlowStructurer::new(&func, &ctx);
-
-        assert_eq!(
-            structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
-            Some(0x1010)
-        );
-    }
-
-    #[test]
-    fn merge_predecessor_rejects_phi_shaped_copy_without_normalization_origin() {
-        let func = function_with_materialized_phi_branch_to_merge();
-        let ctx = FoldingContext::new(64);
-        let structurer = ControlFlowStructurer::new(&func, &ctx);
-
-        assert_eq!(
-            structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
-            None
-        );
-    }
-
-    #[test]
-    fn merged_return_synthesis_does_not_clone_source_occurrence_observations() {
-        let symbols = test_table();
-        let mut owner = RenderObservationOwner::new();
-        let (merged_id, merged) = owner
-            .observe_expr(CExpr::IntLit(1))
-            .expect("merged source occurrence");
-        let source_stmt = CStmt::Block(vec![
-            assign(&symbols, "acc", merged.clone()),
-            CStmt::Return(Some(CExpr::IntLit(0))),
-        ]);
-        let plain_stmt = CStmt::Block(vec![
-            assign(&symbols, "acc", CExpr::IntLit(1)),
-            CStmt::Return(Some(CExpr::IntLit(0))),
-        ]);
-
-        let func = function_with_switch_block_and_unrelated_sub();
-        let ctx = FoldingContext::new(64);
-        let structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rewritten = structurer
-            .rewrite_trailing_return_with_merged_expr(&source_stmt, &merged)
-            .expect("trailing return rewrite");
-        let plain = structurer
-            .rewrite_trailing_return_with_merged_expr(&plain_stmt, &CExpr::IntLit(1))
-            .expect("plain trailing return rewrite");
-        let (stripped, reachable) = strip_test_observations(&owner, rewritten);
-
-        assert!(
-            reachable.contains(merged_id),
-            "the source assignment must retain its exact observation"
-        );
-        assert_eq!(stripped, plain);
     }
 
     #[test]
@@ -6068,7 +5467,7 @@ mod tests {
     }
 
     #[test]
-    fn do_while_without_condition_certificate_has_no_render_proof() {
+    fn do_while_render_proof_uses_body_entry_as_loop_anchor() {
         let mut header = R2ILBlock::new(0x1000, 4);
         header.push(R2ILOp::Branch {
             target: Varnode::constant(0x1004, 8),
@@ -6076,26 +5475,16 @@ mod tests {
         let mut latch = R2ILBlock::new(0x1004, 4);
         latch.push(R2ILOp::CBranch {
             target: Varnode::constant(0x1000, 8),
-            cond: Varnode::register(0x80, 1),
+            cond: Varnode::register(0x10, 8),
         });
         let mut exit = R2ILBlock::new(0x1008, 4);
         exit.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
+            target: Varnode::register(0x30, 8),
         });
-        let mut func =
-            SSAFunction::from_blocks_with_arch(&[header, latch, exit], Some(&test_arch()))
-                .expect("ssa function");
-        func.cfg_mut()
-            .set_terminator(0x1000, BlockTerminator::Branch { target: 0x1004 });
-        func.cfg_mut().set_terminator(
-            0x1004,
-            BlockTerminator::ConditionalBranch {
-                true_target: 0x1000,
-                false_target: 0x1008,
-            },
-        );
-        let ctx = FoldingContext::new(64);
-        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+        let blocks = [header, latch, exit];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
         let region = Region::DoWhileLoop {
             body: Box::new(Region::Sequence(vec![
                 Region::Block(0x1000),
@@ -6104,17 +5493,14 @@ mod tests {
             cond_block: 0x1004,
         };
 
-        let stmt = structurer
+        let _stmt = structurer
             .structure_region(&region)
-            .expect("missing condition proof lowers to a residual");
+            .expect("exact source-owned do-while lowering");
 
-        assert!(
-            format!("{stmt:?}").contains("unresolved loop condition"),
-            "an uncertified loop condition must stay visible"
-        );
-        assert!(
-            structurer.control_render_proofs().is_empty(),
-            "an uncertified loop must not acquire a render proof"
+        assert_eq!(structurer.control_render_proofs()[0].anchor, 0x1000);
+        assert_eq!(
+            structurer.control_render_proofs()[0].loop_latches,
+            vec![0x1004]
         );
     }
 
@@ -7363,7 +6749,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_trailing_return_guard_and_flattens_then_block() {
+    fn trailing_return_is_not_duplicated_into_a_guard() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
             CStmt::if_stmt(
@@ -7377,24 +6763,12 @@ mod tests {
             CStmt::ret(Some(CExpr::IntLit(0))),
         ]);
 
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(
-            cleaned,
-            CStmt::Block(vec![
-                CStmt::if_stmt(
-                    CExpr::unary(UnaryOp::Not, v(&symbols, "ready")),
-                    CStmt::ret(Some(CExpr::IntLit(0))),
-                    None
-                ),
-                assign(&symbols, "x", CExpr::IntLit(1)),
-                assign(&symbols, "y", CExpr::IntLit(2)),
-                CStmt::ret(Some(CExpr::IntLit(0))),
-            ])
-        );
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input.clone());
+        assert_eq!(cleaned, input);
     }
 
     #[test]
-    fn guarded_tail_rewrite_preserves_children_without_relocating_the_split_if() {
+    fn guarded_tail_keeps_the_exact_return_occurrence() {
         let symbols = test_table();
         let mut owner = RenderObservationOwner::new();
         let (cond_id, cond) = owner
@@ -7417,19 +6791,15 @@ mod tests {
         assert!(reachable.contains(cond_id));
         assert!(reachable.contains(body_id));
         assert!(reachable.contains(return_id));
-        assert!(
-            !reachable.contains(if_id),
-            "a split if has no exact output statement that owns its marker"
-        );
+        assert!(reachable.contains(if_id));
         assert_eq!(
             plain,
             CStmt::Block(vec![
                 CStmt::if_stmt(
-                    CExpr::unary(UnaryOp::Not, v(&symbols, "ready")),
-                    CStmt::ret(Some(CExpr::IntLit(0))),
+                    v(&symbols, "ready"),
+                    assign(&symbols, "x", CExpr::IntLit(1)),
                     None,
                 ),
-                assign(&symbols, "x", CExpr::IntLit(1)),
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
         );
@@ -7457,6 +6827,28 @@ mod tests {
         assert!(!reachable.contains(then_id));
         assert!(!reachable.contains(else_id));
         assert_eq!(plain, CStmt::Block(vec![suffix]));
+    }
+
+    #[test]
+    fn common_suffix_factoring_keeps_distinct_return_occurrences() {
+        let symbols = test_table();
+        let then_return = CStmt::ret(Some(CExpr::IntLit(1)));
+        let else_return = CStmt::ret(Some(CExpr::IntLit(1)));
+
+        let factored = ControlFlowStructurer::factor_guarded_common_suffix(
+            v(&symbols, "guard"),
+            vec![then_return.clone()],
+            vec![else_return.clone()],
+        );
+
+        assert_eq!(
+            factored,
+            vec![CStmt::if_stmt(
+                v(&symbols, "guard"),
+                then_return,
+                Some(else_return),
+            )]
+        );
     }
 
     #[test]
@@ -7630,23 +7022,6 @@ mod tests {
                 },
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
-        );
-    }
-
-    #[test]
-    fn selector_expr_from_condition_extracts_non_constant_side() {
-        let symbols = test_table();
-        let cond = CExpr::binary(
-            BinaryOp::Eq,
-            CExpr::binary(BinaryOp::BitAnd, v(&symbols, "i"), CExpr::IntLit(7)),
-            CExpr::IntLit(0),
-        );
-
-        let selector = ControlFlowStructurer::selector_expr_from_condition(&cond)
-            .expect("selector expression");
-        assert_eq!(
-            selector,
-            CExpr::binary(BinaryOp::BitAnd, v(&symbols, "i"), CExpr::IntLit(7))
         );
     }
 

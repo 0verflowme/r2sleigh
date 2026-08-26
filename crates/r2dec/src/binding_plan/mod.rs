@@ -90,9 +90,11 @@ pub(crate) struct InlineProof {
     literal: MachineExprId,
 }
 
-/// Proof that a value has no surviving read or observable effect.
+/// Proof that an exact upstream fact authorizes a value to have no rendered C
+/// occurrence. The seal re-derives the reason-specific fact from the same SSA
+/// authority; this token is not itself a second semantic answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeadValueProof {
+pub(crate) struct ValueElisionProof {
     authority: SsaArtifactAuthority,
     value: ValueId,
 }
@@ -124,22 +126,86 @@ pub(crate) enum ValueDisposition {
     },
     Elided {
         reason: r2ssa::ledger::ElisionReason,
-        proof: DeadValueProof,
+        proof: ValueElisionProof,
     },
     Refused {
         reason: ValueRefusal,
     },
 }
 
+/// Exact graph uses that consume a source-certified machine return target.
+///
+/// This is a per-use answer. A return-address value may also have an ordinary
+/// program use, which must remain renderable even though the `Return` operand
+/// itself is machine control and has no C occurrence.
+pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
+    let graph = source.graph();
+    source
+        .facts()
+        .boundaries
+        .returns
+        .iter()
+        .filter_map(|(at, boundary)| {
+            let fact = boundary.return_address?;
+            let site = UseSite {
+                inst: *at,
+                input_idx: 0,
+            };
+            (boundary.at == *at
+                && graph.inst(*at).is_some_and(|inst| {
+                    matches!(
+                        inst.payload,
+                        r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. })
+                    ) && inst.inputs.as_slice() == [fact.value]
+                })
+                && graph.use_sites(fact.value).contains(&site))
+            .then_some(site)
+        })
+        .collect()
+}
+
+/// Return-target values whose complete use domain is machine return control.
+///
+/// Only these values may be globally elided from the binding domain. The
+/// per-use accounting above remains independent so a mixed-use value stays
+/// bound while its exact `Return` use is still justified as non-rendered.
+pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let sites = certified_return_control_sites(source);
+    sites
+        .iter()
+        .filter_map(|site| graph.inst(site.inst)?.inputs.get(site.input_idx).copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|value| {
+            let uses = graph.use_sites(*value);
+            !uses.is_empty() && uses.iter().all(|site| sites.contains(site))
+        })
+        .collect()
+}
+
 /// Failure of declaration placement or reaching-definition validation.
 ///
 /// Placement itself is deliberately absent: it is derived from the sealed
 /// structured-region artifact immediately before AST emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PlacementRead {
+    Use(UseSite),
+    CertifiedValue { value: ValueId, at: InstId },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementRefusal {
-    NoDominatingRegion { binding: BindingId },
-    MissingDefinition { binding: BindingId },
-    ReadBeforeAssignment { binding: BindingId, site: UseSite },
+    NoDominatingRegion {
+        binding: BindingId,
+    },
+    MissingDefinition {
+        binding: BindingId,
+    },
+    ReadBeforeAssignment {
+        binding: BindingId,
+        read: PlacementRead,
+    },
 }
 
 /// Typed disposition of an addressable stack object. Stack objects do not have
@@ -153,12 +219,28 @@ pub(crate) enum StackObjectDisposition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StackObjectRefusal {
+    MissingSourceIdentity {
+        object: r2ssa::ObjectId,
+    },
+    UnclassifiedSourceRole {
+        object: r2ssa::ObjectId,
+    },
     MissingWidth {
         object: r2ssa::ObjectId,
     },
     InvalidWidth {
         object: r2ssa::ObjectId,
         size_bytes: u32,
+    },
+    ParameterHomeUnavailable {
+        object: r2ssa::ObjectId,
+        parameter_index: u32,
+    },
+    ParameterHomeWidthMismatch {
+        object: r2ssa::ObjectId,
+        parameter_index: u32,
+        slot_width_bits: u32,
+        parameter_width_bits: u32,
     },
 }
 

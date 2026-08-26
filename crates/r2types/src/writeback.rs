@@ -14,7 +14,7 @@ use crate::context::{
     canonical_main_signature_spec, is_generic_arg_name,
     stack_slots_from_legacy_external_stack_vars,
 };
-use crate::convert::CTypeLike;
+use crate::convert::{CTypeLike, render_c_type_like};
 use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion, normalize_external_type_name,
 };
@@ -976,12 +976,17 @@ impl TypeWritebackAnalysis {
         }
         let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
-        let applied_constraints = SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
-            self.source.as_ref(),
-            &mut self.function_facts,
-        );
-        if applied_constraints > 0
-            && !self.refresh_plan_after_source_constraints(&prior_facts, applied_constraints)
+        let (applied_constraints, return_type_changed) =
+            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+                self.source.as_ref(),
+                &mut self.function_facts,
+            );
+        if (applied_constraints > 0 || return_type_changed)
+            && !self.refresh_plan_after_source_constraints(
+                &prior_facts,
+                applied_constraints,
+                return_type_changed,
+            )
         {
             self.function_facts = prior_facts;
             self.plan = prior_plan;
@@ -1036,6 +1041,7 @@ impl TypeWritebackAnalysis {
         &mut self,
         prior_facts: &FunctionFacts,
         expected_constraints: usize,
+        expected_return_type_change: bool,
     ) -> bool {
         let Some(signature) = self
             .function_facts
@@ -1091,6 +1097,11 @@ impl TypeWritebackAnalysis {
             })
             .collect::<BTreeSet<_>>();
         if changed_slots.len() != expected_constraints {
+            return false;
+        }
+        let return_type_changed = prior_signature.and_then(|signature| signature.ret_type.as_ref())
+            != signature.ret_type.as_ref();
+        if return_type_changed != expected_return_type_change {
             return false;
         }
         let mut refreshed_slots = BTreeSet::new();
@@ -4460,6 +4471,18 @@ pub fn build_source_owned_type_writeback_analysis(
     }
     debug_assert_eq!(derived.signature, derived.plan.signature);
     debug_assert_eq!(derived.type_facts, *function_facts.type_facts());
+    let exact_source_fields = field_access_certificates_from_source_aggregate_accesses(&source);
+    if !exact_source_fields.is_empty() {
+        let mut type_facts = function_facts.type_facts().clone();
+        for certificate in exact_source_fields {
+            type_facts.field_access_certificates.retain(|existing| {
+                existing.slot != certificate.slot
+                    || existing.field_offset != certificate.field_offset
+            });
+            type_facts.field_access_certificates.push(certificate);
+        }
+        function_facts.replace_type_facts(type_facts);
+    }
     let mut analysis = TypeWritebackAnalysis {
         source,
         function_facts,
@@ -6320,6 +6343,107 @@ fn field_access_certificates_from_struct_artifacts(
             field_type: access.field_type,
         })
         .collect()
+}
+
+pub(crate) fn source_type_like(
+    graph: &r2ssa::SourceTypeGraph,
+    type_id: u32,
+    visiting: &mut BTreeSet<u32>,
+) -> Option<CTypeLike> {
+    if !visiting.insert(type_id) {
+        return None;
+    }
+    let source_type = graph
+        .types()
+        .get(usize::try_from(type_id).ok()?)
+        .filter(|source_type| source_type.id() == type_id)?;
+    let bits = u32::try_from(source_type.size_bits()).ok()?;
+    let ty = match source_type.kind() {
+        r2ssa::SourceTypeKind::SignedInteger => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        },
+        r2ssa::SourceTypeKind::UnsignedInteger => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unsigned,
+        },
+        r2ssa::SourceTypeKind::Pointer { target_type_id } => {
+            CTypeLike::Pointer(Box::new(source_type_like(graph, target_type_id, visiting)?))
+        }
+        r2ssa::SourceTypeKind::Struct { aggregate_id } => {
+            let aggregate = graph
+                .aggregates()
+                .get(usize::try_from(aggregate_id).ok()?)
+                .filter(|aggregate| {
+                    aggregate.id() == aggregate_id && aggregate.type_id() == type_id
+                })?;
+            CTypeLike::Struct(aggregate.name().to_string())
+        }
+    };
+    visiting.remove(&type_id);
+    Some(ty)
+}
+
+/// Project exact, revision-bound source aggregate accesses into the canonical
+/// type certificate keyed by ABI parameter slot and byte offset.
+///
+/// The r2ssa projection has already joined the immutable source type graph,
+/// parameter provenance, memory occurrence, and access width. r2types only
+/// publishes projections whose logical member type retains that exact width;
+/// it does not recover a field from address syntax or a rendered name.
+fn field_access_certificates_from_source_aggregate_accesses(
+    source: &r2ssa::SsaArtifact,
+) -> Vec<crate::FieldAccessCertificate> {
+    let Some(interface) = source.machine_context().function_interface() else {
+        return Vec::new();
+    };
+    let Some(graph) = interface.type_graph() else {
+        return Vec::new();
+    };
+    let Some(projections) = source
+        .aggregate_accesses()
+        .projections_for_revision(interface.revision_identity())
+    else {
+        return Vec::new();
+    };
+    let ptr_bits = source
+        .machine_context()
+        .memory_model()
+        .default_address_bits();
+    let mut by_location = BTreeMap::<(usize, u64), Option<crate::FieldAccessCertificate>>::new();
+    for projection in projections.values() {
+        let Ok(slot) = usize::try_from(projection.source_parameter_index) else {
+            continue;
+        };
+        let Some(field_type) =
+            source_type_like(graph, projection.member_type_id, &mut BTreeSet::new())
+        else {
+            continue;
+        };
+        if crate::function_facts::type_like_size_bytes(&field_type, ptr_bits)
+            != Some(u64::from(projection.byte_width))
+        {
+            continue;
+        }
+        let certificate = crate::FieldAccessCertificate {
+            slot,
+            field_offset: projection.byte_offset,
+            field_name: projection.member_name.to_string(),
+            field_type: Some(render_c_type_like(&field_type)),
+        };
+        let key = (slot, projection.byte_offset);
+        match by_location.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(certificate));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&certificate) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    by_location.into_values().flatten().collect::<Vec<_>>()
 }
 
 fn array_index_certificates_from_struct_artifacts(
@@ -8733,8 +8857,7 @@ fn merge_local_signature_into_merged_signature(
             // which is weak enough that recovered evidence then replaced it with
             // `void *`, so `void list_free(Node *head)` rendered as returning a
             // pointer and its body ended `return rip;`.
-            let external_returns_void =
-                matches!(external.ret_type.as_ref(), Some(CTypeLike::Void));
+            let external_returns_void = matches!(external.ret_type.as_ref(), Some(CTypeLike::Void));
             if external_returns_void {
                 // Keep it.
             } else if local_signature_should_override_external(
@@ -11549,7 +11672,7 @@ mod tests {
             )],
         );
 
-        assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+        assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
         let candidate = &analysis.plan().var_type_candidates[0];
         assert_eq!(candidate.var_type, "int8_t");
         assert_eq!(candidate.size, 1);
@@ -11581,7 +11704,7 @@ mod tests {
             let mut analysis =
                 constrained_refresh_test_analysis(Arc::clone(&source), 8, candidates);
             let prior_plan = analysis.plan().clone();
-            assert!(!analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+            assert!(!analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
             assert_eq!(analysis.plan(), &prior_plan);
         }
     }

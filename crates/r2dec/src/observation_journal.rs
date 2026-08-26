@@ -81,6 +81,12 @@ pub(crate) const fn test_render_observation_id(index: u32) -> RenderObservationI
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservationTarget {
     Value(ValueId),
+    CertifiedValueRead {
+        value: ValueId,
+        at: InstId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+    },
     Use {
         site: UseSite,
         observation: LegacyUseObservation,
@@ -105,6 +111,7 @@ pub(crate) enum LegacyObservationJournalError {
     Normalization(NormalizationOriginError),
     TooManyObservations,
     InvalidValue(ValueId),
+    InvalidCertifiedValueRead { value: ValueId, at: InstId },
     InvalidUse(UseSite),
     InvalidWrite(InstId),
     InvalidEffectObligation(SemanticObligationId),
@@ -406,6 +413,12 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             LegacyObservationJournalError::InvalidValue(value) => {
                 Self::InvalidValue { value: *value }
             }
+            LegacyObservationJournalError::InvalidCertifiedValueRead { value, at } => {
+                Self::InvalidCertifiedValueRead {
+                    value: *value,
+                    at: *at,
+                }
+            }
             LegacyObservationJournalError::InvalidUse(site) => Self::InvalidUse { site: *site },
             LegacyObservationJournalError::InvalidWrite(inst) => Self::InvalidWrite { inst: *inst },
             LegacyObservationJournalError::InvalidEffectObligation(obligation) => {
@@ -648,6 +661,7 @@ impl SurvivingEffectObservations {
 /// Sealed, source-authority-bound recorder for one legacy rendering run.
 pub(crate) struct LegacyObservationJournal {
     authority: SsaArtifactAuthority,
+    source: std::sync::Arc<SsaArtifact>,
     plan: Rc<BindingPlan>,
     normalized_projections: Vec<Box<[NormalizedOpProjection]>>,
     symbols: Rc<RefCell<SymbolTable>>,
@@ -750,10 +764,21 @@ fn placement_refusal(
         Private::MissingDefinition { binding } => Public::MissingDefinition {
             binding_index: binding.index(),
         },
-        Private::ReadBeforeAssignment { binding, site } => Public::ReadBeforeAssignment {
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::Use(site),
+        } => Public::ReadBeforeAssignment {
             binding_index: binding.index(),
             instruction_id: site.inst.0,
             input_index: site.input_idx,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::CertifiedValue { value, at },
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: at.0,
         },
     }
 }
@@ -799,6 +824,12 @@ fn placement_analysis_refusal(
         Error::InvalidWrite { inst } => Refusal::InvalidWrite {
             instruction_id: inst.0,
         },
+        Error::InvalidCertifiedValueRead { value, at } => {
+            Refusal::InvalidCertifiedValueRead {
+                value_id: value.0,
+                instruction_id: at.0,
+            }
+        }
         Error::MissingPlannedValue { value } => Refusal::MissingPlannedValue {
             value_id: value.0,
         },
@@ -1149,6 +1180,19 @@ impl LegacyObservationJournal {
         id: RenderObservationId,
     ) -> Option<crate::placement::PlacementObservationTarget> {
         match self.targets.get(id.index() as usize)? {
+            ObservationTarget::CertifiedValueRead {
+                value,
+                at,
+                binding,
+                symbol,
+            } => Some(
+                crate::placement::PlacementObservationTarget::CertifiedValueRead {
+                    value: *value,
+                    at: *at,
+                    binding: *binding,
+                    symbol: *symbol,
+                },
+            ),
             ObservationTarget::Use { site, .. } => {
                 Some(crate::placement::PlacementObservationTarget::Use(*site))
             }
@@ -1227,9 +1271,9 @@ impl LegacyObservationJournal {
             .copied()
             .map(|id| (id, 0))
             .collect();
-
         let mut journal = Self {
             authority: source.source().authority().clone(),
+            source: source.shared_source(),
             plan,
             normalized_projections,
             symbols,
@@ -1286,6 +1330,12 @@ impl LegacyObservationJournal {
                     UseSite { inst, input_idx },
                     r2ssa::ledger::ElisionReason::UnobservedMerge,
                 );
+            }
+        }
+        for site in crate::binding_plan::certified_return_control_sites(source.source()) {
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::ReturnControl) {
+                Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
         for site in origins.noop_sites() {
@@ -1472,6 +1522,52 @@ impl LegacyObservationJournal {
         self.value_slot(value)?;
         let id = self
             .allocate_many(vec![ObservationTarget::Value(value)])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(id, expr))
+    }
+
+    /// Mark one exact semantic value read that has no graph [`UseSite`].
+    ///
+    /// Return values are certified at the return instruction by the source
+    /// boundary contract, while the lifted `Return` operand itself is the
+    /// control target. This marker carries that exact `(ValueId, InstId)` into
+    /// final declaration placement without inventing an operand index.
+    pub(crate) fn observe_certified_value_read_expr(
+        &mut self,
+        value: ValueId,
+        at: InstId,
+        symbol: SymbolId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let exact_certificate = self
+            .source
+            .certificates()
+            .returns_by_inst
+            .get(&at)
+            .and_then(|index| self.source.certificates().returns.get(*index))
+            .is_some_and(|certificate| certificate.at == at && certificate.value == value);
+        if !exact_certificate {
+            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                value,
+                at,
+            });
+        }
+        let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
+            return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+        };
+        if !crate::placement::expr_reads_symbol(&expr, symbol) {
+            return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+        }
+        let id = self
+            .allocate_many(vec![ObservationTarget::CertifiedValueRead {
+                value,
+                at,
+                binding: *binding,
+                symbol,
+            }])?
             .into_iter()
             .next()
             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
@@ -1837,6 +1933,7 @@ impl LegacyObservationJournal {
                     return Ok(());
                 }
                 let result = match target {
+                    ObservationTarget::CertifiedValueRead { .. } => Ok(()),
                     ObservationTarget::Value(value) => {
                         match plan.disposition(value) {
                             Some(ValueDisposition::Elided { reason, .. }) => {
@@ -2351,8 +2448,13 @@ mod tests {
 
     use super::*;
     use crate::ast::{CLocal, CType};
-    use crate::binding_plan::{BindingId, ValueDisposition, ValueRefusal};
-    use crate::symbol::SymbolRole;
+    use crate::binding_plan::{
+        BindingId, BindingNameResolution, ValueDisposition, ValueRefusal,
+    };
+    use crate::structured_region::{
+        StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
+    };
+    use crate::symbol::{ExternalKind, SymbolRole};
 
     fn source_owned() -> SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
@@ -2446,6 +2548,173 @@ mod tests {
         )
         .expect("authority-bound journal");
         (source, plan, function, journal)
+    }
+
+    #[test]
+    fn mixed_use_return_control_elides_only_the_exact_return_use() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x80, 8),
+            src: Varnode::register(0x30, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[block]);
+        let graph = source.source().graph();
+        let control_sites = crate::binding_plan::certified_return_control_sites(source.source());
+        let control_site = *control_sites.iter().next().expect("certified return use");
+        assert_eq!(control_sites.len(), 1);
+        let return_control = graph
+            .inst(control_site.inst)
+            .and_then(|inst| inst.inputs.get(control_site.input_idx))
+            .copied()
+            .expect("return control value");
+        assert_eq!(graph.use_sites(return_control).len(), 2);
+        assert!(
+            !crate::binding_plan::certified_return_control_values(source.source())
+                .contains(&return_control)
+        );
+
+        let plan = BindingPlan::build_shadow(&source).expect("mixed-use binding plan");
+        assert!(matches!(
+            plan.disposition(return_control),
+            Some(ValueDisposition::Bound { .. })
+        ));
+        let normalized = source.source().function().clone();
+        let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let function = CFunction::new("mixed_return_control", CType::Void);
+        let journal = LegacyObservationJournal::new(
+            &source,
+            &normalized,
+            &origins,
+            Rc::new(plan),
+            Rc::clone(&function.symbols),
+        )
+        .expect("mixed-use journal");
+
+        assert_eq!(
+            journal.uses[control_site.inst.0 as usize][control_site.input_idx],
+            Some(LegacyUseObservation::Elided(
+                r2ssa::ledger::ElisionReason::ReturnControl
+            ))
+        );
+        let ordinary_site = graph
+            .use_sites(return_control)
+            .iter()
+            .copied()
+            .find(|site| *site != control_site)
+            .expect("ordinary non-control use");
+        assert_ne!(
+            journal.uses[ordinary_site.inst.0 as usize][ordinary_site.input_idx],
+            Some(LegacyUseObservation::Elided(
+                r2ssa::ledger::ElisionReason::ReturnControl
+            ))
+        );
+    }
+
+    #[test]
+    fn certified_value_read_rejects_forged_expression_at_allocation_and_seal() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks(&[block]);
+        let certificate = source
+            .source()
+            .certificates()
+            .returns
+            .first()
+            .cloned()
+            .expect("exact source return-value certificate");
+        let plan = Rc::new(BindingPlan::build_shadow(&source).expect("return binding plan"));
+        let mut function = CFunction::new("certified_read", CType::Int(64));
+        let names = Rc::new(
+            BindingNameResolution::build(
+                &source,
+                Rc::clone(&plan),
+                Rc::clone(&function.symbols),
+            )
+            .expect("sealed return names"),
+        );
+        let symbol = names
+            .symbol_for_value(certificate.value)
+            .expect("certified return has one planned symbol");
+        let binding = match plan.disposition(certificate.value) {
+            Some(ValueDisposition::Bound { binding }) => *binding,
+            other => panic!("certified return must be bound, got {other:?}"),
+        };
+        let normalized = source.source().function().clone();
+        let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let mut journal = LegacyObservationJournal::new(
+            &source,
+            &normalized,
+            &origins,
+            Rc::clone(&plan),
+            Rc::clone(&function.symbols),
+        )
+        .expect("return observation journal");
+
+        for forged in [
+            CExpr::IntLit(7),
+            CExpr::External {
+                name: "forged_return".to_string(),
+                kind: ExternalKind::Global,
+            },
+        ] {
+            assert_eq!(
+                journal.observe_certified_value_read_expr(
+                    certificate.value,
+                    certificate.at,
+                    symbol,
+                    forged,
+                ),
+                Err(LegacyObservationJournalError::RenderedValueRequired(
+                    certificate.value
+                ))
+            );
+        }
+
+        let marked = journal
+            .observe_certified_value_read_expr(
+                certificate.value,
+                certificate.at,
+                symbol,
+                CExpr::Var(symbol),
+            )
+            .expect("valid exact certified read marker");
+        let CExpr::Observed { id, .. } = marked else {
+            panic!("journal returns an observed expression")
+        };
+        let forged_after_allocation = CExpr::observed(id, CExpr::IntLit(7));
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+                CStmt::Return(Some(forged_after_allocation)),
+            ),
+        ))
+        .expect("sealed marked return");
+        let (statement, regions) = sealed.into_marked_parts();
+        function.body = vec![statement];
+
+        assert_eq!(
+            crate::placement::collect_final_placement_occurrences(
+                &function,
+                &regions,
+                source.source(),
+                &names,
+                journal.placement_target_count(),
+                |id| journal.placement_target(id),
+            ),
+            Err(crate::placement::PlacementAnalysisError::UnobservedBindingRead {
+                binding
+            })
+        );
     }
 
     #[test]
@@ -2877,6 +3146,16 @@ mod tests {
             (
                 LegacyObservationJournalError::InvalidValue(ValueId(13)),
                 BindingObservationJournalFailure::InvalidValue { value: ValueId(13) },
+            ),
+            (
+                LegacyObservationJournalError::InvalidCertifiedValueRead {
+                    value: ValueId(14),
+                    at: InstId(15),
+                },
+                BindingObservationJournalFailure::InvalidCertifiedValueRead {
+                    value: ValueId(14),
+                    at: InstId(15),
+                },
             ),
             (
                 LegacyObservationJournalError::InvalidUse(site),

@@ -40,6 +40,7 @@ fn parameter_candidates(
             slot,
             entry_values,
             carrier_width,
+            ..
         } = certified
         else {
             continue;
@@ -118,19 +119,15 @@ fn insert_formal_parameter_candidate(
             width_bytes,
             entry_values: BTreeSet::new(),
         },
-        Some(ParameterCandidate::Exact {
-            entity: first, ..
-        })
-        | Some(ParameterCandidate::Refused { entity: first, .. }) => {
-            ParameterCandidate::Refused {
-                entity,
-                reason: ParameterRefusal::ConflictingSlotOwnership {
-                    slot,
-                    first: *first,
-                    second: entity,
-                },
-            }
-        }
+        Some(ParameterCandidate::Exact { entity: first, .. })
+        | Some(ParameterCandidate::Refused { entity: first, .. }) => ParameterCandidate::Refused {
+            entity,
+            reason: ParameterRefusal::ConflictingSlotOwnership {
+                slot,
+                first: *first,
+                second: entity,
+            },
+        },
     });
 }
 
@@ -198,10 +195,23 @@ pub(super) fn binding_components(
     let graph = source.graph();
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
+    let return_controls = certified_return_control_values(source);
+    let structural_unused =
+        source
+            .obligations()
+            .structural_unused_values(graph)
+            .ok_or(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::Authority,
+            ))?;
     let eligible = graph
         .values
         .iter()
-        .map(|value| value.var.constant_bits().is_none() && !unobserved_merges.contains(value.id))
+        .map(|value| {
+            value.var.constant_bits().is_none()
+                && !unobserved_merges.contains(value.id)
+                && !return_controls.contains(&value.id)
+                && !structural_unused.contains(&value.id)
+        })
         .collect::<Vec<_>>();
     let mut parent = (0..value_count).collect::<Vec<_>>();
     let mut rank = vec![0_u8; value_count];
@@ -465,6 +475,10 @@ impl BindingPlan {
         let machine_projection = MachineProjection::from_artifact(source)
             .map_err(BindingPlanBuildError::MachineProjection)?;
         let graph = source.graph();
+        let return_controls = certified_return_control_values(source);
+        let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
+            BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
+        )?;
         let mut literal_by_value = BTreeMap::<ValueId, MachineExprId>::new();
         for (expr_id, expr) in machine_projection.arena().iter() {
             if let MachineExprKind::Constant { binding, .. } = expr.kind() {
@@ -493,10 +507,26 @@ impl BindingPlan {
                     },
                 ));
             }
-            if source.unobserved_merges().contains(graph_value.id) {
+            if return_controls.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::ReturnControl,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if source.unobserved_merges().contains(graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
-                    proof: DeadValueProof {
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if structural_unused.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                    proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,
                     },
@@ -646,13 +676,35 @@ impl BindingPlan {
                 let r2types::CertifiedEntity::StackSlot {
                     id,
                     object,
+                    base,
                     offset,
                     size,
-                    ..
+                    source_slot,
                 } = entity
                 else {
                     continue;
                 };
+                let Some(source_slot) = *source_slot else {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
+                        },
+                    );
+                    continue;
+                };
+                if source_slot.base() != *base
+                    || source_slot.offset() != *offset
+                    || *size != Some(source_slot.size_bytes())
+                {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
+                        },
+                    );
+                    continue;
+                }
                 let Some(size_bytes) = *size else {
                     stack_objects.insert(
                         *object,
@@ -674,19 +726,72 @@ impl BindingPlan {
                     );
                     continue;
                 };
-                let binding = BindingId(bindings.len() as u32);
-                bindings.push(Binding {
-                    declaration_type: CType::machine_bits(width_bits),
-                    certificate: BindingCertificate {
-                        sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
-                    },
-                    presentation_name_hint: Some(if *offset < 0 {
-                        format!("stack_m{}", offset.unsigned_abs())
-                    } else {
-                        format!("stack_p{}", offset.unsigned_abs())
-                    }),
-                });
-                stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
+                match source_slot.role() {
+                    r2ssa::SourceStackSlotRole::Local => {
+                        let Some(binding) = BindingId::from_dense_index(bindings.len()) else {
+                            return Err(BindingPlanBuildError::TooManyBindings {
+                                count: bindings.len().saturating_add(1),
+                            });
+                        };
+                        bindings.push(Binding {
+                            declaration_type: CType::machine_bits(width_bits),
+                            certificate: BindingCertificate {
+                                sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                            },
+                            presentation_name_hint: Some(if *offset < 0 {
+                                format!("stack_m{}", offset.unsigned_abs())
+                            } else {
+                                format!("stack_p{}", offset.unsigned_abs())
+                            }),
+                        });
+                        stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
+                    }
+                    r2ssa::SourceStackSlotRole::ParameterHome {
+                        parameter_index, ..
+                    } => {
+                        let Some(ParameterDisposition::Bound {
+                            binding,
+                            width_bits: parameter_width_bits,
+                        }) = parameters.get(parameter_index as usize).copied().flatten()
+                        else {
+                            stack_objects.insert(
+                                *object,
+                                StackObjectDisposition::Refused {
+                                    reason: StackObjectRefusal::ParameterHomeUnavailable {
+                                        object: *object,
+                                        parameter_index,
+                                    },
+                                },
+                            );
+                            continue;
+                        };
+                        if parameter_width_bits != width_bits {
+                            stack_objects.insert(
+                                *object,
+                                StackObjectDisposition::Refused {
+                                    reason: StackObjectRefusal::ParameterHomeWidthMismatch {
+                                        object: *object,
+                                        parameter_index,
+                                        slot_width_bits: width_bits,
+                                        parameter_width_bits,
+                                    },
+                                },
+                            );
+                            continue;
+                        }
+                        stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
+                    }
+                    r2ssa::SourceStackSlotRole::UnclassifiedResource => {
+                        stack_objects.insert(
+                            *object,
+                            StackObjectDisposition::Refused {
+                                reason: StackObjectRefusal::UnclassifiedSourceRole {
+                                    object: *object,
+                                },
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -753,6 +858,10 @@ mod parameter_tests {
                 second_slot: 1,
             },
         });
-        assert!(parameters.iter().all(|disposition| *disposition == expected));
+        assert!(
+            parameters
+                .iter()
+                .all(|disposition| *disposition == expected)
+        );
     }
 }

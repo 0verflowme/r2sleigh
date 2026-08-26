@@ -49,6 +49,12 @@ impl std::fmt::Display for LedgerLayer {
 pub enum ElisionReason {
     /// Frame setup and teardown the rendered function does not model.
     StackFrame,
+    /// The exact machine control target consumed by a source-certified return.
+    ///
+    /// This is not the program value returned by the function. The lifted
+    /// `Return` operand transports the return address, while source boundary
+    /// facts separately certify any semantic return value.
+    ReturnControl,
     /// A condition-code write no rendered predicate reads.
     DeadCpuFlag,
     /// A value only ever read to compute a flag that is itself elided.
@@ -63,6 +69,9 @@ pub enum ElisionReason {
     DeadStackBase,
     /// A merge no observation depends on, so nothing reads what it decides.
     UnobservedMerge,
+    /// A source-classified structural instruction produced a value with no
+    /// graph use and owns no semantic obligation.
+    UnusedStructuralValue,
     /// A removed merge input already names the merge result, so its edge copy
     /// would be the identity assignment `x = x`.
     RedundantPhiEdge,
@@ -74,6 +83,7 @@ impl std::fmt::Display for ElisionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::StackFrame => "stack-frame",
+            Self::ReturnControl => "return-control",
             Self::DeadCpuFlag => "dead-cpu-flag",
             Self::DeadFlagOnly => "dead-flag-only",
             Self::DeadUnusedTemporary => "dead-unused-temp",
@@ -81,6 +91,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadCallArgument => "dead-call-arg",
             Self::DeadStackBase => "dead-stack-base",
             Self::UnobservedMerge => "unobserved-merge",
+            Self::UnusedStructuralValue => "unused-structural-value",
             Self::RedundantPhiEdge => "redundant-phi-edge",
             Self::DeadUnclassified => "dead-unclassified",
         })
@@ -375,7 +386,10 @@ mod tests {
 
         let closure = ledger.close();
         assert_eq!(closure.accounted(), closure.total);
-        assert_eq!((closure.rendered, closure.elided, closure.refused), (1, 1, 1));
+        assert_eq!(
+            (closure.rendered, closure.elided, closure.refused),
+            (1, 1, 1)
+        );
         assert_eq!(closure.unattributed, 1);
     }
 

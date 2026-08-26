@@ -208,6 +208,86 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
 }
 
 #[test]
+fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
+    let source_owned = source_owned([
+        R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(7, 8),
+        },
+        R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        },
+    ]);
+    let source = source_owned.source();
+    let boundary = source
+        .facts()
+        .boundaries
+        .returns
+        .values()
+        .next()
+        .expect("return boundary");
+    let return_control = boundary
+        .return_address
+        .expect("exact source return-address fact")
+        .value;
+    let plan = BindingPlan::build_shadow(&source_owned).expect("return-control-aware plan");
+
+    assert!(matches!(
+        plan.disposition(return_control),
+        Some(ValueDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::ReturnControl,
+            proof,
+        }) if proof.authority == *source.authority() && proof.value == return_control
+    ));
+    assert!(
+        binding_components(&source_owned)
+            .expect("construction components")
+            .iter()
+            .all(|component| !component.members.contains(&return_control))
+    );
+    assert!(
+        seal_binding_components(&source_owned)
+            .expect("independent components")
+            .iter()
+            .all(|component| !component.members.contains(&return_control))
+    );
+    assert_eq!(
+        build_upstream_shadow_oracle(&source_owned)
+            .expect("upstream oracle")
+            .value_disposition(return_control),
+        Some(UpstreamValueDisposition::Elided(
+            r2ssa::ledger::ElisionReason::ReturnControl
+        ))
+    );
+
+    let semantic_return = source
+        .facts()
+        .certificates
+        .returns_by_inst
+        .values()
+        .next()
+        .and_then(|index| source.facts().certificates.returns.get(*index))
+        .expect("semantic return certificate")
+        .value;
+    let mut forged = plan;
+    forged.dispositions[semantic_return.0 as usize] = ValueDisposition::Elided {
+        reason: r2ssa::ledger::ElisionReason::ReturnControl,
+        proof: ValueElisionProof {
+            authority: source.authority().clone(),
+            value: semantic_return,
+        },
+    };
+    assert_eq!(
+        forged.validate_seal(&source_owned),
+        Err(BindingPlanBuildError::Seal(
+            BindingPlanSourceMismatch::InvalidElisionProof {
+                value: semantic_return
+            }
+        ))
+    );
+}
+
+#[test]
 fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
     let mut entry = R2ILBlock::new(0x1000, 4);
     entry.push(R2ILOp::CBranch {
@@ -311,7 +391,7 @@ fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
     let mut forged = plan;
     forged.dispositions[dead.0 as usize] = ValueDisposition::Elided {
         reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
-        proof: DeadValueProof {
+        proof: ValueElisionProof {
             authority: source.authority().clone(),
             value: live,
         },

@@ -253,12 +253,10 @@ impl BindingNameResolution {
                     slot,
                     binding.presentation_name_hint(),
                 ),
-                SymbolRole::StackLocal(_) | SymbolRole::Carrier => {
-                    binding.presentation_name_hint()
-                }
+                SymbolRole::StackLocal(_) | SymbolRole::Carrier => binding.presentation_name_hint(),
             }
-                .map(c_identifier_for_presentation)
-                .unwrap_or_else(|| format!("binding_{}", binding_id.index()));
+            .map(c_identifier_for_presentation)
+            .unwrap_or_else(|| format!("binding_{}", binding_id.index()));
             let symbol = symbols.borrow_mut().reserve_binding(
                 presentation,
                 binding.declaration_type().clone(),
@@ -304,9 +302,8 @@ impl BindingNameResolution {
     /// later slot into the wrong position.
     pub(crate) fn parameters(
         &self,
-    ) -> impl ExactSizeIterator<
-        Item = Result<ResolvedParameter, RenderedIdentityRefusal>,
-    > + '_ {
+    ) -> impl ExactSizeIterator<Item = Result<ResolvedParameter, RenderedIdentityRefusal>> + '_
+    {
         self.plan
             .parameters
             .iter()
@@ -551,10 +548,11 @@ impl BindingNameResolution {
             Some(ParameterDisposition::Bound {
                 binding,
                 width_bits,
-            }) => self.symbol_for_binding(binding).map_or(
-                PlannedParameterSymbol::Absent,
-                |symbol| PlannedParameterSymbol::Bound { symbol, width_bits },
-            ),
+            }) => self
+                .symbol_for_binding(binding)
+                .map_or(PlannedParameterSymbol::Absent, |symbol| {
+                    PlannedParameterSymbol::Bound { symbol, width_bits }
+                }),
             Some(ParameterDisposition::Refused { reason }) => {
                 PlannedParameterSymbol::Refused(reason)
             }
@@ -639,8 +637,8 @@ mod tests {
         RegisterProjection, RegisterProjectionDisposition, RegisterStorage, Varnode,
     };
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec,
-        SourceFunctionInterface, SourceFunctionReturn, SsaArtifact,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn, SsaArtifact,
     };
 
     use super::*;
@@ -728,11 +726,14 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"binding-name-resolution".to_vec(),
             "sysv64",
-            [SourceAbiParameterSpec::new(0, CanonicalStorageId {
-                space: CanonicalStorageSpace::Register,
-                offset: 0x38,
-                size: parameter_width,
-            })],
+            [SourceAbiParameterSpec::new(
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Register,
+                    offset: 0x38,
+                    size: parameter_width,
+                },
+            )],
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -856,7 +857,9 @@ mod tests {
         let ParameterDisposition::Bound {
             binding,
             width_bits,
-        } = plan.parameter_disposition(0).expect("slot zero disposition")
+        } = plan
+            .parameter_disposition(0)
+            .expect("slot zero disposition")
         else {
             panic!("unused certified parameter was refused")
         };
@@ -945,10 +948,14 @@ mod tests {
             .expect("render facts")
             .parameter_values(0)
             .collect::<Vec<_>>();
-        assert!(!entry_values.is_empty(), "fixture must certify an entry value");
+        assert!(
+            !entry_values.is_empty(),
+            "fixture must certify an entry value"
+        );
         let plan = BindingPlan::build_shadow(&source).expect("value-backed parameter plan");
-        let ParameterDisposition::Bound { binding, .. } =
-            plan.parameter_disposition(0).expect("slot zero disposition")
+        let ParameterDisposition::Bound { binding, .. } = plan
+            .parameter_disposition(0)
+            .expect("slot zero disposition")
         else {
             panic!("value-backed parameter was refused")
         };
@@ -1009,12 +1016,12 @@ mod tests {
             BindingPlan::build_shadow(&conflict_source).expect("conflict fixture plan");
         let binding = conflict_plan.bindings().next().expect("fixture binding").0;
         conflict_plan.bindings[binding.index()].certificate.sources = Box::new([
-            super::super::BindingCertificateSource::CertifiedEntity(
-                r2ssa::SemanticId::Parameter(0),
-            ),
-            super::super::BindingCertificateSource::CertifiedEntity(
-                r2ssa::SemanticId::Parameter(1),
-            ),
+            super::super::BindingCertificateSource::CertifiedEntity(r2ssa::SemanticId::Parameter(
+                0,
+            )),
+            super::super::BindingCertificateSource::CertifiedEntity(r2ssa::SemanticId::Parameter(
+                1,
+            )),
         ]);
         assert_eq!(conflict_plan.binding_role(binding), None);
         assert!(matches!(
@@ -1097,7 +1104,7 @@ mod tests {
             bound.0,
             ValueDisposition::Elided {
                 reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
-                proof: crate::binding_plan::DeadValueProof {
+                proof: crate::binding_plan::ValueElisionProof {
                     authority: source.source().authority().clone(),
                     value: bound.0,
                 },

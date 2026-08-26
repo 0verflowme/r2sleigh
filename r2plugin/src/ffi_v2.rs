@@ -1738,6 +1738,10 @@ fn binding_observation_journal_failure_json(
         | Failure::ConflictingValue { value } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
         }
+        Failure::InvalidCertifiedValueRead { value, at } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert("instruction_id".to_string(), serde_json::json!(at.0));
+        }
         Failure::InvalidPlannedInline { value, expr_index } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
             cause.insert(
@@ -2027,6 +2031,16 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
                 serde_json::json!(instruction_id),
             );
         }
+        Refusal::InvalidCertifiedValueRead {
+            value_id,
+            instruction_id,
+        } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
         Refusal::MissingPlannedValue { value_id }
         | Refusal::RefusedPlannedValue { value_id } => {
             cause.insert("value_id".to_string(), serde_json::json!(value_id));
@@ -2053,6 +2067,21 @@ fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_jso
             cause.insert(
                 "input_index".to_string(),
                 serde_json::json!(input_index),
+            );
+        }
+        Refusal::CertifiedValueReadBeforeAssignment {
+            binding_index,
+            value_id,
+            instruction_id,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
             );
         }
         Refusal::UndeclaredNames { count } => {
@@ -4103,6 +4132,7 @@ mod tests {
             Failure::NormalizationInvalidCarrierCertificates,
             Failure::TooManyObservations,
             Failure::InvalidValue { value },
+            Failure::InvalidCertifiedValueRead { value, at: inst },
             Failure::InvalidUse { site },
             Failure::InvalidWrite { inst },
             Failure::OutputlessWrite { inst },
@@ -4145,7 +4175,7 @@ mod tests {
         ]);
         assert_eq!(
             cases.len(),
-            93,
+            94,
             "public journal wire-leaf inventory drifted"
         );
         cases
@@ -4191,7 +4221,7 @@ mod tests {
             }
             causes.push(expected_cause);
         }
-        assert_eq!(kinds.len(), 93);
+        assert_eq!(kinds.len(), 94);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -4216,7 +4246,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "93");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "94");
     }
 
     fn every_placement_refusal_wire_leaf() -> Vec<r2engine::PlacementAuditRefusal> {
@@ -4252,9 +4282,13 @@ mod tests {
                 input_index: 15,
             },
             Refusal::InvalidWrite { instruction_id: 16 },
-            Refusal::MissingPlannedValue { value_id: 17 },
-            Refusal::RefusedPlannedValue { value_id: 18 },
-            Refusal::UnscopedObservation { observation_id: 19 },
+            Refusal::InvalidCertifiedValueRead {
+                value_id: 17,
+                instruction_id: 18,
+            },
+            Refusal::MissingPlannedValue { value_id: 19 },
+            Refusal::RefusedPlannedValue { value_id: 20 },
+            Refusal::UnscopedObservation { observation_id: 21 },
             Refusal::UnauthorizedProgramVariable { symbol_index: 36 },
             Refusal::UnobservedBindingRead { binding_index: 20 },
             Refusal::UnobservedBindingWrite { binding_index: 21 },
@@ -4264,6 +4298,11 @@ mod tests {
                 binding_index: 24,
                 instruction_id: 25,
                 input_index: 26,
+            },
+            Refusal::CertifiedValueReadBeforeAssignment {
+                binding_index: 27,
+                value_id: 28,
+                instruction_id: 29,
             },
             Refusal::MissingBinding { binding_index: 27 },
             Refusal::MissingBindingSymbol { binding_index: 28 },
@@ -4295,7 +4334,7 @@ mod tests {
             assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
             causes.push(cause);
         }
-        assert_eq!(kinds.len(), 36);
+        assert_eq!(kinds.len(), 38);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -4321,7 +4360,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "36");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "38");
 
         assert_eq!(
             placement_audit_json(Some(PlacementAudit::Applied)),

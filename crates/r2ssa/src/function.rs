@@ -13,8 +13,7 @@ use r2sleigh_lift::{GenuineLiftedFunction, GenuineLiftedFunctionAuthority, Trust
 use r2source::OwnedFunctionSnapshot;
 use serde::{Deserialize, Serialize};
 
-use crate::AssumptionSet;
-use crate::CanonicalStorageId;
+use crate::{AssumptionSet, CanonicalStorageId, CanonicalStorageSpace};
 use crate::aggregate_access::{
     AggregateAccessProjectionFacts, collect_aggregate_access_projections,
 };
@@ -2518,6 +2517,7 @@ impl SSAFunction {
         let block_in_states = self
             .compute_decompile_family_states_with_control(&family_info, control)?
             .incoming;
+        let mut synthesized_storages = Vec::new();
 
         for &addr in &self.block_order {
             control.poll()?;
@@ -2547,10 +2547,18 @@ impl SSAFunction {
                     op_index,
                 );
                 normalized_ops.push(rewritten);
-                normalized_ops.extend(cleared);
+                if let Some((cleared, storage)) = cleared {
+                    let dst = cleared
+                        .dst()
+                        .expect("cleared-register materialization always writes its carrier")
+                        .clone();
+                    synthesized_storages.push((dst, storage));
+                    normalized_ops.push(cleared);
+                }
             }
             block.ops = normalized_ops;
         }
+        self.canonical_storage_by_var.extend(synthesized_storages);
 
         // Renaming treats overlapping register names as independent variables,
         // so a phi for a contained lane can still carry its version-zero name
@@ -3958,7 +3966,7 @@ fn materialize_cleared_register_write(
     family_info: &RegisterFamilyInfo,
     block_addr: u64,
     op_index: usize,
-) -> Option<SSAOp> {
+) -> Option<(SSAOp, CanonicalStorageId)> {
     // A call's result is whatever the callee left in the register, so the width
     // its clobber is modelled at says nothing about the other bytes.
     if matches!(op, SSAOp::CallDefine { .. }) {
@@ -3985,10 +3993,17 @@ fn materialize_cleared_register_write(
     for (slot, root) in narrow {
         state.insert(slot, root);
     }
-    Some(SSAOp::IntZExt {
-        dst: widened,
-        src: dst.clone(),
-    })
+    Some((
+        SSAOp::IntZExt {
+            dst: widened,
+            src: dst.clone(),
+        },
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: cleared.offset,
+            size: cleared.width,
+        },
+    ))
 }
 
 fn materialize_register_alias_sources(
@@ -9381,6 +9396,28 @@ mod tests {
         ];
 
         func.normalize_register_alias_sources(&arch);
+
+        let cleared = func
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::IntZExt { dst, .. } if dst.name.starts_with("tmp:regclear:") => {
+                    Some(dst.clone())
+                }
+                _ => None,
+            })
+            .expect("narrow x86 write materializes its cleared full carrier");
+        assert_eq!(
+            func.canonical_storage_for_var(&cleared),
+            Some(CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0,
+                size: 8,
+            }),
+            "synthetic full-carrier values retain source-owned storage provenance"
+        );
 
         match ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops)[1] {
             SSAOp::IntSub { a, .. } => {

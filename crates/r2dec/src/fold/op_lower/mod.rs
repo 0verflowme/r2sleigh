@@ -1,24 +1,9 @@
-//! Expression folding for decompilation.
+//! Certified SSA-to-C operation lowering.
 //!
-//! This module performs expression folding to combine SSA operations into
-//! compound C expressions, eliminating unnecessary temporaries and improving
-//! readability.
-//!
-//! ## Key Transformations
-//!
-//! 1. **Single-use inlining**: If a variable is only used once, inline its
-//!    definition at the use site.
-//!    ```text
-//!    t1 = a + b;
-//!    t2 = t1 * c;
-//!    // becomes:
-//!    t2 = (a + b) * c;
-//!    ```
-//!
-//! 2. **Dead code elimination**: Remove definitions of variables that are
-//!    never used (especially CPU flags).
-//!
-//! 3. **Constant folding**: Replace `const:xxx` with actual numeric values.
+//! This module renders the binding dispositions, per-use projections, and
+//! effect decisions sealed by upstream analysis. Inlining and elision happen
+//! only when those plans authorize them; lowering itself does not infer either
+//! policy from use counts, names, or expression shape.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -27,11 +12,7 @@ use r2ssa::{
     SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId,
 };
 #[cfg(test)]
-use r2ssa::MemoryDefFact;
-#[cfg(test)]
 use r2types::StackSlotKey;
-#[cfg(test)]
-use r2types::TypeOracle;
 #[cfg(test)]
 use r2types::normalize_callee_name;
 use r2types::{
@@ -50,10 +31,7 @@ use crate::registers::register_family_name;
 use super::SSABlock;
 use super::context::{EffectOccurrenceKind, FoldingContext};
 use super::context::{ResolutionGuardKey, ResolutionPhase};
-use super::{
-    MAX_ALIAS_REWRITE_DEPTH, MAX_PREDICATE_OPERAND_DEPTH, MAX_RETURN_EXPR_DEPTH,
-    MAX_SIMPLE_EXPR_DEPTH,
-};
+use super::{MAX_ALIAS_REWRITE_DEPTH, MAX_SIMPLE_EXPR_DEPTH};
 
 /// Stage-3 lowering seam. Construction checks that the plan, its machine
 /// projection, and the source-owned report all refer to the exact same SSA
@@ -87,13 +65,6 @@ impl<'a> PlannedLoweringInput<'a> {
     pub(crate) const fn plan(&self) -> &'a BindingPlan {
         self.plan
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallExprSourceProof {
-    Exact((u64, usize)),
-    ContradictedOrAmbiguous,
-    None,
 }
 
 fn certified_compare_truth_relation(
@@ -317,32 +288,15 @@ enum LoweredOp {
     FinalizedStmt(CStmt),
     Expr(CExpr),
     None,
-    Comment(String),
 }
 
 pub(crate) type OpLoweringResult<T> = Result<T, OpLoweringRefusal>;
-
-/// The authoritative result of lowering one operation for expression use.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum LoweredExprAt {
-    Rendered(CExpr),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct CertifiedCallExpr {
     pub(super) expr: CExpr,
     pub(super) target: ValueId,
     pub(super) values: Vec<ValueId>,
-}
-
-fn expr_contains_memory_like_access(expr: &CExpr) -> bool {
-    let mut found = false;
-    expr.visit(&mut |node| {
-        if matches!(node, CExpr::Deref(_) | CExpr::Subscript { .. }) {
-            found = true;
-        }
-    });
-    found
 }
 
 fn expr_contains_call(expr: &CExpr) -> bool {
@@ -414,81 +368,6 @@ pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
     }
 }
 
-fn is_static_jump_table_base_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if matches!(
-        SSAVarNameKind::classify(&lower),
-        SSAVarNameKind::Symbol | SSAVarNameKind::Object
-    ) {
-        return true;
-    }
-    lower
-        .strip_prefix("0x")
-        .is_some_and(|hex| !hex.is_empty() && u64::from_str_radix(hex, 16).is_ok())
-}
-
-fn stmt_contains_memory_like_access(stmt: &CStmt) -> bool {
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } => stmt_contains_memory_like_access(stmt),
-        CStmt::Observed { stmt, .. } => stmt_contains_memory_like_access(stmt),
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => expr_contains_memory_like_access(expr),
-        CStmt::Decl { init, .. } => init.as_ref().is_some_and(expr_contains_memory_like_access),
-        CStmt::Block(stmts) => stmts.iter().any(stmt_contains_memory_like_access),
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            expr_contains_memory_like_access(cond)
-                || stmt_contains_memory_like_access(then_body)
-                || else_body
-                    .as_ref()
-                    .is_some_and(|stmt| stmt_contains_memory_like_access(stmt))
-        }
-        CStmt::While { cond, body } => {
-            expr_contains_memory_like_access(cond) || stmt_contains_memory_like_access(body)
-        }
-        CStmt::DoWhile { body, cond } => {
-            stmt_contains_memory_like_access(body) || expr_contains_memory_like_access(cond)
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            init.as_ref()
-                .is_some_and(|stmt| stmt_contains_memory_like_access(stmt))
-                || cond.as_ref().is_some_and(expr_contains_memory_like_access)
-                || update
-                    .as_ref()
-                    .is_some_and(expr_contains_memory_like_access)
-                || stmt_contains_memory_like_access(body)
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            expr_contains_memory_like_access(expr)
-                || cases.iter().any(|case| {
-                    expr_contains_memory_like_access(&case.value)
-                        || case.body.iter().any(stmt_contains_memory_like_access)
-                })
-                || default
-                    .as_ref()
-                    .is_some_and(|stmts| stmts.iter().any(stmt_contains_memory_like_access))
-        }
-        CStmt::Return(None)
-        | CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => false,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LowerMode {
     Expr,
@@ -512,41 +391,6 @@ struct LowerFrame {
 enum VisibleExprContext {
     Generic,
     ScalarPredicate,
-    ScalarReturn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalExprNormalizeContext {
-    Generic,
-    DefinitionRoot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FinalExprNormalizeScope {
-    context: FinalExprNormalizeContext,
-    source_call: Option<(u64, usize)>,
-}
-
-impl FinalExprNormalizeScope {
-    fn new(context: FinalExprNormalizeContext) -> Self {
-        Self {
-            context,
-            source_call: None,
-        }
-    }
-
-    fn for_source_call(context: FinalExprNormalizeContext, source_call: (u64, usize)) -> Self {
-        Self {
-            context,
-            source_call: Some(source_call),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublicExprSanitizeMode {
-    Generic,
-    CallArg,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -603,6 +447,7 @@ impl<'a> CertifiedRenderPlan<'a> {
     fn call_arg_expr<F>(
         &self,
         site: (u64, usize),
+        index: usize,
         value: r2ssa::ValueId,
         contains_raw_storage_name: F,
     ) -> Option<CExpr>
@@ -613,7 +458,14 @@ impl<'a> CertifiedRenderPlan<'a> {
             return None;
         }
         let call_view = self.prepared_view.call_view_for_site(site)?;
-        let render_fact = call_view.render_fact.as_ref()?;
+        let callsite = r2types::CallsiteKey {
+            block_addr: site.0,
+            op_index: site.1,
+        };
+        let render_fact = self
+            .function_facts
+            .call_render()?
+            .fact_for_site(callsite)?;
         if render_fact.callsite.block_addr != site.0
             || render_fact.callsite.op_index != site.1
             || matches!(
@@ -624,16 +476,13 @@ impl<'a> CertifiedRenderPlan<'a> {
         {
             return None;
         }
-        let index = call_view
-            .authoritative_arg_values
-            .iter()
-            .position(|candidate| *candidate == value)?;
-        if render_fact.proof_values.get(index).copied() != Some(value) {
+        if render_fact.proof_values.get(index).copied() != Some(value)
+            || call_view.authoritative_arg_values.get(index).copied() != Some(value)
+            || call_view.render_fact.as_ref() != Some(render_fact)
+        {
             return None;
         }
-        let expr = self
-            .prepared_view
-            .authoritative_call_arg_expr_for_value(site, value)?;
+        let expr = call_view.authoritative_args.get(index)?.clone();
         if contains_raw_storage_name(&expr) {
             return None;
         }
@@ -725,50 +574,6 @@ impl<'a> CertifiedRenderContext<'a> {
         let (block_addr, op_idx) = self.prepared.inst_op_site(inst)?;
         let fact = self.memory_access_for_op(block_addr, op_idx, false)?;
         (fact.value == Some(value) && !fact.is_write && fact.materialize_result).then_some(fact)
-    }
-
-    fn memory_read_for_value_dependency(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<&'a r2types::MemoryAccessRenderFact> {
-        let mut visited = BTreeSet::new();
-        let mut stack = vec![(value, 0usize)];
-        while let Some((current, depth)) = stack.pop() {
-            if depth > 8 || !visited.insert(current) {
-                continue;
-            }
-            if let Some(cert) = self
-                .prepared
-                .certificates()
-                .memory_accesses
-                .values()
-                .find(|cert| !cert.is_write && cert.width > 0 && cert.value == Some(current))
-            {
-                let fact = self.render_facts.memory_access_for_op(
-                    cert.block_addr,
-                    cert.op_index,
-                    false,
-                    cert.space,
-                )?;
-                if fact.access == cert.access
-                    && fact.space == cert.space
-                    && fact.address == cert.address
-                    && fact.value == cert.value
-                    && fact.width == cert.width
-                {
-                    return Some(fact);
-                }
-                return None;
-            }
-            let Some(inst_id) = self.prepared.graph().def_inst(current) else {
-                continue;
-            };
-            let Some(inst) = self.prepared.graph().inst(inst_id) else {
-                continue;
-            };
-            stack.extend(inst.inputs.iter().map(|input| (*input, depth + 1)));
-        }
-        None
     }
 
     fn return_for_op(&self, block_addr: u64, op_idx: usize) -> Option<&'a ReturnValueRenderFact> {

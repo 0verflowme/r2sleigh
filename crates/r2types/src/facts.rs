@@ -231,6 +231,11 @@ pub enum SignatureCertificateSource {
     SummaryKind,
     SemanticProjection,
     InterprocSummary,
+    /// The return type alone is projected from the immutable source function
+    /// interface and matched to exact native return-value certificates. This
+    /// does not certify parameter types or authorize signature writeback by
+    /// itself.
+    SourceReturnType,
 }
 
 impl SignatureCertificateSource {
@@ -245,6 +250,7 @@ impl SignatureCertificateSource {
             Self::SummaryKind => "summary_kind",
             Self::SemanticProjection => "semantic_projection",
             Self::InterprocSummary => "interproc_summary",
+            Self::SourceReturnType => "source_return_type",
         }
     }
 
@@ -1660,6 +1666,22 @@ mod tests {
         assert!(
             !certificate.authorizes_signature_writeback(),
             "local inference alone is not enough evidence to mutate radare2 signature state"
+        );
+    }
+
+    #[test]
+    fn source_return_type_certificate_does_not_certify_parameter_writeback() {
+        let certificate = SignatureCertificate::from_signature(
+            &exact_signature(),
+            [SignatureCertificateSource::SourceReturnType],
+        )
+        .expect("an exact return projection should remain renderable");
+
+        assert!(certificate.authorizes_signature_render());
+        assert!(!certificate.authorizes_signature_writeback());
+        assert_eq!(
+            SignatureCertificateSource::SourceReturnType.as_str(),
+            "source_return_type"
         );
     }
 

@@ -689,13 +689,13 @@ impl FunctionRenderFacts {
                 return None;
             };
             match self.certified_entities.get(binding) {
-                Some(
-                    entity @ CertifiedEntity::LoopCarrier {
-                        members, ..
-                    },
-                ) if members
-                    .binary_search_by_key(&value, |member| member.value)
-                    .is_ok() => Some(entity),
+                Some(entity @ CertifiedEntity::LoopCarrier { members, .. })
+                    if members
+                        .binary_search_by_key(&value, |member| member.value)
+                        .is_ok() =>
+                {
+                    Some(entity)
+                }
                 _ => None,
             }
         });
@@ -1040,6 +1040,9 @@ pub enum CertifiedEntity {
         slot: u32,
         entry_values: BTreeSet<r2ssa::ValueId>,
         carrier_width: u32,
+        /// Exact logical type from the immutable source interface. Absence is
+        /// unknown and must not be repaired from a merged renderer signature.
+        ty: Option<CTypeLike>,
     },
     StackSlot {
         id: r2ssa::SemanticId,
@@ -1047,6 +1050,9 @@ pub enum CertifiedEntity {
         base: r2ssa::StackAddressBase,
         offset: i64,
         size: Option<u32>,
+        /// Full source slot identity, including its local/parameter-home role.
+        /// Absence grants no addressable C-object authority.
+        source_slot: Option<r2ssa::SourceStackSlotSpec>,
     },
     LoopCarrier {
         id: r2ssa::SemanticId,
@@ -1612,6 +1618,24 @@ impl SourceOwnedFunctionFacts {
         {
             return None;
         }
+        // Source-owned facts are authoritative only when every source-dependent
+        // projection is exactly what this retained SSA artifact produces. Both
+        // construction and consumers previously read `report`, so a stale
+        // detached render/call/control row could validate against itself. Build
+        // the projection again from the retained source and the final canonical
+        // type payload, then require exact equality before sealing.
+        let mut expected = report.clone();
+        Self::rebuild_source_owned_decompile_evidence(source.as_ref(), &mut expected);
+        if report.types != expected.types
+            || report.callee_resolution != expected.callee_resolution
+            || report.callsites != expected.callsites
+            || report.call_results != expected.call_results
+            || report.call_render != expected.call_render
+            || report.control != expected.control
+            || report.render != expected.render
+        {
+            return None;
+        }
         Some(Self { source, report })
     }
 
@@ -1694,40 +1718,139 @@ impl SourceOwnedFunctionFacts {
     /// Parameter-slot resolution needs a coherent ABI. When the source does not
     /// carry one there are no parameter slots to resolve, so the steps keyed on
     /// them have nothing to do; every other piece of evidence is still valid and
-    /// is still attached. Returns how many call-argument type constraints were
-    /// applied.
+    /// is still attached. Returns the number of call-argument type constraints
+    /// applied and whether the exact source return type changed the signature.
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
-    ) -> usize {
-        let param_slots = exact_source_param_slot_resolver(source);
+    ) -> (usize, bool) {
         let mut enriched = report.clone();
         let mut usage = source.facts().assumption_usage.clone();
         usage.extend(enriched.assumption_usage());
         enriched.assumption_usage = usage;
         enriched.display_names.absorb(source.display_names());
-        enriched.attach_prepared_decompile_evidence(source);
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_certified_parameter_exprs(source, param_slots);
-        }
-        enriched.normalize_field_certificates_from_external_layout();
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched
-                .populate_member_access_render_facts_from_field_certificates(source, param_slots);
-        }
-        enriched.populate_certified_loop_carrier_types();
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
-        }
+        Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
         let ptr_bits = source
             .machine_context()
             .memory_model()
             .default_address_bits();
         let applied_constraints = enriched.apply_certified_call_argument_type_constraints(ptr_bits);
         enriched.apply_recovered_evidence_types(source, ptr_bits);
+        // Exact immutable interface evidence outranks advisory propagation.
+        // Apply it after recovered call evidence so the latter cannot rewrite
+        // a declared signedness or logical projection through a weak scalar.
+        let return_type_changed = enriched.apply_exact_source_return_type(source);
+        // Type constraints may change advisory member/carrier types. Rebuild
+        // once more so the sealed render projection is a pure function of the
+        // final type facts and the exact retained source.
+        Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
         *report = enriched;
-        applied_constraints
+        (applied_constraints, return_type_changed)
     }
+
+    fn rebuild_source_owned_decompile_evidence(
+        source: &r2ssa::SsaArtifact,
+        report: &mut FunctionFacts,
+    ) {
+        let param_slots = exact_source_param_slot_resolver(source);
+        report.attach_prepared_decompile_evidence(source);
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_certified_parameter_exprs(source, param_slots);
+        }
+        report.normalize_field_certificates_from_external_layout();
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_member_access_render_facts_from_field_certificates(source, param_slots);
+        }
+        report.populate_certified_loop_carrier_types();
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
+        }
+    }
+}
+
+fn exact_source_return_type(source: &r2ssa::SsaArtifact) -> Option<CTypeLike> {
+    let context = source.machine_context();
+    let abi = context.abi_model();
+    let memory = context.memory_model();
+    if !abi.is_available() || !abi.is_coherent() || !memory.is_available() || !memory.is_coherent()
+    {
+        return None;
+    }
+    let interface = context.function_interface()?;
+    let r2ssa::SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return None;
+    };
+    if storage.space != r2ssa::CanonicalStorageSpace::Register || storage.size == 0 {
+        return None;
+    }
+    let logical = interface.return_logical_value()?;
+    let graph = interface.type_graph()?;
+    let source_type = graph
+        .types()
+        .get(usize::try_from(logical.type_id()).ok()?)
+        .filter(|source_type| source_type.id() == logical.type_id())?;
+    let projection = logical.carrier();
+    let storage_bits = u64::from(storage.size).checked_mul(8)?;
+    if projection.offset_bits() != 0
+        || projection.size_bits() == 0
+        || projection.size_bits() != source_type.size_bits()
+        || projection.size_bits() % 8 != 0
+        || projection.size_bits() > storage_bits
+    {
+        return None;
+    }
+    let logical_width = match projection.kind() {
+        r2ssa::SourceCarrierKind::Full if projection.size_bits() == storage_bits => storage.size,
+        r2ssa::SourceCarrierKind::LowBits
+            if projection.size_bits() < storage_bits
+                && matches!(
+                    source_type.kind(),
+                    r2ssa::SourceTypeKind::SignedInteger | r2ssa::SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            u32::try_from(projection.size_bits() / 8).ok()?
+        }
+        _ => return None,
+    };
+    let expected_carrier = r2ssa::ReturnCarrier::Register { storage };
+    let mut return_count = 0usize;
+    for &block_addr in source.function().block_addrs() {
+        let block = source.function().get_block(block_addr)?;
+        for (op_index, op) in block.ops.iter().enumerate() {
+            if !matches!(op, r2ssa::SSAOp::Return { .. }) {
+                continue;
+            }
+            return_count = return_count.checked_add(1)?;
+            let certificate = source.return_certificate_for_op(block_addr, op_index)?;
+            if !exact_return_certificate_matches(
+                certificate,
+                logical,
+                logical_width,
+                &expected_carrier,
+            ) {
+                return None;
+            }
+        }
+    }
+    if return_count == 0
+        || source.certificates().returns.len() != return_count
+        || source.certificates().returns_by_inst.len() != return_count
+    {
+        return None;
+    }
+
+    crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())
+}
+
+fn exact_return_certificate_matches(
+    certificate: &r2ssa::ReturnValueCertificate,
+    logical: r2ssa::SourceLogicalValue,
+    logical_width: u32,
+    expected_carrier: &r2ssa::ReturnCarrier,
+) -> bool {
+    certificate.source_logical_value == Some(logical)
+        && certificate.width == logical_width
+        && certificate.carrier.as_ref() == Some(expected_carrier)
 }
 
 fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<ParamSlotResolver> {
@@ -2578,12 +2701,17 @@ impl FunctionFacts {
         let prepared_control = prepared_control_facts(prepared);
         let prepared_render = FunctionRenderFacts::from_prepared(prepared);
 
-        merge_callee_resolution_facts(&mut self.callee_resolution, prepared_callee_resolution);
-        merge_callsite_facts(&mut self.callsites, prepared_callsites);
-        merge_call_result_facts(&mut self.call_results, prepared_call_results);
-        merge_call_render_facts(&mut self.call_render, prepared_call_render);
-        merge_control_facts(&mut self.control, prepared_control);
-        merge_render_facts(&mut self.render, prepared_render);
+        // These fields are projections of one exact prepared artifact, not
+        // extension points. Letting detached rows win with `or_insert` gave the
+        // report and its validator the same stale answer. Advisory type and
+        // presentation inputs are consumed while rebuilding, but the resulting
+        // source-owned maps are replaced atomically.
+        self.callee_resolution = prepared_callee_resolution;
+        self.callsites = prepared_callsites;
+        self.call_results = prepared_call_results;
+        self.call_render = prepared_call_render;
+        self.control = prepared_control;
+        self.render = prepared_render;
     }
 
     /// Bind canonical entry values to ABI parameter-slot semantic identities.
@@ -2689,6 +2817,24 @@ impl FunctionFacts {
         }
         for (slot, (entry_values, carrier_width)) in entry_values_by_slot {
             let id = r2ssa::SemanticId::Parameter(slot);
+            let ty = prepared
+                .machine_context()
+                .function_interface()
+                .filter(|interface| {
+                    interface
+                        .parameters()
+                        .get(slot as usize)
+                        .is_some_and(|parameter| parameter.index() == slot)
+                })
+                .and_then(|interface| {
+                    let graph = interface.type_graph()?;
+                    let logical = interface.parameter_logical_values().get(slot as usize)?;
+                    crate::writeback::source_type_like(
+                        graph,
+                        logical.type_id(),
+                        &mut BTreeSet::new(),
+                    )
+                });
             self.render.certified_entities.insert(
                 id,
                 CertifiedEntity::Parameter {
@@ -2696,6 +2842,7 @@ impl FunctionFacts {
                     slot,
                     entry_values,
                     carrier_width,
+                    ty,
                 },
             );
         }
@@ -2740,11 +2887,7 @@ impl FunctionFacts {
             .render
             .loop_carriers()
             .filter_map(|entity| match entity {
-                CertifiedEntity::LoopCarrier {
-                    id,
-                    members,
-                    ..
-                } => Some((*id, members.clone())),
+                CertifiedEntity::LoopCarrier { id, members, .. } => Some((*id, members.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2893,6 +3036,62 @@ impl FunctionFacts {
         self.types
             .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
         applied.len()
+    }
+
+    /// Preserve the source-declared logical return type only when every native
+    /// return has the exact SSA certificate for that declared carrier. The
+    /// immutable interface owns the logical type; the return certificates prove
+    /// that this function actually returns a value through that carrier.
+    fn apply_exact_source_return_type(&mut self, source: &r2ssa::SsaArtifact) -> bool {
+        let Some(return_type) = exact_source_return_type(source) else {
+            return false;
+        };
+        let Some(previous_signature) = self.types.merged_signature.clone() else {
+            return false;
+        };
+        let previous_certificate = self.types.signature_certificate.clone();
+        if previous_signature.ret_type.as_ref() == Some(&return_type) {
+            if let Some(mut sources) = previous_certificate
+                .as_ref()
+                .filter(|certificate| certificate.signature == previous_signature)
+                .map(|certificate| certificate.sources.clone())
+            {
+                sources.push(SignatureCertificateSource::SourceReturnType);
+                sources.sort();
+                sources.dedup();
+                if let Some(certificate) =
+                    crate::SignatureCertificate::from_signature(&previous_signature, sources)
+                {
+                    self.types.signature_certificate = Some(certificate);
+                }
+            }
+            return false;
+        }
+        let Some(signature) = self.types.merged_signature.as_mut() else {
+            return false;
+        };
+        signature.ret_type = Some(return_type);
+        let updated_signature = signature.clone();
+        let mut sources = previous_certificate
+            .as_ref()
+            .filter(|certificate| certificate.signature == previous_signature)
+            .map(|certificate| certificate.sources.clone())
+            .unwrap_or_default();
+        // This evidence proves only the return type. Treating it as general
+        // ExternalContext evidence would also certify unrelated parameter
+        // types and could incorrectly authorize full-signature writeback.
+        sources.push(SignatureCertificateSource::SourceReturnType);
+        sources.sort();
+        sources.dedup();
+        let Some(certificate) =
+            crate::SignatureCertificate::from_signature(&updated_signature, sources)
+        else {
+            self.types.merged_signature = Some(previous_signature);
+            self.types.signature_certificate = previous_certificate;
+            return false;
+        };
+        self.types.signature_certificate = Some(certificate);
+        true
     }
 
     /// The prototype each call site reaches, keyed the way the solver needs it.
@@ -3261,127 +3460,6 @@ fn prepared_callee_resolution_facts(
             }),
         &ctx,
     )
-}
-
-fn merge_callee_resolution_facts(
-    existing: &mut CalleeResolutionFacts,
-    prepared: CalleeResolutionFacts,
-) {
-    for (key, identity) in prepared.by_key {
-        existing.by_key.entry(key).or_insert(identity);
-    }
-    for (addr, key) in prepared.by_direct_addr {
-        existing.by_direct_addr.entry(addr).or_insert(key);
-    }
-    for (callsite, key) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(key);
-    }
-    for (name, key) in prepared.by_name {
-        existing.by_name.entry(name).or_insert(key);
-    }
-}
-
-fn merge_callsite_facts(existing: &mut FunctionCallsiteFacts, prepared: FunctionCallsiteFacts) {
-    for (callsite, facts) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(facts);
-    }
-}
-
-fn merge_call_result_facts(
-    existing: &mut FunctionCallResultFacts,
-    prepared: FunctionCallResultFacts,
-) {
-    for (value, fact) in prepared.by_value {
-        existing.by_value.entry(value).or_insert(fact);
-    }
-    for (callsite, values) in prepared.by_callsite {
-        let existing_values = existing.by_callsite.entry(callsite).or_default();
-        for value in values {
-            if !existing_values.contains(&value) {
-                existing_values.push(value);
-            }
-        }
-    }
-}
-
-fn merge_call_render_facts(
-    existing: &mut FunctionCallRenderFacts,
-    prepared: FunctionCallRenderFacts,
-) {
-    for (callsite, fact) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(fact);
-    }
-}
-
-fn merge_control_facts(existing: &mut FunctionControlFacts, prepared: FunctionControlFacts) {
-    for (block, fact) in prepared.branch_predicates {
-        existing.branch_predicates.entry(block).or_insert(fact);
-    }
-    for (block, assumptions) in prepared.block_assumptions {
-        let existing_assumptions = existing.block_assumptions.entry(block).or_default();
-        for assumption in assumptions {
-            if !existing_assumptions.contains(&assumption) {
-                existing_assumptions.push(assumption);
-            }
-        }
-    }
-    for (loop_id, fact) in prepared.loops {
-        existing.loops.entry(loop_id).or_insert(fact);
-    }
-    for (block, fact) in prepared.switches {
-        existing.switches.entry(block).or_insert(fact);
-    }
-    for (id, domain) in prepared.control_domains.domains {
-        existing.control_domains.domains.entry(id).or_insert(domain);
-    }
-    for (block, id) in prepared.control_domains.by_block {
-        existing.control_domains.by_block.entry(block).or_insert(id);
-    }
-}
-
-fn merge_render_facts(existing: &mut FunctionRenderFacts, prepared: FunctionRenderFacts) {
-    for (id, fact) in prepared.certified_exprs {
-        existing.certified_exprs.entry(id).or_insert(fact);
-    }
-    for (id, fact) in prepared.certified_entities {
-        existing.certified_entities.entry(id).or_insert(fact);
-    }
-    for (id, fact) in prepared.certified_effects {
-        existing.certified_effects.entry(id).or_insert(fact);
-    }
-    for (op, id) in prepared.return_effects_by_op {
-        existing.return_effects_by_op.entry(op).or_insert(id);
-    }
-    for (op, ids) in prepared.memory_effects_by_op {
-        let existing_ids = existing.memory_effects_by_op.entry(op).or_default();
-        for id in ids {
-            if !existing_ids.contains(&id) {
-                existing_ids.push(id);
-            }
-        }
-    }
-    for (value, fact) in prepared.string_literals_by_value {
-        existing
-            .string_literals_by_value
-            .entry(value)
-            .or_insert(fact);
-    }
-    for (op, facts) in prepared.member_accesses_by_op {
-        let existing_facts = existing.member_accesses_by_op.entry(op).or_default();
-        for fact in facts {
-            if !existing_facts.contains(&fact) {
-                existing_facts.push(fact);
-            }
-        }
-    }
-    for (op, facts) in prepared.array_accesses_by_op {
-        let existing_facts = existing.array_accesses_by_op.entry(op).or_default();
-        for fact in facts {
-            if !existing_facts.contains(&fact) {
-                existing_facts.push(fact);
-            }
-        }
-    }
 }
 
 fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCallsiteFacts {
@@ -4081,6 +4159,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                     base: cert.base,
                     offset: cert.offset,
                     size: cert.size,
+                    source_slot: cert.source_slot,
                 },
             )
         })
@@ -4622,7 +4701,10 @@ fn push_structured_summary_pointer_indices(
 mod tests {
     use super::*;
     use crate::{ExternalStackBase, FunctionParamSpec};
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     #[test]
@@ -4634,6 +4716,7 @@ mod tests {
             slot: 0,
             entry_values: entry_values.clone(),
             carrier_width: 8,
+            ty: None,
         };
 
         assert_eq!(entity.coalescing_values(), Some(entry_values));
@@ -4785,6 +4868,7 @@ mod tests {
             base: r2ssa::StackAddressBase::FramePointer,
             offset: -8,
             size: Some(8),
+            source_slot: None,
         };
 
         assert_eq!(forward.coalescing_values(), reversed.coalescing_values());
@@ -4847,6 +4931,194 @@ mod tests {
         assert!(exact_source_param_slot_resolver(&source).is_none());
     }
 
+    fn exact_signed_i32_return_source(has_return: bool) -> r2ssa::SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        for (name, offset, size) in [
+            ("rax", 0x00, 8),
+            ("eax", 0x00, 4),
+            ("rsp", 0x28, 8),
+            ("rip", 0x30, 8),
+        ] {
+            arch.add_register(RegisterDef::new(name, offset, size));
+        }
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
+                },
+            }
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
+        let mut block = R2ILBlock::new(0x401000, 2);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(7, 4),
+        });
+        if has_return {
+            block.push(R2ILOp::Return {
+                target: Varnode::register(0x30, 8),
+            });
+        }
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let logical = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
+        );
+        let graph = r2ssa::SourceTypeGraph::new(
+            [r2ssa::SourceType::new(
+                0,
+                r2ssa::SourceTypeKind::SignedInteger,
+                32,
+                32,
+            )],
+            [],
+        )
+        .expect("exact signed return graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            b"exact-signed-return".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+            [],
+            Some(logical),
+            Some(graph),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .expect("exact signed return interface");
+        r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared signed return source")
+    }
+
+    #[test]
+    fn exact_source_return_type_preserves_signed_i32_with_matching_certificate() {
+        let source = exact_signed_i32_return_source(true);
+
+        assert_eq!(
+            exact_source_return_type(&source),
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            })
+        );
+
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            }),
+            params: Vec::new(),
+        };
+        let mut facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature.clone()),
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::ExternalContext],
+                ),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        );
+        assert!(!facts.apply_exact_source_return_type(&source));
+        assert!(
+            facts
+                .type_facts()
+                .signature_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate
+                    .sources
+                    .contains(&crate::SignatureCertificateSource::SourceReturnType))
+        );
+    }
+
+    #[test]
+    fn exact_source_return_type_refuses_missing_or_mismatched_certificate() {
+        let missing = exact_signed_i32_return_source(false);
+        assert!(missing.certificates().returns.is_empty());
+        assert_eq!(exact_source_return_type(&missing), None);
+
+        let matching = exact_signed_i32_return_source(true);
+        let mut mismatched = matching.certificates().returns[0].clone();
+        mismatched.width = 8;
+        let logical = matching
+            .machine_context()
+            .function_interface()
+            .and_then(r2ssa::SourceFunctionInterface::return_logical_value)
+            .expect("exact logical return");
+        assert!(!exact_return_certificate_matches(
+            &mismatched,
+            logical,
+            4,
+            &r2ssa::ReturnCarrier::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+        ));
+        let mut forged_logical = matching.certificates().returns[0].clone();
+        forged_logical.source_logical_value = None;
+        assert!(!exact_return_certificate_matches(
+            &forged_logical,
+            logical,
+            4,
+            &r2ssa::ReturnCarrier::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+        ));
+    }
+
     #[test]
     fn exact_source_param_slots_accept_exact_empty_interface() {
         let mut arch = ArchSpec::new("x86-64");
@@ -4906,6 +5178,7 @@ mod tests {
                             base,
                             offset,
                             size: None,
+                            source_slot: None,
                         },
                     )
                 })
@@ -5465,7 +5738,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_decompile_evidence_preserves_existing_function_facts() {
+    fn prepared_decompile_evidence_replaces_detached_source_dependent_rows() {
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Call {
             target: Varnode::constant(0x402000, 8),
@@ -5537,35 +5810,33 @@ mod tests {
 
         facts.attach_prepared_decompile_evidence(&prepared);
 
-        assert_eq!(
+        assert_ne!(
             facts
                 .callsites()
                 .and_then(|callsites| callsites.arguments_for_site(callsite)),
             Some(&sentinel_callsite),
-            "prepared callsite evidence must not overwrite existing FunctionFacts callsite proof"
+            "a detached callsite row must not outrank the retained prepared artifact"
         );
-        assert_eq!(
+        assert_ne!(
             facts
                 .call_render()
                 .and_then(|render| render.fact_for_site(callsite)),
             Some(&sentinel_render),
-            "prepared call-render evidence must not overwrite existing FunctionFacts render disposition"
+            "a detached call-render disposition must not outrank the retained prepared artifact"
         );
-        assert_eq!(
+        assert!(
             facts
                 .render()
                 .and_then(|render| render.string_literal_for_value(string_value))
-                .map(|literal| literal.text.as_str()),
-            Some("existing"),
-            "prepared render facts must not erase existing string literal render evidence"
+                .is_none(),
+            "an unvalidated detached string annotation must be removed during source rebuild"
         );
-        assert_eq!(
+        assert!(
             facts
                 .render()
                 .and_then(|render| render.member_accesses_by_op.get(&member_op))
-                .and_then(|members| members.first()),
-            Some(&member_access),
-            "prepared render facts must not erase existing member-access evidence"
+                .is_none(),
+            "an unvalidated detached member projection must be removed during source rebuild"
         );
         assert!(
             facts
@@ -5573,6 +5844,62 @@ mod tests {
                 .and_then(|resolution| resolution.identity_for_callsite(callsite))
                 .is_some(),
             "prepared evidence should still fill missing FunctionFacts groups"
+        );
+    }
+
+    #[test]
+    fn source_owned_seal_rederives_render_call_and_control_facts() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x402000, 8),
+        });
+        let source = Arc::new(
+            r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+                .expect("prepared source-owned seal fixture"),
+        );
+        let canonical_report = || {
+            let mut report =
+                FunctionFacts::default().with_assumptions(source.facts().assumptions.clone());
+            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+                source.as_ref(),
+                &mut report,
+            );
+            report
+        };
+
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), canonical_report()).is_some(),
+            "the independently rederived canonical report must seal"
+        );
+
+        let mut forged_render = canonical_report();
+        forged_render
+            .render
+            .certified_exprs
+            .values_mut()
+            .next()
+            .expect("fixture certified expression")
+            .fact
+            .width = 1;
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), forged_render).is_none(),
+            "a detached render-core mutation must not validate against itself"
+        );
+
+        let mut forged_call = canonical_report();
+        assert!(!forged_call.call_render.by_callsite.is_empty());
+        forged_call.call_render.by_callsite.clear();
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), forged_call).is_none(),
+            "a detached call-render mutation must not validate against itself"
+        );
+
+        let mut forged_control = canonical_report();
+        assert!(!forged_control.control.control_domains.by_block.is_empty());
+        forged_control.control = FunctionControlFacts::default();
+        assert!(
+            SourceOwnedFunctionFacts::seal(source, forged_control).is_none(),
+            "a detached control projection must not validate against itself"
         );
     }
 
@@ -6697,6 +7024,7 @@ mod tests {
                     base: r2ssa::StackAddressBase::FramePointer,
                     offset: -8,
                     size: None,
+                    source_slot: None,
                 },
             )]),
             certified_effects: BTreeMap::from([

@@ -15,11 +15,7 @@ fn seal_parameter_candidates(
     source_owned: &SourceOwnedFunctionFacts,
 ) -> Vec<Option<SealParameterCandidate>> {
     let mut result = Vec::new();
-    if let Some(interface) = source_owned
-        .source()
-        .machine_context()
-        .function_interface()
-    {
+    if let Some(interface) = source_owned.source().machine_context().function_interface() {
         for parameter in interface.parameters() {
             let slot = parameter.index();
             let index = slot as usize;
@@ -34,13 +30,11 @@ fn seal_parameter_candidates(
                     entry_values: BTreeSet::new(),
                 },
                 Some(SealParameterCandidate::Exact { entity: first, .. }) => {
-                    SealParameterCandidate::Refused(
-                        ParameterRefusal::ConflictingSlotOwnership {
-                            slot,
-                            first: *first,
-                            second: entity,
-                        },
-                    )
+                    SealParameterCandidate::Refused(ParameterRefusal::ConflictingSlotOwnership {
+                        slot,
+                        first: *first,
+                        second: entity,
+                    })
                 }
                 Some(SealParameterCandidate::Refused(reason)) => {
                     SealParameterCandidate::Refused(*reason)
@@ -57,6 +51,7 @@ fn seal_parameter_candidates(
             slot,
             entry_values,
             carrier_width,
+            ..
         } = entity
         else {
             continue;
@@ -80,9 +75,7 @@ fn seal_parameter_candidates(
             continue;
         }
         match &result[index] {
-            Some(SealParameterCandidate::Exact {
-                entity: owner, ..
-            }) if owner == id => {
+            Some(SealParameterCandidate::Exact { entity: owner, .. }) if owner == id => {
                 result[index] = Some(SealParameterCandidate::Exact {
                     entity: *id,
                     width_bytes: *carrier_width,
@@ -156,10 +149,23 @@ pub(super) fn seal_binding_components(
     let graph = source.graph();
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
+    let return_controls = certified_return_control_values(source);
+    let structural_unused =
+        source
+            .obligations()
+            .structural_unused_values(graph)
+            .ok_or(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::Authority,
+            ))?;
     let eligible = graph
         .values
         .iter()
-        .map(|value| value.var.constant_bits().is_none() && !unobserved_merges.contains(value.id))
+        .map(|value| {
+            value.var.constant_bits().is_none()
+                && !unobserved_merges.contains(value.id)
+                && !return_controls.contains(&value.id)
+                && !structural_unused.contains(&value.id)
+        })
         .collect::<Vec<_>>();
     let mut members_by_source = BTreeMap::<BindingCertificateSource, BTreeSet<ValueId>>::new();
 
@@ -378,6 +384,14 @@ pub(crate) fn build_upstream_shadow_oracle(
     let graph = source.graph();
     let machine_projection = MachineProjection::from_artifact(source)
         .map_err(BindingPlanBuildError::MachineProjection)?;
+    let return_controls = certified_return_control_values(source);
+    let structural_unused =
+        source
+            .obligations()
+            .structural_unused_values(graph)
+            .ok_or(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::Authority,
+            ))?;
     let resolved = seal_binding_components(source_owned)?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
@@ -399,9 +413,21 @@ pub(crate) fn build_upstream_shadow_oracle(
         .collect::<BTreeSet<_>>();
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
+        if return_controls.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::ReturnControl,
+            ));
+            continue;
+        }
         if source.unobserved_merges().contains(graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::UnobservedMerge,
+            ));
+            continue;
+        }
+        if structural_unused.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::UnusedStructuralValue,
             ));
             continue;
         }
@@ -478,6 +504,10 @@ impl BindingPlan {
 
         let expected = seal_binding_components(source_owned)?;
         let unobserved_merges = source.unobserved_merges();
+        let return_controls = certified_return_control_values(source);
+        let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
+            BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
+        )?;
         for (index, graph_value) in graph.values.iter().enumerate() {
             if graph_value.id.0 as usize != index {
                 return Err(BindingPlanBuildError::Seal(
@@ -533,12 +563,24 @@ impl BindingPlan {
                 } if *refused == value && graph_value.var.constant_bits().is_some() => {}
                 ValueDisposition::Refused { .. }
                     if graph_value.var.constant_bits().is_none()
-                        && !unobserved_merges.contains(value) => {}
+                        && !unobserved_merges.contains(value)
+                        && !return_controls.contains(&value)
+                        && !structural_unused.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnobservedMerge
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && unobserved_merges.contains(value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::ReturnControl
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && return_controls.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::UnusedStructuralValue
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && structural_unused.contains(&value) => {}
                 ValueDisposition::Elided { .. } => {
                     return Err(BindingPlanBuildError::Seal(
                         BindingPlanSourceMismatch::InvalidElisionProof { value },
@@ -624,23 +666,28 @@ impl BindingPlan {
                 continue;
             };
             let slot = index as u32;
-            if seal_parameter_width(*entity, slot, *width_bytes).is_err()
-                || entry_values.is_empty()
+            if seal_parameter_width(*entity, slot, *width_bytes).is_err() || entry_values.is_empty()
             {
                 continue;
             }
             let mut binding = None;
-            if entry_values.iter().all(|value| match self.disposition(*value) {
-                Some(ValueDisposition::Bound { binding: candidate })
-                    if binding.is_none_or(|existing| existing == *candidate) =>
-                {
-                    binding = Some(*candidate);
-                    true
-                }
-                _ => false,
-            }) && let Some(binding) = binding
+            if entry_values
+                .iter()
+                .all(|value| match self.disposition(*value) {
+                    Some(ValueDisposition::Bound { binding: candidate })
+                        if binding.is_none_or(|existing| existing == *candidate) =>
+                    {
+                        binding = Some(*candidate);
+                        true
+                    }
+                    _ => false,
+                })
+                && let Some(binding) = binding
             {
-                slots_by_reused_binding.entry(binding).or_default().push(slot);
+                slots_by_reused_binding
+                    .entry(binding)
+                    .or_default()
+                    .push(slot);
             }
         }
 
@@ -666,11 +713,14 @@ impl BindingPlan {
                     Err(reason) => ParameterDisposition::Refused { reason },
                     Ok(width_bits) if entry_values.is_empty() => {
                         let binding = BindingId(binding_index as u32);
-                        let planned = self.bindings.get(binding_index).ok_or(
-                            BindingPlanBuildError::Seal(
-                                BindingPlanSourceMismatch::UnexpectedParameterDisposition { slot },
-                            ),
-                        )?;
+                        let planned =
+                            self.bindings
+                                .get(binding_index)
+                                .ok_or(BindingPlanBuildError::Seal(
+                                    BindingPlanSourceMismatch::UnexpectedParameterDisposition {
+                                        slot,
+                                    },
+                                ))?;
                         if planned.certificate.sources.as_ref()
                             != [BindingCertificateSource::CertifiedEntity(entity)]
                             || !actual_by_binding[binding_index].is_empty()
@@ -698,8 +748,7 @@ impl BindingPlan {
                         let missing = entry_values.iter().copied().find(|value| {
                             match self.disposition(*value) {
                                 Some(ValueDisposition::Bound { binding: candidate })
-                                    if binding
-                                        .is_none_or(|existing| existing == *candidate) =>
+                                    if binding.is_none_or(|existing| existing == *candidate) =>
                                 {
                                     binding = Some(*candidate);
                                     false
@@ -750,8 +799,13 @@ impl BindingPlan {
             .flat_map(|render| render.certified_entities.values())
             .filter_map(|entity| match entity {
                 r2types::CertifiedEntity::StackSlot {
-                    id, object, size, ..
-                } => Some((*id, *object, *size)),
+                    id,
+                    object,
+                    base,
+                    offset,
+                    size,
+                    source_slot,
+                } => Some((*id, *object, *base, *offset, *size, *source_slot)),
                 r2types::CertifiedEntity::Parameter { .. }
                 | r2types::CertifiedEntity::LoopCarrier { .. } => None,
             })
@@ -764,55 +818,119 @@ impl BindingPlan {
                 },
             ));
         }
-        for (entity, object, size) in expected_stack_objects {
-            let expected_disposition = match size {
+        for (entity, object, base, offset, size, source_slot) in expected_stack_objects {
+            let exact_certificate = source.certificates().stack_slots.get(&object);
+            if exact_certificate.is_none_or(|certificate| {
+                certificate.object != object
+                    || certificate.base != base
+                    || certificate.offset != offset
+                    || certificate.size != size
+                    || certificate.source_slot != source_slot
+            }) {
+                return Err(BindingPlanBuildError::Seal(
+                    BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object },
+                ));
+            }
+            let expected_disposition = match source_slot {
                 None => StackObjectDisposition::Refused {
-                    reason: StackObjectRefusal::MissingWidth { object },
+                    reason: StackObjectRefusal::MissingSourceIdentity { object },
                 },
-                Some(size_bytes) => match size_bytes.checked_mul(8).filter(|width| *width > 0) {
-                    Some(width_bits) => {
-                        let binding = BindingId(binding_index as u32);
-                        let planned =
-                            self.bindings
-                                .get(binding_index)
-                                .ok_or(BindingPlanBuildError::Seal(
+                Some(source_slot)
+                    if source_slot.base() != base
+                        || source_slot.offset() != offset
+                        || size != Some(source_slot.size_bytes()) =>
+                {
+                    StackObjectDisposition::Refused {
+                        reason: StackObjectRefusal::MissingSourceIdentity { object },
+                    }
+                }
+                Some(source_slot) => {
+                    let size_bytes = source_slot.size_bytes();
+                    let Some(width_bits) = size_bytes.checked_mul(8).filter(|width| *width > 0)
+                    else {
+                        let expected = StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::InvalidWidth { object, size_bytes },
+                        };
+                        if self.stack_object_disposition(object) != Some(expected) {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
+                                    object,
+                                },
+                            ));
+                        }
+                        continue;
+                    };
+                    match source_slot.role() {
+                        r2ssa::SourceStackSlotRole::Local => {
+                            let Some(binding) = BindingId::from_dense_index(binding_index) else {
+                                return Err(BindingPlanBuildError::TooManyBindings {
+                                    count: binding_index.saturating_add(1),
+                                });
+                            };
+                            let planned =
+                                self.bindings
+                                    .get(binding_index)
+                                    .ok_or(BindingPlanBuildError::Seal(
                                     BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
                                         object,
                                     },
                                 ))?;
-                        if planned.certificate.sources.as_ref()
-                            != [BindingCertificateSource::CertifiedEntity(entity)]
-                        {
-                            return Err(BindingPlanBuildError::Seal(
-                                BindingPlanSourceMismatch::StackObjectCertificate {
-                                    object,
-                                    binding,
-                                },
-                            ));
+                            if planned.certificate.sources.as_ref()
+                                != [BindingCertificateSource::CertifiedEntity(entity)]
+                                || !actual_by_binding[binding_index].is_empty()
+                            {
+                                return Err(BindingPlanBuildError::Seal(
+                                    BindingPlanSourceMismatch::StackObjectCertificate {
+                                        object,
+                                        binding,
+                                    },
+                                ));
+                            }
+                            if planned.declaration_type != CType::machine_bits(width_bits) {
+                                return Err(BindingPlanBuildError::Seal(
+                                    BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                        object,
+                                        binding,
+                                    },
+                                ));
+                            }
+                            binding_index += 1;
+                            StackObjectDisposition::Bound { binding }
                         }
-                        if planned.declaration_type != CType::machine_bits(width_bits) {
-                            return Err(BindingPlanBuildError::Seal(
-                                BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                        r2ssa::SourceStackSlotRole::ParameterHome {
+                            parameter_index, ..
+                        } => match self.parameter_disposition(parameter_index) {
+                            Some(ParameterDisposition::Bound {
+                                binding,
+                                width_bits: parameter_width_bits,
+                            }) if parameter_width_bits == width_bits => {
+                                StackObjectDisposition::Bound { binding }
+                            }
+                            Some(ParameterDisposition::Bound {
+                                width_bits: parameter_width_bits,
+                                ..
+                            }) => StackObjectDisposition::Refused {
+                                reason: StackObjectRefusal::ParameterHomeWidthMismatch {
                                     object,
-                                    binding,
+                                    parameter_index,
+                                    slot_width_bits: width_bits,
+                                    parameter_width_bits,
                                 },
-                            ));
-                        }
-                        if !actual_by_binding[binding_index].is_empty() {
-                            return Err(BindingPlanBuildError::Seal(
-                                BindingPlanSourceMismatch::StackObjectCertificate {
+                            },
+                            _ => StackObjectDisposition::Refused {
+                                reason: StackObjectRefusal::ParameterHomeUnavailable {
                                     object,
-                                    binding,
+                                    parameter_index,
                                 },
-                            ));
+                            },
+                        },
+                        r2ssa::SourceStackSlotRole::UnclassifiedResource => {
+                            StackObjectDisposition::Refused {
+                                reason: StackObjectRefusal::UnclassifiedSourceRole { object },
+                            }
                         }
-                        binding_index += 1;
-                        StackObjectDisposition::Bound { binding }
                     }
-                    None => StackObjectDisposition::Refused {
-                        reason: StackObjectRefusal::InvalidWidth { object, size_bytes },
-                    },
-                },
+                }
             };
             if self.stack_object_disposition(object) != Some(expected_disposition) {
                 return Err(BindingPlanBuildError::Seal(

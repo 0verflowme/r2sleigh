@@ -186,6 +186,9 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     "normalization_invalid_carrier_certificates": frozenset(),
     "too_many_observations": frozenset(),
     "invalid_value": frozenset({"value_id"}),
+    "invalid_certified_value_read": frozenset(
+        {"value_id", "instruction_id"}
+    ),
     "invalid_use": frozenset({"instruction_id", "input_index"}),
     "invalid_write": frozenset({"instruction_id"}),
     "outputless_write": frozenset({"instruction_id"}),
@@ -242,6 +245,9 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "missing_observation_target": frozenset({"observation_id"}),
     "invalid_use": frozenset({"instruction_id", "input_index"}),
     "invalid_write": frozenset({"instruction_id"}),
+    "invalid_certified_value_read": frozenset(
+        {"value_id", "instruction_id"}
+    ),
     "missing_planned_value": frozenset({"value_id"}),
     "refused_planned_value": frozenset({"value_id"}),
     "unscoped_observation": frozenset({"observation_id"}),
@@ -252,6 +258,9 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "missing_definition": frozenset({"binding_index"}),
     "read_before_assignment": frozenset(
         {"binding_index", "instruction_id", "input_index"}
+    ),
+    "certified_value_read_before_assignment": frozenset(
+        {"binding_index", "value_id", "instruction_id"}
     ),
     "missing_binding": frozenset({"binding_index"}),
     "missing_binding_symbol": frozenset({"binding_index"}),

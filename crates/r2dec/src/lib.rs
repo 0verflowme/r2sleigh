@@ -2454,6 +2454,10 @@ pub enum BindingObservationJournalFailure {
     InvalidValue {
         value: r2ssa::ValueId,
     },
+    InvalidCertifiedValueRead {
+        value: r2ssa::ValueId,
+        at: r2ssa::InstId,
+    },
     InvalidUse {
         site: r2ssa::UseSite,
     },
@@ -2597,6 +2601,7 @@ impl BindingObservationJournalFailure {
             }
             Self::TooManyObservations => "too_many_observations",
             Self::InvalidValue { .. } => "invalid_value",
+            Self::InvalidCertifiedValueRead { .. } => "invalid_certified_value_read",
             Self::InvalidUse { .. } => "invalid_use",
             Self::InvalidWrite { .. } => "invalid_write",
             Self::InvalidEffectObligation { .. } => "invalid_effect_obligation",
@@ -2818,6 +2823,10 @@ pub enum PlacementAuditRefusal {
     InvalidWrite {
         instruction_id: u32,
     },
+    InvalidCertifiedValueRead {
+        value_id: u32,
+        instruction_id: u32,
+    },
     MissingPlannedValue {
         value_id: u32,
     },
@@ -2846,6 +2855,11 @@ pub enum PlacementAuditRefusal {
         binding_index: usize,
         instruction_id: u32,
         input_index: usize,
+    },
+    CertifiedValueReadBeforeAssignment {
+        binding_index: usize,
+        value_id: u32,
+        instruction_id: u32,
     },
     MissingBinding {
         binding_index: usize,
@@ -2900,6 +2914,7 @@ impl PlacementAuditRefusal {
             Self::MissingObservationTarget { .. } => "missing_observation_target",
             Self::InvalidUse { .. } => "invalid_use",
             Self::InvalidWrite { .. } => "invalid_write",
+            Self::InvalidCertifiedValueRead { .. } => "invalid_certified_value_read",
             Self::MissingPlannedValue { .. } => "missing_planned_value",
             Self::RefusedPlannedValue { .. } => "refused_planned_value",
             Self::UnscopedObservation { .. } => "unscoped_observation",
@@ -2911,6 +2926,9 @@ impl PlacementAuditRefusal {
             Self::NoDominatingRegion { .. } => "no_dominating_region",
             Self::MissingDefinition { .. } => "missing_definition",
             Self::ReadBeforeAssignment { .. } => "read_before_assignment",
+            Self::CertifiedValueReadBeforeAssignment { .. } => {
+                "certified_value_read_before_assignment"
+            }
             Self::MissingBinding { .. } => "missing_binding",
             Self::MissingBindingSymbol { .. } => "missing_binding_symbol",
             Self::ExternalBindingMissingParameter { .. } => {
@@ -4539,19 +4557,25 @@ impl Decompiler {
         }
         simplify_identities_in_function(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "simplify_identities_in_function");
-        propagate_single_use_register_carriers(&mut c_function, &fold_ctx);
-        debug_assigned_locals(&c_function, "propagate_single_use_register_carriers");
-        drop_overwritten_assignments(&mut c_function);
-        debug_assigned_locals(&c_function, "drop_overwritten_assignments");
         reconstruct_flag_conditions_in_function(&mut c_function, &fold_ctx);
         debug_assigned_locals(&c_function, "reconstruct_flag_conditions_in_function");
-        prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-        debug_assigned_locals(&c_function, "prune_dead_temp_assignments_in_function_body");
         normalize_redundant_return_carrier_casts(&mut c_function);
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         debug_assigned_locals(&c_function, "normalize_comparison_operand_order");
         unrendered::prune_unreferenced_labels(&mut c_function);
+        if void_function_has_value_return(&c_function) {
+            let refusal = DecompileRenderRefusal::UnrepresentableOperation;
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &c_function.name,
+                    "native render refusal: value-bearing return in void function",
+                ),
+                refusal,
+            ));
+        }
+        // The refusal gate above proves this is a no-op. Do not discard a
+        // value-bearing return here: its expression may carry source effects.
         unrendered::drop_values_from_void_returns(&mut c_function);
         // Executable C is admitted only when the source obligation inventory is
         // complete. The inventory is what says which effects the source has, so a
@@ -4640,6 +4664,58 @@ impl Decompiler {
     }
 }
 
+fn void_function_has_value_return(func: &CFunction) -> bool {
+    if !matches!(func.ret_type, CType::Void) {
+        return false;
+    }
+
+    fn stmt_has_value_return(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
+                stmt_has_value_return(stmt)
+            }
+            CStmt::Return(Some(_)) => true,
+            CStmt::Block(stmts) => stmts.iter().any(stmt_has_value_return),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_has_value_return(then_body)
+                    || else_body
+                        .as_deref()
+                        .is_some_and(stmt_has_value_return)
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+                stmt_has_value_return(body)
+            }
+            CStmt::For { init, body, .. } => {
+                init.as_deref().is_some_and(stmt_has_value_return)
+                    || stmt_has_value_return(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| case.body.iter().any(stmt_has_value_return))
+                    || default
+                        .as_ref()
+                        .is_some_and(|stmts| stmts.iter().any(stmt_has_value_return))
+            }
+            CStmt::Empty
+            | CStmt::Expr(_)
+            | CStmt::Decl { .. }
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Return(None)
+            | CStmt::Comment(_) => false,
+        }
+    }
+
+    func.body.iter().any(stmt_has_value_return)
+}
+
 fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
     match expr {
         CExpr::Observed { expr, .. } => collect_expr_var_names(expr, out),
@@ -4698,6 +4774,7 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolI
 pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::SymbolId> {
     fn visit(stmt: &CStmt, out: &mut Vec<crate::symbol::SymbolId>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => visit(stmt, out),
             CStmt::Observed { stmt, .. } => visit(stmt, out),
             CStmt::Decl { name, .. } => out.push(*name),
             CStmt::Block(body) => body.iter().for_each(|s| visit(s, out)),
@@ -4827,29 +4904,6 @@ pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::
     names
 }
 
-/// Replace a single-use SSA register carrier with the value it copied.
-///
-/// The lifter names every version of a machine register, so bookkeeping the
-/// source did for itself arrives as `x8_8 = arg_28; return x8_8;`. `x8_8` is
-/// not a variable the program has - it is the eighth version of a register -
-/// and declaring one asserts a local that never existed. Where such a carrier
-/// is assigned once from a pure expression and read once afterwards, the read
-/// becomes that expression and the assignment falls to the dead-assignment
-/// prune that already runs.
-///
-/// Propagation is refused when anything between the assignment and the read
-/// writes what the expression reads, because moving a computation past a write
-/// to its own inputs changes what it computes.
-/// Fold a value bound to a name that is read once into the place it is read.
-///
-/// Apply the identity rules to every expression the function renders.
-///
-/// The rules used to reach only the value side of an assignment, so `x ^ x` folded
-/// where it was stored and stayed where it was tested: a loop kept running
-/// `while (len != (i ^ i) + 1)`. A condition is an expression like any other and
-/// the same rules decide it.
-/// Drop an assignment whose value is overwritten before anything reads it.
-
 /// Which locals the body still assigns, printed between passes.
 ///
 /// A statement the fold built and the page does not show was removed by one of
@@ -4923,79 +4977,6 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
     );
 }
 
-fn drop_overwritten_assignments(func: &mut CFunction) {
-    fn assignment_target(stmt: &CStmt) -> Option<(crate::symbol::SymbolId, &CExpr)> {
-        let CStmt::Expr(expr) = stmt.unobserved() else {
-            return None;
-        };
-        let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr.unobserved()
-        else {
-            return None;
-        };
-        let CExpr::Var(name) = left.unobserved() else {
-            return None;
-        };
-        Some((*name, right.as_ref()))
-    }
-
-    fn visit(stmts: &mut Vec<CStmt>) {
-        for stmt in stmts.iter_mut() {
-            single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| visit(body));
-            if let CStmt::For { init: Some(init), .. } = stmt.unobserved_mut() {
-                let mut one = vec![(**init).clone()];
-                visit(&mut one);
-                if let Some(first) = one.into_iter().next() {
-                    *init = Box::new(first);
-                }
-            }
-        }
-        let mut index = 0;
-        while index < stmts.len() {
-            let Some((name, value)) = assignment_target(&stmts[index]) else {
-                index += 1;
-                continue;
-            };
-            if !crate::fold::op_lower::expr_is_side_effect_free(value) {
-                index += 1;
-                continue;
-            }
-            let mut overwritten = None;
-            for offset in index + 1..stmts.len() {
-                let stmt = &stmts[offset];
-                // The overwrite itself names the target, so it is tested before any read.
-                if let Some((target, rhs)) = assignment_target(stmt)
-                    && target == name
-                    && count_var_reads_in_stmts(
-                        std::slice::from_ref(&CStmt::Expr(rhs.clone())),
-                        name,
-                    ) == 0
-                {
-                    overwritten = Some(offset);
-                    break;
-                }
-                if count_var_reads_in_stmts(std::slice::from_ref(stmt), name) > 0 {
-                    break;
-                }
-                // Only straight-line statements are crossed; anything else may read it out of order.
-                if !matches!(stmt.unobserved(), CStmt::Expr(_) | CStmt::Decl { .. }) {
-                    break;
-                }
-            }
-            if overwritten.is_some() {
-                stmts.remove(index);
-                continue;
-            }
-            index += 1;
-        }
-    }
-
-    visit(&mut func.body);
-}
-
 fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
     fn visit(stmt: &mut CStmt, fold_ctx: &FoldingContext<'_>) {
         single_evaluation::for_each_expr_mut(stmt, &mut |expr| {
@@ -5017,13 +4998,6 @@ fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingConte
     }
 }
 
-/// Give a carrier the body writes but the function never declares exactly one
-/// disposition: dropped when nothing reads it, declared when something does.
-///
-/// Propagation runs first and takes the values a single reader consumes. What is
-/// left is a value the function genuinely keeps, and printing it as a bare name
-/// says the program has a variable it never declared. Naming a value obliges the
-/// function to declare it, so the two arms here are what that obligation costs.
 /// Fold machine flag arithmetic into the comparison it spells, wherever it
 /// appears.
 ///
@@ -5055,194 +5029,6 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
     }
 
     walk(&mut func.body, fold_ctx);
-}
-
-/// A name assigned once and read once is not a variable of the program, it is
-/// the value itself with a label attached. That is true of the versioned
-/// register carriers this started with, and equally of the temporaries the
-/// lifter leaves behind: `t3e580 = a - b; *p = t3e580;` says no more than
-/// `*p = a - b;` and says it with a name the function never declares.
-fn propagate_single_use_register_carriers(func: &mut CFunction, fold_ctx: &FoldingContext<'_>) {
-    let symbols = &func.symbols;
-    let declared = func
-        .params
-        .iter()
-        .map(|param| param.name.clone())
-        .chain(func.locals.iter().map(|local| local.name.clone()))
-        .collect::<std::collections::HashSet<_>>();
-
-    fn visit_block(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        stmts: &mut Vec<CStmt>,
-        fold_ctx: &FoldingContext<'_>,
-        declared: &std::collections::HashSet<crate::symbol::SymbolId>,
-        in_loop: bool,
-        whole_body: &[CStmt],
-    ) {
-        for stmt in stmts.iter_mut() {
-            visit_nested(symbols, stmt, fold_ctx, declared, in_loop, whole_body);
-        }
-        // Inside a loop, "the rest of this list" is not all the readers: the
-        // carrier is read again on the next iteration and after the loop ends.
-        // Propagating it into its one apparent reader deletes the update, and
-        // `fnv1a64` at x86-64 -O1 then computes `rax_3 = arg0[i] ^ r8` and never
-        // writes it back, so the function returns the value it started with.
-        if in_loop {
-            return;
-        }
-        let mut index = 0;
-        while index < stmts.len() {
-            let Some((name, value)) = carrier_assignment(&stmts[index], fold_ctx, declared) else {
-                index += 1;
-                continue;
-            };
-            let rest = &stmts[index + 1..];
-            // "The rest of this list" is not all the readers. A value computed
-            // in one block and read in a later one is read once *here* and many
-            // times overall: adler32 at x86-64 -O2 computes `ecx_9` in its tail
-            // and returns it, and propagating it into its one local reader
-            // deleted the statement, leaving the return quoting a name nothing
-            // declares. The loop case below was the same mistake, caught first.
-            if count_var_reads_in_stmts(whole_body, name) != 1 {
-                index += 1;
-                continue;
-            }
-            if count_var_reads_in_stmts(rest, name) != 1 {
-                index += 1;
-                continue;
-            }
-            let Some(offset) = rest
-                .iter()
-                .position(|stmt| {
-                    count_var_reads_in_stmts(std::slice::from_ref(stmt), name) == 1
-                })
-            else {
-                index += 1;
-                continue;
-            };
-            let reads = expr_var_names(&value);
-            let blocked = rest[..offset].iter().any(|between| {
-                let (_, def) = fold_ctx.stmt_reads_and_def_for_render(between);
-                def.is_some_and(|def| reads.contains(&def))
-            });
-            if blocked {
-                index += 1;
-                continue;
-            }
-            let target = index + 1 + offset;
-            substitute_var_in_stmt(&mut stmts[target], name, &value);
-            stmts.remove(index);
-        }
-    }
-
-    fn visit_nested(symbols: &std::cell::RefCell<crate::symbol::SymbolTable>, 
-        stmt: &mut CStmt,
-        fold_ctx: &FoldingContext<'_>,
-        declared: &std::collections::HashSet<crate::symbol::SymbolId>,
-        in_loop: bool,
-        whole_body: &[CStmt],
-    ) {
-        match stmt {
-            CStmt::Observed { stmt, .. } => {
-                visit_nested(symbols, stmt, fold_ctx, declared, in_loop, whole_body)
-            }
-            CStmt::Block(stmts) => {
-                visit_block(symbols, stmts, fold_ctx, declared, in_loop, whole_body)
-            }
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                visit_nested(symbols, then_body, fold_ctx, declared, in_loop, whole_body);
-                if let Some(else_body) = else_body {
-                    visit_nested(symbols, else_body, fold_ctx, declared, in_loop, whole_body);
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit_nested(symbols, body, fold_ctx, declared, true, whole_body)
-            }
-            CStmt::For { init, body, .. } => {
-                if let Some(init) = init {
-                    visit_nested(symbols, init, fold_ctx, declared, true, whole_body);
-                }
-                visit_nested(symbols, body, fold_ctx, declared, true, whole_body);
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    visit_block(
-                        symbols,
-                        &mut case.body,
-                        fold_ctx,
-                        declared,
-                        in_loop,
-                        whole_body,
-                    );
-                }
-                if let Some(default) = default {
-                    visit_block(symbols, default, fold_ctx, declared, in_loop, whole_body);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Counted against the body as it stands when the pass begins. A name whose
-    // only reader is deleted later simply stops being a candidate, which is the
-    // safe direction.
-    let whole_body = func.body.clone();
-    visit_block(
-        symbols,
-        &mut func.body,
-        fold_ctx,
-        &declared,
-        false,
-        &whole_body,
-    );
-}
-
-/// The carrier assigned by this statement, when it is one worth propagating.
-fn carrier_assignment(
-    stmt: &CStmt,
-    fold_ctx: &FoldingContext<'_>,
-    declared: &std::collections::HashSet<crate::symbol::SymbolId>,
-) -> Option<(crate::symbol::SymbolId, CExpr)> {
-    let CStmt::Expr(expr) = stmt.unobserved() else {
-        return None;
-    };
-    let CExpr::Binary {
-        op: BinaryOp::Assign,
-        left,
-        right,
-    } = expr.unobserved()
-    else {
-        return None;
-    };
-    let CExpr::Var(name) = left.unobserved() else {
-        return None;
-    };
-    // Either a register carrier, which this pass has always folded, or a name
-    // the function never declares -- a temporary the lifter left behind. The
-    // second only qualifies when evaluating it does nothing, since moving a
-    // value to its reader moves whatever computing it does along with it.
-    let is_register_carrier =
-        fold_ctx.stmt_is_side_effect_free_versioned_register_carrier_for_render(stmt);
-    let is_undeclared_temporary =
-        !declared.contains(name) && expr_is_pure_for_dead_local_prune(right);
-    if !is_register_carrier && !is_undeclared_temporary {
-        return None;
-    }
-    Some((*name, right.as_ref().clone()))
-}
-
-/// Every variable an expression reads.
-fn expr_var_names(expr: &CExpr) -> Vec<crate::symbol::SymbolId> {
-    let mut names = Vec::new();
-    expr.visit(&mut |node| {
-        if let CExpr::Var(name) = node {
-            names.push(*name);
-        }
-    });
-    names
 }
 
 /// Fold arithmetic between integer literals, and name the result when it names
@@ -5430,251 +5216,6 @@ fn fold_constant_arithmetic_in_expr(
             &source,
             CExpr::StringLit(text.clone()));
     }
-}
-
-/// How many times `name` is read across these statements.
-fn count_var_reads_in_stmts(stmts: &[CStmt], name: crate::symbol::SymbolId) -> usize {
-    let mut reads = 0;
-    for stmt in stmts {
-        count_var_reads_in_stmt(stmt, name, &mut reads);
-    }
-    reads
-}
-
-fn count_var_reads_in_stmt(
-    stmt: &CStmt,
-    name: crate::symbol::SymbolId,
-    reads: &mut usize,
-) {
-    let count_expr = |expr: &CExpr, reads: &mut usize| {
-        expr.visit(&mut |node| {
-            if matches!(node, CExpr::Var(found) if *found == name) {
-                *reads += 1;
-            }
-        });
-    };
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } => count_var_reads_in_stmt(stmt, name, reads),
-        CStmt::Observed { stmt, .. } => count_var_reads_in_stmt(stmt, name, reads),
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(expr) => count_expr(expr, reads),
-        CStmt::Decl { init, .. } => {
-            if let Some(init) = init {
-                count_expr(init, reads);
-            }
-        }
-        CStmt::Return(expr) => {
-            if let Some(expr) = expr {
-                count_expr(expr, reads);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                count_var_reads_in_stmt(stmt, name, reads);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            count_expr(cond, reads);
-            count_var_reads_in_stmt(then_body, name, reads);
-            if let Some(else_body) = else_body {
-                count_var_reads_in_stmt(else_body, name, reads);
-            }
-        }
-        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-            count_expr(cond, reads);
-            count_var_reads_in_stmt(body, name, reads);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                count_var_reads_in_stmt(init, name, reads);
-            }
-            if let Some(cond) = cond {
-                count_expr(cond, reads);
-            }
-            if let Some(update) = update {
-                count_expr(update, reads);
-            }
-            count_var_reads_in_stmt(body, name, reads);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            count_expr(expr, reads);
-            for case in cases {
-                for stmt in &case.body {
-                    count_var_reads_in_stmt(stmt, name, reads);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    count_var_reads_in_stmt(stmt, name, reads);
-                }
-            }
-        }
-    }
-}
-
-/// Put `value` wherever `name` is read in this statement.
-fn substitute_var_in_stmt(stmt: &mut CStmt, name: crate::symbol::SymbolId, value: &CExpr) {
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } => substitute_var_in_stmt(stmt, name, value),
-        CStmt::Observed { stmt, .. } => substitute_var_in_stmt(stmt, name, value),
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(expr) => substitute_var_in_expr(expr, name, value),
-        CStmt::Decl { init, .. } => {
-            if let Some(init) = init {
-                substitute_var_in_expr(init, name, value);
-            }
-        }
-        CStmt::Return(expr) => {
-            if let Some(expr) = expr {
-                substitute_var_in_expr(expr, name, value);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                substitute_var_in_stmt(stmt, name, value);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            substitute_var_in_expr(cond, name, value);
-            substitute_var_in_stmt(then_body, name, value);
-            if let Some(else_body) = else_body {
-                substitute_var_in_stmt(else_body, name, value);
-            }
-        }
-        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-            substitute_var_in_expr(cond, name, value);
-            substitute_var_in_stmt(body, name, value);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                substitute_var_in_stmt(init, name, value);
-            }
-            if let Some(cond) = cond {
-                substitute_var_in_expr(cond, name, value);
-            }
-            if let Some(update) = update {
-                substitute_var_in_expr(update, name, value);
-            }
-            substitute_var_in_stmt(body, name, value);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            substitute_var_in_expr(expr, name, value);
-            for case in cases {
-                for stmt in &mut case.body {
-                    substitute_var_in_stmt(stmt, name, value);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    substitute_var_in_stmt(stmt, name, value);
-                }
-            }
-        }
-    }
-}
-
-fn substitute_var_in_expr(expr: &mut CExpr, name: crate::symbol::SymbolId, value: &CExpr) {
-    if matches!(expr, CExpr::Var(found) if *found == name) {
-        *expr = value.clone();
-        return;
-    }
-    match expr {
-        CExpr::Observed { expr, .. } => substitute_var_in_expr(expr, name, value),
-        CExpr::Unary { operand, .. }
-        | CExpr::Cast { expr: operand, .. }
-        | CExpr::Sizeof(operand)
-        | CExpr::AddrOf(operand)
-        | CExpr::Deref(operand)
-        | CExpr::Paren(operand) => substitute_var_in_expr(operand, name, value),
-        CExpr::Binary { op, left, right } => {
-            // The left operand of an assignment names storage. Substituting a
-            // value there rewrites what the statement writes into what it
-            // wrote, which is how a slot the source never named rendered as
-            // `1 = 1;`.
-            if !op.writes_left_operand() {
-                substitute_var_in_expr(left, name, value);
-            }
-            substitute_var_in_expr(right, name, value);
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            substitute_var_in_expr(cond, name, value);
-            substitute_var_in_expr(then_expr, name, value);
-            substitute_var_in_expr(else_expr, name, value);
-        }
-        CExpr::Call { func, args, .. } => {
-            substitute_var_in_expr(func, name, value);
-            for arg in args {
-                substitute_var_in_expr(arg, name, value);
-            }
-        }
-        CExpr::Subscript { base, index } => {
-            substitute_var_in_expr(base, name, value);
-            substitute_var_in_expr(index, name, value);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            substitute_var_in_expr(base, name, value)
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                substitute_var_in_expr(item, name, value);
-            }
-        }
-        _ => {}
-    }
-}
-
-
-
-fn prune_dead_temp_assignments_in_function_body(
-    func: &mut CFunction,
-    fold_ctx: &FoldingContext<'_>,
-) {
-    let body = CStmt::Block(std::mem::take(&mut func.body));
-    func.body = match fold_ctx.prune_dead_temp_assignments_in_stmt(body) {
-        CStmt::Block(stmts) => stmts,
-        CStmt::Empty => Vec::new(),
-        stmt => vec![stmt],
-    };
 }
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
@@ -6064,46 +5605,6 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
     }
 }
 
-fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
-    match expr {
-        CExpr::Observed { expr, .. } => expr_is_pure_for_dead_local_prune(expr),
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_)
-        | CExpr::Var(_)
-        | CExpr::External { .. } => true,
-        CExpr::Paren(inner)
-        | CExpr::AddrOf(inner)
-        | CExpr::Deref(inner)
-        | CExpr::Cast { expr: inner, .. }
-        | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => expr_is_pure_for_dead_local_prune(inner),
-        CExpr::Binary { left, right, .. } => {
-            expr_is_pure_for_dead_local_prune(left) && expr_is_pure_for_dead_local_prune(right)
-        }
-        CExpr::Subscript { base, index } => {
-            expr_is_pure_for_dead_local_prune(base) && expr_is_pure_for_dead_local_prune(index)
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            expr_is_pure_for_dead_local_prune(base)
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            expr_is_pure_for_dead_local_prune(cond)
-                && expr_is_pure_for_dead_local_prune(then_expr)
-                && expr_is_pure_for_dead_local_prune(else_expr)
-        }
-        CExpr::Comma(items) => items.iter().all(expr_is_pure_for_dead_local_prune),
-        CExpr::Call { .. } => false,
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn test_semantic_region(
     anchor: u64,
@@ -6182,7 +5683,10 @@ pub(crate) fn test_native_semantic_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
     use r2ssa::SSAFunction;
     use r2types::{
         ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
@@ -6193,44 +5697,6 @@ mod tests {
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
-    }
-
-    #[test]
-    fn substitution_leaves_an_assignment_target_alone() {
-        let symbols = test_table();
-        let mut stmt = CStmt::Expr(CExpr::assign(
-            crate::symbol::var_ref(&symbols, "local_4"),
-            crate::symbol::var_ref(&symbols, "local_4"),
-        ));
-        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1),
-        );
-        assert_eq!(
-            stmt,
-            CStmt::Expr(CExpr::assign(
-                crate::symbol::var_ref(&symbols, "local_4"),
-                CExpr::IntLit(1),
-            ))
-        );
-    }
-
-    #[test]
-    fn substitution_leaves_a_compound_assignment_target_alone() {
-        let symbols = test_table();
-        let mut stmt = CStmt::Expr(CExpr::binary(
-            BinaryOp::AddAssign,
-            crate::symbol::var_ref(&symbols, "local_4"),
-            crate::symbol::var_ref(&symbols, "local_4"),
-        ));
-        substitute_var_in_stmt(&mut stmt, crate::symbol::declare(&symbols, "local_4"), &CExpr::IntLit(1),
-        );
-        assert_eq!(
-            stmt,
-            CStmt::Expr(CExpr::binary(
-                BinaryOp::AddAssign,
-                crate::symbol::var_ref(&symbols, "local_4"),
-                CExpr::IntLit(1),
-            ))
-        );
     }
 
     #[test]
@@ -6451,12 +5917,27 @@ mod tests {
 
     fn test_arch_for_decompile() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
-        arch.add_register(RegisterDef::new("RDI", 0x10, 8));
-        arch.add_register(RegisterDef::new("RSI", 0x18, 8));
-        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
-        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let registers = [
+            ("RAX", RegisterStorage { offset: 0x00, size: 8 }),
+            ("RDI", RegisterStorage { offset: 0x10, size: 8 }),
+            ("RSI", RegisterStorage { offset: 0x18, size: 8 }),
+            ("RBP", RegisterStorage { offset: 0x20, size: 8 }),
+            ("RSP", RegisterStorage { offset: 0x28, size: 8 }),
+            ("RIP", RegisterStorage { offset: 0x30, size: 8 }),
+        ];
+        for (name, storage) in registers {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+            arch.register_projections.push(RegisterProjection {
+                written: storage,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: storage,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: u64::from(storage.size) * 8,
+                    },
+                },
+            });
+        }
         arch
     }
 
@@ -6549,72 +6030,6 @@ mod tests {
         assert_eq!(config.ptr_size, 64);
         assert_eq!(config.sp_name, "sp");
         assert_eq!(config.fp_name, "s0");
-    }
-
-    #[test]
-    fn test_final_function_body_prune_keeps_unproved_late_temp_assignments() {
-        let ctx = FoldingContext::new(64);
-        let symbols = &ctx.symbols;
-        let mut func = CFunction {
-            name: "late_prune".to_string(),
-            ret_type: CType::i64(),
-            params: Vec::new(),
-            params_known: true,
-            locals: Vec::new(),
-            body: vec![
-                CStmt::Expr(CExpr::assign(
-                    crate::symbol::var_ref(&symbols, "tmp_ldwn_1"),
-                    CExpr::deref(CExpr::binary(
-                        BinaryOp::Add,
-                        crate::symbol::var_ref(&symbols, "base"),
-                        CExpr::IntLit(50),
-                    )),
-                )),
-                CStmt::Expr(CExpr::assign(
-                    crate::symbol::var_ref(&symbols, "tmp_stwn_1"),
-                    CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::deref(CExpr::binary(
-                            BinaryOp::Add,
-                            crate::symbol::var_ref(&symbols, "base"),
-                            CExpr::IntLit(50),
-                        )),
-                        crate::symbol::var_ref(&symbols, "arg1"),
-                    ),
-                )),
-                CStmt::Expr(CExpr::assign(
-                    CExpr::deref(CExpr::binary(
-                        BinaryOp::Add,
-                        crate::symbol::var_ref(&symbols, "x0_5"),
-                        CExpr::IntLit(50),
-                    )),
-                    CExpr::binary(
-                        BinaryOp::Add,
-                        crate::symbol::var_ref(&symbols, "arg1"),
-                        CExpr::deref(CExpr::binary(
-                            BinaryOp::Add,
-                            crate::symbol::var_ref(&symbols, "base"),
-                            CExpr::IntLit(50),
-                        )),
-                    ),
-                )),
-                CStmt::Return(Some(crate::symbol::var_ref(&symbols, "x0_5"))),
-            ],
-            symbols: std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone())),
-        };
-
-        prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
-
-        assert_eq!(func.body.len(), 4, "{func:?}");
-        assert!(
-            format!("{:?}", func.body).contains("tmp_"),
-            "without a sealed binding plan, late temp assignments must be kept: {:?}",
-            func.body
-        );
-        assert_eq!(
-            func.body[3],
-            CStmt::Return(Some(crate::symbol::var_ref(&func.symbols, "x0_5")))
-        );
     }
 
     #[test]
@@ -7305,6 +6720,30 @@ mod tests {
             ],
             &arch,
         );
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let copy_source = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { src, .. } => Some(src),
+                _ => None,
+            })
+            .expect("copy source");
+        let copy_source_value = prepared
+            .graph()
+            .value_id_for_var(copy_source)
+            .expect("copy source must retain exact ValueId");
+        let return_op = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Return { .. }))
+            .expect("return op");
+        let return_certificate = prepared
+            .return_certificate_for_op(0x1000, return_op)
+            .expect("scalar audit fixture must retain an exact return certificate");
+        assert_eq!(return_certificate.block_addr, 0x1000);
+        assert_eq!(return_certificate.op_index, return_op);
+        let return_value = return_certificate.value;
         let input = source_owned_decompiler_input(
             prepared,
             (
@@ -7312,6 +6751,24 @@ mod tests {
                 "binding shadow production path",
                 None,
             ),
+        );
+        let plan = crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts())
+            .expect("scalar audit fixture binding plan");
+        assert!(matches!(
+            plan.disposition(return_value),
+            Some(crate::binding_plan::ValueDisposition::Bound { .. })
+        ));
+        assert!(matches!(
+            plan.disposition(copy_source_value),
+            Some(crate::binding_plan::ValueDisposition::Inline { .. })
+        ));
+        assert_eq!(
+            input
+                .function_facts()
+                .render()
+                .and_then(|render| render.return_for_op(0x1000, return_op))
+                .map(|fact| fact.value),
+            Some(return_value)
         );
         let config = DecompilerConfig::x86_64();
         let public_decompiler = Decompiler::new(config.clone());

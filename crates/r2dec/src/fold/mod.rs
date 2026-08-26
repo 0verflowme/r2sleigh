@@ -10,9 +10,7 @@ pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 
 pub(super) const MAX_STACK_OFFSET_DEPTH: u32 = 8;
-pub(super) const MAX_STACK_ALIAS_DEPTH: u32 = 8;
 pub(super) const MAX_SIMPLE_EXPR_DEPTH: u32 = 2;
-pub(super) const MAX_RETURN_EXPR_DEPTH: u32 = 8;
 pub(super) const MAX_ALIAS_REWRITE_DEPTH: u32 = 32;
 pub(super) const MAX_COND_STACK_ALIAS_DEPTH: u32 = 8;
 pub(super) const MAX_PREDICATE_SIMPLIFY_DEPTH: u32 = 6;
