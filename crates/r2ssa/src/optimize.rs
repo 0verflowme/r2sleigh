@@ -3187,18 +3187,38 @@ mod sccp_tests {
             R2ILBlock {
                 addr: 0x1004,
                 size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(0, 8),
+                    },
+                    R2ILOp::Copy {
+                        dst: make_reg(8, 8),
+                        src: make_const(1, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x100c, 8),
+                    },
+                ],
                 switch_info: None,
                 op_metadata: Default::default(),
             },
             R2ILBlock {
                 addr: 0x1008,
                 size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(0, 8),
+                    },
+                    R2ILOp::Copy {
+                        dst: make_reg(8, 8),
+                        src: make_const(2, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x100c, 8),
+                    },
+                ],
                 switch_info: None,
                 op_metadata: Default::default(),
             },
@@ -3212,36 +3232,29 @@ mod sccp_tests {
                 op_metadata: Default::default(),
             },
         ]);
-        let removed_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0,
-            size: 8,
-        };
         let retained_storage = CanonicalStorageId {
             space: CanonicalStorageSpace::Register,
             offset: 8,
             size: 8,
         };
-        let retained_dst = SSAVar::new("reg:8", 3, 8);
         let merge = func.get_block_mut(0x100c).expect("merge block");
-        merge.phis = vec![
-            PhiNode {
-                dst: SSAVar::new("reg:0", 3, 8),
-                sources: vec![
-                    (0x1004, SSAVar::new("reg:0", 1, 8)),
-                    (0x1008, SSAVar::new("reg:0", 1, 8)),
-                ],
-                canonical_storage: Some(removed_storage),
-            },
-            PhiNode {
-                dst: retained_dst.clone(),
-                sources: vec![
-                    (0x1004, SSAVar::new("reg:8", 1, 8)),
-                    (0x1008, SSAVar::new("reg:8", 2, 8)),
-                ],
-                canonical_storage: Some(retained_storage),
-            },
-        ];
+        assert_eq!(merge.phis.len(), 2, "both lifted registers require phis");
+        let removed_phi = merge
+            .phis
+            .iter_mut()
+            .find(|phi| phi.canonical_storage.is_some_and(|storage| storage.offset == 0))
+            .expect("first register phi");
+        let shared_source = removed_phi.sources[0].1.clone();
+        for (_, source) in &mut removed_phi.sources {
+            *source = shared_source.clone();
+        }
+        let retained_dst = merge
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(retained_storage))
+            .expect("second register phi")
+            .dst
+            .clone();
         merge.ops = vec![SSAOp::Return {
             target: retained_dst.clone(),
         }];

@@ -120,7 +120,13 @@ pub struct SsaGraph {
 
 impl SsaGraph {
     pub fn from_function(function: &SSAFunction) -> Self {
-        Self::from_function_with_storage(function)
+        Self::try_from_function(function).expect("SSA graph construction requires valid SSA")
+    }
+
+    /// Build a graph only after sealing the complete function-level SSA contract.
+    pub fn try_from_function(function: &SSAFunction) -> Result<Self, crate::SsaIntegrityError> {
+        crate::validate_ssa_function(function)?;
+        Ok(Self::from_function_with_storage(function))
     }
 
     pub(crate) fn from_function_with_storage(function: &SSAFunction) -> Self {
@@ -150,12 +156,22 @@ impl SsaGraph {
             block.predecessors = function
                 .predecessors(block.addr)
                 .into_iter()
-                .filter_map(|addr| block_by_addr.get(&addr).copied())
+                .map(|addr| {
+                    block_by_addr
+                        .get(&addr)
+                        .copied()
+                        .expect("validated predecessor must name an SSA block")
+                })
                 .collect();
             block.successors = function
                 .successors(block.addr)
                 .into_iter()
-                .filter_map(|addr| block_by_addr.get(&addr).copied())
+                .map(|addr| {
+                    block_by_addr
+                        .get(&addr)
+                        .copied()
+                        .expect("validated successor must name an SSA block")
+                })
                 .collect();
         }
 
@@ -229,7 +245,12 @@ impl SsaGraph {
                 let predecessors = phi
                     .sources
                     .iter()
-                    .filter_map(|(addr, _)| block_by_addr.get(addr).copied())
+                    .map(|(addr, _)| {
+                        block_by_addr
+                            .get(addr)
+                            .copied()
+                            .expect("validated phi predecessor must name an SSA block")
+                    })
                     .collect();
                 insts.push(GraphInst {
                     id: inst_id,

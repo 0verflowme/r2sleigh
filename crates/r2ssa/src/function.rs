@@ -26,6 +26,7 @@ use crate::control::{
 use crate::defuse::{BackwardSlice, SliceOpRef, backward_slice_from_op, backward_slice_from_var};
 use crate::domtree::DomTree;
 use crate::graph::SsaGraph;
+use crate::integrity::{SsaIntegrityError, validate_ssa_function};
 use crate::machine_context::{
     SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
     SourceMachineRoles,
@@ -91,24 +92,6 @@ pub enum FunctionPrepareMode {
     Patterns,
     DataRefs,
     Symbolic,
-}
-
-/// Width facts that SSA construction must preserve exactly from canonical
-/// R2IL. A conversion has its own opcode; a Copy or comparison is never allowed
-/// to acquire an implicit conversion merely because two source varnodes share
-/// a display name.
-fn prepared_scalar_widths_are_coherent(op: &SSAOp) -> bool {
-    match op {
-        SSAOp::Copy { dst, src } => dst.size == src.size,
-        SSAOp::IntEqual { dst, a, b }
-        | SSAOp::IntNotEqual { dst, a, b }
-        | SSAOp::IntLess { dst, a, b }
-        | SSAOp::IntSLess { dst, a, b }
-        | SSAOp::IntLessEqual { dst, a, b }
-        | SSAOp::IntSLessEqual { dst, a, b } => dst.size == 1 && a.size == b.size,
-        SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src } => dst.size > src.size,
-        _ => true,
-    }
 }
 
 /// Unforgeable run-local identity for one immutable SSA artifact.
@@ -277,7 +260,7 @@ impl SsaArtifact {
             machine_context,
             &UncheckedSsaWorkControl,
         )
-        .expect("unchecked SSA artifact construction cannot stop")
+        .expect("internal SSA artifact construction requires a validated function")
     }
 
     fn new_with_context_and_control<C: SsaWorkControl + ?Sized>(
@@ -285,7 +268,7 @@ impl SsaArtifact {
         mode: FunctionPrepareMode,
         machine_context: SourceMachineContext,
         control: &C,
-    ) -> Result<Self, SsaExecutionStopReason> {
+    ) -> Result<Self, SsaPrepareError> {
         Self::new_with_context_control_and_provenance(
             function,
             mode,
@@ -301,8 +284,9 @@ impl SsaArtifact {
         mut machine_context: SourceMachineContext,
         provenance: SsaArtifactProvenance,
         control: &C,
-    ) -> Result<Self, SsaExecutionStopReason> {
+    ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
+        validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
         let graph = SsaGraph::from_function_with_storage(&function);
         let storage_spans = StorageSpans::compute(&function, &graph);
@@ -432,7 +416,6 @@ impl SsaArtifact {
             machine_context,
             control,
         )
-        .map_err(Into::into)
     }
 
     /// Build decompiler-prepared SSA with an explicit function interface.
@@ -500,7 +483,6 @@ impl SsaArtifact {
             machine_context,
             control,
         )
-        .map_err(Into::into)
     }
 
     /// Build analysis-only decompiler SSA directly from an immutable genuine lift.
@@ -554,8 +536,7 @@ impl SsaArtifact {
             machine_context,
             SsaArtifactProvenance::GenuineLiftOnly(lifted.authority().clone()),
             control,
-        )
-        .map_err(SsaPrepareError::from)?;
+        )?;
         if !artifact
             .facts
             .obligations
@@ -602,7 +583,6 @@ impl SsaArtifact {
             SourceMachineContext::from_blocks(blocks, arch),
             control,
         )
-        .map_err(Into::into)
     }
 
     pub fn for_data_refs(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
@@ -1176,8 +1156,7 @@ impl TrustedSsaArtifact {
             machine_context,
             SsaArtifactProvenance::TrustedSource(source),
             control,
-        )
-        .map_err(SsaPrepareError::from)?;
+        )?;
         artifact.display_names = display_names;
         if !artifact
             .facts
@@ -1823,6 +1802,7 @@ impl SSAFunction {
             preserve_memory_reads: false,
         };
         func.optimize(&cfg);
+        validate_ssa_function(&func).ok()?;
         Some(func)
     }
 
@@ -1882,6 +1862,7 @@ impl SSAFunction {
             function_interface,
             control,
         )?;
+        validate_ssa_function(&func).map_err(|_| SsaPrepareError::MalformedInput)?;
         control.poll()?;
         Ok(func)
     }
@@ -1916,6 +1897,7 @@ impl SSAFunction {
         func.decompile_prep_facts = None;
         func.invalidate_query_index();
         crate::optimize::optimize_function_with_control(&mut func, &cfg, control)?;
+        validate_ssa_function(&func).map_err(|_| SsaPrepareError::MalformedInput)?;
         func.refresh_decompile_prep_facts_with_control(arch, control)?;
         control.poll()?;
         Ok(func)
@@ -1942,6 +1924,7 @@ impl SSAFunction {
             preserve_memory_reads: true,
         };
         func.optimize(&cfg);
+        validate_ssa_function(&func).ok()?;
         Some(func)
     }
 
@@ -2049,30 +2032,29 @@ impl SSAFunction {
 
             // Convert phi ops to PhiNode structs
             let preds = cfg.predecessors(addr);
-            let phis: Vec<PhiNode> = phi_ops
-                .into_iter()
-                .enumerate()
-                .filter_map(|(phi_idx, op)| {
-                    if let SSAOp::Phi { dst, sources } = op {
-                        let phi_sources: Vec<(u64, SSAVar)> = sources
-                            .into_iter()
-                            .zip(preds.iter())
-                            .map(|(var, &pred)| (pred, var))
-                            .collect();
-                        let canonical_storage = phi_placement
-                            .get_phis(addr)
-                            .get(phi_idx)
-                            .and_then(|phi| phi.storage);
-                        Some(PhiNode {
-                            dst,
-                            sources: phi_sources,
-                            canonical_storage,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut phis = Vec::with_capacity(phi_ops.len());
+            for (phi_idx, op) in phi_ops.into_iter().enumerate() {
+                let SSAOp::Phi { dst, sources } = op else {
+                    unreachable!("phi partition contains only phi operations");
+                };
+                if sources.len() != preds.len() {
+                    return Err(SsaPrepareError::MalformedInput);
+                }
+                let phi_sources = sources
+                    .into_iter()
+                    .zip(preds.iter().copied())
+                    .map(|(var, pred)| (pred, var))
+                    .collect();
+                let canonical_storage = phi_placement
+                    .get_phis(addr)
+                    .get(phi_idx)
+                    .and_then(|phi| phi.storage);
+                phis.push(PhiNode {
+                    dst,
+                    sources: phi_sources,
+                    canonical_storage,
+                });
+            }
 
             let ssa_block = SSABlock {
                 addr,
@@ -2099,14 +2081,7 @@ impl SSAFunction {
         {
             function.normalize_register_alias_sources_with_control(arch, control)?;
         }
-        if !function
-            .blocks
-            .values()
-            .flat_map(|block| block.ops.iter())
-            .all(prepared_scalar_widths_are_coherent)
-        {
-            return Err(SsaPrepareError::MalformedInput);
-        }
+        validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         control.poll()?;
         Ok(function)
     }
@@ -2403,6 +2378,11 @@ impl SSAFunction {
     /// Compute a backward slice for a sink variable.
     pub fn backward_slice(&self, sink: &SSAVar) -> BackwardSlice {
         backward_slice_from_var(self, sink)
+    }
+
+    /// Seal-check the complete SSA definition/use, phi, storage, and width contract.
+    pub fn validate_integrity(&self) -> Result<(), SsaIntegrityError> {
+        validate_ssa_function(self)
     }
 
     /// Compute a backward slice starting from an SSA operation.
@@ -5897,31 +5877,61 @@ mod tests {
 
     #[test]
     fn prepared_function_certifies_unique_return_phi_at_control_return() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1114,
-            size: 4,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let mut function =
-            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
-        let phi_dst = SSAVar::new("RAX", 1, 8);
-        function.get_block_mut(0x1114).expect("return block").phis = vec![PhiNode {
-            dst: phi_dst.clone(),
-            sources: vec![
-                (0x1104, SSAVar::constant(7, 8)),
-                (0x1110, SSAVar::constant(7, 8)),
-            ],
-            canonical_storage: None,
-        }];
-        function.get_block_mut(0x1114).expect("return block").ops = vec![SSAOp::Return {
-            target: SSAVar::new("RIP", 1, 8),
-        }];
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1100,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1110, 8),
+                    cond: make_reg(8, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1104,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(7, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1114, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1110,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Copy {
+                        dst: make_reg(0, 8),
+                        src: make_const(7, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1114, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1114,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+        ];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
         let cert = prepared
             .return_certificate_for_op(0x1114, 0)
             .expect("control return should certify unique return phi");
@@ -5948,38 +5958,65 @@ mod tests {
 
     #[test]
     fn prepared_function_does_not_render_memory_backed_return_phi_at_control_return() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1214,
-            size: 4,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let mut function =
-            SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
-        let load = SSAVar::new("tmp:load", 1, 4);
-        let phi_dst = SSAVar::new("RAX", 1, 4);
-        function.get_block_mut(0x1214).expect("return block").phis = vec![PhiNode {
-            dst: phi_dst,
-            sources: vec![(0x1204, load.clone()), (0x1210, load.clone())],
-            canonical_storage: None,
-        }];
-        function.get_block_mut(0x1214).expect("return block").ops = vec![
-            SSAOp::Load {
-                dst: load,
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("RDI", 0, 8),
+        let arch = make_x86_64_prep_arch();
+        let blocks = vec![
+            R2ILBlock {
+                addr: 0x1200,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x1210, 8),
+                    cond: make_reg(8, 8),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
             },
-            SSAOp::Return {
-                target: SSAVar::new("RIP", 1, 8),
+            R2ILBlock {
+                addr: 0x1204,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Load {
+                        dst: make_reg(0, 4),
+                        space: r2il::SpaceId::Ram,
+                        addr: make_reg(8, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1214, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1210,
+                size: 4,
+                ops: vec![
+                    R2ILOp::Load {
+                        dst: make_reg(0, 4),
+                        space: r2il::SpaceId::Ram,
+                        addr: make_reg(8, 8),
+                    },
+                    R2ILOp::Branch {
+                        target: make_const(0x1214, 8),
+                    },
+                ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1214,
+                size: 4,
+                ops: vec![R2ILOp::Return {
+                    target: make_reg(0, 4),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
             },
         ];
 
-        let prepared = SsaArtifact::new(function, FunctionPrepareMode::Raw);
+        let prepared =
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build");
         let cert = prepared
-            .return_certificate_for_op(0x1214, 1)
+            .return_certificate_for_op(0x1214, 0)
             .expect("control return should identify the unique return phi");
         assert!(
             prepared
@@ -7333,36 +7370,63 @@ mod tests {
 
     #[test]
     fn prepared_expression_certificates_render_only_identity_phis() {
-        fn prepared_with_phi_sources(sources: Vec<SSAVar>) -> SsaArtifact {
-            let blocks = vec![R2ILBlock {
-                addr: 0x1730,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_const(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            }];
-            let mut function =
-                SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
-            let phi_dst = SSAVar::new("reg:0", 1, 8);
-            let phi_sources = sources
-                .into_iter()
-                .enumerate()
-                .map(|(index, source)| (0x1720 + (index as u64 * 4), source))
-                .collect();
-            let block = function.get_block_mut(0x1730).expect("merge block");
-            block.phis = vec![PhiNode {
-                dst: phi_dst.clone(),
-                sources: phi_sources,
-                canonical_storage: None,
-            }];
-            block.ops = vec![SSAOp::Return { target: phi_dst }];
-            SsaArtifact::new(function, FunctionPrepareMode::Raw)
+        fn prepared_with_phi_values(left: u64, right: u64) -> SsaArtifact {
+            let arch = make_x86_64_prep_arch();
+            let blocks = vec![
+                R2ILBlock {
+                    addr: 0x1710,
+                    size: 4,
+                    ops: vec![R2ILOp::CBranch {
+                        target: make_const(0x1724, 8),
+                        cond: make_reg(8, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+                R2ILBlock {
+                    addr: 0x1714,
+                    size: 4,
+                    ops: vec![
+                        R2ILOp::Copy {
+                            dst: make_reg(0, 8),
+                            src: make_const(left, 8),
+                        },
+                        R2ILOp::Branch {
+                            target: make_const(0x1730, 8),
+                        },
+                    ],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+                R2ILBlock {
+                    addr: 0x1724,
+                    size: 4,
+                    ops: vec![
+                        R2ILOp::Copy {
+                            dst: make_reg(0, 8),
+                            src: make_const(right, 8),
+                        },
+                        R2ILOp::Branch {
+                            target: make_const(0x1730, 8),
+                        },
+                    ],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+                R2ILBlock {
+                    addr: 0x1730,
+                    size: 4,
+                    ops: vec![R2ILOp::Return {
+                        target: make_reg(0, 8),
+                    }],
+                    switch_info: None,
+                    op_metadata: Default::default(),
+                },
+            ];
+            SsaArtifact::for_decompile(&blocks, Some(&arch)).expect("prepared SSA should build")
         }
 
-        let same_source = SSAVar::constant(7, 8);
-        let identity_phi = prepared_with_phi_sources(vec![same_source.clone(), same_source]);
+        let identity_phi = prepared_with_phi_values(7, 7);
         let identity_ret = identity_phi
             .return_certificate_for_op(0x1730, 0)
             .expect("identity phi return certificate");
@@ -7375,8 +7439,7 @@ mod tests {
             "identity phi over one renderable ValueId should be renderable"
         );
 
-        let mixed_phi =
-            prepared_with_phi_sources(vec![SSAVar::constant(7, 8), SSAVar::constant(9, 8)]);
+        let mixed_phi = prepared_with_phi_values(7, 9);
         let mixed_ret = mixed_phi
             .return_certificate_for_op(0x1730, 0)
             .expect("mixed phi return certificate");
