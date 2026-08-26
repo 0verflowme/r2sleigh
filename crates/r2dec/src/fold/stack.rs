@@ -1,31 +1,9 @@
 use crate::ast::CExpr;
-use r2ssa::{ObjectId, ObjectKind, SSAVar};
+use r2ssa::{ObjectId, SSAVar};
 
 use super::context::FoldingContext;
 
 impl<'a> FoldingContext<'a> {
-    pub(super) fn prepared_stack_offset_for_var(&self, var: &SSAVar) -> Option<i64> {
-        let objects = self.prepared_objects()?;
-        let object = self
-            .inputs
-            .prepared_ssa?
-            .object_for_var(var, r2il::SpaceId::Ram)
-            .or_else(|| {
-                self.prepared_canonical_value_root(var).and_then(|root| {
-                    self.inputs
-                        .prepared_ssa?
-                        .object_for_var(&root, r2il::SpaceId::Ram)
-                })
-            })?;
-        let fact = objects.object(object)?;
-        match fact.kind {
-            ObjectKind::StackSlot { offset, .. } | ObjectKind::FrameObject { offset, .. } => {
-                Some(offset)
-            }
-            _ => None,
-        }
-    }
-
     pub(super) fn certified_stack_var_expr_for_object(&self, object: ObjectId) -> Option<CExpr> {
         let names = self.inputs.binding_names?;
         match names.require_stack(object) {
@@ -77,33 +55,5 @@ impl<'a> FoldingContext<'a> {
                 Ok(crate::binding_plan::PlannedValueSymbol::Bound(src_symbol)),
             ) if dst_symbol == src_symbol
         )
-    }
-
-    pub(crate) fn stack_var_expr_for_addr_var(&self, addr: &SSAVar) -> Option<CExpr> {
-        let prepared = self.inputs.prepared_ssa?;
-        let object = prepared
-            .object_for_var(addr, r2il::SpaceId::Ram)
-            .or_else(|| {
-                self.prepared_canonical_value_root(addr)
-                    .and_then(|root| prepared.object_for_var(&root, r2il::SpaceId::Ram))
-            })?;
-        let fact = prepared.objects().object(object)?;
-        if !matches!(
-            fact.kind,
-            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. }
-        ) {
-            return None;
-        }
-        self.certified_stack_var_expr_for_object(object)
-    }
-
-    pub(crate) fn refuse_missing_stack_object_origin(&self, offset: i64) -> Option<String> {
-        let _ = crate::binding_plan::RenderedIdentityRefusal::MissingStackObjectOrigin { offset };
-        if self.inputs.binding_names.is_some() {
-            self.retain_first_lowering_refusal(
-                super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
-            );
-        }
-        None
     }
 }

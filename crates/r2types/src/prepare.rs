@@ -236,12 +236,12 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
     match op {
         SSAOp::IntAdd { dst, a, b } => {
             if stack_bases.contains(&a.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&b.name)
+                && let Some(offset) = b.constant_bits()
             {
                 return Some((dst, a, offset as i64));
             }
             if stack_bases.contains(&b.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&a.name)
+                && let Some(offset) = a.constant_bits()
             {
                 return Some((dst, b, offset as i64));
             }
@@ -249,7 +249,7 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
         }
         SSAOp::IntSub { dst, a, b } => {
             if stack_bases.contains(&a.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&b.name)
+                && let Some(offset) = b.constant_bits()
             {
                 return Some((dst, a, -(offset as i64)));
             }
@@ -864,37 +864,13 @@ fn incoming_hint_should_replace(current: &TypeHint, incoming: &TypeHint) -> bool
     incoming.rank > current.rank || (incoming.rank == current.rank && incoming.ty < current.ty)
 }
 
-fn parse_const_value(name: &str) -> Option<u64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-    val_str.parse::<u64>().ok()
-}
-
 fn ssa_var_is_const(var: &SSAVar) -> bool {
-    parse_const_value(&var.name).is_some()
+    var.constant_bits().is_some()
 }
 
 pub(crate) fn ssa_var_is_register_like(var: &SSAVar) -> bool {
-    let lower = var.name.to_ascii_lowercase();
     matches!(
-        SSAVarNameKind::classify(&lower),
+        var.name_kind(),
         SSAVarNameKind::RegisterAlias | SSAVarNameKind::Ordinary
     )
 }
@@ -1355,7 +1331,7 @@ fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
                         }
                     }
                     SSAOp::IntLeft { dst, a, b } => {
-                        let shift_amount = parse_const_value(&b.name).unwrap_or(u64::MAX);
+                        let shift_amount = b.constant_bits().unwrap_or(u64::MAX);
                         if (index_like.contains(&ssa_var_key(a)) && ssa_var_is_const(b))
                             || shift_amount <= 6
                         {
@@ -1388,8 +1364,8 @@ fn infer_pointer_var_keys_from_ssa(
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
                     let a_is_stack = ssa_var_is_stack_base(a, stack_bases);
                     let b_is_stack = ssa_var_is_stack_base(b, stack_bases);
-                    let a_const = parse_const_value(&a.name);
-                    let b_const = parse_const_value(&b.name);
+                    let a_const = a.constant_bits();
+                    let b_const = b.constant_bits();
 
                     if a_is_stack && b_const.is_some() {
                         let raw = b_const.unwrap_or(0);
@@ -1611,9 +1587,9 @@ fn infer_pointer_pointee_width_bytes(
             match op {
                 SSAOp::IntAdd { dst, a, b } => {
                     let (base, offset) = if ssa_var_is_stack_base(a, stack_bases) {
-                        (a, parse_const_value(&b.name).map(|value| value as i64))
+                        (a, b.constant_bits().map(|value| value as i64))
                     } else if ssa_var_is_stack_base(b, stack_bases) {
-                        (b, parse_const_value(&a.name).map(|value| value as i64))
+                        (b, a.constant_bits().map(|value| value as i64))
                     } else {
                         continue;
                     };
@@ -1625,7 +1601,7 @@ fn infer_pointer_pointee_width_bytes(
                     }
                 }
                 SSAOp::IntSub { dst, a, b } if ssa_var_is_stack_base(a, stack_bases) => {
-                    if let Some(offset) = parse_const_value(&b.name) {
+                    if let Some(offset) = b.constant_bits() {
                         stack_addr_slots.insert(
                             ssa_var_block_key(block.addr, dst),
                             format!("{}:{}", a.name.to_ascii_lowercase(), -(offset as i64)),
@@ -1653,13 +1629,11 @@ fn infer_pointer_pointee_width_bytes(
                     }
                 }
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
-                    let b_is_nonzero_const =
-                        parse_const_value(&b.name).is_some_and(|value| value != 0);
+                    let b_is_nonzero_const = b.constant_bits().is_some_and(|value| value != 0);
                     if !ssa_var_is_stack_base(a, stack_bases) && !b_is_nonzero_const {
                         add_pointer_pointee_flow_edge(&mut adjacency, pointer_vars, dst, a);
                     }
-                    let a_is_nonzero_const =
-                        parse_const_value(&a.name).is_some_and(|value| value != 0);
+                    let a_is_nonzero_const = a.constant_bits().is_some_and(|value| value != 0);
                     if !ssa_var_is_stack_base(b, stack_bases)
                         && !a_is_nonzero_const
                         && !matches!(op, SSAOp::IntSub { .. })
@@ -2262,6 +2236,33 @@ mod tests {
     }
 
     #[test]
+    fn constant_spelling_cannot_authorize_stack_address_recovery() {
+        let dst = SSAVar::new("tmp:address", 1, 8);
+        let base = SSAVar::new("rsp", 0, 8);
+        let spoofed = SSAOp::IntAdd {
+            dst: dst.clone(),
+            a: base.clone(),
+            b: SSAVar::new("const:8", 0, 8),
+        };
+        let certified = SSAOp::IntAdd {
+            dst,
+            a: base.clone(),
+            b: SSAVar::constant(8, 8),
+        };
+
+        assert!(!ssa_var_is_const(&SSAVar::new(
+            "const:ffffffffffffffff",
+            0,
+            8
+        )));
+        assert!(stack_addr_temp(&spoofed, &["rsp"]).is_none());
+        assert_eq!(
+            stack_addr_temp(&certified, &["rsp"]),
+            Some((certified.dst().expect("destination"), &base, 8))
+        );
+    }
+
+    #[test]
     fn recovered_signature_params_follow_x86_64_arch_profile() {
         let block = SSABlock {
             addr: 0x401000,
@@ -2331,7 +2332,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("RDX", 2, 8),
                     a: SSAVar::new("RDX", 1, 8),
-                    b: SSAVar::new("const:38", 0, 8),
+                    b: SSAVar::constant(0x38, 8),
                 },
             ],
         };
@@ -2486,7 +2487,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:sp8", 1, 8),
                     a: SSAVar::new("rsp", 0, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
@@ -2645,7 +2646,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:home", 1, 8),
                     a: SSAVar::new("rbp", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:saved_arg", 1, 8),
@@ -2665,7 +2666,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:home_reload", 1, 8),
                     a: SSAVar::new("rbp", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:base", 1, 8),
@@ -2683,7 +2684,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:scaled", 1, 8),
                     a: SSAVar::new("rcx", 2, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:element", 1, 8),
@@ -2875,7 +2876,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:sp8", 1, 8),
                     a: SSAVar::new("rsp", 0, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
@@ -2954,7 +2955,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("rsp", 2, 8),
                     a: SSAVar::new("rsp", 1, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("rip", 1, 8),
@@ -2981,7 +2982,7 @@ mod tests {
             ops: vec![
                 SSAOp::IntSub {
                     dst: SSAVar::new("tmp:not_stack", 1, 8),
-                    a: SSAVar::new("const:0x20", 0, 8),
+                    a: SSAVar::constant(0x20, 8),
                     b: SSAVar::new("rsp", 0, 8),
                 },
                 SSAOp::Load {

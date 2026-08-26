@@ -99,11 +99,6 @@ pub(crate) enum RenderedIdentityRefusal {
     MissingWriteDisposition {
         inst: InstId,
     },
-    /// A later consumer retained only layout arithmetic, not the source-owned
-    /// stack object whose binding would authorize an identifier.
-    MissingStackObjectOrigin {
-        offset: i64,
-    },
 }
 
 /// Failure to project one sealed binding plan into the identifier table used

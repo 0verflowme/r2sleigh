@@ -10,11 +10,6 @@
 //! forward bitset analysis over a sorted worklist, with cost
 //! `O((bindings / word_bits) * (blocks + edges))` per fixpoint sweep.
 
-#![allow(
-    dead_code,
-    reason = "Stage 7 placement analysis lands before final AST occurrence wiring"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{
@@ -156,8 +151,7 @@ pub(crate) fn collect_final_placement_occurrences(
                     | PlacementObservationTarget::CertifiedValueRead { .. }
                     | PlacementObservationTarget::Write(_)
             )
-        )
-            && scoped[index].is_none()
+        ) && scoped[index].is_none()
         {
             return Err(PlacementAnalysisError::UnscopedObservation {
                 observation: RenderObservationId::from_dense_index(index),
@@ -407,9 +401,7 @@ fn audit_plan_symbols(
         .collect::<BTreeMap<_, _>>();
     for local in &function.locals {
         if !by_symbol.contains_key(&local.name) {
-            return Err(PlacementAnalysisError::UnauthorizedProgramVariable {
-                symbol: local.name,
-            });
+            return Err(PlacementAnalysisError::UnauthorizedProgramVariable { symbol: local.name });
         }
     }
     for statement in &function.body {
@@ -442,7 +434,15 @@ fn audit_statement(
         }
         CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-            audit_expr(expr, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_expr(
+                expr,
+                SymbolAccess::Read,
+                &active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
         }
         CStmt::Decl { name, init, .. } => {
             audit_program_symbol(
@@ -454,7 +454,15 @@ fn audit_statement(
                 by_symbol,
             )?;
             if let Some(init) = init {
-                audit_expr(init, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+                audit_expr(
+                    init,
+                    SymbolAccess::Read,
+                    &active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
             }
         }
         CStmt::Block(statements) => {
@@ -467,19 +475,43 @@ fn audit_statement(
             then_body,
             else_body,
         } => {
-            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_expr(
+                cond,
+                SymbolAccess::Read,
+                &active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
             audit_statement(then_body, source, names, targets, by_symbol)?;
             if let Some(else_body) = else_body {
                 audit_statement(else_body, source, names, targets, by_symbol)?;
             }
         }
         CStmt::While { cond, body } => {
-            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_expr(
+                cond,
+                SymbolAccess::Read,
+                &active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
             audit_statement(body, source, names, targets, by_symbol)?;
         }
         CStmt::DoWhile { body, cond } => {
             audit_statement(body, source, names, targets, by_symbol)?;
-            audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_expr(
+                cond,
+                SymbolAccess::Read,
+                &active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
         }
         CStmt::For {
             init,
@@ -491,10 +523,26 @@ fn audit_statement(
                 audit_statement(init, source, names, targets, by_symbol)?;
             }
             if let Some(cond) = cond {
-                audit_expr(cond, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+                audit_expr(
+                    cond,
+                    SymbolAccess::Read,
+                    &active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
             }
             if let Some(update) = update {
-                audit_expr(update, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+                audit_expr(
+                    update,
+                    SymbolAccess::Read,
+                    &active,
+                    source,
+                    names,
+                    targets,
+                    by_symbol,
+                )?;
             }
             audit_statement(body, source, names, targets, by_symbol)?;
         }
@@ -503,7 +551,15 @@ fn audit_statement(
             cases,
             default,
         } => {
-            audit_expr(expr, SymbolAccess::Read, &active, source, names, targets, by_symbol)?;
+            audit_expr(
+                expr,
+                SymbolAccess::Read,
+                &active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
             for case in cases {
                 audit_expr(
                     &case.value,
@@ -867,7 +923,10 @@ fn certified_value_read_matches(
         && certificate.value == value
         && graph.op_site_for_inst(at) == Some((certificate.block_addr, certificate.op_index))
         && graph.inst(at).is_some_and(|inst| {
-            matches!(inst.payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
+            matches!(
+                inst.payload,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. })
+            )
         })
         && matches!(
             names.disposition_for_value(value),
@@ -890,8 +949,7 @@ pub(crate) fn expr_reads_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -
         | CExpr::Paren(operand) => expr_reads_symbol(operand, symbol),
         CExpr::Binary { op, left, right } => {
             expr_reads_symbol(right, symbol)
-                || (!matches!(op, BinaryOp::Assign)
-                    || !matches!(left.unobserved(), CExpr::Var(_)))
+                || (!matches!(op, BinaryOp::Assign) || !matches!(left.unobserved(), CExpr::Var(_)))
                     && expr_reads_symbol(left, symbol)
         }
         CExpr::Ternary {
@@ -904,8 +962,7 @@ pub(crate) fn expr_reads_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -
                 || expr_reads_symbol(else_expr, symbol)
         }
         CExpr::Call { func, args, .. } => {
-            expr_reads_symbol(func, symbol)
-                || args.iter().any(|arg| expr_reads_symbol(arg, symbol))
+            expr_reads_symbol(func, symbol) || args.iter().any(|arg| expr_reads_symbol(arg, symbol))
         }
         CExpr::Subscript { base, index } => {
             expr_reads_symbol(base, symbol) || expr_reads_symbol(index, symbol)
@@ -952,6 +1009,7 @@ pub(crate) struct PlacementDecisions {
 }
 
 impl PlacementDecisions {
+    #[cfg(test)]
     pub(crate) fn decision(&self, binding: BindingId) -> Option<PlacementDecision> {
         self.decisions.get(binding.index()).copied().flatten()
     }
@@ -1301,9 +1359,13 @@ pub(crate) fn derive_placement_decisions(
     reads: &[FinalBindingRead],
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementDecisions, PlacementAnalysisError> {
-    derive_with_cfg(regions, function, binding_count,
+    derive_with_cfg(
+        regions,
+        function,
+        binding_count,
         externally_declared,
-        reads, writes,
+        reads,
+        writes,
     )
 }
 
@@ -1742,7 +1804,8 @@ impl DenseBindingSet {
 mod tests {
     use super::*;
     use crate::region::Region;
-    use crate::structured_region::{StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
+    use crate::structured_region::{
+        StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
     };
     use crate::symbol::{SymbolRole, SymbolTable};
 
@@ -1925,7 +1988,8 @@ mod tests {
             order: FinalOccurrenceOrder(3),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes).expect("placement");
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
+            .expect("placement");
         let sequence = regions.source_root();
         assert_eq!(
             decisions.decision(binding),
@@ -1961,7 +2025,8 @@ mod tests {
             order: FinalOccurrenceOrder(2),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes).expect("placement");
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
+            .expect("placement");
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Refused(
@@ -2105,11 +2170,10 @@ mod tests {
     #[test]
     fn inline_replaces_only_the_exact_marked_assignment() {
         let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
-        let symbol = symbols.borrow_mut().declare(
-            "value",
-            crate::ast::CType::UInt(32),
-            SymbolRole::Carrier,
-        );
+        let symbol =
+            symbols
+                .borrow_mut()
+                .declare("value", crate::ast::CType::UInt(32), SymbolRole::Carrier);
         let marker = observation(7);
         let assignment = CStmt::observed(
             marker,
@@ -2133,7 +2197,6 @@ mod tests {
                 init: Some(CExpr::UIntLit(9)),
                 ..
             } if *name == symbol
-        )
-        );
+        ));
     }
 }

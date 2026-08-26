@@ -9,15 +9,6 @@ pub(super) fn classify_sides(
     shadow: SideJudgment,
     observations_equal: bool,
 ) -> ShadowClassification {
-    let old_unclassified = matches!(old, SideJudgment::Unclassified(_));
-    let shadow_unclassified = matches!(shadow, SideJudgment::Unclassified(_));
-    if old_unclassified || shadow_unclassified {
-        return ShadowClassification::Unclassified {
-            old: old_unclassified,
-            shadow: shadow_unclassified,
-        };
-    }
-
     match (old, shadow) {
         (SideJudgment::Correct, SideJudgment::Correct) => ShadowClassification::AgreeCorrect,
         (SideJudgment::Wrong(_), SideJudgment::Correct) => ShadowClassification::OldWrong,
@@ -28,9 +19,6 @@ pub(super) fn classify_sides(
             } else {
                 BothWrongRelation::Different
             })
-        }
-        (SideJudgment::Unclassified(_), _) | (_, SideJudgment::Unclassified(_)) => {
-            unreachable!("unclassified sides returned above")
         }
     }
 }

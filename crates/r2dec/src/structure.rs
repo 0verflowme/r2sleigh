@@ -4695,7 +4695,6 @@ mod tests {
         let mut ctx = FoldingContext::new(64);
         ctx.inputs.prepared_ssa = Some(facts.source());
         ctx.inputs.function_facts = facts.report();
-        ctx.inputs.certified_rendering_required = true;
         let origins = Box::leak(Box::new(
             crate::normalize::NormalizationOrigins::for_unchanged(
                 facts.source().function(),
@@ -5457,7 +5456,7 @@ mod tests {
         assert_eq!(
             ControlFlowStructurer::normalized_self_update_signature(&symbols, &rewritten),
             Some((
-                "value".to_string(),
+                crate::symbol::declare(&symbols, "value"),
                 BinaryOp::ShlAssign,
                 CExpr::IntLit(5),
             ))

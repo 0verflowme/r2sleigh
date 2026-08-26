@@ -1,36 +1,20 @@
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::{CExpr, CType};
-use r2ssa::{
-    BlockId, InstId, MemorySSAFacts, ObjectModel, SemanticObligationId, SsaArtifact, UseSite,
-    ValueId,
-};
+use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
 #[cfg(test)]
-use r2types::ExternalStackVarSpec;
+use r2types::{ExternalStackSlotSpec, StackSlotKey, VisibleBinding};
 use r2types::{
-    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb,
-    FunctionFacts, InterprocSummaryView, StackSlotKey, TypeOracle, VisibleBinding,
+    CalleeFact, CalleeResolutionFacts, FunctionFacts, InterprocSummaryView, TypeOracle,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ResolutionPhase {
-    Semantic,
-    Definition,
-    DefinitionRaw,
-    Memory,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ResolutionGuardKey {
-    pub(crate) phase: ResolutionPhase,
-    pub(crate) name: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EffectOccurrenceKind {
@@ -67,23 +51,15 @@ pub(crate) struct FoldInputs<'a> {
     /// Spellings for addresses this function touches, for rendering only.
     pub(crate) display_names: &'a r2types::DisplayNames,
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) certified_rendering_required: bool,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
-    pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
-    pub(crate) external_type_db: &'a ExternalTypeDb,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     /// Sole `BindingId -> SymbolId` projection for this native rendering.
-    pub(crate) binding_names:
-        Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
+    pub(crate) binding_names: Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
-    pub(crate) prepared_objects: Option<&'a ObjectModel>,
-    #[allow(dead_code)]
-    pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
     /// Exact origin of every operation in the normalized function.
     pub(crate) normalization_origins: Option<&'a crate::normalize::NormalizationOrigins>,
     /// Sole authority-bound observation journal for this native rendering.
@@ -158,7 +134,6 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
-    pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
     /// Legacy cache retained only as a negative test fixture: production
     /// inlining is authorized exclusively by the sealed binding plan.
     ///
@@ -172,11 +147,6 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) inlined_renderings: std::cell::RefCell<HashMap<String, CExpr>>,
     #[cfg(test)]
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
-    pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// Names minted while folding, handed to the function when it is built.
@@ -197,8 +167,7 @@ pub(crate) struct FoldingContext<'a> {
     /// Transaction-local lowering failure. Legacy helpers are still mostly
     /// expression-returning, so an exact projection failure records this flag
     /// and the operation boundary discards the whole candidate AST.
-    pub(crate) pending_lowering_refusal:
-        Cell<Option<crate::fold::op_lower::OpLoweringRefusal>>,
+    pub(crate) pending_lowering_refusal: Cell<Option<crate::fold::op_lower::OpLoweringRefusal>>,
 }
 
 impl FoldArchConfig {
@@ -269,16 +238,10 @@ impl<'a> FoldingContext<'a> {
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
-            load_expr_memo: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
-            semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
-            value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
-            definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
-            definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
-            resolution_guard: std::cell::RefCell::new(HashSet::new()),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             observation_error: std::cell::RefCell::new(None),
             pending_lowering_refusal: Cell::new(None),
@@ -611,15 +574,18 @@ impl<'a> FoldingContext<'a> {
         };
         let source_site = prepared.inst_op_site(source_inst);
         let call_fact = source_site.and_then(|(block_addr, op_idx)| {
-            self.inputs.call_render_facts()?.fact_for_site(
-                r2types::CallsiteKey {
+            self.inputs
+                .call_render_facts()?
+                .fact_for_site(r2types::CallsiteKey {
                     block_addr,
                     op_index: op_idx,
                 })
         });
         let return_certified = source_site
             .and_then(|(block_addr, op_idx)| {
-                self.inputs.render_facts()?.return_for_op(block_addr, op_idx)
+                self.inputs
+                    .render_facts()?
+                    .return_for_op(block_addr, op_idx)
             })
             .is_some_and(|fact| Some(fact.value) == value);
         let rendered_call = call_fact.filter(|fact| {
@@ -645,8 +611,7 @@ impl<'a> FoldingContext<'a> {
                 .obligations()
                 .obligations_for_inst(source_inst)
                 .filter(|obligation| {
-                    obligation.id.kind == ObligationKind::CallResult
-                        && obligation.inputs == [value]
+                    obligation.id.kind == ObligationKind::CallResult && obligation.inputs == [value]
                 })
                 .count()
                 == 1
@@ -674,20 +639,20 @@ impl<'a> FoldingContext<'a> {
                         r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. },
                     ) => {
                         rendered_call.is_some()
-                        && (obligation.id.kind == ObligationKind::Call
-                            || (obligation.id.kind == ObligationKind::CallArgument
-                                && !obligation.inputs.is_empty()
-                                && obligation.inputs.iter().all(|input| {
-                                    rendered_call
-                                        .is_some_and(|fact| fact.proof_values.contains(input))
-                                }))
-                            || (obligation.id.kind == ObligationKind::CallResult
-                                && unique_call_result
-                                && obligation.inputs.as_slice() == value.as_slice()))
+                            && (obligation.id.kind == ObligationKind::Call
+                                || (obligation.id.kind == ObligationKind::CallArgument
+                                    && !obligation.inputs.is_empty()
+                                    && obligation.inputs.iter().all(|input| {
+                                        rendered_call
+                                            .is_some_and(|fact| fact.proof_values.contains(input))
+                                    }))
+                                || (obligation.id.kind == ObligationKind::CallResult
+                                    && unique_call_result
+                                    && obligation.inputs.as_slice() == value.as_slice()))
                     }
                     _ => {
                         obligation.id.kind == ObligationKind::LiveValueProducer
-                        && inst.output == value
+                            && inst.output == value
                     }
                 },
                 EffectOccurrenceKind::MemoryRead | EffectOccurrenceKind::MemoryWrite => false,
@@ -706,8 +671,7 @@ impl<'a> FoldingContext<'a> {
     ) -> BTreeSet<SemanticObligationId> {
         use r2ssa::{SemanticObligationComponent, SemanticObligationKind};
 
-        let Some(prepared) =
-            self.inputs.prepared_ssa else {
+        let Some(prepared) = self.inputs.prepared_ssa else {
             return BTreeSet::new();
         };
         let graph = prepared.graph();
@@ -736,7 +700,7 @@ impl<'a> FoldingContext<'a> {
                             .collect::<Vec<_>>()
                 {
                     obligation_ids.insert(obligation.id);
-    }
+                }
             }
         }
         obligation_ids
@@ -756,7 +720,8 @@ impl<'a> FoldingContext<'a> {
             return BTreeSet::new();
         };
         let Some(origins) = self.inputs.normalization_origins else {
-            return self.source_inst_for_normalized_site(site)
+            return self
+                .source_inst_for_normalized_site(site)
                 .map(|inst| self.exact_value_obligations(kind, inst, value))
                 .unwrap_or_default();
         };
@@ -764,16 +729,18 @@ impl<'a> FoldingContext<'a> {
             Some(crate::normalize::NormalizedOpOrigin::Original(inst)) => {
                 self.exact_value_obligations(kind, *inst, value)
             }
-            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => self.exact_effect_obligations_for_phi_edges(
+            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => self
+                .exact_effect_obligations_for_phi_edges(
                     origin.definition.inst,
                     std::slice::from_ref(&origin.incoming),
                 ),
-            Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => self.exact_effect_obligations_for_phi_edges(
+            Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => self
+                .exact_effect_obligations_for_phi_edges(
                     origin.definition.inst,
                     &origin.replaced_sites,
                 ),
             None => BTreeSet::new(),
-            }
+        }
     }
 
     fn exact_effect_obligations_for_inst_memory(
@@ -839,7 +806,7 @@ impl<'a> FoldingContext<'a> {
     ) -> BTreeSet<SemanticObligationId> {
         self.source_inst_for_normalized_op(block_addr, op_idx)
             .map(|inst| {
-            self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+                self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
             })
             .unwrap_or_default()
     }
@@ -853,12 +820,11 @@ impl<'a> FoldingContext<'a> {
         address: Option<ValueId>,
         value: Option<ValueId>,
     ) -> BTreeSet<SemanticObligationId> {
-        self
-            .inputs
+        self.inputs
             .prepared_ssa
             .and_then(|prepared| prepared.graph().inst_id_for_op_site(block_addr, op_idx))
             .map(|inst| {
-            self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+                self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
             })
             .unwrap_or_default()
     }
@@ -869,12 +835,11 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn new(ptr_size: u32) -> Self {
         #[cfg(test)]
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
+        #[cfg(test)]
         static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
             OnceLock::new();
         #[cfg(test)]
-        static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
-        static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
 
@@ -898,18 +863,13 @@ impl<'a> FoldingContext<'a> {
             binary_symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             function_facts: empty_function_facts(),
             #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
-            external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
-            external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
         };
 
         Self::from_inputs(inputs)

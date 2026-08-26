@@ -143,15 +143,6 @@ fn signature_strength(signature: &r2types::FunctionSignatureSpec) -> u8 {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct DataRef {
-    pub(crate) from: u64,
-    pub(crate) to: u64,
-    pub(crate) space: r2il::SpaceId,
-    pub(crate) ref_type: String,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct R2SleighDataRef {
@@ -171,16 +162,6 @@ const FFI_DATA_REF_SPACE_REGISTER: u32 = 1;
 const FFI_DATA_REF_SPACE_UNIQUE: u32 = 2;
 const FFI_DATA_REF_SPACE_CONST: u32 = 3;
 const FFI_DATA_REF_SPACE_CUSTOM: u32 = 4;
-
-#[cfg(test)]
-fn data_ref_from_fact(fact: &r2ssa::DataRefFact) -> DataRef {
-    DataRef {
-        from: fact.from,
-        to: fact.to,
-        space: fact.space,
-        ref_type: fact.kind.as_str().to_string(),
-    }
-}
 
 fn ffi_data_ref_space(space: r2il::SpaceId) -> (u32, u32) {
     match space {

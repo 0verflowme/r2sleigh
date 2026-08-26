@@ -5,20 +5,18 @@
 //! only when those plans authorize them; lowering itself does not infer either
 //! policy from use counts, names, or expression shape.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::BTreeSet;
 
 use r2ssa::{
-    DecompilePrepFacts, MemoryLocation, ObjectKind, ObjectModel, PreparedFunctionFacts,
-    SSAFunction, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, ValueId,
+    DecompilePrepFacts, SSAFunction, SSAOp, SSAVar, SsaArtifact, ValueId,
 };
-#[cfg(test)]
-use r2types::StackSlotKey;
 #[cfg(test)]
 use r2types::normalize_callee_name;
 use r2types::{
-    CTypeLike, CalleeIdentity, ExternalField, ExternalStackBase, ExternalStackSlotRole,
-    ExternalStruct, ExternalUnion, FunctionRenderFacts, ReturnValueRenderFact,
-    SourceOwnedFunctionFacts, normalize_external_type_name, parse_type_like_spec,
+    CalleeIdentity, ExternalStackSlotRole, FunctionRenderFacts, ReturnValueRenderFact,
+    SourceOwnedFunctionFacts,
 };
 
 use crate::analysis;
@@ -28,8 +26,6 @@ use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
 
 use super::SSABlock;
 use super::context::{EffectOccurrenceKind, FoldingContext};
-use super::context::{ResolutionGuardKey, ResolutionPhase};
-use super::{MAX_ALIAS_REWRITE_DEPTH, MAX_SIMPLE_EXPR_DEPTH};
 
 /// Stage-3 lowering seam. Construction checks that the plan, its machine
 /// projection, and the source-owned report all refer to the exact same SSA
@@ -113,115 +109,11 @@ fn certified_compare_truth_relation_handles_complement_and_swapped_equality() {
     );
 }
 
-fn external_struct_field_name_for_offset(
-    st: &ExternalStruct,
-    offset: u64,
-    access_size: Option<u32>,
-    ptr_bits: u32,
-) -> Option<String> {
-    st.fields
-        .range(..=offset)
-        .next_back()
-        .and_then(|(_, field)| external_field_name_for_offset(field, offset, access_size, ptr_bits))
-}
-
-fn external_union_field_name_for_offset(
-    un: &ExternalUnion,
-    offset: u64,
-    access_size: Option<u32>,
-    ptr_bits: u32,
-) -> Option<String> {
-    if offset != 0 {
-        return None;
-    }
-    un.fields
-        .values()
-        .find_map(|field| external_field_name_for_offset(field, offset, access_size, ptr_bits))
-}
-
-fn external_field_name_for_offset(
-    field: &ExternalField,
-    offset: u64,
-    access_size: Option<u32>,
-    ptr_bits: u32,
-) -> Option<String> {
-    if offset < field.offset {
-        return None;
-    }
-    let rel = offset - field.offset;
-    if let Some(CTypeLike::Array(inner, len)) = field
-        .ty
-        .as_deref()
-        .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
-    {
-        let elem_size = c_type_like_size_bytes(&inner, ptr_bits)?;
-        if elem_size == 0 || !rel.is_multiple_of(elem_size) {
-            return None;
-        }
-        if let Some(access_size) = access_size
-            && u64::from(access_size) > elem_size
-        {
-            return (rel == 0).then(|| field.name.clone());
-        }
-        let index = rel / elem_size;
-        if len.is_some_and(|count| index >= count as u64) {
-            return None;
-        }
-        return Some(format!("{}[{index}]", field.name));
-    }
-    (rel == 0).then(|| field.name.clone())
-}
-
-fn c_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
-    match ty {
-        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
-        CTypeLike::Bool => Some(1),
-        CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
-            Some((u64::from(*bits).saturating_add(7) / 8).max(1))
-        }
-        CTypeLike::Pointer(_) => Some((ptr_bits / 8).max(1) as u64),
-        CTypeLike::Array(inner, Some(count)) => {
-            c_type_like_size_bytes(inner, ptr_bits).map(|size| size.saturating_mul(*count as u64))
-        }
-        CTypeLike::Array(inner, None) => c_type_like_size_bytes(inner, ptr_bits),
-        CTypeLike::Struct(_) | CTypeLike::Union(_) | CTypeLike::Enum(_) | CTypeLike::Typedef(_) => {
-            None
-        }
-    }
-}
-
-fn c_type_size_bytes(ty: &CType, ptr_size: u32) -> Option<u64> {
-    match ty {
-        CType::Void | CType::Unknown | CType::Function { .. } => None,
-        CType::Bool => Some(1),
-        CType::Int(bits) | CType::UInt(bits) | CType::BitVector(bits) | CType::Float(bits) => {
-            Some((u64::from(*bits).saturating_add(7) / 8).max(1))
-        }
-        CType::Pointer(_) => Some(u64::from(ptr_size.max(1))),
-        CType::Array(inner, Some(count)) => {
-            c_type_size_bytes(inner, ptr_size).map(|size| size.saturating_mul(*count as u64))
-        }
-        CType::Array(inner, None) => c_type_size_bytes(inner, ptr_size),
-        CType::Typedef(name) => match name.as_str() {
-            "size_t" | "ssize_t" | "uintptr_t" | "intptr_t" | "ptrdiff_t" => {
-                Some(u64::from(ptr_size.max(1)))
-            }
-            "uint8_t" | "int8_t" | "char" | "unsigned char" | "signed char" => Some(1),
-            "uint16_t" | "int16_t" => Some(2),
-            "uint32_t" | "int32_t" => Some(4),
-            "uint64_t" | "int64_t" => Some(8),
-            _ => None,
-        },
-        CType::Struct(_) | CType::Union(_) | CType::Enum(_) => None,
-    }
-}
-
 mod aliases;
 mod calls;
 mod lowering;
 mod memory_renderer;
 mod projection;
-mod return_resolver;
 
 #[derive(Debug, Clone, PartialEq)]
 enum LoweredOp {
@@ -238,16 +130,6 @@ pub(super) struct CertifiedCallExpr {
     pub(super) expr: CExpr,
     pub(super) target: ValueId,
     pub(super) values: Vec<ValueId>,
-}
-
-fn expr_contains_call(expr: &CExpr) -> bool {
-    let mut found = false;
-    expr.visit(&mut |node| {
-        if matches!(node, CExpr::Call { .. }) {
-            found = true;
-        }
-    });
-    found
 }
 
 pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
@@ -328,39 +210,6 @@ struct LowerFrame {
     with_call_args: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VisibleExprContext {
-    Generic,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct VisibleExprQuality {
-    semantic_shapes: i32,
-    semantic_names: i32,
-    stable_pointer_shapes: i32,
-    generic_stack_penalty: i32,
-    transient_reg_penalty: i32,
-    temp_penalty: i32,
-    zero_offset_penalty: i32,
-    stack_home_penalty: i32,
-    node_penalty: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum RenderCandidateSource {
-    ExactNameDefinition,
-    ValueDefinition,
-    SemanticValue,
-    ForwardedValue,
-    RawDefinition,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct RenderCandidate {
-    expr: CExpr,
-    source: RenderCandidateSource,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CertifiedRenderPlan<'a> {
     function_facts: &'a r2types::FunctionFacts,
@@ -381,16 +230,12 @@ impl<'a> CertifiedRenderPlan<'a> {
         }
     }
 
-    fn call_arg_expr<F>(
+    fn call_arg_expr(
         &self,
         site: (u64, usize),
         index: usize,
         value: r2ssa::ValueId,
-        contains_raw_storage_name: F,
-    ) -> Option<CExpr>
-    where
-        F: FnOnce(&CExpr) -> bool,
-    {
+    ) -> Option<CExpr> {
         if !self.proof.expression_is_renderable(value) {
             return None;
         }
@@ -399,10 +244,7 @@ impl<'a> CertifiedRenderPlan<'a> {
             block_addr: site.0,
             op_index: site.1,
         };
-        let render_fact = self
-            .function_facts
-            .call_render()?
-            .fact_for_site(callsite)?;
+        let render_fact = self.function_facts.call_render()?.fact_for_site(callsite)?;
         if render_fact.callsite.block_addr != site.0
             || render_fact.callsite.op_index != site.1
             || matches!(
@@ -419,11 +261,7 @@ impl<'a> CertifiedRenderPlan<'a> {
         {
             return None;
         }
-        let expr = call_view.authoritative_args.get(index)?.clone();
-        if contains_raw_storage_name(&expr) {
-            return None;
-        }
-        Some(expr)
+        call_view.authoritative_args.get(index).cloned()
     }
 
     fn stack_param_expr_for_memory_fact(
@@ -435,21 +273,20 @@ impl<'a> CertifiedRenderPlan<'a> {
             return None;
         }
         let offset = self.proof.render_facts.stack_slot_offset(fact.object)?;
-        self
-            .function_facts
+        self.function_facts
             .authorized_stack_param_owner_render(fact.object, offset)?;
-        let mut matching_slots = self
-            .function_facts
-            .type_facts()
-            .stack_slots
-            .iter()
-            .filter(|(key, slot)| {
-                key.offset == offset
-                    && matches!(
-                        slot.role,
-                        ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
-                    )
-            });
+        let mut matching_slots =
+            self.function_facts
+                .type_facts()
+                .stack_slots
+                .iter()
+                .filter(|(key, slot)| {
+                    key.offset == offset
+                        && matches!(
+                            slot.role,
+                            ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
+                        )
+                });
         let (_, slot) = matching_slots.next()?;
         if matching_slots.next().is_some() {
             return None;
@@ -576,39 +413,6 @@ fn linear_coeff_expr(term: CExpr, coeff: i64) -> Option<CExpr> {
         0 => Some(CExpr::IntLit(0)),
         1 => Some(term),
         _ => Some(CExpr::binary(BinaryOp::Mul, term, CExpr::IntLit(coeff))),
-    }
-}
-
-pub(crate) fn should_replace_preserved_stack_alias(existing: &str) -> bool {
-    let normalized = existing.trim_start_matches('&');
-    normalized == "stack"
-        || normalized.starts_with("local_")
-        || normalized.starts_with("stack_")
-        || normalized == "saved_fp"
-}
-
-pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
-    analysis::utils::is_generic_stack_placeholder_alias(existing)
-}
-
-fn call_arg_callee_name(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    expr: &CExpr,
-) -> Option<std::rc::Rc<str>> {
-    match expr {
-        CExpr::Observed { expr, .. } => call_arg_callee_name(symbols, expr),
-        // A local binding may hold a function pointer, but its spelling is not
-        // the identity of the external function it may point at.
-        CExpr::Var(_) => None,
-        // A call names something outside the function, so the callee is an
-        // external. Matching only variables here lost the signature for every
-        // call the moment callees started saying what they are.
-        CExpr::External { name, .. } => Some(std::rc::Rc::from(name.as_str())),
-        CExpr::Deref(inner) | CExpr::Paren(inner) | CExpr::AddrOf(inner) => {
-            call_arg_callee_name(symbols, inner)
-        }
-        CExpr::Cast { expr: inner, .. } => call_arg_callee_name(symbols, inner),
-        _ => None,
     }
 }
 

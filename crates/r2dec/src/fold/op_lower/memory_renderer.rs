@@ -464,141 +464,64 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Whether a type says the expression is a pointer, when it says either.
-    ///
-    /// `None` means the type answers nothing -- it is missing, or opaque, or a
-    /// shape that is neither addressable nor countable -- and the caller must
-    /// look elsewhere.
-    fn expr_type_answers_pointer(&self, expr: &CExpr) -> Option<bool> {
-        match self.expr_type_hint(expr)? {
-            CType::Pointer(_) | CType::Array(_, _) => Some(true),
-            CType::Int(_) | CType::UInt(_) | CType::Bool | CType::Enum(_) | CType::Typedef(_) => {
-                Some(false)
-            }
-            _ => None,
-        }
-    }
-
-    fn subscript_expr_for_base_and_index(
-        &self,
-        base: CExpr,
-        index: &CExpr,
-        elem_ty: &CType,
-    ) -> Option<CExpr> {
-        let base_source_ty = self.expr_type_hint(&base);
-        // The pointee names the element only when it is a type an element can
-        // have. `void *` says nothing about what one step is, so the width the
-        // access itself asks for stands.
-        let elem_ty = match &base_source_ty {
-            Some(CType::Pointer(inner)) | Some(CType::Array(inner, _))
-                if !matches!(inner.as_ref(), CType::Void | CType::Unknown) =>
-            {
-                inner.as_ref().clone()
-            }
-            _ => elem_ty.clone(),
+    fn typed_subscript_access(&self, expr: CExpr, elem_ty: &CType) -> CExpr {
+        let CExpr::Subscript { base, index } = expr else {
+            return expr;
         };
-        let elem_size = elem_ty
-            .bits()
-            .map(|bits| bits.div_ceil(8).max(1))
-            .unwrap_or(1);
-        let index = self.scaled_index_expr(index, elem_size)?;
-        let base = self.cast_expr_if_needed(base, CType::ptr(elem_ty), base_source_ty.as_ref());
-        Some(CExpr::Subscript {
-            base: Box::new(base),
-            index: Box::new(index),
-        })
-    }
-
-    pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
-        let CExpr::Binary {
-            op: BinaryOp::Add,
-            left,
-            right,
-        } = expr
-        else {
-            return None;
+        let elem_bytes = match elem_ty {
+            CType::Int(bits) | CType::UInt(bits) | CType::Float(bits) => bits / 8,
+            _ => 0,
         };
-
-        let orientations = [
-            (left.as_ref(), right.as_ref()),
-            (right.as_ref(), left.as_ref()),
-        ];
-
-        // Which operand is the pointer is a question the types answer whenever
-        // both are typed, and then there is nothing to weigh. `looks_like_pointer`
-        // otherwise falls back to the shape of the name, and on a binary with no
-        // symbols every name is invented in a shape it accepts: `buf + len` read
-        // as two pointers, the first orientation that got past the checks below
-        // decided it, and `buf[len] = 0` came out as `len[buf] = 0` -- a write
-        // through a length. So the typed reading is settled first, and the
-        // name-shaped one only answers what the types leave open.
-        for (base, index) in orientations {
-            let normalized_base = self.normalize_pointer_base_expr(base, 0);
-            if self.expr_type_answers_pointer(&normalized_base) == Some(true)
-                && self.expr_type_answers_pointer(index) == Some(false)
-                && let Some(indexed) =
-                    self.subscript_expr_for_base_and_index(normalized_base, index, elem_ty)
-            {
-                return Some(indexed);
+        let already_typed = matches!(
+            base.as_ref(),
+            CExpr::Cast {
+                ty: CType::Pointer(_),
+                ..
             }
+        );
+        if elem_bytes <= 1 || already_typed {
+            return CExpr::Subscript { base, index };
         }
-
-        for (base, index) in orientations {
-            let normalized_base = self.normalize_pointer_base_expr(base, 0);
-            if !(self.looks_like_pointer(&normalized_base)
-                || self.is_non_index_pointer_expr(&normalized_base))
-            {
-                continue;
-            }
-            if self.looks_like_pointer(index) || self.is_non_index_pointer_expr(index) {
-                continue;
-            }
-            let Some(indexed) =
-                self.subscript_expr_for_base_and_index(normalized_base, index, elem_ty)
-            else {
-                continue;
-            };
-            return Some(indexed);
+        match Self::index_in_elements(&index, elem_bytes) {
+            Some(unscaled) => CExpr::Subscript {
+                base: Box::new(CExpr::cast(CType::ptr(elem_ty.clone()), *base)),
+                index: Box::new(unscaled),
+            },
+            None => CExpr::Deref(Box::new(CExpr::cast(
+                CType::ptr(elem_ty.clone()),
+                CExpr::binary(
+                    BinaryOp::Add,
+                    CExpr::cast(CType::ptr(CType::UInt(8)), *base),
+                    *index,
+                ),
+            ))),
         }
-
-        None
     }
 
-    fn scaled_index_expr(&self, expr: &CExpr, elem_size: u32) -> Option<CExpr> {
-        if elem_size <= 1 {
-            return Some(expr.clone());
-        }
-
-        match expr {
+    fn index_in_elements(index: &CExpr, elem_bytes: u32) -> Option<CExpr> {
+        match index {
+            CExpr::Paren(inner) => Self::index_in_elements(inner, elem_bytes),
             CExpr::Binary {
                 op: BinaryOp::Mul,
                 left,
                 right,
-            } => {
-                if self.literal_to_i64(right) == Some(i64::from(elem_size)) {
-                    return Some((**left).clone());
+            } => match (left.as_ref(), right.as_ref()) {
+                (other, CExpr::IntLit(value)) | (CExpr::IntLit(value), other)
+                    if *value == i64::from(elem_bytes) =>
+                {
+                    Some(other.clone())
                 }
-                if self.literal_to_i64(left) == Some(i64::from(elem_size)) {
-                    return Some((**right).clone());
-                }
-                None
-            }
-            CExpr::Binary {
-                op: BinaryOp::Shl,
-                left,
-                right,
-            } => {
-                let shift = self.literal_to_i64(right)?;
-                if !(0..=30).contains(&shift) {
-                    return None;
-                }
-                (1u32.checked_shl(shift as u32)? == elem_size).then(|| (**left).clone())
+                _ => None,
+            },
+            CExpr::IntLit(value) if value % i64::from(elem_bytes) == 0 => {
+                Some(CExpr::IntLit(value / i64::from(elem_bytes)))
             }
             _ => None,
         }
     }
+
     pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        if let Some(value) = var.constant_bits() {
+        if let Some(value) = self.certified_const_bits(var) {
             return Some(if value > 0x7fff_ffff {
                 CExpr::UIntLit(value)
             } else {
@@ -709,9 +632,6 @@ impl<'a> FoldingContext<'a> {
         let expr = self
             .render_certified_address_expr_for_var(&addr, 0, &mut HashSet::new())
             .or_else(|| self.render_certified_value_expr_for_var(&addr))?;
-        if self.expr_contains_raw_stack_base_arithmetic(&expr) {
-            return None;
-        }
         Some((addr, expr))
     }
 
@@ -724,7 +644,7 @@ impl<'a> FoldingContext<'a> {
         if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
             return None;
         }
-        if var.constant_bits().is_some() {
+        if self.certified_const_bits(var).is_some() {
             return self.render_certified_value_expr_for_var(var);
         }
         let prepared = self.prepared_ssa()?;
@@ -912,7 +832,7 @@ impl<'a> FoldingContext<'a> {
         if depth > 4 {
             return None;
         }
-        if let Some(value) = var.constant_bits() {
+        if let Some(value) = self.certified_const_bits(var) {
             return Some(value);
         }
         let prepared = self.prepared_ssa()?;
@@ -937,224 +857,5 @@ impl<'a> FoldingContext<'a> {
             ),
             _ => None,
         }
-    }
-
-    pub(super) fn render_authoritative_memory_access_by_name(
-        &self,
-        name: &str,
-        elem_size: u32,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if !self.enter_resolution_guard(ResolutionPhase::Memory, name) {
-            return None;
-        }
-
-        let result = self.render_memory_access_by_name(name, elem_size, depth, visited);
-
-        self.leave_resolution_guard(ResolutionPhase::Memory, name);
-        result
-    }
-
-    pub(super) fn render_canonical_load_expr(
-        &self,
-        dst: &SSAVar,
-        addr: &SSAVar,
-        elem_ty: CType,
-    ) -> OpLoweringResult<CExpr> {
-        let memo_key = self
-            .prepared_value_id_for_var(dst)
-            .map(|value| (value, elem_ty.to_string()));
-        if let Some(cached) = memo_key
-            .as_ref()
-            .and_then(|key| self.load_expr_memo.borrow().get(key).cloned())
-        {
-            return Ok(cached);
-        }
-        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty.clone())?;
-        // A subscript on an integer base does not say what it reads, and the
-        // width is known here. Left unstated, every consumer invents one: the
-        // corpus harness rewrites `x[i]` as `((unsigned char *)x)[i]`, so
-        // murmur3's dword read became a byte read and the hash came out wrong.
-        let rendered = self.typed_subscript_access(rendered, &elem_ty);
-        if let Some(key) = memo_key {
-            self.load_expr_memo
-                .borrow_mut()
-                .insert(key, rendered.clone());
-        }
-        Ok(rendered)
-    }
-
-    /// State the pointee an integer-based subscript reads.
-    ///
-    /// The index counts bytes -- the lifter scaled it when it built the address
-    /// -- so widening the pointee means dividing that scaling back out, or the
-    /// read moves: `((uint32_t *)data)[i * 4]` lands at `i * 16`.
-    fn typed_subscript_access(&self, expr: CExpr, elem_ty: &CType) -> CExpr {
-        let CExpr::Subscript { base, index } = expr else {
-            return expr;
-        };
-        let elem_bytes = match elem_ty {
-            CType::Int(bits) | CType::UInt(bits) | CType::Float(bits) => bits / 8,
-            _ => 0,
-        };
-        let already_typed = matches!(
-            base.as_ref(),
-            CExpr::Cast {
-                ty: CType::Pointer(_),
-                ..
-            }
-        );
-        if elem_bytes <= 1 || already_typed {
-            return CExpr::Subscript { base, index };
-        }
-        let scaled = match index.as_ref() {
-            CExpr::Var(name) => self
-                .definition_of(&self.spelling(*name))
-                .unwrap_or_else(|| (*index).clone()),
-            other => other.clone(),
-        };
-        match Self::index_in_elements(&scaled, elem_bytes) {
-            Some(unscaled) => CExpr::Subscript {
-                base: Box::new(CExpr::cast(CType::ptr(elem_ty.clone()), *base)),
-                index: Box::new(unscaled),
-            },
-            None => CExpr::Deref(Box::new(CExpr::cast(
-                CType::ptr(elem_ty.clone()),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::cast(CType::ptr(CType::UInt(8)), *base),
-                    *index,
-                ),
-            ))),
-        }
-    }
-
-    /// A byte-counting index expressed in elements, when it divides exactly.
-    fn index_in_elements(index: &CExpr, elem_bytes: u32) -> Option<CExpr> {
-        match index {
-            CExpr::Paren(inner) => Self::index_in_elements(inner, elem_bytes),
-            CExpr::Binary {
-                op: BinaryOp::Mul,
-                left,
-                right,
-            } => match (left.as_ref(), right.as_ref()) {
-                (other, CExpr::IntLit(value)) | (CExpr::IntLit(value), other)
-                    if *value == i64::from(elem_bytes) =>
-                {
-                    Some(other.clone())
-                }
-                _ => None,
-            },
-            CExpr::IntLit(value) if value % i64::from(elem_bytes) == 0 => {
-                Some(CExpr::IntLit(value / i64::from(elem_bytes)))
-            }
-            _ => None,
-        }
-    }
-
-    fn render_canonical_load_expr_uncached(
-        &self,
-        dst: &SSAVar,
-        addr: &SSAVar,
-        elem_ty: CType,
-    ) -> OpLoweringResult<CExpr> {
-        if let Some(named) = self.prepared_named_memory_expr_for_value(dst) {
-            return Ok(named);
-        }
-        let pointee_load = dst.size < addr.size;
-        // One resolver. `get_expr` already tries forwarding, then semantic
-        // values, then the recorded definition, then the name, and the two
-        // lookups that used to run ahead of it are the third and a variant of
-        // it -- so putting them first meant an address was resolved by a rule
-        // that had not been told what the value forwards to, while the decision
-        // to leave that value's statement out was taken by a rule that had.
-        let fallback_addr_expr = self.get_expr(addr)?;
-        let mut semantic_visited = HashSet::new();
-        let mut best = self.render_authoritative_memory_access_by_name(
-            &dst.display_name(),
-            dst.size,
-            0,
-            &mut semantic_visited,
-        );
-        best = self.choose_preferred_visible_expr(
-            best,
-            self.render_authoritative_memory_access_by_name(
-                &addr.display_name(),
-                dst.size,
-                0,
-                &mut semantic_visited,
-            ),
-        );
-        let fallback_rendered = self.render_memory_access_from_visible_expr(
-            &fallback_addr_expr,
-            dst.size,
-            0,
-            &mut semantic_visited,
-        );
-        if let Some(fallback_structured) = fallback_rendered
-            .as_ref()
-            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
-            .cloned()
-            && !best
-                .as_ref()
-                .is_some_and(Self::expr_is_structured_memory_candidate)
-        {
-            best = Some(fallback_structured);
-        }
-        best = self.choose_preferred_visible_expr(best, fallback_rendered);
-        if let Some(expr) = best {
-            if let CExpr::Deref(inner) = &expr
-                && let Some(indexed) = self.indexed_pointer_add_expr(inner, &elem_ty)
-            {
-                return Ok(indexed);
-            }
-            return Ok(expr);
-        }
-
-        if pointee_load {
-            let ptr_ty = CType::ptr(elem_ty.clone());
-            let casted =
-                self.cast_addr_expr_to_ptr_if_needed(addr, fallback_addr_expr.clone(), &ptr_ty);
-            return Ok(CExpr::Deref(Box::new(casted)));
-        }
-
-        if dst.size >= addr.size
-            && let Some(stack_var) = self.stack_var_expr_for_addr_var(addr)
-        {
-            return Ok(stack_var);
-        }
-
-        if addr.constant_bits().is_some()
-            && matches!(&fallback_addr_expr, CExpr::Var(_) | CExpr::StringLit(_))
-        {
-            return Ok(fallback_addr_expr);
-        }
-
-        Ok(self.typed_deref_expr(addr, fallback_addr_expr, elem_ty))
-    }
-
-    pub(super) fn render_memory_access_from_visible_expr(
-        &self,
-        expr: &CExpr,
-        elem_size: u32,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        self.render_memory_access_from_visible_expr_with_direction(
-            expr, elem_size, false, depth, visited,
-        )
-    }
-
-    fn render_memory_access_from_visible_expr_with_direction(
-        &self,
-        expr: &CExpr,
-        elem_size: u32,
-        _is_write: bool,
-        _depth: u32,
-        _visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        let elem_ty = type_from_size(elem_size);
-        self.indexed_pointer_add_expr(expr, &elem_ty)
     }
 }

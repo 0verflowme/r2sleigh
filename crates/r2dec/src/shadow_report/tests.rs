@@ -133,7 +133,6 @@ fn matching_snapshot(
 fn classification_truth_table_includes_equal_and_different_both_wrong() {
     let correct = SideJudgment::Correct;
     let wrong = SideJudgment::Wrong(WrongReason::DispositionMismatch);
-    let unknown = SideJudgment::Unclassified(UnclassifiedReason::MalformedObservation);
     assert_eq!(
         classify_sides(correct, correct, true),
         ShadowClassification::AgreeCorrect
@@ -153,27 +152,6 @@ fn classification_truth_table_includes_equal_and_different_both_wrong() {
     assert_eq!(
         classify_sides(wrong, wrong, false),
         ShadowClassification::BothWrong(BothWrongRelation::Different)
-    );
-    assert_eq!(
-        classify_sides(unknown, correct, false),
-        ShadowClassification::Unclassified {
-            old: true,
-            shadow: false,
-        }
-    );
-    assert_eq!(
-        classify_sides(correct, unknown, false),
-        ShadowClassification::Unclassified {
-            old: false,
-            shadow: true,
-        }
-    );
-    assert_eq!(
-        classify_sides(unknown, unknown, true),
-        ShadowClassification::Unclassified {
-            old: true,
-            shadow: true,
-        }
     );
 }
 
@@ -444,7 +422,7 @@ fn validation_rederives_every_stored_cell_field() {
         }
     });
     assert_mutation(ReportCellField::OldJudgment, |cell| {
-        cell.old = SideJudgment::Unclassified(UnclassifiedReason::MalformedObservation)
+        cell.old = SideJudgment::Wrong(WrongReason::EquivalenceClassMismatch)
     });
     assert_mutation(ReportCellField::ShadowJudgment, |cell| {
         cell.shadow = SideJudgment::Wrong(WrongReason::DispositionMismatch)

@@ -1354,6 +1354,7 @@ pub(crate) fn inspect_render_observations<E>(
 /// Marker validation and observer callbacks both complete before mutation.
 /// On success the already-validated AST is stripped without a redundant
 /// validation pass.
+#[cfg(test)]
 pub(crate) fn inspect_and_strip_render_observations<E>(
     function: &mut CFunction,
     expected_count: usize,

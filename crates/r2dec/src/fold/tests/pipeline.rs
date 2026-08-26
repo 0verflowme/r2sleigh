@@ -23,10 +23,7 @@ mod tests {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
     }
 
-    use r2types::{
-        CalleeFact, CalleeReturnRelation, ExternalStackBase, ExternalStackVarSpec, StackSlotKey,
-        VisibleBinding, VisibleBindingKind,
-    };
+    use r2types::{CalleeFact, CalleeReturnRelation};
 
     #[derive(Debug, Clone)]
     struct FunctionType {
@@ -93,15 +90,6 @@ mod tests {
 
     fn make_var(name: &str, version: u32, size: u32) -> SSAVar {
         SSAVar::new(name, version, size)
-    }
-
-    fn make_block(ops: Vec<SSAOp>) -> SSABlock {
-        SSABlock {
-            addr: 0x1000,
-            size: 4,
-            ops,
-            phis: Vec::new(),
-        }
     }
 
     fn make_test_arch_x86_64() -> ArchSpec {
@@ -520,27 +508,6 @@ mod tests {
         });
     }
 
-    fn stack_var_spec(name: &str, ty: Option<CType>, base: Option<&str>) -> ExternalStackVarSpec {
-        ExternalStackVarSpec {
-            name: name.to_string(),
-            ty: ty.as_ref().map(crate::ctype_to_type_like),
-            base: match base.map(|raw| raw.to_ascii_lowercase()) {
-                Some(raw) if raw == "rbp" || raw == "ebp" || raw == "bp" || raw == "fp" => {
-                    r2types::ExternalStackBase::FramePointer
-                }
-                Some(raw) if raw == "rsp" || raw == "esp" || raw == "sp" => {
-                    r2types::ExternalStackBase::StackPointer
-                }
-                Some(raw) => r2types::ExternalStackBase::Named(raw),
-                None => r2types::ExternalStackBase::default(),
-            },
-            role: r2types::ExternalStackSlotRole::Unknown,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        }
-    }
-
     fn minimal_callee_fact(addr: u64, name: &str) -> CalleeFact {
         minimal_callee_fact_with_linkage(addr, name, r2types::CalleeLinkage::Unknown)
     }
@@ -588,80 +555,6 @@ mod tests {
         fact
     }
 
-    fn install_minimal_import_callee_facts(ctx: &mut FoldingContext<'_>, facts: &[(u64, &str)]) {
-        install_function_callee_facts(
-            ctx,
-            facts
-                .iter()
-                .map(|(addr, name)| (*addr, minimal_import_callee_fact(*addr, name)))
-                .collect(),
-        );
-    }
-
-    fn visible_stack_binding(name: &str, ty: Option<CType>, offset: i64) -> VisibleBinding {
-        VisibleBinding {
-            name: name.to_string(),
-            ty: ty.as_ref().map(crate::ctype_to_type_like),
-            kind: VisibleBindingKind::Local,
-            stack_slot: Some(StackSlotKey {
-                base: ExternalStackBase::FramePointer,
-                offset,
-            }),
-            param_index: None,
-            source_reg: None,
-        }
-    }
-
-    fn make_aarch64_ctx<'a>() -> FoldingContext<'a> {
-        let arch = Box::leak(Box::new(FoldArchConfig {
-            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-            ptr_size: 8,
-            sp_name: "sp".to_string(),
-            fp_name: "x29".to_string(),
-            ret_reg_name: "x0".to_string(),
-            arg_regs: vec![
-                "x0".to_string(),
-                "x1".to_string(),
-                "x2".to_string(),
-                "x3".to_string(),
-                "x4".to_string(),
-                "x5".to_string(),
-                "x6".to_string(),
-                "x7".to_string(),
-            ],
-            caller_saved_regs: HashSet::new(),
-        }));
-        let empty_u64 = Box::leak(Box::new(HashMap::new()));
-        let empty_stack = Box::leak(Box::new(HashMap::new()));
-        let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
-        let empty_visible = Box::leak(Box::new(Vec::new()));
-        FoldingContext::from_inputs(FoldInputs {
-            normalization_origins: None,
-            observation_journal: None,
-            binding_names: None,
-            display_names: crate::empty_display_names(),
-            arch,
-            function_names: empty_u64,
-            strings: empty_u64,
-            binary_symbols: empty_u64,
-            function_facts: empty_function_facts(),
-            certified_rendering_required: false,
-            stack_slots: empty_stack_slots,
-            external_stack_vars: empty_stack,
-            visible_bindings: empty_visible,
-            external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
-            type_oracle: None,
-            function_return_type: None,
-            prepared_ssa: None,
-            prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
-        })
-    }
-
     fn make_x86_64_ctx<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
             flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
@@ -683,7 +576,6 @@ mod tests {
             caller_saved_regs: HashSet::new(),
         }));
         let empty_u64 = Box::leak(Box::new(HashMap::new()));
-        let empty_stack = Box::leak(Box::new(HashMap::new()));
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         FoldingContext::from_inputs(FoldInputs {
@@ -696,17 +588,12 @@ mod tests {
             strings: empty_u64,
             binary_symbols: empty_u64,
             function_facts: empty_function_facts(),
-            certified_rendering_required: false,
             stack_slots: empty_stack_slots,
-            external_stack_vars: empty_stack,
             visible_bindings: empty_visible,
-            external_type_db: Box::leak(Box::new(r2types::ExternalTypeDb::default())),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
         })
     }
 
@@ -841,7 +728,6 @@ mod tests {
             .clone()
             .with_decompile_route(standard_route_for_test("test typed render facts"));
         install_function_facts(ctx, facts);
-        ctx.inputs.certified_rendering_required = true;
     }
 
     fn make_x86_64_ctx_with_prepared<'a>(
@@ -1209,20 +1095,15 @@ mod tests {
             plan.binding_role(parameter_binding),
             Some(crate::binding_plan::BindingRole::Parameter { slot: 0 })
         );
-        let parameter_symbol = match names
+        let crate::binding_plan::PlannedParameterSymbol::Bound {
+            symbol: parameter_symbol,
+            ..
+        } = names
             .require_parameter_slot(0)
-            .expect("parameter binding name")
-        {
-            crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. } => symbol,
-            other => panic!("exact parameter must have one symbol: {other:?}"),
-        };
-        let stack_symbol = match names
+            .expect("parameter binding name");
+        let crate::binding_plan::PlannedStackSymbol::Bound(stack_symbol) = names
             .require_stack(object)
-            .expect("stack-home binding name")
-        {
-            crate::binding_plan::PlannedStackSymbol::Bound(symbol) => symbol,
-            other => panic!("exact parameter home must have one symbol: {other:?}"),
-        };
+            .expect("stack-home binding name");
         assert_eq!(stack_symbol, parameter_symbol);
     }
 
@@ -1559,158 +1440,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_stack_read_modify_write_drops_addr_of_aliases() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.set_external_stack_vars(HashMap::from([
-            (-8, stack_var_spec("sum", Some(CType::Int(32)), Some("rbp"))),
-            (-4, stack_var_spec("i", Some(CType::Int(32)), Some("rbp"))),
-        ]));
-        ctx.inputs.visible_bindings = Box::leak(Box::new(vec![
-            visible_stack_binding("sum", Some(CType::Int(32)), -8),
-            visible_stack_binding("i", Some(CType::Int(32)), -4),
-        ]));
-        ctx.state.analysis_ctx.stack_info.stack_vars =
-            HashMap::from([(-8, "sum".to_string()), (-4, "i".to_string())]);
-
-        let sum_rhs = ctx.collapse_scalar_stack_addr_artifact(CExpr::binary(
-            BinaryOp::Add,
-            CExpr::AddrOf(Box::new(ctx.name_ref("sum"))),
-            CExpr::Subscript {
-                base: Box::new(ctx.name_ref("arr")),
-                index: Box::new(ctx.name_ref("i")),
-            },
-        ));
-        let i_rhs =
-            ctx.rewrite_scalar_stack_placeholder_rhs(&ctx.name_ref("i"), ctx.name_ref("local_3"));
-        let cross_slot_rhs = ctx
-            .rewrite_scalar_stack_placeholder_rhs(&ctx.name_ref("sum"), ctx.name_ref("local_17"));
-
-        assert!(
-            expr_contains_var(&ctx, &sum_rhs, "sum") && !expr_contains_addr_of(&sum_rhs),
-            "scalar sum update should not expose address aliases: {sum_rhs:?}"
-        );
-        assert_eq!(
-            i_rhs,
-            ctx.name_ref("local_3"),
-            "adjacent stack placeholders must not become source-shaped scalar arithmetic without value proof"
-        );
-        assert_eq!(
-            cross_slot_rhs,
-            ctx.name_ref("local_17"),
-            "large cross-slot placeholder deltas must not be rewritten as scalar arithmetic"
-        );
-    }
-
-    #[test]
-    fn canonical_frame_stack_slot_offsets_are_rmw_candidates() {
-        let mut ctx = make_x86_64_ctx();
-        ctx.set_external_stack_vars(HashMap::from([(
-            -8,
-            stack_var_spec("count", Some(CType::UInt(64)), Some("rbp")),
-        )]));
-        ctx.state.analysis_ctx.stack_info.stack_vars = HashMap::from([(-8, "count".to_string())]);
-
-        let offsets = ctx.stack_offsets_for_visible_storage_name({
-            let CExpr::Var(id) = ctx.name_ref("count") else {
-                unreachable!()
-            };
-            id
-        });
-        assert!(offsets.contains(&-8), "keeps derived offset: {offsets:?}");
-        assert!(
-            offsets.contains(&8),
-            "canonical frame-pointer stack slot should be available as an RMW proof candidate: {offsets:?}"
-        );
-    }
-
-    fn expr_contains_var(ctx: &FoldingContext<'_>, expr: &CExpr, target: &str) -> bool {
-        match expr {
-            CExpr::Observed { expr, .. } => expr_contains_var(ctx, expr, target),
-            CExpr::External { .. } => false,
-            CExpr::Var(name) => &*ctx.spelling(*name) == target,
-            CExpr::Unary { operand, .. }
-            | CExpr::Paren(operand)
-            | CExpr::Deref(operand)
-            | CExpr::AddrOf(operand)
-            | CExpr::Sizeof(operand)
-            | CExpr::Cast { expr: operand, .. } => expr_contains_var(ctx, operand, target),
-            CExpr::Binary { left, right, .. } => {
-                expr_contains_var(ctx, left, target) || expr_contains_var(ctx, right, target)
-            }
-            CExpr::Subscript { base, index } => {
-                expr_contains_var(ctx, base, target) || expr_contains_var(ctx, index, target)
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                expr_contains_var(ctx, base, target)
-            }
-            CExpr::Call { func, args, .. } => {
-                expr_contains_var(ctx, func, target)
-                    || args.iter().any(|arg| expr_contains_var(&ctx, arg, target))
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                expr_contains_var(ctx, cond, target)
-                    || expr_contains_var(ctx, then_expr, target)
-                    || expr_contains_var(ctx, else_expr, target)
-            }
-            CExpr::Comma(items) => items
-                .iter()
-                .any(|item| expr_contains_var(&ctx, item, target)),
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::SizeofType(_) => false,
-        }
-    }
-
-    fn expr_contains_addr_of(expr: &CExpr) -> bool {
-        match expr {
-            CExpr::Observed { expr, .. } => expr_contains_addr_of(expr),
-            CExpr::AddrOf(_) => true,
-            CExpr::External { .. } => false,
-            CExpr::Unary { operand, .. }
-            | CExpr::Paren(operand)
-            | CExpr::Deref(operand)
-            | CExpr::Sizeof(operand)
-            | CExpr::Cast { expr: operand, .. } => expr_contains_addr_of(operand),
-            CExpr::Binary { left, right, .. } => {
-                expr_contains_addr_of(left) || expr_contains_addr_of(right)
-            }
-            CExpr::Subscript { base, index } => {
-                expr_contains_addr_of(base) || expr_contains_addr_of(index)
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                expr_contains_addr_of(base)
-            }
-            CExpr::Call { func, args, .. } => {
-                expr_contains_addr_of(func) || args.iter().any(expr_contains_addr_of)
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                expr_contains_addr_of(cond)
-                    || expr_contains_addr_of(then_expr)
-                    || expr_contains_addr_of(else_expr)
-            }
-            CExpr::Comma(items) => items.iter().any(expr_contains_addr_of),
-            CExpr::Var(_)
-            | CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::SizeofType(_) => false,
-        }
-    }
-
-    #[test]
     fn test_constant_parsing() {
         assert_eq!(parse_const_value("const:0x42"), Some(0x42));
         assert_eq!(parse_const_value("const:42"), Some(0x42));
@@ -2004,14 +1733,6 @@ mod tests {
     }
 
     #[test]
-    fn arm64_register_names_are_arch_metadata_not_effect_proof() {
-        let ctx = FoldingContext::new(64);
-        assert!(ctx.inputs.arch.is_register_like_base_name("x8"));
-        assert!(ctx.inputs.arch.is_register_like_base_name("w9"));
-        assert!(ctx.inputs.arch.is_register_like_base_name("x30"));
-    }
-
-    #[test]
     fn should_inline_requires_the_exact_sealed_disposition() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -2066,21 +1787,6 @@ mod tests {
                     .expect("bound destination symbol")
             ))
         );
-    }
-
-    #[test]
-    fn low_signal_visible_name_uses_typed_storage_kind_and_display_heuristics() {
-        let ctx = FoldingContext::new(64);
-
-        assert!(ctx.is_low_signal_visible_name("tmp:1_0"));
-        assert!(ctx.is_low_signal_visible_name("CONST:1_0"));
-        assert!(ctx.is_low_signal_visible_name("RAM:401000_0"));
-        assert!(ctx.is_low_signal_visible_name("tmp_loop_counter"));
-        assert!(ctx.is_low_signal_visible_name("t19"));
-        assert!(ctx.is_low_signal_visible_name("v3e_2"));
-        assert!(!ctx.is_low_signal_visible_name("space1:20"));
-        assert!(!ctx.is_low_signal_visible_name("value"));
-        assert!(!ctx.is_low_signal_visible_name("rax_1"));
     }
 
     #[test]
@@ -2216,23 +1922,6 @@ mod tests {
 
         assert!(reachable.contains(use_id));
         assert_eq!(function.body, vec![plain]);
-    }
-
-    #[test]
-    fn scalar_address_artifact_classification_is_observation_transparent() {
-        let ctx = FoldingContext::new(64);
-        let plain = CExpr::AddrOf(Box::new(ctx.name_ref("local_8")));
-        let mut owner = crate::ast::RenderObservationOwner::new();
-        let (_, observed) = owner
-            .observe_expr(plain.clone())
-            .expect("address observation");
-
-        assert!(ctx.expr_is_address_artifact_in_scalar_context(&plain));
-        assert_eq!(
-            ctx.expr_is_address_artifact_in_scalar_context(&observed),
-            ctx.expr_is_address_artifact_in_scalar_context(&plain),
-            "observation metadata must not change scalar address classification"
-        );
     }
 
     #[test]
@@ -2380,100 +2069,6 @@ mod tests {
         assert_eq!(
             or,
             CExpr::binary(BinaryOp::BitOr, ctx.name_ref("x"), CExpr::IntLit(1))
-        );
-    }
-
-    #[test]
-    fn raw_callee_fact_name_does_not_resolve_normalized_alias_without_typed_resolution() {
-        let mut ctx = make_aarch64_ctx();
-        install_function_callee_facts(
-            &mut ctx,
-            BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]),
-        );
-
-        let identity = ctx.callee_identity_for_name("printf");
-
-        assert_eq!(identity.target_addr, None);
-        assert_eq!(identity.normalized_name(), "printf");
-        assert!(
-            !ctx.callee_target_policy_for_identity(&identity).imported,
-            "raw callee facts must not resolve normalized aliases outside typed callee resolution",
-        );
-    }
-
-    #[test]
-    fn typed_callee_resolution_resolves_normalized_alias_without_import_policy() {
-        let mut ctx = make_aarch64_ctx();
-        let callee_facts =
-            BTreeMap::from([(0x401000, minimal_callee_fact(0x401000, "sym.imp.printf"))]);
-        let function_names = HashMap::new();
-        let binary_symbols = HashMap::new();
-        let known_signatures = HashMap::new();
-        let resolution =
-            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
-                function_names: &function_names,
-                symbols: &binary_symbols,
-                callee_facts: &callee_facts,
-                known_function_signatures: &known_signatures,
-            });
-        install_function_callee_facts(&mut ctx, callee_facts);
-        mutate_function_facts(&mut ctx, |function_facts| {
-            function_facts.set_callee_resolution(resolution);
-        });
-
-        let identity = ctx.callee_identity_for_name("printf");
-
-        assert_eq!(identity.target_addr, Some(0x401000));
-        assert_eq!(identity.normalized_name(), "printf");
-        assert!(
-            !ctx.callee_target_policy_for_identity(&identity).imported,
-            "typed normalized aliases resolve identity, but import-looking names are not import authority",
-        );
-    }
-
-    #[test]
-    fn typed_callee_resolution_authorizes_import_policy_with_explicit_linkage() {
-        let mut ctx = make_aarch64_ctx();
-        let callee_facts = BTreeMap::from([(
-            0x401000,
-            minimal_import_callee_fact(0x401000, "sym.imp.printf"),
-        )]);
-        let function_names = HashMap::new();
-        let binary_symbols = HashMap::new();
-        let known_signatures = HashMap::new();
-        let resolution =
-            r2types::CalleeResolutionFacts::from_context(&r2types::CalleeIdentityContext {
-                function_names: &function_names,
-                symbols: &binary_symbols,
-                callee_facts: &callee_facts,
-                known_function_signatures: &known_signatures,
-            });
-        install_function_callee_facts(&mut ctx, callee_facts);
-        mutate_function_facts(&mut ctx, |function_facts| {
-            function_facts.set_callee_resolution(resolution);
-        });
-
-        let identity = ctx.callee_identity_for_name("printf");
-
-        assert_eq!(identity.target_addr, Some(0x401000));
-        assert_eq!(identity.normalized_name(), "printf");
-        assert!(
-            ctx.callee_target_policy_for_identity(&identity).imported,
-            "explicit imported linkage authorizes import policy after normalized fact lookup",
-        );
-    }
-
-    #[test]
-    fn callee_fact_name_fallback_rejects_empty_normalized_alias_collisions() {
-        let mut ctx = make_aarch64_ctx();
-        install_minimal_import_callee_facts(&mut ctx, &[(0x401000, "imp.")]);
-
-        let identity = ctx.callee_identity_for_name("sym.imp.");
-
-        assert_eq!(identity.target_addr, None);
-        assert!(
-            !ctx.callee_target_policy_for_identity(&identity).imported,
-            "empty normalized aliases must not bind unrelated import-looking callee facts",
         );
     }
 
@@ -2636,26 +2231,6 @@ mod tests {
         assert!(
             else_preserves_return_zero,
             "else arm should preserve the raw SSA definition RAX_2 = 0"
-        );
-    }
-
-    #[test]
-    fn visible_expression_quality_is_observation_transparent_in_supported_contexts() {
-        let ctx = make_x86_64_ctx();
-        let plain = CExpr::binary(BinaryOp::Ne, ctx.name_ref("arg1"), CExpr::IntLit(0));
-        let mut owner = crate::ast::RenderObservationOwner::new();
-        let (_, inner) = owner
-            .observe_expr(plain.clone())
-            .expect("inner quality observation");
-        let (_, marked) = owner
-            .observe_expr(inner)
-            .expect("outer quality observation");
-
-        let context = VisibleExprContext::Generic;
-        assert_eq!(
-            ctx.debug_visible_expr_quality(&marked, context),
-            ctx.debug_visible_expr_quality(&plain, context),
-            "observation wrappers must have zero ranking weight"
         );
     }
 
@@ -3139,7 +2714,7 @@ mod tests {
             CertifiedRenderContext::new(&prepared, &render),
         );
         assert_eq!(
-            adapter.call_arg_expr((0x1000, 2), 0, arg_value, |_| false),
+            adapter.call_arg_expr((0x1000, 2), 0, arg_value),
             Some(crate::symbol::var_ref(&symbols, "n"))
         );
 
@@ -3149,10 +2724,7 @@ mod tests {
             &view,
             CertifiedRenderContext::new(&prepared, &unrenderable),
         );
-        assert_eq!(
-            adapter.call_arg_expr((0x1000, 2), 0, arg_value, |_| false),
-            None
-        );
+        assert_eq!(adapter.call_arg_expr((0x1000, 2), 0, arg_value), None);
 
         let wrong_value_view =
             prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
@@ -3161,22 +2733,7 @@ mod tests {
             &wrong_value_view,
             CertifiedRenderContext::new(&prepared, &render),
         );
-        assert_eq!(
-            adapter.call_arg_expr((0x1000, 2), 0, arg_value, |_| false),
-            None
-        );
-
-        let raw_storage_view =
-            prepared_view(arg_value, crate::symbol::var_ref(&symbols, "tmp:raw_1"));
-        let adapter = CertifiedRenderPlan::new(
-            &function_facts,
-            &raw_storage_view,
-            CertifiedRenderContext::new(&prepared, &render),
-        );
-        assert_eq!(
-            adapter.call_arg_expr((0x1000, 2), 0, arg_value, |_| true),
-            None
-        );
+        assert_eq!(adapter.call_arg_expr((0x1000, 2), 0, arg_value), None);
     }
 
     #[test]

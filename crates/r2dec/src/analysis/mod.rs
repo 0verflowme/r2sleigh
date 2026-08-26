@@ -14,8 +14,7 @@ pub(crate) mod prepared_semantic;
 pub(crate) mod utils;
 
 pub(crate) use prepared_semantic::{
-    PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView,
-    PreparedSemanticViewInputs,
+    PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView, PreparedSemanticViewInputs,
     build_prepared_runtime_facts_with_control,
 };
 
@@ -46,11 +45,6 @@ impl DecompilerFacts {
     pub(crate) fn semantic(&self) -> &UseInfo {
         &self.use_info
     }
-
-    pub(crate) fn stack(&self) -> &StackInfo {
-        &self.stack_info
-    }
-
 }
 
 /// No condition codes, for a fixture whose target states none.
@@ -175,10 +169,6 @@ impl ValueRef {
             value_id: Some(value_id),
             var,
         }
-    }
-
-    pub(crate) fn display_name(&self) -> String {
-        self.var.display_name()
     }
 
     #[allow(dead_code)]
@@ -330,7 +320,6 @@ impl StackSlotProvenance {
             },
         }
     }
-
 }
 
 fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
@@ -579,7 +568,6 @@ impl UseInfo {
 
     #[cfg(test)]
     pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
-
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
@@ -605,35 +593,11 @@ impl UseInfo {
         if self.ambiguous_value_ids.contains(&value) {
             return 0;
         }
-        self.use_counts_by_value
-            .get(&value)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.definitions_by_value.get(&value_id)
-    }
-
-    /// The definition of a value, asked for by the value.
-    ///
-    /// One precedence. `definition_for_name` and `definition_for_var` both ask
-    /// the value-keyed store first and fall back to the name-keyed one; this
-    /// asked in the opposite order, so the same question had two answers
-    /// depending on which accessor a caller happened to reach for. A value is
-    /// the identity here -- a name can be ambiguous and a value cannot -- so the
-    /// value-keyed store wins, as it does everywhere else.
-    #[cfg(test)]
-    pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.definition_for_value(value_id)
+        self.use_counts_by_value.get(&value).copied().unwrap_or(0)
     }
 
     #[cfg(test)]
     pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-
         if self.ambiguous_value_names.contains(name) {
             return None;
         }
@@ -652,21 +616,6 @@ impl UseInfo {
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-    }
-
-    pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.semantic_values_by_value.get(&value_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_semantic_value_for_value(
-        &self,
-        value_id: ValueId,
-    ) -> Option<&SemanticValue> {
-        self.semantic_value_for_value(value_id)
     }
 
     #[cfg(test)]
@@ -695,21 +644,6 @@ impl UseInfo {
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
     }
 
-    pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.forwarded_values_by_value.get(&value_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_forwarded_value_for_value(
-        &self,
-        value_id: ValueId,
-    ) -> Option<&ValueProvenance> {
-        self.forwarded_value_for_value(value_id)
-    }
-
     #[cfg(test)]
     pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
         if self.ambiguous_value_names.contains(name) {
@@ -735,20 +669,6 @@ impl UseInfo {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
-        self.stack_slot_for_name(name)
-    }
-
     pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
         if self.ambiguous_value_vars.contains(var) {
             return None;
@@ -764,13 +684,6 @@ impl UseInfo {
         self.condition_values.contains(&value)
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
-        self.value_id_for_name(name)
-            .is_some_and(|value| self.is_condition_value(value))
-    }
-
 }
 
-impl StackInfo {
-}
+impl StackInfo {}

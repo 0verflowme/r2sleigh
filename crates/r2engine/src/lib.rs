@@ -5899,20 +5899,10 @@ fn build_engine_analysis_artifact(
         None
     };
     let pattern_ssa_blocks = semantic_analysis.ssa_func.local_ssa_blocks();
-    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
-    let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_ssa(
-        &semantic_analysis.ssa_func,
-        Some(arch_name.as_str()),
-        request.ptr_bits,
-        &mut diagnostics,
-    );
-    let local_field_accesses = r2types::local_field_accesses_from_struct_artifacts(&local_structs);
     let optional_semantics_required = optional_semantics_required_for_analysis(
         &request.parsed_context,
         &semantic_analysis.ssa_func,
         &pattern_ssa_blocks,
-        !local_field_accesses.is_empty(),
     );
     let semantic_artifact = (|| {
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
@@ -6145,7 +6135,6 @@ fn optional_semantics_required_for_analysis(
     parsed_context: &r2types::ParsedExternalContext,
     ssa_func: &SsaArtifact,
     pattern_ssa_blocks: &[r2ssa::SSABlock],
-    _has_local_field_accesses: bool,
 ) -> bool {
     if parsed_context_has_layout_hints(parsed_context) {
         return true;
@@ -8088,7 +8077,6 @@ mod tests {
             &parsed,
             &ssa,
             &pattern_blocks,
-            true,
         ));
 
         parsed.stack_slots.insert(
@@ -8114,7 +8102,6 @@ mod tests {
             &parsed,
             &ssa,
             &pattern_blocks,
-            false,
         ));
     }
 

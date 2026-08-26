@@ -1,14 +1,8 @@
 //! Authority-bound observations of the legacy renderer's final AST decisions.
 //!
 //! This module owns the only production allocator for render observation IDs.
-//! It is intentionally not wired into lowering yet: Stage 5 callers will mark
-//! exact occurrences, run every AST rewrite, then seal the dense source V/U/W
-//! snapshot from the final wrapped nodes.
-
-#![allow(
-    dead_code,
-    reason = "Stage 5 journal foundation is sealed before production cutover"
-)]
+//! Callers mark exact occurrences, run every AST rewrite, then seal the dense
+//! source V/U/W snapshot from the final wrapped nodes.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,9 +16,10 @@ use r2types::SourceOwnedFunctionFacts;
 
 use crate::ast::{
     BinaryOp, CExpr, CFunction, CStmt, RenderObservationInspectError, RenderObservationNode,
-    RenderObservationStripError, inspect_and_strip_render_observations,
-    inspect_render_observations,
+    RenderObservationStripError, inspect_render_observations,
 };
+#[cfg(test)]
+use crate::ast::inspect_and_strip_render_observations;
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch, ValueDisposition};
 use crate::codegen::{EmissionReadyFunction, prepare_function_for_emission};
 use crate::normalize::{
@@ -569,6 +564,7 @@ pub(crate) struct LegacyObservationCoverage {
 }
 
 impl LegacyObservationCoverage {
+    #[cfg(test)]
     pub(crate) fn equations_hold(self) -> bool {
         self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
     }
@@ -621,21 +617,11 @@ pub(crate) struct SurvivingEffectObservations {
 }
 
 impl SurvivingEffectObservations {
-    fn empty(source: &SsaArtifact) -> Self {
-        Self {
-            occurrences: source
-                .obligations()
-                .obligations()
-                .keys()
-                .map(|id| (*id, 0))
-                .collect(),
-        }
-    }
-
     pub(crate) fn occurrence_count(&self, id: SemanticObligationId) -> Option<usize> {
         self.occurrences.get(&id).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn surviving(
         &self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences
@@ -662,10 +648,7 @@ pub(crate) struct LegacyObservationJournal {
 
 enum LegacyObservationSeal {
     Complete(SealedLegacyObservations),
-    BindingFailure {
-        error: LegacyObservationJournalError,
-        effects: SurvivingEffectObservations,
-    },
+    BindingFailure(LegacyObservationJournalError),
 }
 
 /// Internal ownership boundary for an AST that may still contain markers.
@@ -893,6 +876,7 @@ impl From<NativePlacementFailure> for crate::PlacementAuditRefusal {
 }
 
 impl MarkedNativeDraft {
+    #[cfg(test)]
     pub(crate) fn new(function: CFunction, journal: LegacyObservationJournal) -> Self {
         Self {
             function,
@@ -966,6 +950,7 @@ impl MarkedNativeDraft {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn seal(
         self,
         source: &SourceOwnedFunctionFacts,
@@ -1007,7 +992,7 @@ impl MarkedNativeDraft {
         }
         let observations = match self.journal.seal_preserving_effects(source, &mut ready) {
             Ok(LegacyObservationSeal::Complete(observations)) => observations,
-            Ok(LegacyObservationSeal::BindingFailure { error, .. }) | Err(error) => {
+            Ok(LegacyObservationSeal::BindingFailure(error)) | Err(error) => {
                 return Err(BindingShadowAuditFailure::JournalSeal(
                     BindingObservationJournalFailure::from(&error),
                 ));
@@ -1057,42 +1042,16 @@ pub(crate) struct SealedNativeFunction {
 }
 
 impl SealedNativeFunction {
-    /// Build a marker-free native product when the observation journal could
-    /// not be initialized. The missing audit remains explicit to the caller.
-    pub(crate) fn without_observations(
-        function: CFunction,
-        plan: Rc<BindingPlan>,
-        source: &SsaArtifact,
-        failure: BindingShadowAuditFailure,
-        placement_audit: crate::PlacementAudit,
-    ) -> Self {
-        Self {
-            ready: prepare_function_for_emission(&function),
-            observations: None,
-            fallback_effects: Some(SurvivingEffectObservations::empty(source)),
-            effect_audit: crate::EffectObligationAudit::NOT_RUN,
-            placement_audit,
-            observation_failure: Some(failure),
-            plan,
-        }
-    }
-
     pub(crate) const fn emission(&self) -> &EmissionReadyFunction {
         &self.ready
     }
 
+    #[cfg(test)]
     pub(crate) fn observations(&self) -> &LegacyAnalysisSnapshot {
         self.observations
             .as_ref()
             .map(SealedLegacyObservations::snapshot)
             .expect("strictly sealed native function must retain observations")
-    }
-
-    pub(crate) fn observation_coverage(&self) -> LegacyObservationCoverage {
-        self.observations
-            .as_ref()
-            .map(SealedLegacyObservations::coverage)
-            .expect("strictly sealed native function must retain observation coverage")
     }
 
     pub(crate) fn audit_observations(
@@ -1645,6 +1604,7 @@ impl LegacyObservationJournal {
     /// This is the expression twin of [`Self::observe_normalized_output_stmt`].
     /// Both value and write identity come exclusively from the authority-bound
     /// normalized output projection retained by this journal.
+    #[cfg(test)]
     pub(crate) fn observe_normalized_output_expr(
         &mut self,
         site: NormalizedOpSite,
@@ -1819,6 +1779,7 @@ impl LegacyObservationJournal {
     /// this point. Effect markers have an independent source domain, so that
     /// failure must not erase the exact effect occurrences that reached the
     /// final emission tree.
+    #[cfg(test)]
     fn seal_effects_only(
         self,
         source: &SourceOwnedFunctionFacts,
@@ -1865,6 +1826,7 @@ impl LegacyObservationJournal {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn seal(
         self,
         source: &SourceOwnedFunctionFacts,
@@ -1872,14 +1834,14 @@ impl LegacyObservationJournal {
     ) -> Result<SealedLegacyObservations, LegacyObservationJournalError> {
         match self.seal_preserving_effects(source, ready)? {
             LegacyObservationSeal::Complete(observations) => Ok(observations),
-            LegacyObservationSeal::BindingFailure { error, .. } => Err(error),
+            LegacyObservationSeal::BindingFailure(error) => Err(error),
         }
     }
 
-    /// Inspect the final marker tree once, always accumulating the independent
-    /// effect stream while retaining the first legacy binding-classification
-    /// failure. A binding failure leaves the marker tree unchanged so the
-    /// caller can discard it only after taking ownership of the effect counts.
+    /// Inspect the final marker tree once while retaining the first legacy
+    /// binding-classification failure. Effect occurrences are sealed only with
+    /// a fully classified product; a binding failure leaves the tree unchanged
+    /// and exposes neither executable C nor a partial effect stream.
     fn seal_preserving_effects(
         mut self,
         source: &SourceOwnedFunctionFacts,
@@ -1983,12 +1945,7 @@ impl LegacyObservationJournal {
         })?;
 
         if let Some(error) = binding_failure {
-            return Ok(LegacyObservationSeal::BindingFailure {
-                error,
-                effects: SurvivingEffectObservations {
-                    occurrences: effect_occurrences,
-                },
-            });
+            return Ok(LegacyObservationSeal::BindingFailure(error));
         }
 
         let mut seal_authority = ObservationSealAuthority::new();
@@ -1998,12 +1955,7 @@ impl LegacyObservationJournal {
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
         if let Some(error) = self.first_unaccounted_render_observation() {
-            return Ok(LegacyObservationSeal::BindingFailure {
-                error,
-                effects: SurvivingEffectObservations {
-                    occurrences: std::mem::take(&mut self.effect_occurrences),
-                },
-            });
+            return Ok(LegacyObservationSeal::BindingFailure(error));
         }
         Ok(LegacyObservationSeal::Complete(
             self.into_sealed_observations(source),
@@ -2215,16 +2167,6 @@ impl LegacyObservationJournal {
         self.values
             .get_mut(value.0 as usize)
             .ok_or(LegacyObservationJournalError::InvalidValue(value))
-    }
-
-    fn use_slot(
-        &self,
-        site: UseSite,
-    ) -> Result<&Option<LegacyUseObservation>, LegacyObservationJournalError> {
-        self.uses
-            .get(site.inst.0 as usize)
-            .and_then(|row| row.get(site.input_idx))
-            .ok_or(LegacyObservationJournalError::InvalidUse(site))
     }
 
     fn use_slot_mut(

@@ -104,7 +104,6 @@ impl<'a> FoldingContext<'a> {
         self.resolved_callee_target(Some((block_addr, op_idx)), None)
     }
 
-    #[cfg(test)]
     pub(super) fn callee_identity_for_callsite(
         &self,
         block_addr: u64,
@@ -206,12 +205,9 @@ impl<'a> FoldingContext<'a> {
         value: r2ssa::ValueId,
         render_plan: Option<&CertifiedRenderPlan<'_>>,
     ) -> Option<CExpr> {
-        render_plan?.call_arg_expr(site, index, value, |expr| {
-            self.certified_return_expr_contains_raw_storage_name(expr)
-        })
+        render_plan?.call_arg_expr(site, index, value)
     }
 
-    #[cfg(test)]
     pub(super) fn known_signature_for_site(
         &self,
         block_addr: u64,
@@ -221,19 +217,9 @@ impl<'a> FoldingContext<'a> {
             .and_then(|identity| identity.known_signature().cloned())
     }
 
-    pub(super) fn known_signature_for_callee_expr(
-        &self,
-        callee: &CExpr,
-    ) -> Option<r2types::FunctionType> {
-        self.callee_identity_for_expr(callee)
-            .and_then(|identity| identity.known_signature().cloned())
-    }
-
     pub(super) fn resolve_call_target(&self, target: &SSAVar) -> OpLoweringResult<CExpr> {
-        if let Some(addr) = target.constant_bits() {
-            return Ok(
-                self.callee_identity_expr(&self.callee_identity_for_direct_target(addr))
-            );
+        if let Some(addr) = self.certified_const_bits(target) {
+            return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(addr)));
         }
         if target.name_kind().is_constant() {
             return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
@@ -255,7 +241,6 @@ impl<'a> FoldingContext<'a> {
         self.resolved_callee_target_for_site(block_addr, op_idx)
             .is_some_and(|target| target.policy.modeled)
     }
-
 }
 
 /// What kind of outside thing a call names.
@@ -303,11 +288,7 @@ mod indexed_argument_tests {
                 callsite,
                 target: Some(r2ssa::ValueId(9)),
                 disposition: r2types::CallsiteRenderDisposition::SideEffectStatement,
-                proof_values: proof_values
-                    .iter()
-                    .copied()
-                    .map(r2ssa::ValueId)
-                    .collect(),
+                proof_values: proof_values.iter().copied().map(r2ssa::ValueId).collect(),
                 residual_reason: None,
             },
         )

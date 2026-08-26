@@ -5078,26 +5078,8 @@ fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashM
     out
 }
 
-fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-
-    let raw = if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()?
-    } else if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        dec.parse::<u64>().ok()?
-    } else {
-        u64::from_str_radix(val_str, 16).ok()?
-    };
-    Some(signed_offset_from_const(raw, ptr_bits))
+fn exact_ssa_const_offset(var: &SSAVar, ptr_bits: u32) -> Option<i64> {
+    Some(signed_offset_from_const(var.constant_bits()?, ptr_bits))
 }
 
 fn local_struct_type_slots(
@@ -5346,7 +5328,7 @@ fn local_affine_value(
     if let Some(value) = memo.get(var) {
         return value.clone();
     }
-    if let Some(constant) = parse_ssa_const_offset(&var.name, ptr_bits) {
+    if let Some(constant) = exact_ssa_const_offset(var, ptr_bits) {
         return Some(LocalAffineValue {
             root: None,
             scale: 0,
@@ -5402,7 +5384,7 @@ fn local_affine_value(
             }
         }
         Some(SSAOp::IntLeft { a, b, .. }) => {
-            let shift = parse_ssa_const_offset(&b.name, ptr_bits)?;
+            let shift = exact_ssa_const_offset(b, ptr_bits)?;
             let shift = u32::try_from(shift).ok()?;
             let multiplier = 1i128.checked_shl(shift)?;
             let value = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
@@ -5546,7 +5528,7 @@ pub fn infer_local_struct_artifacts_from_ssa(
     infer_local_struct_artifacts_from_blocks(&blocks, None, arch_name, ptr_bits, diagnostics)
 }
 
-pub fn infer_local_struct_artifacts_from_prepared_ssa(
+fn infer_local_struct_artifacts_from_prepared_ssa(
     prepared: &SsaArtifact,
     arch_name: Option<&str>,
     ptr_bits: u32,
@@ -5778,20 +5760,20 @@ fn infer_local_struct_artifacts_from_blocks(
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
-                        if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                        if let Some(off) = exact_ssa_const_offset(b, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
                             if is_stack_base(a_lower.as_str()) {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
-                        if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits) {
+                        if let Some(off) = exact_ssa_const_offset(a, ptr_bits) {
                             let b_lower = b.name.to_ascii_lowercase();
                             if is_stack_base(b_lower.as_str()) {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                         {
                             let off = base.offset.saturating_add(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -5837,7 +5819,7 @@ fn infer_local_struct_artifacts_from_blocks(
                                 );
                             }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&a.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(a, ptr_bits)
                         {
                             let off = base.offset.saturating_add(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -5885,7 +5867,7 @@ fn infer_local_struct_artifacts_from_blocks(
                         }
                     }
                     SSAOp::IntSub { dst, a, b } => {
-                        if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                        if let Some(delta) = exact_ssa_const_offset(b, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
                             if is_stack_base(a_lower.as_str()) {
                                 changed |= set_stack_slot(
@@ -5896,7 +5878,7 @@ fn infer_local_struct_artifacts_from_blocks(
                             }
                         }
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                         {
                             let off = base.offset.saturating_sub(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -6297,7 +6279,7 @@ fn infer_local_struct_artifacts_from_blocks(
 }
 
 /// Project advisory local field observations without granting certificates.
-pub fn local_field_accesses_from_struct_artifacts(
+fn local_field_accesses_from_struct_artifacts(
     local_structs: &LocalStructArtifacts,
 ) -> Vec<LocalFieldAccessFact> {
     local_field_accesses_named(local_structs, &HashMap::new())
@@ -6732,7 +6714,7 @@ fn scalar_array_access_certificates_from_ssa(
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
-                        if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        if let Some(off) = exact_ssa_const_offset(b, ptr_bits)
                             && is_stack_base(a.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -6743,7 +6725,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 &mut stack_addr_offset_names,
                             );
                         }
-                        if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits)
+                        if let Some(off) = exact_ssa_const_offset(a, ptr_bits)
                             && is_stack_base(b.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -6813,7 +6795,7 @@ fn scalar_array_access_certificates_from_ssa(
                         }
                     }
                     SSAOp::IntSub { dst, a, b } => {
-                        if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        if let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                             && is_stack_base(a.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -7576,7 +7558,7 @@ fn phi_pointer_step_matches(
     if pointer_term != phi_dst {
         return false;
     }
-    let Some(offset) = parse_ssa_const_offset(&offset_term.name, ctx.ptr_bits) else {
+    let Some(offset) = exact_ssa_const_offset(offset_term, ctx.ptr_bits) else {
         return false;
     };
     offset
@@ -7653,7 +7635,7 @@ fn scalar_pointer_plus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarPointerValue> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     scalar_pointer_offset_by_const(block_addr, pointer_var, offset, ctx)
 }
 
@@ -7663,7 +7645,7 @@ fn scalar_pointer_minus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarPointerValue> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     scalar_pointer_offset_by_const(block_addr, pointer_var, offset.saturating_neg(), ctx)
 }
 
@@ -7688,7 +7670,7 @@ fn scalar_array_plus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarArrayAddrExpr> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     let mut expr = scalar_array_addr_expr_for_var(
         block_addr,
         array_var,
@@ -7752,7 +7734,7 @@ fn scalar_index_matches_stride(
     {
         return false;
     }
-    if let Some(offset) = parse_ssa_const_offset(&var.name, 64) {
+    if let Some(offset) = exact_ssa_const_offset(var, 64) {
         return offset >= 0 && (offset as u64).is_multiple_of(stride.max(1));
     }
     if let Some(factor) = scalar_index_affine_factor(block_addr, var, ctx, depth)
@@ -7786,7 +7768,7 @@ fn scalar_index_matches_stride(
             scaled_index_term_matches_stride(block_addr, a, b, stride, ctx, depth + 1)
         }
         SSAOp::IntLeft { a, b, .. } => {
-            parse_ssa_const_offset(&b.name, 64)
+            exact_ssa_const_offset(b, 64)
                 .and_then(|shift| (shift >= 0).then_some(1u64.checked_shl(shift as u32)?))
                 == Some(stride)
                 && scalar_index_matches_stride(block_addr, a, 1, ctx, depth + 1)
@@ -7831,7 +7813,7 @@ fn scalar_index_affine_factor(
     {
         return None;
     }
-    if parse_ssa_const_offset(&var.name, 64).is_some() {
+    if exact_ssa_const_offset(var, 64).is_some() {
         return Some(AffineIndexFactor {
             root: None,
             scale: 0,
@@ -7861,7 +7843,7 @@ fn scalar_index_affine_factor(
         SSAOp::IntMult { a, b, .. } => affine_scaled_term(block_addr, a, b, ctx, depth + 1)
             .or_else(|| affine_scaled_term(block_addr, b, a, ctx, depth + 1)),
         SSAOp::IntLeft { a, b, .. } => {
-            let shift = parse_ssa_const_offset(&b.name, 64)?;
+            let shift = exact_ssa_const_offset(b, 64)?;
             if shift < 0 {
                 return None;
             }
@@ -7909,7 +7891,7 @@ fn affine_scaled_term(
     ctx: &ScalarArrayInferenceCtx<'_>,
     depth: u32,
 ) -> Option<AffineIndexFactor> {
-    let multiplier = parse_ssa_const_offset(&multiplier.name, 64)?;
+    let multiplier = exact_ssa_const_offset(multiplier, 64)?;
     let factor = scalar_index_affine_factor(block_addr, term, ctx, depth)?;
     Some(AffineIndexFactor {
         root: factor.root,
@@ -7945,12 +7927,10 @@ fn scaled_index_term_matches_stride(
     ctx: &ScalarArrayInferenceCtx<'_>,
     depth: u32,
 ) -> bool {
-    if parse_ssa_const_offset(&a.name, 64).is_some_and(|value| value >= 0 && value as u64 == stride)
-    {
+    if exact_ssa_const_offset(a, 64).is_some_and(|value| value >= 0 && value as u64 == stride) {
         return scalar_index_matches_stride(block_addr, b, 1, ctx, depth + 1);
     }
-    if parse_ssa_const_offset(&b.name, 64).is_some_and(|value| value >= 0 && value as u64 == stride)
-    {
+    if exact_ssa_const_offset(b, 64).is_some_and(|value| value >= 0 && value as u64 == stride) {
         return scalar_index_matches_stride(block_addr, a, 1, ctx, depth + 1);
     }
     false
@@ -8707,7 +8687,7 @@ fn stack_slot_key_from_add_sub(
     ptr_bits: u32,
 ) -> Option<StackSlotKey> {
     let base = stack_base_from_var(a)?;
-    let raw = parse_const_value(&b.name)?;
+    let raw = b.constant_bits()?;
     let offset = signed_offset_from_const(raw, ptr_bits);
     Some(StackSlotKey {
         base,
@@ -10476,7 +10456,7 @@ fn infer_global_field_profiles(
     ssa_blocks: &[SSABlock],
     ptr_bits: u32,
 ) -> BTreeMap<u64, BTreeMap<u64, InferredGlobalFieldEvidence>> {
-    let mut addr_exprs: HashMap<String, GlobalAddrExpr> = HashMap::new();
+    let mut addr_exprs: HashMap<(u64, SSAVar), GlobalAddrExpr> = HashMap::new();
     let mut field_evidence: BTreeMap<u64, BTreeMap<u64, InferredGlobalFieldEvidence>> =
         BTreeMap::new();
     let offset_bound = 0x4000i64;
@@ -10485,21 +10465,21 @@ fn infer_global_field_profiles(
         let mut changed = false;
         for block in ssa_blocks {
             for op in &block.ops {
-                let addr_of = |var: &SSAVar, map: &HashMap<String, GlobalAddrExpr>| {
-                    parse_const_value(&var.name)
+                let addr_of = |var: &SSAVar, map: &HashMap<(u64, SSAVar), GlobalAddrExpr>| {
+                    var.constant_bits()
                         .filter(|base| *base >= 0x10000)
                         .map(|base| GlobalAddrExpr {
                             base,
                             offset: 0,
                             confidence: 92,
                         })
-                        .or_else(|| map.get(&ssa_var_block_key(block.addr, var)).copied())
+                        .or_else(|| map.get(&(block.addr, var.clone())).copied())
                 };
                 let set_expr =
                     |dst: &SSAVar,
                      expr: GlobalAddrExpr,
-                     map: &mut HashMap<String, GlobalAddrExpr>| {
-                        let key = ssa_var_block_key(block.addr, dst);
+                     map: &mut HashMap<(u64, SSAVar), GlobalAddrExpr>| {
+                        let key = (block.addr, dst.clone());
                         match map.get(&key).copied() {
                             Some(prev) if prev.confidence >= expr.confidence => false,
                             _ => {
@@ -10550,7 +10530,7 @@ fn infer_global_field_profiles(
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&b.name)
+                            && let Some(raw) = b.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10567,7 +10547,7 @@ fn infer_global_field_profiles(
                                 );
                             }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&a.name)
+                            && let Some(raw) = a.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10587,7 +10567,7 @@ fn infer_global_field_profiles(
                     }
                     SSAOp::IntSub { dst, a, b } => {
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&b.name)
+                            && let Some(raw) = b.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10612,7 +10592,7 @@ fn infer_global_field_profiles(
                         element_size,
                     } => {
                         if let Some(base_expr) = addr_of(base, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&index.name)
+                            && let Some(raw) = index.constant_bits()
                         {
                             let scaled = signed_offset_from_const(raw, ptr_bits)
                                 .saturating_mul((*element_size).into());
@@ -10637,7 +10617,7 @@ fn infer_global_field_profiles(
                         element_size,
                     } => {
                         if let Some(base_expr) = addr_of(base, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&index.name)
+                            && let Some(raw) = index.constant_bits()
                         {
                             let scaled = signed_offset_from_const(raw, ptr_bits)
                                 .saturating_mul((*element_size).into());
@@ -10667,18 +10647,14 @@ fn infer_global_field_profiles(
     for block in ssa_blocks {
         for op in &block.ops {
             let resolve_addr = |addr: &SSAVar| -> Option<GlobalAddrExpr> {
-                parse_const_value(&addr.name)
+                addr.constant_bits()
                     .filter(|base| *base >= 0x10000)
                     .map(|base| GlobalAddrExpr {
                         base,
                         offset: 0,
                         confidence: 92,
                     })
-                    .or_else(|| {
-                        addr_exprs
-                            .get(&ssa_var_block_key(block.addr, addr))
-                            .copied()
-                    })
+                    .or_else(|| addr_exprs.get(&(block.addr, addr.clone())).copied())
             };
             match op {
                 SSAOp::Load {
@@ -11348,30 +11324,6 @@ fn is_low_quality_stack_name(name: &str) -> bool {
         || is_generic_arg_name(&lower)
 }
 
-fn parse_const_value(name: &str) -> Option<u64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-    val_str.parse::<u64>().ok()
-}
-
 fn size_to_type(size: u32) -> String {
     match size {
         1 => "int8_t".to_string(),
@@ -11466,6 +11418,41 @@ mod tests {
     }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn constant_offsets_require_exact_ssa_evidence() {
+        let spoofed = SSAVar::new("const:20", 0, 8);
+        let exact = SSAVar::constant(0x20, 8);
+
+        assert_eq!(exact_ssa_const_offset(&spoofed, 64), None);
+        assert_eq!(exact_ssa_const_offset(&exact, 64), Some(0x20));
+    }
+
+    #[test]
+    fn global_field_profiles_refuse_spoofed_constant_names() {
+        let load_from = |addr| SSABlock {
+            addr: 0x401000,
+            size: 4,
+            ops: vec![SSAOp::Load {
+                dst: SSAVar::new("value", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr,
+            }],
+        };
+
+        let spoofed =
+            infer_global_field_profiles(&[load_from(SSAVar::new("const:10000", 0, 8))], 64);
+        let exact = infer_global_field_profiles(&[load_from(SSAVar::constant(0x10000, 8))], 64);
+
+        assert!(spoofed.is_empty());
+        assert_eq!(
+            exact
+                .get(&0x10000)
+                .and_then(|fields| fields.get(&0))
+                .map(|field| field.reads),
+            Some(1)
+        );
+    }
 
     fn source_owned_worker_fixture(entry: u64) -> (Arc<SsaArtifact>, r2il::ArchSpec) {
         let mut arch = r2il::ArchSpec::new("x86-64");
@@ -16252,7 +16239,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16262,7 +16249,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16272,7 +16259,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16393,7 +16380,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16403,7 +16390,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16413,7 +16400,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16591,7 +16578,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_arr", 1, 8),
@@ -16605,7 +16592,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_idx", 1, 4),
@@ -16619,7 +16606,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_v", 1, 4),
@@ -17065,7 +17052,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("scaled", 1, 8),
                     a: SSAVar::new("RSI", 0, 8),
-                    b: SSAVar::new("const:38", 0, 8),
+                    b: SSAVar::constant(0x38, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -17075,7 +17062,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("value", 1, 4),
@@ -20511,7 +20498,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_arr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_arr", 1, 8),
@@ -20525,7 +20512,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_idx", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_idx", 1, 4),
@@ -20539,7 +20526,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_idx", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("idx32", 1, 4),
@@ -20553,7 +20540,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx8", 1, 8),
                     a: SSAVar::new("idx64", 1, 8),
-                    b: SSAVar::new("const:3", 0, 4),
+                    b: SSAVar::constant(3, 4),
                 },
                 SSAOp::IntSub {
                     dst: SSAVar::new("idx7", 1, 8),
@@ -20563,12 +20550,12 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx56", 1, 8),
                     a: SSAVar::new("idx7", 1, 8),
-                    b: SSAVar::new("const:3", 0, 4),
+                    b: SSAVar::constant(3, 4),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_arr", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("arr", 1, 8),
@@ -20583,7 +20570,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field8", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -20593,7 +20580,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field34", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:34", 0, 8),
+                    b: SSAVar::constant(0x34, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("field34_val", 1, 4),
@@ -21221,7 +21208,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("buf_slot_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("buf", 1, 8),
@@ -21231,7 +21218,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("len_slot_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:ffffffffffffffe0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_ffe0, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("len", 1, 8),
@@ -21246,7 +21233,7 @@ mod tests {
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
                     addr: SSAVar::new("nul_addr", 1, 8),
-                    val: SSAVar::new("const:0", 0, 1),
+                    val: SSAVar::constant(0, 1),
                 },
             ],
         }];
@@ -21363,7 +21350,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("RDI", 1, 8),
                     a: SSAVar::new("RDI", 2, 8),
-                    b: SSAVar::new("const:1", 0, 8),
+                    b: SSAVar::constant(1, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("byte", 1, 1),
@@ -21543,12 +21530,12 @@ mod tests {
                 SSAOp::IntSub {
                     dst: SSAVar::new("sp", 1, 8),
                     a: SSAVar::new("sp", 0, 8),
-                    b: SSAVar::new("const:200", 0, 8),
+                    b: SSAVar::constant(0x200, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("slot", 1, 8),
                     a: SSAVar::new("sp", 1, 8),
-                    b: SSAVar::new("const:178", 0, 8),
+                    b: SSAVar::constant(0x178, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -21558,7 +21545,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("slot", 2, 8),
                     a: SSAVar::new("sp", 1, 8),
-                    b: SSAVar::new("const:178", 0, 8),
+                    b: SSAVar::constant(0x178, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("x8", 1, 8),
@@ -21568,7 +21555,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("arg_addr", 1, 8),
                     a: SSAVar::new("x8", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("x0", 1, 8),
@@ -21673,7 +21660,7 @@ mod tests {
                     SSAOp::IntAdd {
                         dst: SSAVar::new("slot", 1, 8),
                         a: SSAVar::new("RBP", 0, 8),
-                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                        b: SSAVar::constant(0xffff_ffff_ffff_ffe8, 8),
                     },
                     SSAOp::Store {
                         space: r2il::SpaceId::Ram,
@@ -21689,7 +21676,7 @@ mod tests {
                     SSAOp::IntAdd {
                         dst: SSAVar::new("slot", 2, 8),
                         a: SSAVar::new("RBP", 0, 8),
-                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                        b: SSAVar::constant(0xffff_ffff_ffff_ffe8, 8),
                     },
                     SSAOp::Load {
                         dst: SSAVar::new("ptr", 1, 8),
@@ -21699,7 +21686,7 @@ mod tests {
                     SSAOp::IntLeft {
                         dst: SSAVar::new("idx_scaled", 1, 8),
                         a: SSAVar::new("RSI", 0, 8),
-                        b: SSAVar::new("const:2", 0, 8),
+                        b: SSAVar::constant(2, 8),
                     },
                     SSAOp::IntAdd {
                         dst: SSAVar::new("elem", 1, 8),
@@ -21836,7 +21823,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:4900", 1, 8),
                     a: SSAVar::new("RSI", 1, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:4a00", 1, 8),
@@ -21846,7 +21833,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:4900", 2, 8),
                     a: SSAVar::new("tmp:4a00", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -21856,7 +21843,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("scores2", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:10", 0, 8),
+                    b: SSAVar::constant(0x10, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("score", 1, 4),
@@ -21866,7 +21853,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("flags", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("flagv", 1, 2),
@@ -22007,7 +21994,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("idx_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("idx", 1, 4),
@@ -22021,7 +22008,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx_x8", 1, 8),
                     a: SSAVar::new("idx64", 1, 8),
-                    b: SSAVar::new("const:3", 0, 8),
+                    b: SSAVar::constant(3, 8),
                 },
                 SSAOp::IntSub {
                     dst: SSAVar::new("idx_x7", 1, 8),
@@ -22031,7 +22018,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx_x56", 1, 8),
                     a: SSAVar::new("idx_x7", 1, 8),
-                    b: SSAVar::new("const:3", 0, 8),
+                    b: SSAVar::constant(3, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -22041,7 +22028,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:34", 0, 8),
+                    b: SSAVar::constant(0x34, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("value", 1, 4),

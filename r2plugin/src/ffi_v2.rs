@@ -1649,8 +1649,7 @@ fn binding_observation_journal_failure_json(
                 serde_json::json!(binding_index),
             );
         }
-        Failure::BindingPlanNonBoundValue { value }
-        | Failure::BindingPlanInvalidLiteralInline { value }
+        Failure::BindingPlanInvalidLiteralInline { value }
         | Failure::BindingPlanInvalidElisionProof { value }
         | Failure::BindingPlanUnexpectedValueDisposition { value } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
@@ -1689,18 +1688,8 @@ fn binding_observation_journal_failure_json(
         | Failure::BindingPlanParameterDeclarationWidth {
             slot,
             binding_index,
-        }
-        | Failure::BindingPlanParameterRole {
-            slot,
-            binding_index,
         } => {
             cause.insert("parameter_slot".to_string(), serde_json::json!(slot));
-            cause.insert(
-                "binding_index".to_string(),
-                serde_json::json!(binding_index),
-            );
-        }
-        Failure::BindingPlanBindingRole { binding_index } => {
             cause.insert(
                 "binding_index".to_string(),
                 serde_json::json!(binding_index),
@@ -4090,7 +4079,6 @@ mod tests {
                 value,
                 binding_index: 52,
             },
-            Failure::BindingPlanNonBoundValue { value },
             Failure::BindingPlanCertificateMembership { binding_index: 53 },
             Failure::BindingPlanDeclarationWidth { binding_index: 54 },
             Failure::BindingPlanInvalidLiteralInline { value },

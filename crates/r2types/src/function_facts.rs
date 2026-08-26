@@ -3223,41 +3223,11 @@ fn prepared_callee_resolution_facts(
         .iter()
         .map(|(addr, name)| (*addr, name.clone()))
         .collect::<HashMap<_, _>>();
-    let mut known_function_signatures = type_facts
+    let known_function_signatures = type_facts
         .known_function_signatures
         .iter()
         .map(|(name, ty)| (crate::normalize_callee_name(name), ty.clone()))
         .collect::<HashMap<_, _>>();
-    // radare2 has no prototype for a fortified `__*_chk` import, so the call
-    // reached inference with neither argument types nor an arity, and an arity
-    // guess would have dropped the size argument it really passes. The embedded
-    // registry answers for the names it knows -- but only where radare2 said
-    // nothing, because a prototype radare2 carries came from the binary's own
-    // type database and outranks anything recovered from a name.
-    let mut registry_signatures = HashMap::new();
-    crate::enrich_known_function_signatures_from_names(
-        &mut registry_signatures,
-        function_names
-            .values()
-            .chain(symbols.values())
-            .map(String::as_str)
-            .chain(
-                type_facts
-                    .callee_facts
-                    .values()
-                    .filter_map(|fact| fact.name.as_deref()),
-            )
-            .collect::<BTreeSet<_>>(),
-        prepared
-            .machine_context()
-            .memory_model()
-            .default_address_bits(),
-    );
-    for (name, signature) in registry_signatures {
-        known_function_signatures
-            .entry(crate::normalize_callee_name(&name))
-            .or_insert(signature);
-    }
     let ctx = CalleeIdentityContext {
         function_names: &function_names,
         symbols: &symbols,
@@ -5149,6 +5119,34 @@ mod tests {
                 .is_some(),
             "callsite identity must travel through FunctionFacts, not a render side channel"
         );
+    }
+
+    #[test]
+    fn prepared_display_name_does_not_create_a_known_signature() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x402000, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared direct call");
+        let callsite = CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 0,
+        };
+        let mut names = crate::DisplayNames::default();
+        names.insert_function(0x402000, "sym.imp.__memcpy_chk");
+        let mut facts = FunctionFacts::default();
+        facts.set_display_names(names);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+
+        let identity = facts
+            .callee_resolution()
+            .and_then(|resolution| resolution.identity_for_callsite(callsite))
+            .expect("direct target identity");
+        assert_eq!(identity.raw_name(), "sym.imp.__memcpy_chk");
+        assert!(identity.known_signature().is_none());
+        assert_eq!(identity.non_variadic_known_arity(), None);
     }
 
     #[test]

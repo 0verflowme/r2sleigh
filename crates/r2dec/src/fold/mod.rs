@@ -9,8 +9,6 @@ pub(crate) use context::FoldingContext;
 pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 
-pub(super) const MAX_SIMPLE_EXPR_DEPTH: u32 = 2;
-pub(super) const MAX_ALIAS_REWRITE_DEPTH: u32 = 32;
 pub(super) const MAX_PREDICATE_OPERAND_DEPTH: u32 = 12;
 pub(super) const MAX_SF_SURROGATE_DEPTH: usize = 128;
 pub(super) const MAX_SUB_LIKE_DEPTH: usize = 128;

@@ -1,21 +1,9 @@
 #[cfg(test)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use r2ssa::{SSAVar, SSAVarNameKind};
-
-use crate::ast::CExpr;
-
-/// The spelling under which a flag is recorded, with prefix and version removed.
-pub(crate) fn flag_base_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let base = lower.strip_prefix("reg:").unwrap_or(&lower);
-    match base.rsplit_once('_') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
-            head.to_string()
-        }
-        _ => base.to_string(),
-    }
-}
+#[cfg(test)]
+use r2ssa::SSAVar;
+use r2ssa::SSAVarNameKind;
 
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     let val_str = name.strip_prefix("const:")?;
@@ -36,48 +24,6 @@ pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     } else {
         val_str.parse().ok()
     }
-}
-
-pub(crate) fn is_generic_stack_placeholder_alias(existing: &str) -> bool {
-
-    let normalized = existing.trim_start_matches('&');
-    normalized == "stack"
-        || normalized.starts_with("stack_")
-        || normalized == "slot"
-        || normalized.starts_with("slot_")
-        || normalized == "saved_fp"
-}
-
-pub(crate) fn parse_compare_const_value_with_width(
-    var: &SSAVar,
-    _compare_width: u32,
-) -> Option<u64> {
-    let raw = var.name.strip_prefix("const:")?;
-    let raw = raw.split('_').next().unwrap_or(raw);
-
-    if let Some(dec) = raw.strip_prefix("0d").or_else(|| raw.strip_prefix("0D")) {
-        return dec.parse().ok();
-    }
-
-    parse_const_value(&var.name)
-}
-
-#[cfg(test)]
-pub(crate) fn parse_compare_const_value(var: &SSAVar) -> Option<u64> {
-    parse_compare_const_value_with_width(var, var.size)
-}
-
-pub(crate) fn compare_const_to_expr_with_width(var: &SSAVar, compare_width: u32) -> CExpr {
-    let val = parse_compare_const_value_with_width(var, compare_width).unwrap_or(0);
-    if val > 0x7fffffff {
-        CExpr::UIntLit(val)
-    } else {
-        CExpr::IntLit(val as i64)
-    }
-}
-
-pub(crate) fn compare_const_to_expr(var: &SSAVar) -> CExpr {
-    compare_const_to_expr_with_width(var, var.size)
 }
 
 /// How a value keyed only by its display name is spelled.
@@ -130,13 +76,11 @@ pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
 }
 
 pub(crate) fn is_temporary_name(name: &str) -> bool {
-
     ssa_name_kind(name).is_temporary()
 }
 
 #[cfg(test)]
 pub(crate) fn is_temporary_or_memory_name(name: &str) -> bool {
-
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Temporary | SSAVarNameKind::Memory
@@ -152,7 +96,6 @@ pub(crate) fn is_temporary_constant_or_memory_name(name: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
-
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Constant | SSAVarNameKind::Memory | SSAVarNameKind::AddressSpace
@@ -161,7 +104,6 @@ pub(crate) fn is_constant_or_memory_name(name: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn is_low_signal_ssa_storage_name(name: &str) -> bool {
-
     matches!(
         ssa_name_kind(name),
         SSAVarNameKind::Temporary
@@ -191,33 +133,6 @@ pub(crate) fn ssa_render_base_name(var: &SSAVar) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn trace_ssa_var_to_source(
-    var: &SSAVar,
-    copy_source: &impl Fn(&str) -> Option<String>,
-    var_aliases: &HashMap<String, String>,
-) -> String {
-    let mut current_key = var.display_name();
-    let mut visited = HashSet::new();
-
-    for _ in 0..20 {
-        if !visited.insert(current_key.clone()) {
-            break;
-        }
-
-        if let Some(src_key) = copy_source(&current_key) {
-            if src_key.starts_with('*') {
-                return format!("var_{}", current_key.split('_').next_back().unwrap_or("0"));
-            }
-            current_key = src_key.clone();
-            continue;
-        }
-        break;
-    }
-
-    format_traced_name(&current_key, var_aliases)
-}
-
-#[cfg(test)]
 fn is_hex_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -227,58 +142,11 @@ mod tests {
     use super::*;
     use r2ssa::SSAVar;
 
-    /// The names a fixture in this module declares.
-    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
-        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
-    }
-
     #[test]
     fn parse_const_value_uses_ssa_hex_payload_by_default() {
         assert_eq!(parse_const_value("const:100"), Some(0x100));
         assert_eq!(parse_const_value("const:0x100"), Some(0x100));
         assert_eq!(parse_const_value("const:0d100"), Some(100));
-    }
-
-    #[test]
-    fn generic_stack_placeholder_alias_covers_all_generic_forms() {
-        for name in ["stack", "stack_10", "slot", "slot_20", "saved_fp"] {
-            assert!(
-                is_generic_stack_placeholder_alias(name),
-                "{name} should be classified as a generic stack placeholder"
-            );
-            let addr_name = format!("&{name}");
-            assert!(
-                is_generic_stack_placeholder_alias(&addr_name),
-                "{addr_name} should be classified after address-of trimming"
-            );
-        }
-
-        for name in ["local_10", "arg0", "real_slot_name", "saved_lr"] {
-            assert!(
-                !is_generic_stack_placeholder_alias(name),
-                "{name} should not be treated as a generic stack placeholder"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_compare_const_value_keeps_lifted_hex_immediates_and_explicit_decimal_tests() {
-        let wide = SSAVar::new("const:64", 0, 8);
-        let narrow = SSAVar::new("const:64", 0, 4);
-        let explicit_decimal = SSAVar::new("const:0d64", 0, 8);
-
-        assert_eq!(parse_compare_const_value(&wide), Some(0x64));
-        assert_eq!(parse_compare_const_value(&narrow), Some(0x64));
-        assert_eq!(parse_compare_const_value(&explicit_decimal), Some(64));
-    }
-
-    #[test]
-    fn parse_compare_const_value_with_width_prefers_hex_for_wide_comparisons() {
-        let narrow = SSAVar::new("const:64", 0, 4);
-        let decimal = SSAVar::new("const:0d100", 0, 4);
-
-        assert_eq!(parse_compare_const_value_with_width(&narrow, 8), Some(0x64));
-        assert_eq!(parse_compare_const_value_with_width(&decimal, 4), Some(100));
     }
 
     #[test]
@@ -306,7 +174,10 @@ mod tests {
         // here is a legal C identifier. What this pins is that the answer matches
         // `spell_var`'s, so a value has one spelling; that either of these reaches
         // a name at all is a separate defect, recorded rather than papered over.
-        assert_eq!(format_traced_name("const:2a_0", &HashMap::new()), "const:2a");
+        assert_eq!(
+            format_traced_name("const:2a_0", &HashMap::new()),
+            "const:2a"
+        );
         assert_eq!(
             format_traced_name("ram:401000_0", &HashMap::new()),
             "ram:401000"

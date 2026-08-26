@@ -95,10 +95,6 @@ impl EmissionReadyFunction {
         crate::structured_region::strip_final_region_markers(&mut self.function.body, regions)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by public Stage 5 AST boundaries after markers are sealed"
-    )]
     pub(crate) fn into_function(self) -> CFunction {
         assert!(
             !has_render_observations(&self.function),

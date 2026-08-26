@@ -13,11 +13,6 @@
 //! It deliberately contains no declaration-placement answer: placement is a
 //! pure calculation over this artifact and the surviving binding occurrences.
 
-#![allow(
-    dead_code,
-    reason = "Stage 7 region identity lands before its structurer and placement cutovers"
-)]
-
 use std::sync::Arc;
 
 use crate::ast::{CStmt, SwitchCase};
@@ -116,14 +111,6 @@ impl StructuredRegionMarker {
         }
     }
 
-    pub(crate) const fn entry(self) -> u64 {
-        self.entry
-    }
-
-    pub(crate) const fn kind(self) -> StructuredRegionKind {
-        self.kind
-    }
-
     pub(crate) const fn emission_anchor(self) -> Option<RegionEmissionAnchor> {
         self.anchor
     }
@@ -142,8 +129,11 @@ pub(crate) struct StructuredRegionNode {
     parent: Option<RegionId>,
     depth: u32,
     entry: u64,
+    #[cfg(test)]
     children: Box<[RegionId]>,
+    #[cfg(test)]
     emission_anchor: RegionEmissionAnchor,
+    #[cfg(test)]
     kind: StructuredRegionKind,
 }
 
@@ -160,14 +150,17 @@ impl StructuredRegionNode {
         self.entry
     }
 
+    #[cfg(test)]
     pub(crate) fn children(&self) -> &[RegionId] {
         &self.children
     }
 
+    #[cfg(test)]
     pub(crate) const fn emission_anchor(&self) -> RegionEmissionAnchor {
         self.emission_anchor
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> StructuredRegionKind {
         self.kind
     }
@@ -177,6 +170,7 @@ impl StructuredRegionNode {
 #[derive(Debug, Clone)]
 pub(crate) struct SealedStructuredRegionArtifact {
     authority: StructuredRegionArtifactAuthority,
+    #[cfg(test)]
     root: RegionId,
     nodes: Box<[StructuredRegionNode]>,
 }
@@ -186,25 +180,23 @@ impl SealedStructuredRegionArtifact {
         &self.authority
     }
 
+    #[cfg(test)]
     pub(crate) const fn root(&self) -> RegionId {
         self.root
     }
 
     /// Root of the analyzed tree below the explicit function-body scope.
+    #[cfg(test)]
     pub(crate) fn source_root(&self) -> RegionId {
         self.nodes[self.root.index()].children[0]
     }
 
     /// Children already retained for `id`, in exact render order.
+    #[cfg(test)]
     pub(crate) fn children(&self, id: RegionId) -> Option<&[RegionId]> {
         self.nodes
             .get(id.index())
             .map(|node| node.children.as_ref())
-    }
-
-    /// Anchor that the structurer must attach to the emitted occurrence.
-    pub(crate) fn emission_anchor(&self, id: RegionId) -> Option<RegionEmissionAnchor> {
-        self.nodes.get(id.index()).map(|node| node.emission_anchor)
     }
 
     pub(crate) fn nodes(&self) -> &[StructuredRegionNode] {
@@ -372,8 +364,10 @@ struct DraftNode {
     parent: Option<RegionId>,
     depth: u32,
     entry: u64,
+    #[cfg(test)]
     children: Vec<RegionId>,
     emission_anchor: RegionEmissionAnchor,
+    #[cfg(test)]
     kind: StructuredRegionKind,
 }
 
@@ -385,18 +379,21 @@ struct DraftNode {
 /// order in which their statements are emitted.
 pub(crate) struct StructuredRegionDraft {
     authority: StructuredRegionArtifactAuthority,
+    #[cfg(test)]
     root: RegionId,
     nodes: Vec<DraftNode>,
 }
 
 impl StructuredRegionDraft {
     /// Retain one analyzed region tree in deterministic render preorder.
+    #[cfg(test)]
     pub(crate) fn from_region(
         function_entry: u64,
         region: &Region,
     ) -> Result<Self, StructuredRegionBuildError> {
         let mut draft = Self {
             authority: StructuredRegionArtifactAuthority::new(),
+            #[cfg(test)]
             root: RegionId(0),
             nodes: Vec::new(),
         };
@@ -423,24 +420,9 @@ impl StructuredRegionDraft {
         Ok(draft)
     }
 
+    #[cfg(test)]
     pub(crate) const fn authority(&self) -> &StructuredRegionArtifactAuthority {
         &self.authority
-    }
-
-    pub(crate) const fn root(&self) -> RegionId {
-        self.root
-    }
-
-    /// Root of the analyzed tree below the explicit function-body scope.
-    pub(crate) fn source_root(&self) -> RegionId {
-        self.nodes[self.root.index()].children[0]
-    }
-
-    /// Children already retained for `id`, in exact render order.
-    pub(crate) fn children(&self, id: RegionId) -> Option<&[RegionId]> {
-        self.nodes
-            .get(id.index())
-            .map(|node| node.children.as_slice())
     }
 
     /// Anchor that the structurer must attach to the emitted occurrence.
@@ -449,6 +431,7 @@ impl StructuredRegionDraft {
     }
 
     /// Record one root-level statement appended after the analyzed region.
+    #[cfg(test)]
     pub(crate) fn append_synthetic(
         &mut self,
         kind: SyntheticRegionKind,
@@ -472,6 +455,7 @@ impl StructuredRegionDraft {
     pub(crate) fn seal(self) -> SealedStructuredRegionArtifact {
         SealedStructuredRegionArtifact {
             authority: self.authority,
+            #[cfg(test)]
             root: self.root,
             nodes: self
                 .nodes
@@ -480,8 +464,11 @@ impl StructuredRegionDraft {
                     parent: node.parent,
                     depth: node.depth,
                     entry: node.entry,
+                    #[cfg(test)]
                     children: node.children.into_boxed_slice(),
+                    #[cfg(test)]
                     emission_anchor: node.emission_anchor,
+                    #[cfg(test)]
                     kind: node.kind,
                 })
                 .collect(),
@@ -493,7 +480,7 @@ impl StructuredRegionDraft {
         parent: Option<RegionId>,
         depth: u32,
         entry: u64,
-        kind: StructuredRegionKind,
+        _kind: StructuredRegionKind,
     ) -> Result<RegionId, StructuredRegionBuildError> {
         let raw = u32::try_from(self.nodes.len())
             .map_err(|_| StructuredRegionBuildError::TooManyRegions)?;
@@ -502,9 +489,11 @@ impl StructuredRegionDraft {
             parent,
             depth,
             entry,
+            #[cfg(test)]
             children: Vec::new(),
             emission_anchor: RegionEmissionAnchor(raw),
-            kind,
+            #[cfg(test)]
+            kind: _kind,
         });
         Ok(id)
     }
@@ -518,14 +507,11 @@ pub(crate) struct SealedStructuredBody {
 }
 
 impl SealedStructuredBody {
-    pub(crate) fn stmt(&self) -> &CStmt {
-        &self.stmt
-    }
-
     pub(crate) fn regions(&self) -> &SealedStructuredRegionArtifact {
         &self.regions
     }
 
+    #[cfg(test)]
     pub(crate) fn into_stmt(mut self) -> CStmt {
         strip_region_markers(&mut self.stmt);
         self.stmt
@@ -544,9 +530,7 @@ impl SealedStructuredBody {
     ///
     /// Consumers receive both the canonical artifact node and the semantic
     /// statement it owns.  They never need to match the internal AST wrapper.
-    pub(crate) fn visit_occurrences(
-        &self,
-        mut visit: impl FnMut(StructuredRegionOccurrence<'_>)) {
+    pub(crate) fn visit_occurrences(&self, mut visit: impl FnMut(StructuredRegionOccurrence<'_>)) {
         visit_occurrences(
             &self.stmt,
             &self.regions,
@@ -561,6 +545,7 @@ impl SealedStructuredBody {
     /// chains remain intact on `stmt`, and each semantic statement position is
     /// reported once. This is the bridge final occurrence collectors use; they
     /// do not need an ad hoc AST matcher for lexical markers.
+    #[cfg(test)]
     pub(crate) fn visit_scoped_statements(
         &self,
         mut visit: impl FnMut(ScopedStructuredStatement<'_>),
@@ -577,25 +562,35 @@ impl SealedStructuredBody {
 
 /// Borrowed view of one exact emitted lexical occurrence.
 pub(crate) struct StructuredRegionOccurrence<'a> {
+    #[cfg(test)]
     id: RegionId,
+    #[cfg(test)]
     anchor: RegionEmissionAnchor,
+    #[cfg(test)]
     node: &'a StructuredRegionNode,
+    #[cfg(test)]
     stmt: &'a CStmt,
+    #[cfg(not(test))]
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> StructuredRegionOccurrence<'a> {
+    #[cfg(test)]
     pub(crate) const fn id(&self) -> RegionId {
         self.id
     }
 
+    #[cfg(test)]
     pub(crate) const fn anchor(&self) -> RegionEmissionAnchor {
         self.anchor
     }
 
+    #[cfg(test)]
     pub(crate) const fn node(&self) -> &'a StructuredRegionNode {
         self.node
     }
 
+    #[cfg(test)]
     pub(crate) const fn stmt(&self) -> &'a CStmt {
         self.stmt
     }
@@ -604,7 +599,9 @@ impl<'a> StructuredRegionOccurrence<'a> {
 /// One semantic statement occurrence paired with its exact lexical region.
 pub(crate) struct ScopedStructuredStatement<'a> {
     region: RegionId,
+    #[cfg(test)]
     anchor: RegionEmissionAnchor,
+    #[cfg(test)]
     node: &'a StructuredRegionNode,
     stmt: &'a CStmt,
 }
@@ -614,10 +611,12 @@ impl<'a> ScopedStructuredStatement<'a> {
         self.region
     }
 
+    #[cfg(test)]
     pub(crate) const fn anchor(&self) -> RegionEmissionAnchor {
         self.anchor
     }
 
+    #[cfg(test)]
     pub(crate) const fn node(&self) -> &'a StructuredRegionNode {
         self.node
     }
@@ -647,6 +646,7 @@ pub(crate) fn seal_structured_body(
 
     let mut draft = StructuredRegionDraft {
         authority: StructuredRegionArtifactAuthority::new(),
+        #[cfg(test)]
         root: RegionId(0),
         nodes: Vec::new(),
     };
@@ -656,6 +656,7 @@ pub(crate) fn seal_structured_body(
         root_marker.entry,
         StructuredRegionKind::FunctionBody,
     )?;
+    #[cfg(test)]
     debug_assert_eq!(root, draft.root);
     root_marker.anchor = draft.emission_anchor(root);
     seal_stmt_children(root_stmt, root, &mut draft)?;
@@ -681,6 +682,7 @@ fn seal_stmt_children(
                 .checked_add(1)
                 .ok_or(StructuredRegionBuildError::RegionDepthOverflow)?;
             let id = draft.push_node(Some(parent), depth, marker.entry, marker.kind)?;
+            #[cfg(test)]
             draft.nodes[parent.index()].children.push(id);
             marker.anchor = draft.emission_anchor(id);
             seal_stmt_children(stmt, id, draft)
@@ -703,8 +705,7 @@ fn seal_stmt_children(
             }
             Ok(())
         }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. } => {
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
             seal_stmt_children(body, parent, draft)
         }
         CStmt::For { init, body, .. } => {
@@ -749,14 +750,20 @@ fn visit_occurrences<'a>(
             let anchor = marker
                 .emission_anchor()
                 .expect("sealed body contains only sealed region markers");
-            let (id, node) = regions
+            let (_id, _node) = regions
                 .node_for_anchor(authority, anchor)
                 .expect("sealed marker belongs to its structured-region artifact");
             visit(StructuredRegionOccurrence {
-                id,
+                #[cfg(test)]
+                id: _id,
+                #[cfg(test)]
                 anchor,
-                node,
+                #[cfg(test)]
+                node: _node,
+                #[cfg(test)]
                 stmt,
+                #[cfg(not(test))]
+                _marker: std::marker::PhantomData,
             });
             visit_occurrences(stmt, regions, authority, visit);
         }
@@ -776,8 +783,7 @@ fn visit_occurrences<'a>(
                 visit_occurrences(else_body, regions, authority, visit);
             }
         }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. } => {
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
             visit_occurrences(body, regions, authority, visit)
         }
         CStmt::For { init, body, .. } => {
@@ -828,16 +834,18 @@ fn visit_scoped_stmt<'a>(
         return;
     }
 
-    if let Some((region, anchor)) = current {
-        let node = regions
-        .node(region)
-        .expect("scoped statement region belongs to its artifact");
-    visit(ScopedStructuredStatement {
-        region,
-        anchor,
-        node,
-        stmt,
-    });
+    if let Some((region, _anchor)) = current {
+        let _node = regions
+            .node(region)
+            .expect("scoped statement region belongs to its artifact");
+        visit(ScopedStructuredStatement {
+            region,
+            #[cfg(test)]
+            anchor: _anchor,
+            #[cfg(test)]
+            node: _node,
+            stmt,
+        });
     }
 
     // Leading observation wrappers are one statement occurrence. Recurse into
@@ -863,8 +871,7 @@ fn visit_scoped_stmt<'a>(
                 visit_scoped_stmt(else_body, current, regions, authority, visit);
             }
         }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. } => {
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
             visit_scoped_stmt(body, current, regions, authority, visit)
         }
         CStmt::For { init, body, .. } => {
@@ -915,8 +922,7 @@ fn strip_region_markers(stmt: &mut CStmt) {
                 strip_region_markers(else_body);
             }
         }
-        CStmt::While { body, .. }
-        | CStmt::DoWhile { body, .. } => strip_region_markers(body),
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => strip_region_markers(body),
         CStmt::For { init, body, .. } => {
             if let Some(init) = init {
                 strip_region_markers(init);
@@ -958,6 +964,7 @@ pub(crate) fn kind_of(region: &Region) -> StructuredRegionKind {
     }
 }
 
+#[cfg(test)]
 fn direct_children(region: &Region) -> Vec<&Region> {
     match region {
         Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => Vec::new(),

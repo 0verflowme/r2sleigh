@@ -54,19 +54,17 @@ pub mod symbol;
 pub(crate) mod unrendered;
 mod variable;
 
-pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
-pub use codegen::CodeGenConfig;
-pub use control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
-pub use fold::lower_ssa_ops_to_stmts;
-pub use highlight::highlight_c_ansi;
-pub use region::{Region, RegionAnalyzer};
-pub(crate) use structure::ControlFlowStructurer;
 use crate::codegen::{CodeGenerator, EmissionReadyFunction, prepare_function_for_emission};
 use crate::fold::FoldingContext;
 use crate::fold::context::{FoldArchConfig, FoldInputs};
 use crate::observation_journal::{
     LegacyObservationCoverage, LegacyObservationJournal, MarkedNativeDraft, SealedNativeFunction,
 };
+pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
+pub use codegen::CodeGenConfig;
+pub use control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
+pub use fold::lower_ssa_ops_to_stmts;
+pub use highlight::highlight_c_ansi;
 use r2ssa::SSAFunction;
 #[cfg(test)]
 use r2ssa::SSAOp;
@@ -77,14 +75,15 @@ use r2types::{
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
+pub use region::{Region, RegionAnalyzer};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
+pub(crate) use structure::ControlFlowStructurer;
 
 fn is_generic_arg_name(name: &str) -> bool {
-
     let lower = name.trim().to_ascii_lowercase();
     lower
         .strip_prefix("arg")
@@ -92,7 +91,7 @@ fn is_generic_arg_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn ctype_to_type_like(ty: &CType) -> CTypeLike {
     match ty {
         CType::Void => CTypeLike::Void,
@@ -1303,7 +1302,9 @@ pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
 /// number in the line rather than an absence from it. An unaccounted count is
 /// never zero because nothing went wrong; it is zero only when every obligation
 /// was reached by a rule that named its fate.
-fn note_unproven_constructs(func: &mut CFunction, ledger: Option<&r2ssa::ledger::ObligationLedger>,
+fn note_unproven_constructs(
+    func: &mut CFunction,
+    ledger: Option<&r2ssa::ledger::ObligationLedger>,
 ) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
@@ -1934,7 +1935,6 @@ impl DecompilerContext {
             function_facts: function_facts.report().clone(),
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -1964,15 +1964,10 @@ impl DecompilerInput {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
-)]
 #[derive(Debug)]
 enum BindingShadowFailure {
-    Build(crate::binding_plan::BindingPlanBuildError),
-    Pairing(crate::binding_plan::BindingPlanSourceMismatch),
-    Report(crate::shadow_report::ShadowReportError),
+    Pairing,
+    Report,
     IncompleteObservations {
         ledger: crate::shadow_report::ShadowLedger,
         coverage: LegacyObservationCoverage,
@@ -1983,22 +1978,12 @@ enum BindingShadowFailure {
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
-)]
 #[derive(Debug)]
 struct BindingShadow {
-    plan: crate::binding_plan::BindingPlan,
-    report: crate::shadow_report::ShadowReport,
     ledger: crate::shadow_report::ShadowLedger,
     coverage: LegacyObservationCoverage,
 }
 
-#[allow(
-    dead_code,
-    reason = "Stage 4 retains the typed audit for tests while production rendering ignores it"
-)]
 #[derive(Debug)]
 enum BindingShadowOutcome {
     Complete(BindingShadow),
@@ -2012,28 +1997,24 @@ impl BindingShadowOutcome {
         legacy: &crate::shadow_report::LegacyAnalysisSnapshot,
         coverage: LegacyObservationCoverage,
     ) -> Self {
-        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(source, plan) {
-            return Self::Failed(BindingShadowFailure::Pairing(error));
+        if crate::fold::op_lower::PlannedLoweringInput::try_new(source, plan).is_err() {
+            return Self::Failed(BindingShadowFailure::Pairing);
         }
         let report = match crate::shadow_report::ShadowReport::build(plan, source, legacy) {
             Ok(report) => report,
-            Err(error) => return Self::Failed(BindingShadowFailure::Report(error)),
+            Err(_) => return Self::Failed(BindingShadowFailure::Report),
         };
-        if let Err(error) = report.validate_against(plan, source, legacy) {
-            return Self::Failed(BindingShadowFailure::Report(error));
+        if report.validate_against(plan, source, legacy).is_err() {
+            return Self::Failed(BindingShadowFailure::Report);
         }
         let ledger = report.ledger(source);
         if !coverage.is_complete() {
-            return Self::Failed(BindingShadowFailure::IncompleteObservations {
-                ledger,
-                coverage });
+            return Self::Failed(BindingShadowFailure::IncompleteObservations { ledger, coverage });
         }
         if !ledger.passes_quality() || !coverage.passes_quality() {
             return Self::Failed(BindingShadowFailure::NonQuality { ledger, coverage });
         }
         Self::Complete(BindingShadow {
-            plan: plan.clone(),
-            report,
             ledger,
             coverage,
         })
@@ -2060,10 +2041,7 @@ pub struct BindingShadowDomainAudit {
 
 impl BindingShadowDomainAudit {
     pub const fn equations_hold(self) -> bool {
-        let Some(both_wrong) = self
-            .both_wrong_equal
-            .checked_add(self.both_wrong_different)
-        else {
+        let Some(both_wrong) = self.both_wrong_equal.checked_add(self.both_wrong_different) else {
             return false;
         };
         let Some(classified) = self.agree_correct.checked_add(self.old_wrong) else {
@@ -2169,9 +2147,7 @@ pub struct BindingObservationAudit {
 
 impl BindingObservationAudit {
     pub const fn equations_hold(self) -> bool {
-        self.values.equations_hold()
-            && self.uses.equations_hold()
-            && self.writes.equations_hold()
+        self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
     }
 
     pub const fn is_complete(self) -> bool {
@@ -2179,9 +2155,7 @@ impl BindingObservationAudit {
     }
 
     pub const fn passes_quality(self) -> bool {
-        self.values.passes_quality()
-            && self.uses.passes_quality()
-            && self.writes.passes_quality()
+        self.values.passes_quality() && self.uses.passes_quality() && self.writes.passes_quality()
     }
 }
 
@@ -2205,15 +2179,11 @@ pub struct BindingShadowAuditLedger {
 
 impl BindingShadowAuditLedger {
     pub const fn equations_hold(self) -> bool {
-        self.values.equations_hold()
-            && self.uses.equations_hold()
-            && self.writes.equations_hold()
+        self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
     }
 
     pub const fn passes_quality(self) -> bool {
-        self.values.passes_quality()
-            && self.uses.passes_quality()
-            && self.writes.passes_quality()
+        self.values.passes_quality() && self.uses.passes_quality() && self.writes.passes_quality()
     }
 }
 
@@ -2237,31 +2207,49 @@ impl From<crate::shadow_report::ShadowLedger> for BindingShadowAuditLedger {
 pub enum BindingMachineProjectionFailure {
     UntrustedArtifactProvenance,
     IncompleteObligationInventory,
-    MissingGraphValue { value: r2ssa::ValueId,
+    MissingGraphValue {
+        value: r2ssa::ValueId,
     },
-    MissingGraphBlock { block: r2ssa::BlockId,
+    MissingGraphBlock {
+        block: r2ssa::BlockId,
     },
-    DuplicateBlockAddress { address: u64,
+    DuplicateBlockAddress {
+        address: u64,
     },
     TopologyMismatch,
     MachineContextMismatch,
-    MissingInstruction { inst: r2ssa::InstId,
+    MissingInstruction {
+        inst: r2ssa::InstId,
     },
-    MissingInstructionDisposition { inst: r2ssa::InstId,
+    MissingInstructionDisposition {
+        inst: r2ssa::InstId,
     },
-    MissingUseDisposition { site: r2ssa::UseSite,
+    MissingUseDisposition {
+        site: r2ssa::UseSite,
     },
-    MissingWriteDisposition { inst: r2ssa::InstId,
+    MissingWriteDisposition {
+        inst: r2ssa::InstId,
     },
-    MissingOutput { inst: r2ssa::InstId,
+    MissingOutput {
+        inst: r2ssa::InstId,
     },
-    InvalidValueWidth { value: r2ssa::ValueId, size_bytes: u32,
+    InvalidValueWidth {
+        value: r2ssa::ValueId,
+        size_bytes: u32,
     },
-    ConstantTooWide { value: r2ssa::ValueId, width_bits: u32,
+    ConstantTooWide {
+        value: r2ssa::ValueId,
+        width_bits: u32,
     },
-    WrongOperandCount { inst: r2ssa::InstId, expected: usize, actual: usize,
+    WrongOperandCount {
+        inst: r2ssa::InstId,
+        expected: usize,
+        actual: usize,
     },
-    WidthMismatch { inst: r2ssa::InstId, expected_bits: u32, actual_bits: u32,
+    WidthMismatch {
+        inst: r2ssa::InstId,
+        expected_bits: u32,
+        actual_bits: u32,
     },
     InvalidCastWidth {
         inst: r2ssa::InstId,
@@ -2275,23 +2263,33 @@ pub enum BindingMachineProjectionFailure {
         result_bits: u32,
         lsb_bits: u32,
     },
-    InvalidChild { expr_index: usize, child_index: usize,
+    InvalidChild {
+        expr_index: usize,
+        child_index: usize,
     },
-    InvalidExpressionType { expr_index: usize,
+    InvalidExpressionType {
+        expr_index: usize,
     },
-    DuplicateEntity { value: r2ssa::ValueId,
+    DuplicateEntity {
+        value: r2ssa::ValueId,
     },
-    EntityMismatch { inst: r2ssa::InstId,
+    EntityMismatch {
+        inst: r2ssa::InstId,
     },
-    ObligationMismatch { inst: r2ssa::InstId,
+    ObligationMismatch {
+        inst: r2ssa::InstId,
     },
-    UseDispositionMismatch { site: r2ssa::UseSite,
+    UseDispositionMismatch {
+        site: r2ssa::UseSite,
     },
-    WriteDispositionMismatch { inst: r2ssa::InstId,
+    WriteDispositionMismatch {
+        inst: r2ssa::InstId,
     },
-    ObligationSourceMismatch { instruction: r2ssa::CanonicalInstructionId,
+    ObligationSourceMismatch {
+        instruction: r2ssa::CanonicalInstructionId,
     },
-    UnsupportedOperation { inst: r2ssa::InstId,
+    UnsupportedOperation {
+        inst: r2ssa::InstId,
     },
 }
 
@@ -2388,50 +2386,84 @@ pub enum BindingObservationJournalFailure {
     SourceAuthority,
     BindingPlanAuthority,
     BindingPlanMachineProjection(BindingMachineProjectionFailure),
-    BindingPlanValueTopology { index: usize, value: r2ssa::ValueId,
+    BindingPlanValueTopology {
+        index: usize,
+        value: r2ssa::ValueId,
     },
-    BindingPlanDispositionCount { expected: usize, actual: usize,
+    BindingPlanDispositionCount {
+        expected: usize,
+        actual: usize,
     },
-    BindingPlanBindingCount { expected: usize, actual: usize,
+    BindingPlanBindingCount {
+        expected: usize,
+        actual: usize,
     },
-    BindingPlanInvalidBindingReference { value: r2ssa::ValueId, binding_index: usize,
+    BindingPlanInvalidBindingReference {
+        value: r2ssa::ValueId,
+        binding_index: usize,
     },
-    BindingPlanCertificateMembership { binding_index: usize,
+    BindingPlanCertificateMembership {
+        binding_index: usize,
     },
-    BindingPlanDeclarationWidth { binding_index: usize,
+    BindingPlanDeclarationWidth {
+        binding_index: usize,
     },
-    BindingPlanInvalidLiteralInline { value: r2ssa::ValueId,
+    BindingPlanInvalidLiteralInline {
+        value: r2ssa::ValueId,
     },
-    BindingPlanInvalidElisionProof { value: r2ssa::ValueId,
+    BindingPlanInvalidElisionProof {
+        value: r2ssa::ValueId,
     },
-    BindingPlanUnexpectedValueDisposition { value: r2ssa::ValueId,
+    BindingPlanUnexpectedValueDisposition {
+        value: r2ssa::ValueId,
     },
-    BindingPlanStackObjectCount { expected: usize, actual: usize,
+    BindingPlanStackObjectCount {
+        expected: usize,
+        actual: usize,
     },
-    BindingPlanUnexpectedStackObjectDisposition { object: r2ssa::ObjectId,
+    BindingPlanUnexpectedStackObjectDisposition {
+        object: r2ssa::ObjectId,
     },
-    BindingPlanStackObjectCertificate { object: r2ssa::ObjectId, binding_index: usize,
+    BindingPlanStackObjectCertificate {
+        object: r2ssa::ObjectId,
+        binding_index: usize,
     },
-    BindingPlanStackObjectDeclarationWidth { object: r2ssa::ObjectId, binding_index: usize,
+    BindingPlanStackObjectDeclarationWidth {
+        object: r2ssa::ObjectId,
+        binding_index: usize,
     },
-    BindingPlanParameterCount { expected: usize, actual: usize,
+    BindingPlanParameterCount {
+        expected: usize,
+        actual: usize,
     },
-    BindingPlanUnexpectedParameterDisposition { slot: u32,
+    BindingPlanUnexpectedParameterDisposition {
+        slot: u32,
     },
-    BindingPlanParameterCertificate { slot: u32, binding_index: usize,
+    BindingPlanParameterCertificate {
+        slot: u32,
+        binding_index: usize,
     },
-    BindingPlanParameterDeclarationWidth { slot: u32, binding_index: usize,
+    BindingPlanParameterDeclarationWidth {
+        slot: u32,
+        binding_index: usize,
     },
     NormalizationSourceAuthority,
     NormalizationBlockTopology,
-    NormalizationRowCount { block_address: u64,
+    NormalizationRowCount {
+        block_address: u64,
     },
-    NormalizationOriginalInstruction { block_address: u64, op_idx: usize,
+    NormalizationOriginalInstruction {
+        block_address: u64,
+        op_idx: usize,
     },
     NormalizationOriginalCoverage,
-    NormalizationPhiEdge { block_address: u64, op_idx: usize,
+    NormalizationPhiEdge {
+        block_address: u64,
+        op_idx: usize,
     },
-    NormalizationRelocatedInitializer { block_address: u64, op_idx: usize,
+    NormalizationRelocatedInitializer {
+        block_address: u64,
+        op_idx: usize,
     },
     NormalizationRemovedPhi,
     NormalizationRemovedPhiEdge,
@@ -2564,9 +2596,7 @@ impl BindingObservationJournalFailure {
             Self::BindingPlanUnexpectedParameterDisposition { .. } => {
                 "binding_plan_unexpected_parameter_disposition"
             }
-            Self::BindingPlanParameterCertificate { .. } => {
-                "binding_plan_parameter_certificate"
-            }
+            Self::BindingPlanParameterCertificate { .. } => "binding_plan_parameter_certificate",
             Self::BindingPlanParameterDeclarationWidth { .. } => {
                 "binding_plan_parameter_declaration_width"
             }
@@ -2662,13 +2692,10 @@ impl BindingShadowAuditOutcome {
                 ledger: shadow.ledger.into(),
                 observations: shadow.coverage.into(),
             },
-            BindingShadowOutcome::Failed(BindingShadowFailure::Build(_)) => {
-                Self::Failed(BindingShadowAuditFailure::PlanBuild)
-            }
-            BindingShadowOutcome::Failed(BindingShadowFailure::Pairing(_)) => {
+            BindingShadowOutcome::Failed(BindingShadowFailure::Pairing) => {
                 Self::Failed(BindingShadowAuditFailure::SourcePairing)
             }
-            BindingShadowOutcome::Failed(BindingShadowFailure::Report(_)) => {
+            BindingShadowOutcome::Failed(BindingShadowFailure::Report) => {
                 Self::Failed(BindingShadowAuditFailure::Report)
             }
             BindingShadowOutcome::Failed(BindingShadowFailure::IncompleteObservations {
@@ -2678,9 +2705,7 @@ impl BindingShadowAuditOutcome {
                 ledger: (*ledger).into(),
                 observations: (*coverage).into(),
             }),
-            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality {
-                ledger,
-                coverage }) => {
+            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality { ledger, coverage }) => {
                 Self::Failed(BindingShadowAuditFailure::NonQuality {
                     ledger: (*ledger).into(),
                     observations: (*coverage).into(),
@@ -2882,9 +2907,7 @@ impl PlacementAuditRefusal {
             Self::BindingOutsidePlan { .. } => "binding_outside_plan",
             Self::RegionOutsideArtifact { .. } => "region_outside_artifact",
             Self::BlockOutsideFunction { .. } => "block_outside_function",
-            Self::RegionDoesNotDominateOccurrence { .. } => {
-                "region_does_not_dominate_occurrence"
-            }
+            Self::RegionDoesNotDominateOccurrence { .. } => "region_does_not_dominate_occurrence",
             Self::ExternalBindingOutsidePlan { .. } => "external_binding_outside_plan",
             Self::RegionMarkerUnsealed => "region_marker_unsealed",
             Self::RegionMarkerForeign { .. } => "region_marker_foreign",
@@ -2901,9 +2924,7 @@ impl PlacementAuditRefusal {
             Self::MissingPlannedValue { .. } => "missing_planned_value",
             Self::RefusedPlannedValue { .. } => "refused_planned_value",
             Self::UnscopedObservation { .. } => "unscoped_observation",
-            Self::UnauthorizedProgramVariable { .. } => {
-                "unauthorized_program_variable"
-            }
+            Self::UnauthorizedProgramVariable { .. } => "unauthorized_program_variable",
             Self::UnobservedBindingRead { .. } => "unobserved_binding_read",
             Self::UnobservedBindingWrite { .. } => "unobserved_binding_write",
             Self::NoDominatingRegion { .. } => "no_dominating_region",
@@ -2914,9 +2935,7 @@ impl PlacementAuditRefusal {
             }
             Self::MissingBinding { .. } => "missing_binding",
             Self::MissingBindingSymbol { .. } => "missing_binding_symbol",
-            Self::ExternalBindingMissingParameter { .. } => {
-                "external_binding_missing_parameter"
-            }
+            Self::ExternalBindingMissingParameter { .. } => "external_binding_missing_parameter",
             Self::MissingRegion { .. } => "missing_region",
             Self::DuplicateRegion { .. } => "duplicate_region",
             Self::MissingInlineWrite { .. } => "missing_inline_write",
@@ -2964,9 +2983,7 @@ impl DecompileRenderRefusal {
             Self::MissingMachineProjectionAuthorization => {
                 "missing_machine_projection_authorization"
             }
-            Self::MissingProgramVariableAuthorization => {
-                "missing_program_variable_authorization"
-            }
+            Self::MissingProgramVariableAuthorization => "missing_program_variable_authorization",
             Self::DeclarationPlacement(refusal) => refusal.kind(),
             Self::RefusedBindingDisposition { .. } => "refused_binding_disposition",
             Self::NormalizationOriginUnavailable => "normalization_origin_unavailable",
@@ -3042,8 +3059,7 @@ fn rendered_identity_refusal_category(
         | RenderedIdentityRefusal::MissingBinding { .. }
         | RenderedIdentityRefusal::MissingValueDisposition { .. }
         | RenderedIdentityRefusal::MissingParameterDisposition { .. }
-        | RenderedIdentityRefusal::MissingStackDisposition { .. }
-        | RenderedIdentityRefusal::MissingStackObjectOrigin { .. } => {
+        | RenderedIdentityRefusal::MissingStackDisposition { .. } => {
             DecompileRenderRefusal::MissingProgramVariableAuthorization
         }
     }
@@ -3148,14 +3164,23 @@ impl PendingDecompileBindingAudit {
     }
 
     pub fn finalize(self) -> DecompileBindingAudit {
-        let (binding_shadow, effect_obligations, placement_audit, render_refusal) = self.product.map_or((self.ready, self.ready_effects, self.ready_placement, self.ready_refusal), |(product, source)| {
+        let (binding_shadow, effect_obligations, placement_audit, render_refusal) =
+            self.product.map_or(
+                (
+                    self.ready,
+                    self.ready_effects,
+                    self.ready_placement,
+                    self.ready_refusal,
+                ),
+                |(product, source)| {
                     (
                         product.binding_shadow(&source),
                         product.effect_obligations(),
                         product.placement_audit(),
                         product.render_refusal(),
                     )
-                });
+                },
+            );
         DecompileBindingAudit {
             output: self.output,
             binding_shadow,
@@ -3234,7 +3259,9 @@ impl InternalBuildProduct {
         }
     }
 
-    fn binding_shadow(&self, source: &r2types::SourceOwnedFunctionFacts,
+    fn binding_shadow(
+        &self,
+        source: &r2types::SourceOwnedFunctionFacts,
     ) -> BindingShadowAuditOutcome {
         let native = match self {
             Self::Native(native) => native,
@@ -3245,11 +3272,7 @@ impl InternalBuildProduct {
             Ok(observations) => observations,
             Err(failure) => return BindingShadowAuditOutcome::Failed(failure),
         };
-        let outcome = BindingShadowOutcome::build(
-            native.plan(),
-            source,
-            observations,
-            coverage);
+        let outcome = BindingShadowOutcome::build(native.plan(), source, observations, coverage);
         BindingShadowAuditOutcome::from_internal(&outcome)
     }
 
@@ -3408,8 +3431,7 @@ impl Decompiler {
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
             return Ok(PreparedDecompile::Immediate(
-                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(
-                    &func_name, reason)),
+                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(&func_name, reason)),
             ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
@@ -3452,11 +3474,10 @@ impl Decompiler {
             PreparedDecompile::Immediate(audit) => return Ok(audit),
             PreparedDecompile::NativeOrResidual(product) => product,
         };
-        let render_work =
-            DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
+        let render_work = DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
         render_work.poll()?;
-        let output = CodeGenerator::new(self.config.codegen.clone())
-            .generate_function(product.emission());
+        let output =
+            CodeGenerator::new(self.config.codegen.clone()).generate_function(product.emission());
         // This is deliberately the last production work-control decision.
         // Everything below classifies the already sealed observation journal.
         render_work.poll()?;
@@ -3491,9 +3512,7 @@ impl Decompiler {
         self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
             .map(PendingDecompileBindingAudit::into_output)
             .map_err(|(stop, partial)| {
-                (
-                    stop,
-                    partial.map(PendingDecompileBindingAudit::into_output))
+                (stop, partial.map(PendingDecompileBindingAudit::into_output))
             })
     }
 
@@ -3508,7 +3527,8 @@ impl Decompiler {
         &self,
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
-    ) -> Result<DecompileBindingAudit, (DecompileExecutionStop, Option<DecompileBindingAudit>)> {
+    ) -> Result<DecompileBindingAudit, (DecompileExecutionStop, Option<DecompileBindingAudit>)>
+    {
         self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
             .map(PendingDecompileBindingAudit::finalize)
             .map_err(|(stop, partial)| (stop, partial.map(PendingDecompileBindingAudit::finalize)))
@@ -3544,8 +3564,8 @@ impl Decompiler {
                 )),
             ));
         }
-        let output = CodeGenerator::new(self.config.codegen.clone())
-            .generate_function(product.emission());
+        let output =
+            CodeGenerator::new(self.config.codegen.clone()).generate_function(product.emission());
         if let Err(stop) = render_work.poll() {
             return Err((
                 stop,
@@ -3594,35 +3614,38 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                &func_name,
-                &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
-            ),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
+                ),
             ));
         }
         let decompiler = Self::new(self.config.clone()).with_context(input.context_projection());
         let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(
-                &func_name,
-                &missing_decompile_route_residual_comment(&func_name),
-            ),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &missing_decompile_route_residual_comment(&func_name),
+                ),
             ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, reason),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(&func_name, reason),
             ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             decompiler.context.function_facts.decompile_route(),
             decompiler.context.function_facts.semantic_report(),
         ) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_render_boundary(&func_name, &reason),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(&func_name, &reason),
             ));
         }
         if route_is_summary_boundary(semantic_route) {
-            return Ok(InternalBuildProduct::residual(residual_function_for_summary_route_boundary(
-                &func_name,
-                semantic_route),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_summary_route_boundary(&func_name, semantic_route),
             ));
         }
         decompiler.build_function_internal_with_control(input, semantic_route, work)
@@ -4008,7 +4031,8 @@ impl Decompiler {
                 for phi in &block.phis {
                     let value = graph.value_id_for_var(&phi.dst);
                     let carrier = value.is_some_and(|value| {
-                        render_facts.is_some_and(|facts| facts.loop_carrier_for_value(value).is_some())
+                        render_facts
+                            .is_some_and(|facts| facts.loop_carrier_for_value(value).is_some())
                     });
                     eprintln!(
                         "MERGEPHI block={:#x} dst={} size={} value={:?} carrier={}",
@@ -4068,7 +4092,9 @@ impl Decompiler {
                                     .value(member)
                                     .map(|value| value.var.display_name())
                                     .unwrap_or_default(),
-                                graph.value(member).and_then(|value| value.canonical_storage),
+                                graph
+                                    .value(member)
+                                    .and_then(|value| value.canonical_storage),
                                 spans.span_of(member)
                             );
                         }
@@ -4110,13 +4136,15 @@ impl Decompiler {
                 )
             };
         if let Some(render_facts) = self.context.function_facts.render() {
-            if let Err(error) = normalize::materialize_certified_loop_carrier_initializers_with_control(
-                &mut normalized_func,
-                &mut normalization_origins,
-                prepared,
-                render_facts,
-                work,
-            ) {
+            if let Err(error) =
+                normalize::materialize_certified_loop_carrier_initializers_with_control(
+                    &mut normalized_func,
+                    &mut normalization_origins,
+                    prepared,
+                    render_facts,
+                    work,
+                )
+            {
                 match error {
                     normalize::NormalizationFailure::Execution(error) => return Err(error),
                     normalize::NormalizationFailure::Origins(error) => {
@@ -4145,29 +4173,29 @@ impl Decompiler {
                 DecompileRenderRefusal::NormalizationOriginUnavailable,
             ));
         }
-        let binding_plan = match crate::binding_plan::BindingPlan::build_shadow(
-            input.source_owned_facts()) {
-            Ok(plan) => std::rc::Rc::new(plan),
-            Err(error) => {
-                let refusal = match error {
-                    crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
-                    | crate::binding_plan::BindingPlanBuildError::Seal(
-                        crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
-                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
-                    _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
-                };
-                return Ok(InternalBuildProduct::refused(
-                    residual_function_for_render_boundary(
-                        &func
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                        &format!("native render refusal: {}", refusal.kind()),
-                    ),
-                    refusal,
-                ));
-            }
-        };
+        let binding_plan =
+            match crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts()) {
+                Ok(plan) => std::rc::Rc::new(plan),
+                Err(error) => {
+                    let refusal = match error {
+                        crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
+                        | crate::binding_plan::BindingPlanBuildError::Seal(
+                            crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
+                        ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                        _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                    };
+                    return Ok(InternalBuildProduct::refused(
+                        residual_function_for_render_boundary(
+                            &func
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                            &format!("native render refusal: {}", refusal.kind()),
+                        ),
+                        refusal,
+                    ));
+                }
+            };
         if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
             input.source_owned_facts(),
             &binding_plan,
@@ -4205,13 +4233,14 @@ impl Decompiler {
                         _,
                     ) => DecompileRenderRefusal::MissingProgramVariableAuthorization,
                 };
-                return Ok(InternalBuildProduct::refused(residual_function_for_render_boundary(
-                    &func
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("native render refusal: {}", refusal.kind()),
-                ),
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
                     refusal,
                 ));
             }
@@ -4248,7 +4277,10 @@ impl Decompiler {
                 for (index, op) in block.ops.iter().enumerate() {
                     let op: &r2ssa::SSAOp = op;
                     let kind = format!("{op:?}");
-                    let kind = kind.split(|c: char| c == ' ' || c == '{').next().unwrap_or("?");
+                    let kind = kind
+                        .split(|c: char| c == ' ' || c == '{')
+                        .next()
+                        .unwrap_or("?");
                     eprintln!(
                         "NORMOP block={:#x} idx={index} kind={kind} dst={:?} srcs={:?}",
                         block.addr,
@@ -4274,7 +4306,9 @@ impl Decompiler {
                 let resolved = resolved?;
                 let ty = usize::try_from(resolved.slot)
                     .ok()
-                    .and_then(|slot| render_signature.and_then(|signature| signature.params.get(slot)))
+                    .and_then(|slot| {
+                        render_signature.and_then(|signature| signature.params.get(slot))
+                    })
                     .and_then(|parameter| parameter.ty.as_ref())
                     .map(type_like_to_ctype)
                     .unwrap_or(resolved.declaration_type);
@@ -4297,10 +4331,8 @@ impl Decompiler {
                 ));
             }
         };
-        let inferred_ret_type = evidence_return_type(
-            prepared,
-            input.source_owned_facts().evidence_types(),
-        );
+        let inferred_ret_type =
+            evidence_return_type(prepared, input.source_owned_facts().evidence_types());
         let signature_ret_type =
             render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
@@ -4351,13 +4383,14 @@ impl Decompiler {
                         DecompileRenderRefusal::MissingProgramVariableAuthorization
                     }
                 };
-                return Ok(InternalBuildProduct::refused(residual_function_for_render_boundary(
-                    &func
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
-                    &format!("native render refusal: {}", refusal.kind()),
-                ),
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
                     refusal,
                 ));
             }
@@ -4375,19 +4408,14 @@ impl Decompiler {
             binary_symbols: &self.context.symbols,
             function_facts: &self.context.function_facts,
             #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
-            external_stack_vars: &self.context.type_facts().external_stack_vars,
             visible_bindings: &self.context.type_facts().visible_bindings,
-            external_type_db: &self.context.type_facts().external_type_db,
             type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
             binding_names: Some(&binding_names),
             prepared_semantic_view: Some(&prepared_semantic_view),
-            prepared_objects: Some(prepared.objects()),
-            prepared_memory: Some(prepared.memory()),
         };
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         // One rendered function has one table, and this is the one the passes
@@ -4573,13 +4601,9 @@ impl Decompiler {
             other => vec![observations.reapply(other)],
         }
     }
-
 }
 
-fn evidence_return_type(
-    source: &r2ssa::SsaArtifact,
-    evidence: &r2types::EvidenceTypes,
-) -> CType {
+fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::EvidenceTypes) -> CType {
     let mut candidate: Option<CType> = None;
     let mut saw_return = false;
     for certificate in &source.certificates().returns {
@@ -4619,16 +4643,11 @@ fn void_function_has_value_return(func: &CFunction) -> bool {
                 ..
             } => {
                 stmt_has_value_return(then_body)
-                    || else_body
-                        .as_deref()
-                        .is_some_and(stmt_has_value_return)
+                    || else_body.as_deref().is_some_and(stmt_has_value_return)
             }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                stmt_has_value_return(body)
-            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => stmt_has_value_return(body),
             CStmt::For { init, body, .. } => {
-                init.as_deref().is_some_and(stmt_has_value_return)
-                    || stmt_has_value_return(body)
+                init.as_deref().is_some_and(stmt_has_value_return) || stmt_has_value_return(body)
             }
             CStmt::Switch { cases, default, .. } => {
                 cases
@@ -4864,7 +4883,11 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
             }
             match stmt {
                 CStmt::Block(inner) => walk(inner, out),
-                CStmt::If { then_body, else_body, .. } => {
+                CStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     walk(std::slice::from_ref(then_body), out);
                     if let Some(body) = else_body {
                         walk(std::slice::from_ref(body), out);
@@ -4896,13 +4919,19 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
             }
             match stmt {
                 CStmt::Block(inner) => n += count_returns(inner),
-                CStmt::If { then_body, else_body, .. } => {
+                CStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     n += count_returns(std::slice::from_ref(then_body));
                     if let Some(body) = else_body {
                         n += count_returns(std::slice::from_ref(body));
                     }
                 }
-                CStmt::While { body, .. } | CStmt::DoWhile { body, .. } | CStmt::For { body, .. } => n += count_returns(std::slice::from_ref(body)),
+                CStmt::While { body, .. }
+                | CStmt::DoWhile { body, .. }
+                | CStmt::For { body, .. } => n += count_returns(std::slice::from_ref(body)),
                 _ => {}
             }
         }
@@ -4920,7 +4949,10 @@ fn simplify_identities_in_function(func: &mut CFunction, fold_ctx: &FoldingConte
             let taken = std::mem::replace(expr, CExpr::IntLit(0));
             *expr = fold_ctx.simplify_identities(taken);
         });
-        if let CStmt::For { init: Some(init), .. } = stmt.unobserved_mut() {
+        if let CStmt::For {
+            init: Some(init), ..
+        } = stmt.unobserved_mut()
+        {
             visit(init, fold_ctx);
         }
         single_evaluation::for_each_child_block_mut(stmt, &mut |body, _| {
@@ -5149,14 +5181,15 @@ fn fold_constant_arithmetic_in_expr(
         && let Some(text) = strings.get(&value)
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_outer_expr_observations(
-            &source,
-            CExpr::StringLit(text.clone()));
+        *expr = crate::ast::carry_outer_expr_observations(&source, CExpr::StringLit(text.clone()));
     }
 }
 
 fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
-    fn visit(stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<crate::symbol::SymbolId, CType>,
+    fn visit(
+        stmt: &mut CStmt,
+        ret_type: &CType,
+        declared_types: &HashMap<crate::symbol::SymbolId, CType>,
     ) {
         match stmt {
             CStmt::StructuredRegion { stmt, .. } => visit(stmt, ret_type, declared_types),
@@ -5172,8 +5205,7 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
                 let CExpr::Var(name) = inner.unobserved() else {
                     return;
                 };
-                if declared_types.get(name).is_some_and(|ty| ty == ret_type)
-                {
+                if declared_types.get(name).is_some_and(|ty| ty == ret_type) {
                     *target = *inner.clone();
                 }
             }
@@ -5232,7 +5264,8 @@ fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
         .chain(
             func.locals
                 .iter()
-                .map(|local| (local.name, local.ty.clone())))
+                .map(|local| (local.name, local.ty.clone())),
+        )
         .collect::<HashMap<_, _>>();
     for stmt in &mut func.body {
         visit(stmt, &func.ret_type, &declared_types);
@@ -5375,8 +5408,7 @@ fn normalize_comparison_operand_order(func: &mut CFunction) {
 }
 
 fn normalize_declared_assignment_literals(func: &mut CFunction) {
-    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<crate::symbol::SymbolId, CType>,
-    ) {
+    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<crate::symbol::SymbolId, CType>) {
         match expr {
             CExpr::Observed { expr, .. } => visit_expr(expr, declared_types),
             CExpr::Unary { operand, .. }
@@ -5535,7 +5567,8 @@ fn normalize_declared_assignment_literals(func: &mut CFunction) {
         .chain(
             func.locals
                 .iter()
-                .map(|local| (local.name, local.ty.clone())))
+                .map(|local| (local.name, local.ty.clone())),
+        )
         .collect::<HashMap<_, _>>();
     for stmt in &mut func.body {
         visit_stmt(stmt, &declared_types, &func.ret_type);
@@ -5692,19 +5725,13 @@ mod tests {
             strings: Box::leak(Box::new(HashMap::new())),
             binary_symbols: Box::leak(Box::new(HashMap::new())),
             function_facts: crate::fold::context::empty_function_facts(),
-            #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
-            external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
-            external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),
             type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             binding_names: None,
             prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
         })
     }
 
@@ -5854,12 +5881,48 @@ mod tests {
     fn test_arch_for_decompile() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         let registers = [
-            ("RAX", RegisterStorage { offset: 0x00, size: 8 }),
-            ("RDI", RegisterStorage { offset: 0x10, size: 8 }),
-            ("RSI", RegisterStorage { offset: 0x18, size: 8 }),
-            ("RBP", RegisterStorage { offset: 0x20, size: 8 }),
-            ("RSP", RegisterStorage { offset: 0x28, size: 8 }),
-            ("RIP", RegisterStorage { offset: 0x30, size: 8 }),
+            (
+                "RAX",
+                RegisterStorage {
+                    offset: 0x00,
+                    size: 8,
+                },
+            ),
+            (
+                "RDI",
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+            ),
+            (
+                "RSI",
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+            ),
+            (
+                "RBP",
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+            ),
+            (
+                "RSP",
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+            ),
+            (
+                "RIP",
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+            ),
         ];
         for (name, storage) in registers {
             arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
@@ -5973,7 +6036,9 @@ mod tests {
         let symbols = test_table();
         let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
             CExpr::IntLit(1),
-            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var(crate::symbol::declare(&symbols, "result")),
+            CStmt::Return(Some(CExpr::cast(
+                CType::Int(64),
+                CExpr::var(crate::symbol::declare(&symbols, "result")),
             ))),
             None,
         )]);
@@ -6066,10 +6131,9 @@ mod tests {
         fold_constant_arithmetic_in_expr(&mut expr, &strings);
         let mut function = CFunction::new("folded", CType::Pointer(Box::new(CType::Int(8))))
             .with_body(vec![CStmt::Return(Some(expr))]);
-        let reachable = crate::ast::strip_render_observations(
-            &mut function,
-            observations.expected_count())
-        .expect("constant folding preserves a valid marker domain");
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("constant folding preserves a valid marker domain");
 
         assert!(reachable.contains(root_id));
         assert!(!reachable.contains(left_id));
@@ -6095,12 +6159,10 @@ mod tests {
             ])
         );
 
-        let mut function = CFunction::new("commented", CType::Int(32))
-            .with_body(vec![commented]);
-        let reachable = crate::ast::strip_render_observations(
-            &mut function,
-            observations.expected_count())
-        .expect("comment insertion preserves a valid marker domain");
+        let mut function = CFunction::new("commented", CType::Int(32)).with_body(vec![commented]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("comment insertion preserves a valid marker domain");
         assert!(reachable.contains(stmt_id));
     }
 
@@ -6117,13 +6179,12 @@ mod tests {
             ]))
             .expect("block observation");
         let commented = Decompiler::prepend_comment(block, "summary".to_string());
-        let mut function = CFunction::new("commented_block", CType::Int(32))
-            .with_body(vec![commented]);
+        let mut function =
+            CFunction::new("commented_block", CType::Int(32)).with_body(vec![commented]);
 
-        let reachable = crate::ast::strip_render_observations(
-            &mut function,
-            observations.expected_count())
-        .expect("comment insertion preserves a valid marker domain");
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("comment insertion preserves a valid marker domain");
         assert!(reachable.contains(child_id));
         assert!(
             !reachable.contains(block_id),
@@ -6155,10 +6216,9 @@ mod tests {
         let body = decompiler.stmt_to_vec(block);
         let mut function = CFunction::new("split", CType::Int(32)).with_body(body);
 
-        let reachable = crate::ast::strip_render_observations(
-            &mut function,
-            observations.expected_count())
-        .expect("block decomposition preserves a valid marker domain");
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("block decomposition preserves a valid marker domain");
         assert!(reachable.contains(first_id));
         assert!(
             !reachable.contains(block_id),
@@ -6720,7 +6780,8 @@ mod tests {
             .build_function_internal_with_control(&input, semantic_route, work)
             .expect("native production build");
 
-        let internal_output = CodeGenerator::new(config.codegen).generate_function(built.emission());
+        let internal_output =
+            CodeGenerator::new(config.codegen).generate_function(built.emission());
         let public_output = public_decompiler.decompile_input(&input);
         assert_eq!(internal_output, public_output);
         let audited = public_decompiler.decompile_input_with_binding_audit(&input);

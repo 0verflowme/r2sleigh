@@ -7,11 +7,6 @@
 //! certificate.  This keeps the report diagnostic: it cannot become a second
 //! renderer input by accident.
 
-#![allow(
-    dead_code,
-    reason = "Stage 4 report is wired into production after its isolated core is reviewed"
-)]
-
 use r2ssa::{
     InstId, MachineUseDisposition, MachineUseRefusal, MachineUseSlice, MachineValueUse,
     MachineWriteDisposition, MachineWriteProjection, MachineWriteRefusal, SsaArtifactAuthority,
@@ -118,6 +113,7 @@ impl LegacyAnalysisSnapshot {
 
     /// Construct the honest Stage 4 baseline when the old renderer has no
     /// canonical per-use or per-write table to expose.
+    #[cfg(test)]
     pub(crate) fn with_absent_machine_observations(
         source: &SourceOwnedFunctionFacts,
         values: impl Into<Box<[LegacyValueCell]>>,
@@ -154,16 +150,7 @@ impl LegacyAnalysisSnapshot {
         Self::new(source, values, uses, writes)
     }
 
-    pub(crate) fn value_observation(
-        &self,
-        value: ValueId,
-    ) -> Option<LegacyValueObservation> {
-        self.values
-            .get(value.0 as usize)
-            .filter(|cell| cell.value == value)
-            .map(|cell| cell.observation)
-    }
-
+    #[cfg(test)]
     pub(crate) fn use_observation(&self, site: UseSite) -> Option<LegacyUseObservation> {
         self.uses
             .get(site.inst.0 as usize)?
@@ -172,13 +159,6 @@ impl LegacyAnalysisSnapshot {
             .map(|cell| cell.observation)
     }
 
-    pub(crate) fn write_observation(&self, inst: InstId) -> Option<LegacyWriteObservation> {
-        self.writes
-            .get(inst.0 as usize)?
-            .as_ref()
-            .filter(|cell| cell.inst == inst)
-            .map(|cell| cell.observation)
-    }
 }
 
 /// Typed pointer to the canonical evidence used for a classification.
@@ -217,19 +197,12 @@ pub(crate) enum WrongReason {
     EquivalenceClassMismatch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnclassifiedReason {
-    MissingCanonicalEvidence,
-    MalformedObservation,
-}
-
 /// Judgment of one side against canonical evidence, before the two sides are
 /// compared with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SideJudgment {
     Correct,
     Wrong(WrongReason),
-    Unclassified(UnclassifiedReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +221,6 @@ pub(crate) enum ShadowClassification {
     OldWrong,
     ShadowWrong,
     BothWrong(BothWrongRelation),
-    Unclassified { old: bool, shadow: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,22 +242,22 @@ pub(crate) struct ShadowCell<K> {
 }
 
 impl<K: Copy> ShadowCell<K> {
+    #[cfg(test)]
     pub(crate) const fn key(&self) -> K {
         self.key
     }
 
-    pub(crate) const fn evidence(&self) -> ShadowEvidenceKey {
-        self.evidence
-    }
-
+    #[cfg(test)]
     pub(crate) const fn old_judgment(&self) -> SideJudgment {
         self.old
     }
 
+    #[cfg(test)]
     pub(crate) const fn shadow_judgment(&self) -> SideJudgment {
         self.shadow
     }
 
+    #[cfg(test)]
     pub(crate) const fn classification(&self) -> ShadowClassification {
         self.classification
     }
@@ -326,7 +298,6 @@ impl DomainLedger {
                 ShadowClassification::BothWrong(BothWrongRelation::Different) => {
                     ledger.both_wrong_different += 1;
                 }
-                ShadowClassification::Unclassified { .. } => ledger.unclassified += 1,
             }
         }
         ledger
@@ -358,6 +329,7 @@ impl DomainLedger {
 
     /// Stage 4 soundness gate.  Legacy errors are findings; shadow errors,
     /// unclassified cells, and both-wrong cells fail the cutover gate.
+    #[cfg(test)]
     pub(crate) const fn passes_stage4(self) -> bool {
         self.equations_hold()
             && self.shadow_wrong_total() == 0
@@ -368,7 +340,11 @@ impl DomainLedger {
     /// Quality is stricter than soundness: even an upstream-justified refusal
     /// remains visible failure rather than an earned semantic pass.
     pub(crate) const fn passes_quality(self) -> bool {
-        self.passes_stage4() && self.refused == 0
+        self.equations_hold()
+            && self.shadow_wrong_total() == 0
+            && self.both_wrong() == 0
+            && self.unclassified == 0
+            && self.refused == 0
     }
 }
 
@@ -384,6 +360,7 @@ impl ShadowLedger {
         self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
     }
 
+    #[cfg(test)]
     pub(crate) const fn passes_stage4(self) -> bool {
         self.values.passes_stage4() && self.uses.passes_stage4() && self.writes.passes_stage4()
     }
@@ -467,10 +444,6 @@ pub(crate) enum ShadowReportError {
     InvalidLegacyBinding {
         binding: LegacyBindingId,
     },
-    ReportValueTopology {
-        index: usize,
-        value: ValueId,
-    },
     ReportValueCount {
         expected: usize,
         actual: usize,
@@ -484,10 +457,6 @@ pub(crate) enum ShadowReportError {
         expected: usize,
         actual: usize,
     },
-    ReportUseTopology {
-        expected: UseSite,
-        actual: UseSite,
-    },
     ReportWriteCount {
         expected: usize,
         actual: usize,
@@ -495,10 +464,6 @@ pub(crate) enum ShadowReportError {
     ReportWritePresence {
         inst: InstId,
         expected: bool,
-    },
-    ReportWriteTopology {
-        expected: InstId,
-        actual: InstId,
     },
     ReportClassification {
         evidence: ShadowEvidenceKey,
@@ -533,16 +498,9 @@ mod classification;
 #[cfg(test)]
 use classification::classify_sides;
 impl ShadowReport {
-    pub(crate) const fn values(&self) -> &[ShadowCell<ValueId>] {
-        &self.values
-    }
-
+    #[cfg(test)]
     pub(crate) const fn uses(&self) -> &[Box<[ShadowCell<UseSite>]>] {
         &self.uses
-    }
-
-    pub(crate) const fn writes(&self) -> &[Option<ShadowCell<InstId>>] {
-        &self.writes
     }
 
     pub(crate) fn ledger(&self, source_owned: &SourceOwnedFunctionFacts) -> ShadowLedger {

@@ -6,15 +6,15 @@ use r2ssa::{SSAOp, SSAVar, ValueId};
 use r2types::TypeOracle;
 
 #[cfg(test)]
+use super::StackSlotProvenance;
+#[cfg(test)]
+use super::utils::format_traced_name;
+#[cfg(test)]
 use super::utils::parse_const_value;
 use super::{
     BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, UseInfo, ValueProvenance,
     ValueRef,
 };
-#[cfg(test)]
-use super::StackSlotProvenance;
-#[cfg(test)]
-use super::utils::format_traced_name;
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::binding_plan::PlannedValueSymbol;
 
@@ -65,10 +65,8 @@ impl<'a> LowerCtx<'a> {
 
     #[cfg(test)]
     fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.use_info.and_then(|info| {
-            info.value_id_for_name(name)
-                .and_then(|value_id| info.render_definition_for_value(value_id))
-        })
+        self.use_info
+            .and_then(|info| info.render_definition_for_name(name))
     }
 
     fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
@@ -77,27 +75,24 @@ impl<'a> LowerCtx<'a> {
 
     #[cfg(test)]
     fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        self.use_info.and_then(|info| {
-            info.value_id_for_name(name)
-                .and_then(|value_id| info.render_semantic_value_for_value(value_id))
-        })
+        self.use_info
+            .and_then(|info| info.render_semantic_value_for_name(name))
     }
 
     fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
-        self.use_info.and_then(|info| info.semantic_value_for_var(var))
-    }
-
-    #[cfg(test)]
-    fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        self.use_info.and_then(|info| {
-            info.value_id_for_name(name)
-                .and_then(|value_id| info.render_forwarded_value_for_value(value_id))
-        })
+        self.use_info
+            .and_then(|info| info.semantic_value_for_var(var))
     }
 
     fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
         self.use_info
             .and_then(|info| info.forwarded_value_for_var(var))
+    }
+
+    #[cfg(test)]
+    fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
+        self.use_info
+            .and_then(|info| info.render_forwarded_value_for_name(name))
     }
 
     fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
@@ -137,8 +132,7 @@ impl<'a> LowerCtx<'a> {
         let resolver = self
             .binding_names
             .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
-        let value = self
-            .exact_value_id(var)?;
+        let value = self.exact_value_id(var)?;
         match resolver
             .require_value(value)
             .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?
@@ -273,7 +267,10 @@ impl<'a> LowerCtx<'a> {
         visited: &mut HashSet<String>,
     ) -> CExpr {
         if depth > 8 {
-            return crate::symbol::var_ref(self.symbols, format_traced_name(name, self.var_aliases));
+            return crate::symbol::var_ref(
+                self.symbols,
+                format_traced_name(name, self.var_aliases),
+            );
         }
 
         if let Some(val) = parse_const_value(name) {
@@ -376,18 +373,24 @@ impl<'a> LowerCtx<'a> {
                 b,
                 Some(uint_type_from_size(a.size.max(b.size))),
             )?,
-            SSAOp::IntSLess { a, b, .. } => {
-                self.typed_binary_expr(BinaryOp::Lt, a, b, Some(type_from_size(a.size.max(b.size))))?
-            }
+            SSAOp::IntSLess { a, b, .. } => self.typed_binary_expr(
+                BinaryOp::Lt,
+                a,
+                b,
+                Some(type_from_size(a.size.max(b.size))),
+            )?,
             SSAOp::IntLessEqual { a, b, .. } => self.typed_binary_expr(
                 BinaryOp::Le,
                 a,
                 b,
                 Some(uint_type_from_size(a.size.max(b.size))),
             )?,
-            SSAOp::IntSLessEqual { a, b, .. } => {
-                self.typed_binary_expr(BinaryOp::Le, a, b, Some(type_from_size(a.size.max(b.size))))?
-            }
+            SSAOp::IntSLessEqual { a, b, .. } => self.typed_binary_expr(
+                BinaryOp::Le,
+                a,
+                b,
+                Some(type_from_size(a.size.max(b.size))),
+            )?,
             SSAOp::IntEqual { a, b, .. } => self.binary_expr(BinaryOp::Eq, a, b)?,
             SSAOp::IntNotEqual { a, b, .. } => self.binary_expr(BinaryOp::Ne, a, b)?,
             SSAOp::IntNegate { src, .. } => CExpr::unary(UnaryOp::Neg, self.get_expr(src)?),
@@ -516,11 +519,7 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-    fn intrinsic_call(
-        &self,
-        name: &str,
-        source: &SSAVar,
-    ) -> Result<CExpr, OpLoweringRefusal> {
+    fn intrinsic_call(&self, name: &str, source: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
         Ok(CExpr::call(
             CExpr::External {
                 name: name.to_string(),
@@ -537,7 +536,6 @@ impl<'a> LowerCtx<'a> {
         depth: u32,
         visited: &mut HashSet<String>,
     ) -> Option<CExpr> {
-
         if depth > 8 || !visited.insert(format!("sem:{name}")) {
             return None;
         }
@@ -698,7 +696,10 @@ impl<'a> LowerCtx<'a> {
         visited: &mut HashSet<ValueId>,
     ) -> Result<Option<CExpr>, OpLoweringRefusal> {
         let value_id = self.exact_value_id(&value.var)?;
-        if value.value_id.is_some_and(|certificate| certificate != value_id) {
+        if value
+            .value_id
+            .is_some_and(|certificate| certificate != value_id)
+        {
             return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
         }
         if !visited.insert(value_id) {
@@ -844,11 +845,7 @@ impl<'a> LowerCtx<'a> {
         Ok(self.build_subscript_expr(base_expr, index_expr, elem_ty, is_sub))
     }
 
-    fn typed_deref_expr(
-        &self,
-        addr: &SSAVar,
-        elem_size: u32,
-    ) -> Result<CExpr, OpLoweringRefusal> {
+    fn typed_deref_expr(&self, addr: &SSAVar, elem_size: u32) -> Result<CExpr, OpLoweringRefusal> {
         let addr_expr = self.get_expr(addr)?;
         let addr_ty = self.type_oracle.map(|oracle| oracle.type_of(addr));
         let is_pointer_typed = if let (Some(oracle), Some(ty)) = (self.type_oracle, addr_ty) {
@@ -1347,7 +1344,8 @@ mod tests {
                 }
                 for (name, provenance) in _forwarded_values {
                     if let Some(value_id) = info.value_id_for_name_or_bind(name) {
-                        info.forwarded_values_by_value.insert(value_id, provenance.clone());
+                        info.forwarded_values_by_value
+                            .insert(value_id, provenance.clone());
                     }
                 }
                 info
@@ -1527,50 +1525,6 @@ mod tests {
                 "opaque operations must retain the canonical machine refusal"
             );
         }
-    }
-
-    #[test]
-    fn op_to_expr_preserves_select_value_semantics() {
-        let symbols = test_table();
-        let function_names = HashMap::new();
-        let strings = HashMap::new();
-        let binary_symbols = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
-        let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &var_aliases,
-            &ptr_arith,
-            &stack_slots,
-            &forwarded_values,
-            &function_names,
-            &strings,
-            &binary_symbols,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Select {
-                dst: SSAVar::new("tmp:result", 1, 4),
-                cond: SSAVar::new("cond", 0, 1),
-                if_true: SSAVar::new("when_true", 0, 4),
-                if_false: SSAVar::new("when_false", 0, 4),
-            }),
-            Ok(CExpr::Ternary {
-                cond: Box::new(crate::symbol::var_ref(&symbols, "cond")),
-                then_expr: Box::new(crate::symbol::var_ref(&symbols, "when_true")),
-                else_expr: Box::new(crate::symbol::var_ref(&symbols, "when_false")),
-            })
-        );
     }
 
     #[test]
@@ -1806,7 +1760,10 @@ mod tests {
                     BinaryOp::Mul,
                     CExpr::Cast {
                         ty: CType::Int(64),
-                        expr: Box::new(CExpr::unary(UnaryOp::Neg, crate::symbol::var_ref(&symbols, "arg2"))),
+                        expr: Box::new(CExpr::unary(
+                            UnaryOp::Neg,
+                            crate::symbol::var_ref(&symbols, "arg2"),
+                        )),
                     },
                     CExpr::IntLit(4),
                 ),
@@ -1996,7 +1953,10 @@ mod tests {
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([
-            ("tmp:base_1".to_string(), crate::symbol::var_ref(&symbols, "rdx_1")),
+            (
+                "tmp:base_1".to_string(),
+                crate::symbol::var_ref(&symbols, "rdx_1"),
+            ),
             (
                 "tmp:addr_1".to_string(),
                 CExpr::binary(
@@ -2061,8 +2021,14 @@ mod tests {
                 "tmp:arr_local_1".to_string(),
                 crate::symbol::var_ref(&symbols, "local_8"),
             ),
-            ("local_8".to_string(), crate::symbol::var_ref(&symbols, "arg1")),
-            ("local_c".to_string(), crate::symbol::var_ref(&symbols, "arg2")),
+            (
+                "local_8".to_string(),
+                crate::symbol::var_ref(&symbols, "arg1"),
+            ),
+            (
+                "local_c".to_string(),
+                crate::symbol::var_ref(&symbols, "arg2"),
+            ),
             (
                 addr.display_name(),
                 CExpr::binary(
