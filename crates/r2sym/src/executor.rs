@@ -1349,7 +1349,11 @@ impl<'ctx> SymExecutor<'ctx> {
         for tail_op in tail {
             self.execution.poll()?;
             let forked = self.step(state, tail_op)?;
-            debug_assert!(forked.is_empty());
+            if !forked.is_empty() {
+                return Err(crate::SymError::UnsupportedOp(
+                    "local branch copy tail unexpectedly forked execution".to_string(),
+                ));
+            }
             state.step();
         }
         state.set_static_execution_pc(target_addr);

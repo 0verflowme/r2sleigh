@@ -899,18 +899,24 @@ impl<'ctx> SymSolver<'ctx> {
     fn state_constraint_pairs_with_facts(
         &self,
         state: &SymState<'ctx>,
-    ) -> Vec<(
-        ConstraintCursorKey,
-        ConstraintCursorKey,
-        Bool,
-        CursorConstraintFacts,
-    )> {
-        self.state_constraint_pairs(state)
+    ) -> Option<
+        Vec<(
+            ConstraintCursorKey,
+            ConstraintCursorKey,
+            Bool,
+            CursorConstraintFacts,
+        )>,
+    > {
+        let constraints = self.state_constraint_pairs(state);
+        let facts = self.ensure_cursor_facts(state);
+        if constraints.len() != facts.len() {
+            return None;
+        }
+        constraints
             .into_iter()
-            .zip(self.ensure_cursor_facts(state))
+            .zip(facts)
             .map(|((key, constraint), (fact_key, parent, facts))| {
-                debug_assert_eq!(key, fact_key);
-                (key, parent, constraint, facts)
+                (key == fact_key).then_some((key, parent, constraint, facts))
             })
             .collect()
     }
@@ -926,20 +932,23 @@ impl<'ctx> SymSolver<'ctx> {
         atoms.len()
     }
 
-    fn state_constraint_analysis(&self, state: &SymState<'ctx>) -> Rc<StateConstraintAnalysis> {
+    fn state_constraint_analysis(
+        &self,
+        state: &SymState<'ctx>,
+    ) -> Option<Rc<StateConstraintAnalysis>> {
         let cache_key = state.constraint_cursor_key();
         if let Some(cached) = self.analysis_cache.borrow().state_cache.get(&cache_key) {
-            return cached.clone();
+            return Some(cached.clone());
         }
 
-        let pairs = self.state_constraint_pairs_with_facts(state);
+        let pairs = self.state_constraint_pairs_with_facts(state)?;
         if pairs.is_empty() {
             let empty = Rc::new(StateConstraintAnalysis::default());
             self.analysis_cache
                 .borrow_mut()
                 .state_cache
                 .insert(cache_key, empty.clone());
-            return empty;
+            return Some(empty);
         }
 
         let mut cached_prefix = StateConstraintAnalysis::default();
@@ -965,12 +974,14 @@ impl<'ctx> SymSolver<'ctx> {
                 .insert(*key, cached);
         }
 
-        self.analysis_cache
-            .borrow()
-            .state_cache
-            .get(&cache_key)
-            .cloned()
-            .unwrap_or_else(|| Rc::new(current))
+        Some(
+            self.analysis_cache
+                .borrow()
+                .state_cache
+                .get(&cache_key)
+                .cloned()
+                .unwrap_or_else(|| Rc::new(current)),
+        )
     }
 
     fn cached_state_constraint_analysis(
@@ -1009,7 +1020,7 @@ impl<'ctx> SymSolver<'ctx> {
         match mode {
             SolverMode::ExploreFast => self.cached_state_constraint_analysis(state),
             SolverMode::QueryDeep if self.should_build_partition_analysis(state, kind) => {
-                Some(self.state_constraint_analysis(state))
+                self.state_constraint_analysis(state)
             }
             SolverMode::QueryDeep => None,
         }
@@ -2103,7 +2114,9 @@ mod tests {
         state.add_true_constraint(&y.eq(&ctx, &SymValue::concrete(42, 32)));
 
         let solver = SymSolver::new(&ctx);
-        let analysis = solver.state_constraint_analysis(&state);
+        let analysis = solver
+            .state_constraint_analysis(&state)
+            .expect("coherent cursor facts");
         assert_eq!(analysis.ground_constraints.len(), 0);
         assert_eq!(analysis.partitions.len(), 2);
     }
