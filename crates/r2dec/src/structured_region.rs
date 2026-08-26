@@ -815,7 +815,7 @@ fn visit_occurrences<'a>(
 ) {
     match stmt {
         CStmt::StructuredRegion { marker, stmt } => {
-            let anchor = marker
+            let _anchor = marker
                 .emission_anchor()
                 .expect("sealed body contains only sealed region markers");
             let (_id, _node) = regions
@@ -825,7 +825,7 @@ fn visit_occurrences<'a>(
                 #[cfg(test)]
                 id: _id,
                 #[cfg(test)]
-                anchor,
+                anchor: _anchor,
                 #[cfg(test)]
                 node: _node,
                 #[cfg(test)]

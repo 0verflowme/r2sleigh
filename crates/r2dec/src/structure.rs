@@ -563,6 +563,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.stop_reason.get()
     }
 
+    /// Release one lexical merge deferral exactly once.
+    ///
+    /// The pop is semantic state mutation, not a debug check: leaving a merge
+    /// on this stack changes which later blocks the structurer suppresses.  A
+    /// stack mismatch therefore invalidates the current control-flow proof and
+    /// must take the existing safety-residual path in every build profile.
+    fn release_deferred_merge(&mut self, expected: u64) -> bool {
+        let actual = self.deferred_merge_blocks.pop();
+        if actual == Some(expected) {
+            return true;
+        }
+        if self.safety_reason.is_none() {
+            let actual = actual
+                .map(|addr| format!("0x{addr:x}"))
+                .unwrap_or_else(|| "empty stack".to_string());
+            self.safety_reason = Some(format!(
+                "deferred merge stack mismatch: expected 0x{expected:x}, found {}",
+                actual
+            ));
+        }
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn control_render_proofs(&self) -> &[ControlRenderProof] {
         &self.control_render_proofs
@@ -1030,8 +1053,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         self.deferred_merge_blocks.push(merge);
                     }
                     let stmt = self.structure_region(region)?;
-                    if let Some(merge) = deferred_merge {
-                        debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+                    if let Some(merge) = deferred_merge
+                        && !self.release_deferred_merge(merge)
+                    {
+                        return Ok(CStmt::Empty);
                     }
                     if !matches!(stmt, CStmt::Empty) {
                         stmts.push(stmt);
@@ -1094,8 +1119,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     Some(region) => Some(self.structure_branch_region(*cond_block, region)?),
                     None => None,
                 };
-                if let Some(merge) = merge_block {
-                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*merge));
+                if let Some(merge) = merge_block
+                    && !self.release_deferred_merge(*merge)
+                {
+                    return Ok(CStmt::Empty);
                 }
                 let branches_terminate = else_stmt.as_ref().is_some_and(|else_stmt| {
                     Self::stmt_guarantees_termination(&then_stmt)
@@ -1195,7 +1222,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let mut body_stmt =
                     Self::strip_trailing_latch_marker(self.structure_loop_body(body)?);
                 if !cond_owned_by_body {
-                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(*cond_block));
+                    if !self.release_deferred_merge(*cond_block) {
+                        return Ok(CStmt::Empty);
+                    }
                     let mut stmts = Self::stmt_into_vec(body_stmt);
                     Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block)?);
                     body_stmt = Self::stmt_from_vec(stmts);
@@ -1613,8 +1642,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         } else {
             None
         };
-        if let Some(merge) = merge_block {
-            debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+        if let Some(merge) = merge_block
+            && !self.release_deferred_merge(merge)
+        {
+            return Ok(CStmt::Empty);
         }
         let switch_stmt = self.observe_control_ownership(
             switch_block,
@@ -2001,8 +2032,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         }
                     }
                 }
-                if let Some(merge) = deferred_merge {
-                    debug_assert_eq!(self.deferred_merge_blocks.pop(), Some(merge));
+                if let Some(merge) = deferred_merge
+                    && !self.release_deferred_merge(merge)
+                {
+                    return Ok(CStmt::Empty);
                 }
             }
             if all_stmts.is_empty() {
@@ -4985,6 +5018,31 @@ mod tests {
 
         assert!(reason.contains("missing canonical control facts"));
         assert_eq!(structurer.active_domains, vec![RenderedBlockDomain::default()]);
+    }
+
+    #[test]
+    fn deferred_merge_release_mutates_state_and_refuses_mismatch() {
+        let func = function_with_terminating_if_and_shared_merge();
+        let ctx = FoldingContext::new(64);
+
+        let mut matching = ControlFlowStructurer::new(&func, &ctx);
+        matching.deferred_merge_blocks.push(0x1010);
+        assert!(matching.release_deferred_merge(0x1010));
+        assert!(matching.deferred_merge_blocks.is_empty());
+        assert!(matching.safety_reason().is_none());
+
+        let mut mismatched = ControlFlowStructurer::new(&func, &ctx);
+        mismatched.deferred_merge_blocks.push(0x1010);
+        assert!(!mismatched.release_deferred_merge(0x1020));
+        assert!(
+            mismatched.deferred_merge_blocks.is_empty(),
+            "the semantic pop must execute even when the proof mismatches"
+        );
+        assert!(mismatched.safety_reason().is_some_and(|reason| {
+            reason.contains("deferred merge stack mismatch")
+                && reason.contains("expected 0x1020")
+                && reason.contains("0x1010")
+        }));
     }
 
     /// A reference declared in the table the code under test reads, because an

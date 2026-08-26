@@ -1819,14 +1819,19 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         binding_occurrences.sort_by_key(Occurrence::sort_key);
     }
 
-    let must_in = must_assignment_inputs(
+    let must_in = match must_assignment_inputs(
         cfg,
         binding_count,
         &block_addrs,
         &block_indices,
         &occurrences,
         externally_declared,
-    );
+    ) {
+        Ok(inputs) => inputs,
+        Err(mismatch) => {
+            return Ok(refuse_unprovable_binding_domain(binding_count, mismatch));
+        }
+    };
     let mut decisions = vec![None; binding_count];
 
     for (binding_index, binding_occurrences) in occurrences.iter().enumerate() {
@@ -2072,6 +2077,26 @@ fn first_read_before_assignment(
     None
 }
 
+/// A malformed dense-set domain invalidates the must-assignment proof for the
+/// whole binding domain. Refuse every binding so no caller can accidentally
+/// consume a partial `zip` result as a placement proof.
+fn refuse_unprovable_binding_domain(
+    binding_count: usize,
+    _mismatch: DenseBindingDomainMismatch,
+) -> PlacementDecisions {
+    let decisions = (0..binding_count)
+        .map(|index| {
+            let binding = BindingId::from_dense_index(index)
+                .expect("binding_count was already accepted as a dense BindingId domain");
+            Some(PlacementDecision::Refused(
+                PlacementRefusal::UnprovableExecutionOrder { binding },
+            ))
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    PlacementDecisions { decisions }
+}
+
 fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
     cfg: &C,
     binding_count: usize,
@@ -2079,14 +2104,14 @@ fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
     block_indices: &BTreeMap<u64, usize>,
     occurrences: &[Vec<Occurrence>],
     externally_declared: &BTreeSet<BindingId>,
-) -> Vec<DenseBindingSet> {
+) -> Result<Vec<DenseBindingSet>, DenseBindingDomainMismatch> {
     let mut generated = vec![DenseBindingSet::empty(binding_count); block_addrs.len()];
     for (binding_index, binding_occurrences) in occurrences.iter().enumerate() {
         let binding = BindingId::from_dense_index(binding_index)
             .expect("binding occurrence index fits BindingId");
         for occurrence in binding_occurrences {
             if matches!(occurrence.kind, OccurrenceKind::Write { .. }) {
-                generated[block_indices[&occurrence.block]].insert(binding);
+                generated[block_indices[&occurrence.block]].insert(binding)?;
             }
         }
     }
@@ -2100,19 +2125,19 @@ fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
         predecessors.sort_unstable();
         predecessors.dedup();
         let next_input = if block == cfg.entry() {
-            DenseBindingSet::from_bindings(binding_count, externally_declared)
+            DenseBindingSet::from_bindings(binding_count, externally_declared)?
         } else if predecessors.is_empty() {
             DenseBindingSet::empty(binding_count)
         } else {
             let first = predecessors.remove(0);
             let mut intersection = outputs[block_indices[&first]].clone();
             for predecessor in predecessors {
-                intersection.intersect_with(&outputs[block_indices[&predecessor]]);
+                intersection.intersect_with(&outputs[block_indices[&predecessor]])?;
             }
             intersection
         };
         let mut next_output = next_input.clone();
-        next_output.union_with(&generated[block_index]);
+        next_output.union_with(&generated[block_index])?;
         let output_changed = next_output != outputs[block_index];
         inputs[block_index] = next_input;
         outputs[block_index] = next_output;
@@ -2125,8 +2150,11 @@ fn must_assignment_inputs<C: PlacementControlFlow + ?Sized>(
             }
         }
     }
-    inputs
+    Ok(inputs)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DenseBindingDomainMismatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DenseBindingSet {
@@ -2156,12 +2184,15 @@ impl DenseBindingSet {
         set
     }
 
-    fn from_bindings(binding_count: usize, bindings: &BTreeSet<BindingId>) -> Self {
+    fn from_bindings(
+        binding_count: usize,
+        bindings: &BTreeSet<BindingId>,
+    ) -> Result<Self, DenseBindingDomainMismatch> {
         let mut set = Self::empty(binding_count);
         for binding in bindings {
-            set.insert(*binding);
+            set.insert(*binding)?;
         }
-        set
+        Ok(set)
     }
 
     fn contains(&self, binding: BindingId) -> bool {
@@ -2170,23 +2201,36 @@ impl DenseBindingSet {
             && self.words[index / u64::BITS as usize] & (1_u64 << (index % u64::BITS as usize)) != 0
     }
 
-    fn insert(&mut self, binding: BindingId) {
+    fn insert(&mut self, binding: BindingId) -> Result<(), DenseBindingDomainMismatch> {
         let index = binding.index();
-        debug_assert!(index < self.binding_count);
+        if index >= self.binding_count {
+            return Err(DenseBindingDomainMismatch);
+        }
         self.words[index / u64::BITS as usize] |= 1_u64 << (index % u64::BITS as usize);
+        Ok(())
     }
 
-    fn intersect_with(&mut self, other: &Self) {
-        debug_assert_eq!(self.binding_count, other.binding_count);
+    fn intersect_with(&mut self, other: &Self) -> Result<(), DenseBindingDomainMismatch> {
+        self.validate_domain(other)?;
         for (left, right) in self.words.iter_mut().zip(&other.words) {
             *left &= *right;
         }
+        Ok(())
     }
 
-    fn union_with(&mut self, other: &Self) {
-        debug_assert_eq!(self.binding_count, other.binding_count);
+    fn union_with(&mut self, other: &Self) -> Result<(), DenseBindingDomainMismatch> {
+        self.validate_domain(other)?;
         for (left, right) in self.words.iter_mut().zip(&other.words) {
             *left |= *right;
+        }
+        Ok(())
+    }
+
+    fn validate_domain(&self, other: &Self) -> Result<(), DenseBindingDomainMismatch> {
+        if self.binding_count == other.binding_count && self.words.len() == other.words.len() {
+            Ok(())
+        } else {
+            Err(DenseBindingDomainMismatch)
         }
     }
 }
@@ -2203,6 +2247,40 @@ mod tests {
 
     fn observation(index: u32) -> RenderObservationId {
         crate::observation_journal::test_render_observation_id(index)
+    }
+
+    #[test]
+    fn dense_binding_sets_refuse_mismatched_domains_without_partial_mutation() {
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let mut one_binding = DenseBindingSet::empty(1);
+        one_binding.insert(binding).expect("in-domain binding");
+        let two_bindings = DenseBindingSet::all(2);
+        let original = one_binding.clone();
+        let mismatch = DenseBindingDomainMismatch;
+
+        assert_eq!(one_binding.intersect_with(&two_bindings), Err(mismatch));
+        assert_eq!(one_binding, original);
+        assert_eq!(one_binding.union_with(&two_bindings), Err(mismatch));
+        assert_eq!(one_binding, original);
+        assert_eq!(
+            one_binding.insert(BindingId::from_dense_index(1).expect("binding")),
+            Err(mismatch)
+        );
+        assert_eq!(one_binding, original);
+    }
+
+    #[test]
+    fn invalid_dense_domain_refuses_every_placement_binding() {
+        let decisions = refuse_unprovable_binding_domain(2, DenseBindingDomainMismatch);
+        for index in 0..2 {
+            let binding = BindingId::from_dense_index(index).expect("binding");
+            assert_eq!(
+                decisions.decision(binding),
+                Some(PlacementDecision::Refused(
+                    PlacementRefusal::UnprovableExecutionOrder { binding },
+                ))
+            );
+        }
     }
 
     #[derive(Debug)]

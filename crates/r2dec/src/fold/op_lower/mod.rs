@@ -390,6 +390,7 @@ impl LowerFrame {
 include!("implementation.rs");
 
 /// Parse a constant value from a name like "const:0x42" or "const:42".
+#[cfg(test)]
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     analysis::utils::parse_const_value(name)
 }

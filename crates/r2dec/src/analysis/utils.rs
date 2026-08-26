@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use r2ssa::SSAVar;
 use r2ssa::SSAVarNameKind;
 
+#[cfg(test)]
 pub(crate) fn parse_const_value(name: &str) -> Option<u64> {
     let val_str = name.strip_prefix("const:")?;
     let val_str = val_str.split('_').next().unwrap_or(val_str);
@@ -75,6 +76,7 @@ pub(crate) fn ssa_name_kind(name: &str) -> SSAVarNameKind {
     SSAVarNameKind::classify(&lower)
 }
 
+#[cfg(test)]
 pub(crate) fn is_temporary_name(name: &str) -> bool {
     ssa_name_kind(name).is_temporary()
 }
