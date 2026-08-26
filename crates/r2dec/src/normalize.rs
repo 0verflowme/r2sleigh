@@ -296,10 +296,9 @@ impl NormalizationOrigins {
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
-                let output = source.output.map(|value| NormalizedOutputProjection {
-                    inst: *inst,
-                    value,
-                });
+                let output = source
+                    .output
+                    .map(|value| NormalizedOutputProjection { inst: *inst, value });
                 Some(NormalizedOpProjection { inputs, output })
             }
             NormalizedOpOrigin::PhiEdgeCopy(origin) => {
@@ -326,7 +325,10 @@ impl NormalizationOrigins {
                         uses: Box::new([]),
                     });
                 }
-                let inputs = inputs.into_iter().collect::<Option<Vec<_>>>()?.into_boxed_slice();
+                let inputs = inputs
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?
+                    .into_boxed_slice();
                 Some(NormalizedOpProjection {
                     inputs,
                     output: Some(NormalizedOutputProjection {
@@ -1219,13 +1221,17 @@ fn materialize_phis_where_with_control(
         control.poll()?;
         let mut moves_by_pred = HashMap::<u64, Vec<PhiMove>>::new();
         let mut complete = true;
-        let selected = widest_per_storage(
-            block
-                .phis
-                .iter()
-                .filter(|phi| eligible(phi))
-                .collect::<Vec<_>>(),
-        );
+        // Keep every eligible SSA definition exact. Two phis can cover
+        // overlapping machine slices while remaining different values with
+        // different per-use projections. Collapsing them here by storage or
+        // width would make normalization a second owner of binding identity.
+        // The sealed BindingPlan and its upstream MachineProjection govern
+        // whether those exact values share one rendered C object.
+        let selected = block
+            .phis
+            .iter()
+            .filter(|phi| eligible(phi))
+            .collect::<Vec<_>>();
         if selected.is_empty() {
             continue;
         }
@@ -1407,48 +1413,6 @@ struct PhiMove {
     src: r2ssa::SSAVar,
     op: SSAOp,
     origin: PhiEdgeOrigin,
-}
-
-/// Keep one merge per register, not one per width the machine wrote it at.
-///
-/// A header that merges both `RAX` and `EAX` is merging one register twice, and
-/// materialising both gives the rendering two mutable variables for one value.
-/// They then share a name and the body reads `x = x` beside the update that
-/// already wrote it. The widest slice contains the others, so it is the one that
-/// carries the value; anything at a different offset is a different place and is
-/// kept.
-fn widest_per_storage<'a>(phis: Vec<&'a r2ssa::PhiNode>) -> Vec<&'a r2ssa::PhiNode> {
-    use r2ssa::CanonicalStorageSpace;
-    // Ordered, because what the fold emits has to be the same on every run and
-    // a hash map hands its values back in whatever order it likes.
-    let mut widest_by_slot: std::collections::BTreeMap<
-        (CanonicalStorageSpace, u64),
-        &r2ssa::PhiNode,
-    > = std::collections::BTreeMap::new();
-    let mut kept = Vec::with_capacity(phis.len());
-    for phi in phis {
-        let Some(storage) = phi.canonical_storage else {
-            kept.push(phi);
-            continue;
-        };
-        if !matches!(storage.space, CanonicalStorageSpace::Register) {
-            kept.push(phi);
-            continue;
-        }
-        match widest_by_slot.entry((storage.space, storage.offset)) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(phi);
-            }
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                let held = slot.get().canonical_storage.map_or(0, |held| held.size);
-                if storage.size > held {
-                    slot.insert(phi);
-                }
-            }
-        }
-    }
-    kept.extend(widest_by_slot.into_values());
-    kept
 }
 
 fn materialized_phi_edge_op(
@@ -2173,6 +2137,118 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_register_alias_phis_keep_exact_ssa_identities() {
+        let wide_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let narrow_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 4,
+        };
+        let mut arch = ArchSpec::new("overlapping-alias-phi-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::new("EAX", 0, 4));
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(2, 4),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut header = R2ILBlock::new(0x1004, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x100c, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut latch = R2ILBlock::new(0x1008, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 4),
+            a: Varnode::register(0, 4),
+            b: Varnode::constant(1, 4),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let func = SSAFunction::from_blocks_raw(&[entry, header, latch, exit], Some(&arch))
+            .expect("source-derived overlapping alias SSA");
+        let header = func.get_block(0x1004).expect("header");
+        let wide_phi = header
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(wide_storage))
+            .expect("wide source-derived phi")
+            .dst
+            .clone();
+        let narrow_phi = header
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(narrow_storage))
+            .expect("narrow source-derived phi")
+            .dst
+            .clone();
+
+        let (normalized, origins, graph) = materialize_all_phis_with_origins(&func);
+        origins
+            .validate_against_graph(&normalized, &graph, None)
+            .expect("each overlapping alias phi keeps an exact origin ledger");
+        assert!(
+            normalized
+                .get_block(0x1004)
+                .is_some_and(|header| header.phis.is_empty()),
+            "renderer normalization must not discard the narrow phi in favor of the widest alias"
+        );
+
+        let wide_value = graph
+            .value_id_for_var(&wide_phi)
+            .expect("wide phi has an exact ValueId");
+        let narrow_value = graph
+            .value_id_for_var(&narrow_phi)
+            .expect("narrow phi has an exact ValueId");
+        assert_ne!(wide_value, narrow_value);
+        let removed = origins
+            .removed_phis()
+            .iter()
+            .map(|origin| origin.definition.value)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            removed,
+            BTreeSet::from([wide_value, narrow_value]),
+            "normalization records both SSA definitions instead of choosing a carrier by width"
+        );
+
+        for phi in [&wide_phi, &narrow_phi] {
+            let copies = normalized
+                .blocks()
+                .flat_map(|block| block.ops.iter())
+                .filter(|op| matches!(op, SSAOp::Copy { dst, .. } if dst == phi))
+                .count();
+            assert_eq!(
+                copies, 2,
+                "each exact phi gets one entry-edge and one backedge assignment"
+            );
+        }
+    }
+
+    #[test]
     fn lower_loop_backedge_unconditionally_when_dst_is_dead_on_exit_edge() {
         let hash_1 = SSAVar::new("RAX", 1, 8);
         let hash_2 = SSAVar::new("RAX", 2, 8);
@@ -2268,11 +2344,13 @@ mod tests {
         let phi_inst = graph
             .insts
             .iter()
-            .find(|inst| inst.output.is_some_and(|output| {
-                graph
-                    .value(output)
-                    .is_some_and(|value| value.var == phi_value)
-            }))
+            .find(|inst| {
+                inst.output.is_some_and(|output| {
+                    graph
+                        .value(output)
+                        .is_some_and(|value| value.var == phi_value)
+                })
+            })
             .expect("phi instruction");
         assert_eq!(
             origins.noop_sites().collect::<Vec<_>>(),
@@ -2921,9 +2999,11 @@ mod tests {
         let exit_ops = &normalized.get_block(0x3010).expect("exit block").ops;
         let preserve = exit_ops
             .iter()
-            .position(|op| matches!(op,
+            .position(|op| {
+                matches!(op,
                 SSAOp::Copy { dst, src }
-                    if dst.name == "RCX" && src == &post_loop_phi.dst))
+                    if dst.name == "RCX" && src == &post_loop_phi.dst)
+            })
             .expect("the exact post-loop pointer is preserved");
         let reuse = exit_ops
             .iter()
