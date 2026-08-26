@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
@@ -65,25 +65,6 @@ pub struct RecoveredSignatureParam {
     pub initial_ty: CTypeLike,
 }
 
-/// Type inference told which registers this target's convention actually uses.
-///
-/// The lifter states the convention; a pointer width does not. Inferring the ABI
-/// from `ptr_bits == 64` answers System V AMD64 for arm64 as well, which is how
-/// an arm64 function came to have its parameters looked for in `rdi`.
-fn convention_type_inference(prepared: &SsaArtifact, ptr_bits: u32) -> TypeInference {
-    let context = prepared.machine_context();
-    let arg_regs = context.argument_register_names();
-    if arg_regs.is_empty() {
-        return TypeInference::new(ptr_bits);
-    }
-    let ret_regs = context
-        .result_slot()
-        .and_then(|slot| context.register_name(slot))
-        .into_iter()
-        .collect();
-    TypeInference::new_with_abi(ptr_bits, arg_regs, ret_regs)
-}
-
 pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSignature {
     let function_name = prepared
         .function()
@@ -94,32 +75,27 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
         .machine_context()
         .memory_model()
         .default_address_bits();
-    let ssa_blocks = prepared.local_ssa_blocks();
     let recovered_params = recover_signature_params_from_prepared_ssa(prepared, ptr_bits);
     let arch_name = prepared_arch_name(prepared).unwrap_or("");
-    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context(&ssa_blocks);
-    let mut type_inference = convention_type_inference(prepared, ptr_bits);
-    type_inference.set_prepared_ssa(prepared);
-    type_inference.infer_function(prepared);
+    let evidence_types = crate::solve_evidence_types(prepared, &BTreeMap::new(), ptr_bits);
     let certified_parameter_widths = certified_parameter_memory_widths(prepared);
 
     let mut canonical_params = recovered_params
         .iter()
         .map(|param| {
-            let initial_ty = certified_parameter_pointer_type(
+            let certified_ty = certified_parameter_pointer_type(
                 param.initial_ty.clone(),
                 certified_parameter_widths.get(&param.arg_index),
             );
-            let mut evidence =
-                collect_signature_type_evidence_for_var(&evidence_ctx, &param.ssa_var, &initial_ty);
+            let initial_ty = prepared
+                .graph()
+                .value_id_for_var(&param.ssa_var)
+                .and_then(|value| evidence_types.value_type(value))
+                .cloned()
+                .unwrap_or(certified_ty);
+            let mut evidence = exact_signature_type_evidence(&initial_ty);
             if certified_parameter_widths.contains_key(&param.arg_index) {
                 evidence.pointer_proven = evidence.pointer_proven.max(1);
-            }
-            if matches!(initial_ty, CTypeLike::Void | CTypeLike::Unknown) {
-                merge_initial_signature_type_evidence(
-                    &type_inference.type_from_size(param.ssa_var.size),
-                    &mut evidence,
-                );
             }
             let ty = resolve_evidence_driven_signature_type(
                 initial_ty,
@@ -152,22 +128,25 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
         &mut canonical_params,
     );
 
-    let (ret_type, ret_evidence) = infer_signature_return_type_from_prepared(
-        prepared,
-        &type_inference,
-        ptr_bits,
-        &evidence_ctx,
-    );
-    let input_counts = collect_version0_input_regs(prepared);
-    build_inferred_signature(
+    let (ret_type, ret_evidence) =
+        infer_signature_return_type_from_prepared(prepared, &evidence_types, ptr_bits);
+    let mut inferred = build_inferred_signature(
         &function_name,
         arch_name,
         ptr_bits,
         &canonical_params,
         &ret_type,
         &ret_evidence,
-        &input_counts,
-    )
+        &HashMap::new(),
+    );
+    if let Some(interface) = prepared.machine_context().function_interface() {
+        inferred.callconv = interface.calling_convention().to_string();
+        inferred.callconv_confidence = 100;
+    } else {
+        inferred.callconv = "unknown".to_string();
+        inferred.callconv_confidence = 0;
+    }
+    inferred
 }
 
 fn certified_parameter_memory_widths(prepared: &SsaArtifact) -> HashMap<usize, BTreeSet<u32>> {
@@ -844,23 +823,6 @@ pub fn infer_signature_return_type(
                 continue;
             };
 
-            let target_name = target.name.to_ascii_lowercase();
-            if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-                let bits = if target.size.saturating_mul(8) <= 32 {
-                    32
-                } else {
-                    64
-                };
-                let ty = CTypeLike::Float(bits);
-                let mut evidence = SignatureTypeEvidence::default();
-                merge_initial_signature_type_evidence(&ty, &mut evidence);
-                evidence.width_bits = bits;
-                candidates.push(ty);
-                candidate_evidence.push(evidence);
-                candidate_constants.push(None);
-                continue;
-            }
-
             let initial_ty = type_inference.get_type(target);
             let evidence =
                 collect_signature_type_evidence_for_var(evidence_ctx, target, &initial_ty);
@@ -872,7 +834,7 @@ pub fn infer_signature_return_type(
             );
             candidates.push(ty);
             candidate_evidence.push(evidence);
-            candidate_constants.push(r2ssa::parse_const_value(&target.name));
+            candidate_constants.push(target.constant_bits());
         }
     }
 
@@ -920,100 +882,100 @@ pub fn infer_signature_return_type(
 
 fn infer_signature_return_type_from_prepared(
     prepared: &SsaArtifact,
-    type_inference: &TypeInference,
+    evidence_types: &crate::EvidenceTypes,
     ptr_bits: u32,
-    evidence_ctx: &SignatureTypeEvidenceContext,
 ) -> (CTypeLike, SignatureTypeEvidence) {
-    let mut return_vars = prepared
+    let mut return_values = prepared
         .facts()
         .certificates
         .returns
         .iter()
-        .filter_map(|certificate| {
-            transparent_return_source(prepared, certificate.value)
-                .or_else(|| prepared.value_var(certificate.value).cloned())
+        .map(|certificate| {
+            transparent_return_source_value(prepared, certificate.value)
+                .unwrap_or(certificate.value)
         })
         .collect::<Vec<_>>();
-    return_vars.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then(left.version.cmp(&right.version))
-            .then(left.size.cmp(&right.size))
-    });
-    return_vars.dedup();
-    if return_vars.is_empty() {
+    return_values.sort();
+    return_values.dedup();
+    if return_values.is_empty() {
         return (CTypeLike::Void, SignatureTypeEvidence::default());
     }
 
-    infer_signature_return_type_from_vars(&return_vars, type_inference, ptr_bits, evidence_ctx)
+    infer_signature_return_type_from_values(prepared, &return_values, evidence_types, ptr_bits)
 }
 
-fn transparent_return_source(prepared: &SsaArtifact, start: r2ssa::ValueId) -> Option<SSAVar> {
+fn transparent_return_source_value(
+    prepared: &SsaArtifact,
+    start: r2ssa::ValueId,
+) -> Option<r2ssa::ValueId> {
     let mut current = start;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        let current_var = prepared.value_var(current)?.clone();
         let Some(inst) = prepared
             .graph()
             .def_inst(current)
             .and_then(|inst| prepared.graph().inst(inst))
         else {
-            return Some(current_var);
+            return Some(current);
         };
         let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return Some(current_var);
+            return Some(current);
         };
-        let source = match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. } => src,
-            SSAOp::Subpiece { src, offset, .. } if *offset == 0 => src,
-            _ => return Some(current_var),
+        match op {
+            SSAOp::Copy { .. }
+            | SSAOp::New { .. }
+            | SSAOp::IntZExt { .. }
+            | SSAOp::IntSExt { .. }
+            | SSAOp::Trunc { .. }
+            | SSAOp::Subpiece { offset: 0, .. } => {}
+            _ => return Some(current),
         };
-        let Some(source_value) = prepared.graph().value_id_for_var(source) else {
-            return Some(current_var);
+        let Some(source_value) = inst.inputs.first().copied() else {
+            return Some(current);
         };
         current = source_value;
     }
     None
 }
 
-fn infer_signature_return_type_from_vars(
-    return_vars: &[SSAVar],
-    type_inference: &TypeInference,
+fn exact_signature_type_evidence(ty: &CTypeLike) -> SignatureTypeEvidence {
+    let mut evidence = SignatureTypeEvidence::default();
+    merge_initial_signature_type_evidence(ty, &mut evidence);
+    match ty {
+        CTypeLike::Pointer(_) => evidence.pointer_proven = 1,
+        CTypeLike::Bool => evidence.bool_like = 1,
+        CTypeLike::Float(bits) => {
+            evidence.scalar_proven = 1;
+            evidence.width_bits = *bits;
+        }
+        CTypeLike::Int { bits, .. } => evidence.width_bits = *bits,
+        _ => {}
+    }
+    evidence
+}
+
+fn infer_signature_return_type_from_values(
+    prepared: &SsaArtifact,
+    return_values: &[r2ssa::ValueId],
+    evidence_types: &crate::EvidenceTypes,
     ptr_bits: u32,
-    evidence_ctx: &SignatureTypeEvidenceContext,
 ) -> (CTypeLike, SignatureTypeEvidence) {
     let mut candidates = Vec::new();
     let mut candidate_evidence = Vec::new();
     let mut candidate_constants = Vec::new();
-    for value in return_vars {
-        let target_name = value.name.to_ascii_lowercase();
-        if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-            let bits = if value.size.saturating_mul(8) <= 32 {
-                32
-            } else {
-                64
-            };
-            let ty = CTypeLike::Float(bits);
-            let mut evidence = SignatureTypeEvidence::default();
-            merge_initial_signature_type_evidence(&ty, &mut evidence);
-            evidence.width_bits = bits;
-            candidates.push(ty);
-            candidate_evidence.push(evidence);
-            candidate_constants.push(None);
+    for value in return_values {
+        let Some(var) = prepared.value_var(*value) else {
             continue;
-        }
-
-        let initial_ty = type_inference.get_type(value);
-        let evidence = collect_signature_type_evidence_for_var(evidence_ctx, value, &initial_ty);
-        let ty =
-            resolve_evidence_driven_signature_type(initial_ty, value.size, ptr_bits, &evidence);
+        };
+        let initial_ty = evidence_types
+            .value_type(*value)
+            .cloned()
+            .unwrap_or_else(|| fallback_scalar_type_like(var.size, &Default::default(), ptr_bits));
+        let evidence = exact_signature_type_evidence(&initial_ty);
+        let ty = resolve_evidence_driven_signature_type(initial_ty, var.size, ptr_bits, &evidence);
         candidates.push(ty);
         candidate_evidence.push(evidence);
-        candidate_constants.push(r2ssa::parse_const_value(&value.name));
+        candidate_constants.push(var.constant_bits());
     }
     choose_signature_return_type(
         candidates,
@@ -1590,6 +1552,43 @@ mod tests {
         arch
     }
 
+    fn prepared_x86_scalar_return(
+        return_carrier_name: &str,
+        calling_convention: &str,
+    ) -> SsaArtifact {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new(return_carrier_name, 0, 8));
+        arch.add_register(r2il::RegisterDef::new("RIP", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("RSP", 16, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            format!("signature-{return_carrier_name}").into_bytes(),
+            calling_convention,
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register(8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(16)))
+        .expect("exact renamed return interface");
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::unique(0x20, 4),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(8, 8),
+        });
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared renamed return source")
+    }
+
     fn aarch64_parameter_arch() -> r2il::ArchSpec {
         let mut arch = r2il::ArchSpec::new("aarch64");
         arch.addr_size = 8;
@@ -1834,6 +1833,34 @@ mod tests {
         let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.ret_type, "uint32_t");
+    }
+
+    #[test]
+    fn prepared_signature_callconv_is_source_owned_and_rename_invariant() {
+        let expected = "source-owned-test-cc";
+        let ordinary =
+            infer_signature_from_prepared_ssa(&prepared_x86_scalar_return("rax", expected));
+        let renamed = infer_signature_from_prepared_ssa(&prepared_x86_scalar_return(
+            "xmm0_misleading",
+            expected,
+        ));
+
+        assert_eq!(ordinary.callconv, expected);
+        assert_eq!(renamed.callconv, expected);
+        assert_eq!(ordinary.callconv_confidence, 100);
+        assert_eq!(renamed.callconv_confidence, 100);
+    }
+
+    #[test]
+    fn misleading_xmm0_spelling_does_not_manufacture_a_float_return() {
+        let inferred = infer_signature_from_prepared_ssa(&prepared_x86_scalar_return(
+            "xmm0_misleading",
+            "source-owned-test-cc",
+        ));
+
+        assert_eq!(inferred.ret_type, "uint32_t");
+        assert_ne!(inferred.ret_type, "float");
+        assert_ne!(inferred.ret_type, "double");
     }
 
     #[test]

@@ -16,183 +16,19 @@ pub type OpSiteKey = (u64, usize);
 pub type MemoryOpSiteKey = (u64, usize, bool);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ParamSlotResolver {
-    slots_by_register: BTreeMap<String, usize>,
+struct ParamSlotResolver {
+    slots_by_value: BTreeMap<r2ssa::ValueId, usize>,
 }
 
 impl ParamSlotResolver {
-    pub fn new() -> Self {
-        Self::default()
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots_by_value.is_empty()
     }
 
-    pub fn from_arch_name(arch_name: Option<&str>) -> Self {
-        let (arg_regs, _, _) = crate::prepare::recover_vars_arch_profile(arch_name);
-        Self::from_arg_alias_map(arg_regs)
+    fn slot_for_value(&self, value: r2ssa::ValueId) -> Option<usize> {
+        self.slots_by_value.get(&value).copied()
     }
-
-    pub fn from_arg_alias_map(arg_regs: crate::prepare::ArgAliasMap) -> Self {
-        let mut resolver = Self::new();
-        for (slot, (canonical, aliases)) in arg_regs.iter().enumerate() {
-            resolver.insert_alias(canonical, slot);
-            for alias in *aliases {
-                resolver.insert_alias(alias, slot);
-            }
-        }
-        resolver
-    }
-
-    pub fn from_arg_regs<I, S>(arg_regs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut resolver = Self::new();
-        for (slot, reg) in arg_regs.into_iter().enumerate() {
-            resolver.insert_register_family_aliases(reg.as_ref(), slot);
-        }
-        resolver
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slots_by_register.is_empty()
-    }
-
-    pub fn insert_alias(&mut self, register: &str, slot: usize) {
-        let normalized = normalize_param_slot_register_name(register);
-        if normalized.is_empty() {
-            return;
-        }
-        self.slots_by_register.entry(normalized).or_insert(slot);
-    }
-
-    pub fn slot_for_register_name(&self, register: &str) -> Option<usize> {
-        let normalized = normalize_param_slot_register_name(register);
-        self.slots_by_register.get(&normalized).copied()
-    }
-
-    pub fn slot_for_var(&self, var: &r2ssa::SSAVar) -> Option<usize> {
-        if var.version != 0 || !var.is_register() || var.is_memory() {
-            return None;
-        }
-        self.slot_for_register_name(&var.name)
-    }
-
-    fn insert_register_family_aliases(&mut self, register: &str, slot: usize) {
-        let normalized = normalize_param_slot_register_name(register);
-        if normalized.is_empty() {
-            return;
-        }
-        self.insert_alias(&normalized, slot);
-        for alias in inferred_param_slot_register_aliases(&normalized) {
-            self.insert_alias(&alias, slot);
-        }
-    }
-}
-
-fn normalize_param_slot_register_name(register: &str) -> String {
-    register.trim_start_matches('$').to_ascii_lowercase()
-}
-
-fn inferred_param_slot_register_aliases(register: &str) -> Vec<String> {
-    match register {
-        "rax" => {
-            return ["eax", "ax", "al", "ah"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "eax" | "ax" | "al" | "ah" => return vec!["rax".to_string()],
-        "rbx" => {
-            return ["ebx", "bx", "bl", "bh"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ebx" | "bx" | "bl" | "bh" => return vec!["rbx".to_string()],
-        "rcx" => {
-            return ["ecx", "cx", "cl", "ch"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ecx" | "cx" | "cl" | "ch" => return vec!["rcx".to_string()],
-        "rdx" => {
-            return ["edx", "dx", "dl", "dh"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "edx" | "dx" | "dl" | "dh" => return vec!["rdx".to_string()],
-        "rsi" => {
-            return ["esi", "si", "sil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "esi" | "si" | "sil" => return vec!["rsi".to_string()],
-        "rdi" => {
-            return ["edi", "di", "dil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "edi" | "di" | "dil" => return vec!["rdi".to_string()],
-        "rbp" => {
-            return ["ebp", "bp", "bpl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ebp" | "bp" | "bpl" => return vec!["rbp".to_string()],
-        "rsp" => {
-            return ["esp", "sp", "spl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "esp" | "sp" | "spl" => return vec!["rsp".to_string()],
-        _ => {}
-    }
-
-    if let Some(rest) = register.strip_prefix('r')
-        && let Some(index) = rest.strip_suffix('d').or_else(|| rest.strip_suffix('w'))
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("r{index}")];
-    }
-    if let Some(index) = register.strip_prefix('r')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![
-            format!("r{index}d"),
-            format!("r{index}w"),
-            format!("r{index}b"),
-        ];
-    }
-    if let Some(index) = register.strip_prefix('x')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("w{index}")];
-    }
-    if let Some(index) = register.strip_prefix('w')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("x{index}")];
-    }
-    if let Some(index) = register.strip_prefix('a')
-        && let Ok(index) = index.parse::<u8>()
-        && index <= 7
-    {
-        return vec![format!("x{}", index + 10)];
-    }
-    if let Some(index) = register.strip_prefix('x')
-        && let Ok(index) = index.parse::<u8>()
-        && (10..=17).contains(&index)
-    {
-        return vec![format!("a{}", index - 10)];
-    }
-
-    Vec::new()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,7 +1164,7 @@ pub struct CallArgumentValueFact {
 pub struct RegisterCallArgumentLocationFact {
     pub index: usize,
     pub value: r2ssa::ValueId,
-    pub name: String,
+    pub storage: r2ssa::CanonicalStorageId,
     pub source_inst: Option<r2ssa::InstId>,
 }
 
@@ -1601,6 +1437,7 @@ pub struct FunctionFacts {
 pub struct SourceOwnedFunctionFacts {
     source: Arc<r2ssa::SsaArtifact>,
     report: FunctionFacts,
+    evidence_types: crate::EvidenceTypes,
 }
 
 impl SourceOwnedFunctionFacts {
@@ -1636,7 +1473,17 @@ impl SourceOwnedFunctionFacts {
         {
             return None;
         }
-        Some(Self { source, report })
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        let evidence_types =
+            crate::solve_evidence_types(source.as_ref(), &report.callsite_signatures(), ptr_bits);
+        Some(Self {
+            source,
+            report,
+            evidence_types,
+        })
     }
 
     pub fn source(&self) -> &r2ssa::SsaArtifact {
@@ -1653,6 +1500,11 @@ impl SourceOwnedFunctionFacts {
 
     pub fn report(&self) -> &FunctionFacts {
         &self.report
+    }
+
+    /// Exact ValueId/ObjectId-keyed type solution for the retained source.
+    pub fn evidence_types(&self) -> &crate::EvidenceTypes {
+        &self.evidence_types
     }
 
     pub(crate) fn stamp_report_decompile_route(
@@ -1860,60 +1712,36 @@ fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<Param
     if !abi.is_available()
         || !abi.is_coherent()
         || abi.argument_registers().len() != interface.parameters().len()
+        || source.facts().boundaries.parameters.len() != interface.parameters().len()
     {
         return None;
     }
-    let mut resolver = ParamSlotResolver::new();
-    let mut indices = BTreeSet::new();
-    let mut parameter_storages = Vec::new();
-    for parameter in interface.parameters() {
-        let slot = usize::try_from(parameter.index()).ok()?;
-        if parameter.storage().space != r2ssa::CanonicalStorageSpace::Register
-            || !indices.insert(slot)
-        {
-            return None;
-        }
-        let mut abi_slots = abi
+    let mut resolver = ParamSlotResolver::default();
+    for (index, parameter) in &source.facts().boundaries.parameters {
+        let slot = usize::try_from(*index).ok()?;
+        let source_parameter = interface
+            .parameters()
+            .iter()
+            .find(|candidate| candidate.index() == *index)?;
+        let abi_slot = abi
             .argument_registers()
             .iter()
-            .filter(|candidate| candidate.index() == parameter.index());
-        let abi_slot = abi_slots.next()?;
-        if abi_slots.next().is_some() || abi_slot.storage() != parameter.storage() {
-            return None;
-        }
-        parameter_storages.push((slot, parameter.storage()));
-    }
-    let mut matched_slots = BTreeSet::new();
-    for (alias, alias_storage) in context.register_storages_by_name() {
-        if alias_storage.space != r2ssa::CanonicalStorageSpace::Register || alias_storage.size == 0
-        {
-            continue;
-        }
-        let mut matches = parameter_storages.iter().filter(|(_, parameter)| {
-            parameter.space == alias_storage.space
-                && parameter.offset == alias_storage.offset
-                && alias_storage.size <= parameter.size
-        });
-        let Some((slot, _)) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            return None;
-        }
-        let normalized = normalize_param_slot_register_name(alias);
-        if normalized.is_empty()
+            .find(|candidate| candidate.index() == *index)?;
+        let graph_value = source.graph().value(parameter.value)?;
+        if parameter.index != *index
+            || parameter.abi_storage != source_parameter.storage()
+            || parameter.abi_storage != abi_slot.storage()
+            || graph_value.canonical_storage != Some(parameter.graph_storage)
+            || graph_value.var.size != parameter.graph_storage.size
+            || graph_value.var.version != 0
+            || source.graph().def_inst(parameter.value).is_some()
             || resolver
-                .slots_by_register
-                .get(&normalized)
-                .is_some_and(|existing| existing != slot)
+                .slots_by_value
+                .insert(parameter.value, slot)
+                .is_some()
         {
             return None;
         }
-        resolver.slots_by_register.insert(normalized, *slot);
-        matched_slots.insert(*slot);
-    }
-    if matched_slots.len() != parameter_storages.len() {
-        return None;
     }
     Some(resolver)
 }
@@ -2730,7 +2558,7 @@ impl FunctionFacts {
             if value.var.version != 0 || !parameter_entry_value_has_live_use(prepared, value.id) {
                 continue;
             }
-            let Some(slot) = param_slots.slot_for_var(&value.var) else {
+            let Some(slot) = param_slots.slot_for_value(value.id) else {
                 continue;
             };
             let Some(parameter_id) = r2ssa::SemanticId::parameter(slot) else {
@@ -3119,9 +2947,6 @@ impl FunctionFacts {
     /// the solver did not reach keeps whatever it had.
     pub fn apply_recovered_evidence_types(&mut self, source: &r2ssa::SsaArtifact, ptr_bits: u32) {
         let signatures = self.callsite_signatures();
-        if signatures.is_empty() {
-            return;
-        }
         let recovered = crate::evidence::solve_evidence_types(source, &signatures, ptr_bits);
         if recovered.is_empty() {
             return;
@@ -3484,13 +3309,14 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                 .argument_certificates
                 .iter()
                 .filter_map(|argument| {
-                    let r2ssa::CallArgumentLocation::Register { name } = &argument.location else {
+                    let r2ssa::CallArgumentLocation::Register { storage } = &argument.location
+                    else {
                         return None;
                     };
                     Some(RegisterCallArgumentLocationFact {
                         index: argument.index,
                         value: argument.value,
-                        name: name.clone(),
+                        storage: *storage,
                         source_inst: argument.source_inst,
                     })
                 })
@@ -3753,10 +3579,10 @@ fn prepared_address_base_param_slot(
         .and_then(|reload| graph.value(reload.canonical_source))
         && source.var.version == 0
     {
-        return param_slots.slot_for_var(&source.var);
+        return param_slots.slot_for_value(source.id);
     }
     let Some(def_inst) = graph.def_inst(value) else {
-        return param_slots.slot_for_var(var);
+        return param_slots.slot_for_value(value);
     };
     let inst = graph.inst(def_inst)?;
     if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
@@ -3837,7 +3663,7 @@ fn prepared_sub_param_slot(
 }
 
 fn const_var_i64(var: &r2ssa::SSAVar) -> Option<i64> {
-    let raw = r2ssa::parse_const_value(&var.name)?;
+    let raw = var.constant_bits()?;
     let bits = var.size.saturating_mul(8);
     if bits == 0 || bits >= 64 {
         return Some(raw as i64);
@@ -4708,6 +4534,18 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     #[test]
+    fn constant_looking_spelling_is_not_constant_evidence() {
+        assert_eq!(
+            const_var_i64(&r2ssa::SSAVar::new("const:ffffffffffffffb8", 0, 8)),
+            None
+        );
+        assert_eq!(
+            const_var_i64(&r2ssa::SSAVar::constant(0xffff_ffff_ffff_ffb8, 8)),
+            Some(-72)
+        );
+    }
+
+    #[test]
     fn parameter_coalescing_values_are_exact_entry_membership() {
         let entry_values =
             BTreeSet::from([r2ssa::ValueId(7), r2ssa::ValueId(2), r2ssa::ValueId(11)]);
@@ -4876,23 +4714,40 @@ mod tests {
     }
 
     #[test]
-    fn exact_source_param_slots_include_source_owned_low_width_aliases() {
+    fn exact_source_param_slots_ignore_misleading_register_names() {
         let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("rdi", 0x20, 8));
-        arch.add_register(RegisterDef::new("edi", 0x20, 4));
-        arch.add_register(RegisterDef::new("rsp", 0x30, 8));
+        arch.add_register(RegisterDef::new("rax", 0x20, 8));
+        arch.add_register(RegisterDef::new("not_an_argument", 0x20, 4));
+        arch.add_register(RegisterDef::new("rdi", 0x30, 8));
         arch.add_register(RegisterDef::new("rip", 0x40, 8));
         let storage = r2ssa::CanonicalStorageId {
             space: r2ssa::CanonicalStorageSpace::Register,
             offset: 0x20,
             size: 8,
         };
-        let interface = r2ssa::SourceFunctionInterface::new_exact(
+        let logical = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+        );
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [r2ssa::SourceType::new(
+                0,
+                r2ssa::SourceTypeKind::UnsignedInteger,
+                64,
+                64,
+            )],
+            [],
+        )
+        .expect("exact parameter type graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
             b"exact-param-alias".to_vec(),
             "sysv64",
             [r2ssa::SourceAbiParameterSpec::new(0, storage)],
             r2ssa::SourceFunctionReturn::Void,
             [],
+            [logical],
+            None,
+            Some(type_graph),
         )
         .and_then(|interface| {
             interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
@@ -4909,16 +4764,40 @@ mod tests {
             })
         })
         .expect("exact interface");
-        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &[R2ILBlock::new(0x1000, 1)],
-            Some(&arch),
-            interface,
-        )
-        .expect("prepared source");
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0x20, 8),
+        });
+        let source =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared source");
 
         let resolver = exact_source_param_slot_resolver(&source).expect("exact resolver");
-        assert_eq!(resolver.slot_for_register_name("rdi"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("edi"), Some(0));
+        let parameter = source
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("exact boundary parameter");
+        assert_eq!(resolver.slot_for_value(parameter.value), Some(0));
+        let parameter_var = &source
+            .graph()
+            .value(parameter.value)
+            .expect("parameter graph value")
+            .var;
+        assert_eq!(
+            source
+                .decompile_prep_facts()
+                .and_then(|facts| facts.formal_parameter_of(parameter_var)),
+            Some(0),
+            "SSA preparation must consume the same exact boundary slot"
+        );
+        assert_eq!(
+            Some(parameter_var.name.as_str()),
+            Some("rax"),
+            "the deliberately ABI-misleading display name must not change the slot"
+        );
     }
 
     #[test]
@@ -5294,7 +5173,11 @@ mod tests {
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
-                        name: "rdi".to_string(),
+                        storage: r2ssa::CanonicalStorageId {
+                            space: r2ssa::CanonicalStorageSpace::Register,
+                            offset: 0,
+                            size: 8,
+                        },
                         source_inst: Some(r2ssa::InstId(4)),
                     }],
                     stack_argument_locations: Vec::new(),
@@ -5317,8 +5200,16 @@ mod tests {
                 .callsites()
                 .and_then(|callsites| callsites.arguments_for_site(callsite))
                 .and_then(|args| args.register_argument_locations.first())
-                .map(|location| (location.index, location.value, location.name.as_str())),
-            Some((0, value, "rdi")),
+                .map(|location| (location.index, location.value, location.storage)),
+            Some((
+                0,
+                value,
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            )),
             "register argument location proof must travel through FunctionFacts"
         );
     }
@@ -5535,7 +5426,11 @@ mod tests {
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
-                name: "rdi".to_string(),
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
                 source_inst: Some(r2ssa::InstId(4)),
             }],
             stack_argument_locations: vec![
@@ -5932,7 +5827,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         let render = facts.render().expect("prepared render facts");
@@ -6037,7 +5932,7 @@ mod tests {
         ));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         facts.populate_certified_loop_carrier_types();
 
@@ -6089,7 +5984,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -6129,7 +6024,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -6153,7 +6048,7 @@ mod tests {
         matching_facts.attach_prepared_decompile_evidence(&prepared);
         matching_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -6213,8 +6108,8 @@ mod tests {
         .expect("prepared exact stack-home fixture")
     }
 
-    fn x86_stack_home_param_slots() -> ParamSlotResolver {
-        ParamSlotResolver::from_arch_name(Some("x86-64"))
+    fn x86_stack_home_param_slots(prepared: &r2ssa::SsaArtifact) -> ParamSlotResolver {
+        exact_source_param_slot_resolver(prepared).expect("exact source parameter slots")
     }
 
     #[test]
@@ -6269,7 +6164,7 @@ mod tests {
             None,
         );
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         let render = facts.render().expect("certified render facts");
 
         let rdi = prepared
@@ -6500,7 +6395,7 @@ mod tests {
             .expect("prepared");
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         let render = facts.render().expect("render facts");
         let copied = prepared
             .graph()
@@ -6554,27 +6449,6 @@ mod tests {
     }
 
     #[test]
-    fn param_slot_resolver_maps_explicit_windows_x64_register_order() {
-        let resolver = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
-
-        assert_eq!(resolver.slot_for_register_name("rcx"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("ecx"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("rdx"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("edx"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("rdi"), None);
-    }
-
-    #[test]
-    fn param_slot_resolver_maps_aarch64_aliases_from_abi_evidence() {
-        let resolver = ParamSlotResolver::from_arch_name(Some("aarch64"));
-
-        assert_eq!(resolver.slot_for_register_name("x0"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("w0"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("x1"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("w1"), Some(1));
-    }
-
-    #[test]
     fn field_certificates_fail_closed_without_param_slot_resolver() {
         let prepared = member_load_prepared_for_register(&x86_stack_home_arch(), 0x10);
         let mut facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
@@ -6582,7 +6456,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &ParamSlotResolver::new(),
+            &ParamSlotResolver::default(),
         );
 
         assert!(
@@ -6590,56 +6464,6 @@ mod tests {
                 .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
                 .is_none()),
             "missing ABI slot evidence must not guess rdi as parameter slot 0"
-        );
-    }
-
-    #[test]
-    fn field_certificates_use_explicit_windows_x64_param_slots() {
-        let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("rax", 0x00, 8));
-        arch.add_register(RegisterDef::new("rcx", 0x10, 8));
-        arch.add_register(RegisterDef::new("rdx", 0x18, 8));
-        let param_slots = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
-
-        let rcx_prepared = member_load_prepared_for_register(&arch, 0x10);
-        let mut rcx_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
-        rcx_facts.attach_prepared_decompile_evidence(&rcx_prepared);
-        rcx_facts.populate_member_access_render_facts_from_field_certificates(
-            &rcx_prepared,
-            &param_slots,
-        );
-        assert!(
-            rcx_facts.render().is_some_and(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "explicit Windows x64 resolver must map rcx to slot 0"
-        );
-
-        let rdx_prepared = member_load_prepared_for_register(&arch, 0x18);
-        let mut wrong_slot_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
-        wrong_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
-        wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
-            &rdx_prepared,
-            &param_slots,
-        );
-        assert!(
-            wrong_slot_facts.render().is_none_or(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_none()),
-            "slot 0 certificate must not authorize rdx when resolver maps rdx to slot 1"
-        );
-
-        let mut matching_slot_facts = FunctionFacts::new(field_certificate_type_facts(1, 8), None);
-        matching_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
-        matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
-            &rdx_prepared,
-            &param_slots,
-        );
-        assert!(
-            matching_slot_facts.render().is_some_and(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "explicit Windows x64 resolver must map rdx to slot 1"
         );
     }
 
@@ -6701,7 +6525,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -6729,7 +6553,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -6807,14 +6631,14 @@ mod tests {
         let mut facts = FunctionFacts::new(type_facts, None);
 
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         facts.populate_array_access_render_facts_from_scalar_candidates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         let render = facts.render().expect("render facts");
@@ -6880,7 +6704,7 @@ mod tests {
         wrong_slot_facts.attach_prepared_decompile_evidence(&prepared);
         wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         assert!(
             wrong_slot_facts.render().is_none_or(|render| render
@@ -6893,7 +6717,7 @@ mod tests {
         matching_slot_facts.attach_prepared_decompile_evidence(&prepared);
         matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         assert!(
             matching_slot_facts.render().is_none_or(|render| render

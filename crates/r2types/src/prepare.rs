@@ -489,18 +489,15 @@ pub fn recover_signature_params_from_ssa(
 }
 
 fn prepared_formal_parameters(prepared: &r2ssa::SsaArtifact) -> BTreeMap<usize, SSAVar> {
-    let Some(facts) = prepared.decompile_prep_facts() else {
-        return BTreeMap::new();
-    };
     let mut parameters = BTreeMap::<usize, SSAVar>::new();
-    for (var, index) in &facts.formal_parameters {
-        let replace = parameters.get(index).is_none_or(|current| {
-            (var.version != 0, &var.name, var.size)
-                < (current.version != 0, &current.name, current.size)
-        });
-        if replace {
-            parameters.insert(*index, var.clone());
+    for (index, fact) in &prepared.facts().boundaries.parameters {
+        if fact.index != *index {
+            continue;
         }
+        let Some(var) = prepared.value_var(fact.value) else {
+            continue;
+        };
+        parameters.insert(*index as usize, var.clone());
     }
     parameters
 }
@@ -509,15 +506,10 @@ pub(crate) fn recover_signature_params_from_prepared_ssa(
     prepared: &r2ssa::SsaArtifact,
     ptr_bits: u32,
 ) -> Vec<RecoveredSignatureParam> {
-    let blocks = prepared.local_ssa_blocks();
-    let evidence = collect_signature_type_evidence_context(&blocks);
-
     prepared_formal_parameters(prepared)
         .into_iter()
         .map(|(index, var)| {
-            let initial_ty = if source_parameter_is_logical_pointer(prepared, index, ptr_bits)
-                || evidence.pointer_vars.contains(&ssa_var_key(&var))
-            {
+            let initial_ty = if source_parameter_is_logical_pointer(prepared, index, ptr_bits) {
                 crate::CTypeLike::Pointer(Box::new(crate::CTypeLike::Void))
             } else {
                 size_to_neutral_int_type_like(var.size)

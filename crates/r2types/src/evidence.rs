@@ -19,6 +19,7 @@ use crate::context::{ExternalStackBase, StackSlotKey};
 use crate::convert::{CTypeLike, to_c_type_like};
 use crate::facts::FunctionType;
 use crate::model::{Signedness, Type, TypeArena, TypeId};
+use crate::oracle::TypeOracle;
 use crate::solver::{SolvedTypes, SolverConfig, TypeSolver};
 
 /// A node of the recovered type graph.
@@ -57,6 +58,155 @@ impl EvidenceTypes {
 
     pub fn stack_slot_types(&self) -> impl Iterator<Item = (&StackSlotKey, &CTypeLike)> {
         self.slot_types.iter()
+    }
+}
+
+/// Exact ValueId-keyed type evidence projected through the retained source.
+///
+/// `TypeOracle` predates `ValueId`, so its query accepts an `SSAVar`. This
+/// adapter resolves that value only through the exact graph's intern table and
+/// then reads the canonical evidence result. It never parses or compares a
+/// variable spelling and it refuses synthetic/foreign variables as `Top`.
+pub struct SourceEvidenceTypeOracle<'a> {
+    source: &'a r2ssa::SsaArtifact,
+    external_type_db: &'a crate::ExternalTypeDb,
+    arena: TypeArena,
+    value_types: BTreeMap<r2ssa::ValueId, TypeId>,
+    top: TypeId,
+}
+
+impl<'a> SourceEvidenceTypeOracle<'a> {
+    pub fn new(
+        source: &'a r2ssa::SsaArtifact,
+        evidence: &EvidenceTypes,
+        external_type_db: &'a crate::ExternalTypeDb,
+    ) -> Self {
+        let mut arena = TypeArena::default();
+        let top = arena.top();
+        let value_types = evidence
+            .value_types
+            .iter()
+            .map(|(value, ty)| (*value, intern_render_type(&mut arena, ty)))
+            .collect();
+        Self {
+            source,
+            external_type_db,
+            arena,
+            value_types,
+            top,
+        }
+    }
+
+    fn external_struct_for_type(&self, ty: TypeId) -> Option<&crate::ExternalStruct> {
+        let named = match self.arena.get(ty) {
+            Type::Struct(shape) => shape.name.as_deref(),
+            Type::Ptr(inner) => match self.arena.get(*inner) {
+                Type::Struct(shape) => shape.name.as_deref(),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        self.external_type_db
+            .structs
+            .get(&named.to_ascii_lowercase())
+    }
+}
+
+fn intern_render_type(arena: &mut TypeArena, ty: &CTypeLike) -> TypeId {
+    match ty {
+        CTypeLike::Void => arena.unknown_alias("void"),
+        CTypeLike::Bool => arena.bool_ty(),
+        CTypeLike::Int { bits, signedness } => arena.int(*bits, *signedness),
+        CTypeLike::Float(bits) => arena.float(*bits),
+        CTypeLike::Pointer(inner) => {
+            let inner = intern_render_type(arena, inner);
+            arena.ptr(inner)
+        }
+        CTypeLike::Array(inner, len) => {
+            let inner = intern_render_type(arena, inner);
+            arena.array(inner, *len, None)
+        }
+        CTypeLike::Struct(name) | CTypeLike::Typedef(name) => {
+            arena.struct_named_or_existing(name.clone())
+        }
+        CTypeLike::Union(name) | CTypeLike::Enum(name) => arena.unknown_alias(name.clone()),
+        CTypeLike::Function | CTypeLike::Unknown => arena.top(),
+    }
+}
+
+impl TypeOracle for SourceEvidenceTypeOracle<'_> {
+    fn type_of(&self, var: &r2ssa::SSAVar) -> TypeId {
+        self.source
+            .graph()
+            .value_id_for_var(var)
+            .and_then(|value| self.value_types.get(&value).copied())
+            .unwrap_or(self.top)
+    }
+
+    fn struct_shape(&self, ty: TypeId) -> Option<&crate::StructShape> {
+        match self.arena.get(ty) {
+            Type::Struct(shape) => Some(shape),
+            Type::Ptr(inner) => match self.arena.get(*inner) {
+                Type::Struct(shape) => Some(shape),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn is_pointer(&self, ty: TypeId) -> bool {
+        matches!(self.arena.get(ty), Type::Ptr(_))
+    }
+
+    fn is_array(&self, ty: TypeId) -> bool {
+        matches!(self.arena.get(ty), Type::Array { .. })
+    }
+
+    fn field_name(&self, ty: TypeId, offset: u64) -> Option<&str> {
+        self.struct_shape(ty)
+            .and_then(|shape| shape.fields.get(&offset))
+            .and_then(|field| field.name.as_deref())
+            .or_else(|| {
+                self.external_struct_for_type(ty)
+                    .and_then(|st| st.fields.get(&offset))
+                    .map(|field| field.name.as_str())
+            })
+    }
+
+    fn field_name_any(&self, offset: u64) -> Option<&str> {
+        let mut matched: Option<&str> = None;
+        for st in self.external_type_db.structs.values() {
+            let Some(field) = st.fields.get(&offset) else {
+                continue;
+            };
+            match matched {
+                None => matched = Some(field.name.as_str()),
+                Some(existing) if existing == field.name => {}
+                Some(_) => return None,
+            }
+        }
+        matched
+    }
+
+    fn field_layout(&self, ty: TypeId, offset: u64) -> Option<crate::ResolvedFieldLayout> {
+        self.struct_shape(ty)
+            .and_then(|shape| {
+                let field = shape.fields.get(&offset)?;
+                Some(crate::ResolvedFieldLayout::direct(
+                    shape.name.clone(),
+                    offset,
+                    field.name.clone()?,
+                ))
+            })
+            .or_else(|| {
+                let st = self.external_struct_for_type(ty)?;
+                let field = st.fields.get(&offset)?;
+                Some(crate::ResolvedFieldLayout::direct(
+                    Some(st.name.clone()),
+                    offset,
+                    field.name.clone(),
+                ))
+            })
     }
 }
 
@@ -136,9 +286,16 @@ impl<'a> EvidenceBuilder<'a> {
     }
 
     fn value_is_constant(&self, value: r2ssa::ValueId) -> bool {
-        self.source
-            .value_var(value)
-            .is_some_and(r2ssa::SSAVar::is_const)
+        self.source.graph().value(value).is_some_and(|graph_value| {
+            let Some(bits) = graph_value.var.constant_bits() else {
+                return false;
+            };
+            graph_value.canonical_storage.is_some_and(|storage| {
+                storage.space == r2ssa::CanonicalStorageSpace::Constant
+                    && storage.offset == bits
+                    && storage.size == graph_value.var.size
+            })
+        })
     }
 
     fn equate(&mut self, a: r2ssa::ValueId, b: r2ssa::ValueId) {
@@ -872,5 +1029,67 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn memory_and_ssa_evidence_solve_without_callee_signatures() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rdi", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"evidence-without-callee-signatures".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(0))],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register(8)))
+        .and_then(|interface| interface.with_return_address_storage(register(16)))
+        .expect("exact source interface");
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::unique(0x100, 8),
+            src: r2il::Varnode::register(0, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(0x200, 4),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x100, 8),
+        });
+        let source =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared source");
+        let parameter = source
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("exact parameter")
+            .value;
+        let address = source
+            .certificates()
+            .memory_accesses
+            .values()
+            .next()
+            .expect("certified load")
+            .address;
+
+        let solved = solve_evidence_types(&source, &BTreeMap::new(), 64);
+        let expected = CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Unknown,
+        }));
+        assert_eq!(solved.value_type(address), Some(&expected));
+        assert_eq!(
+            solved.value_type(parameter),
+            Some(&expected),
+            "copy identity must carry memory evidence to the exact entry value"
+        );
     }
 }

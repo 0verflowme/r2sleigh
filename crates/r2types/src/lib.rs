@@ -45,7 +45,7 @@ pub use context::{
     parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
 pub use convert::{CTypeLike, render_c_type_like, to_c_type_like};
-pub use evidence::{EvidenceNode, EvidenceTypes, solve_evidence_types};
+pub use evidence::{EvidenceNode, EvidenceTypes, SourceEvidenceTypeOracle, solve_evidence_types};
 pub use external::{
     ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,
     ExternalTypedef, ExternalUnion, normalize_external_type_name,
@@ -77,10 +77,10 @@ pub use function_facts::{
     ExpressionRenderFact, FunctionCallRenderFacts, FunctionCallResultFacts, FunctionCallsiteFacts,
     FunctionControlFacts, FunctionFacts, FunctionInputQualityFacts, FunctionRenderFacts,
     InterprocSummaryView, LoopStructureFact, MemberAccessRenderFact, MemoryAccessRenderFact,
-    MemoryOpSiteKey, OpSiteKey, ParamSlotResolver, PredicateComparisonFact,
-    RegisterCallArgumentLocationFact, ReturnValueRenderFact, SourceOwnedFunctionFacts,
-    StackCallArgumentLocationFact, StackSlotOwnerRenderAuthorization, SummaryEffectRollup,
-    SummaryHelperView, SummaryOutParamFact, SwitchSelectorFact,
+    MemoryOpSiteKey, OpSiteKey, PredicateComparisonFact, RegisterCallArgumentLocationFact,
+    ReturnValueRenderFact, SourceOwnedFunctionFacts, StackCallArgumentLocationFact,
+    StackSlotOwnerRenderAuthorization, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
+    SwitchSelectorFact,
 };
 pub use inference::{CombinedTypeOracle, TypeInference, register_alias_names};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
@@ -131,9 +131,9 @@ pub use writeback::{
     canonicalize_writeback_apply_type_name, infer_local_struct_artifacts_from_prepared_ssa,
     infer_local_struct_artifacts_from_ssa, inferred_signature_to_function_type_facts,
     local_field_accesses_from_struct_artifacts, local_field_accesses_named,
-    semantic_artifact_prefers_bounded_type_plan,
-    signature_certificate_source_names, signature_register_arg_duplicate_delete_required,
-    signature_register_arg_rename_decision, signature_register_arg_stack_conflict_delete_required,
+    semantic_artifact_prefers_bounded_type_plan, signature_certificate_source_names,
+    signature_register_arg_duplicate_delete_required, signature_register_arg_rename_decision,
+    signature_register_arg_stack_conflict_delete_required,
     signature_register_arg_type_apply_required, signature_register_arg_var_score,
     signature_writeback_action_decision, signature_writeback_arch_supported,
     signature_writeback_size_eligible, type_writeback_global_type_link_apply_decision,
