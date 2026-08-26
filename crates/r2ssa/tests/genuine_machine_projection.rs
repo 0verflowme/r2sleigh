@@ -64,10 +64,11 @@ fn genuine_projection_allowing_residuals(
     (artifact, projection, arch)
 }
 
-fn exact_single_write_to_storage(
+fn exact_single_write_between_storages(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
-    storage: CanonicalStorageId,
+    source: CanonicalStorageId,
+    destination: CanonicalStorageId,
 ) -> MachineWriteProjection {
     let writes = artifact
         .graph()
@@ -77,13 +78,24 @@ fn exact_single_write_to_storage(
             inst.output
                 .and_then(|output| artifact.graph().value(output))
                 .and_then(|value| value.canonical_storage)
-                == Some(storage)
+                == Some(destination)
+                && inst.inputs.iter().any(|input| {
+                    artifact
+                        .graph()
+                        .value(*input)
+                        .and_then(|value| value.canonical_storage)
+                        == Some(source)
+                })
         })
         .collect::<Vec<_>>();
     assert_eq!(
         writes.len(),
         1,
-        "storage must have exactly one surviving definition, got {writes:?}"
+        "source-to-destination storage write must have exactly one surviving definition, got {:?}",
+        writes
+            .iter()
+            .map(|write| (write, projection.write_disposition(write.id)))
+            .collect::<Vec<_>>()
     );
     match projection
         .write_disposition(writes[0].id)
@@ -150,9 +162,10 @@ fn genuine_x86_eax_write_survives_as_one_carrier_zero_extension() {
         &[0x89, 0xd8], // mov eax, ebx
     );
     let rax = declared_register_storage(&arch, "RAX");
+    let ebx = declared_register_storage(&arch, "EBX");
 
     assert_eq!(
-        exact_single_write_to_storage(&artifact, &projection, rax),
+        exact_single_write_between_storages(&artifact, &projection, ebx, rax),
         MachineWriteProjection::ZeroExtend {
             from_width_bits: 32,
             to_width_bits: 64,
@@ -167,9 +180,10 @@ fn genuine_aarch64_w0_write_survives_as_one_carrier_zero_extension() {
         &[0xe0, 0x03, 0x01, 0x2a], // mov w0, w1
     );
     let x0 = declared_register_storage(&arch, "x0");
+    let w1 = declared_register_storage(&arch, "w1");
 
     assert_eq!(
-        exact_single_write_to_storage(&artifact, &projection, x0),
+        exact_single_write_between_storages(&artifact, &projection, w1, x0),
         MachineWriteProjection::ZeroExtend {
             from_width_bits: 32,
             to_width_bits: 64,
@@ -184,9 +198,10 @@ fn genuine_x86_ah_write_survives_as_one_high_slice_insert() {
         &[0x88, 0xdc], // mov ah, bl
     );
     let ah = declared_register_storage(&arch, "AH");
+    let bl = declared_register_storage(&arch, "BL");
 
     assert_eq!(
-        exact_single_write_to_storage(&artifact, &projection, ah),
+        exact_single_write_between_storages(&artifact, &projection, bl, ah),
         MachineWriteProjection::Insert {
             bit_offset: 8,
             width_bits: 8,
