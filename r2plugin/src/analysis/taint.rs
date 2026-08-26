@@ -171,7 +171,10 @@ fn build_taint_summary_report(
     let ssa_func = r2ssa::SSAFunction::from_blocks_with_arch(blocks, ctx_ref.arch.as_ref())?;
     let policy = current_taint_policy();
     let sources = collect_taint_sources(&ssa_func, &policy);
-    let analysis = r2ssa::TaintAnalysis::with_arch(&ssa_func, policy, ctx_ref.arch.as_ref());
+    // This legacy block-only endpoint has no source snapshot or exact callsite
+    // interface. Calls therefore expose only their explicit SSA operands;
+    // architecture labels and register spellings are not ABI authority.
+    let analysis = r2ssa::TaintAnalysis::new(&ssa_func, policy);
     let result = analysis.analyze();
 
     Some(TaintSummaryReportJson {
@@ -331,7 +334,10 @@ pub(crate) fn r2taint_function_json(
         }
     }
 
-    let analysis = r2ssa::TaintAnalysis::with_arch(&ssa_func, policy, ctx_ref.arch.as_ref());
+    // The raw FFI shape carries no source-owned callsite certificate. Keep
+    // implicit call arguments unavailable instead of guessing them from the
+    // architecture and register names.
+    let analysis = r2ssa::TaintAnalysis::new(&ssa_func, policy);
     let result = analysis.analyze();
 
     let mut tainted_vars = Vec::new();
@@ -431,6 +437,25 @@ pub(crate) fn r2taint_function_summary_free(summary: *mut R2TaintFunctionSummary
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn register(offset: u64) -> Varnode {
+        Varnode {
+            space: SpaceId::Register,
+            offset,
+            size: 8,
+            meta: None,
+        }
+    }
+
+    fn constant(value: u64) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: value,
+            size: 8,
+            meta: None,
+        }
+    }
 
     #[test]
     fn taint_document_versions_nested_ssa_operations_once() {
@@ -455,5 +480,40 @@ mod tests {
         assert_eq!(value["schema_version"], TAINT_JSON_SCHEMA_VERSION);
         assert_eq!(value["schema_version"], 1);
         assert!(value["sinks"][0]["op"].get("schema_version").is_none());
+    }
+
+    #[test]
+    fn block_only_plugin_taint_does_not_guess_implicit_call_arguments() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 56, 8));
+        let mut context = R2ILContext::new();
+        context.arch = Some(arch);
+        let blocks = vec![R2ILBlock {
+            addr: 0x2000,
+            size: 2,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: register(56),
+                    src: register(0),
+                },
+                R2ILOp::Call {
+                    target: constant(0x402000),
+                },
+            ],
+        }];
+
+        let report = build_taint_summary_report(&context, &blocks).expect("taint report");
+        assert!(
+            !report.sources.is_empty(),
+            "fixture must contain taint sources"
+        );
+        assert!(
+            report.sink_hits.is_empty(),
+            "an x86 architecture label is not source-owned callsite authority"
+        );
     }
 }

@@ -19,10 +19,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use r2il::ArchSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::function::{SSABlock, SSAFunction, SourceSite, UseLocation};
+use crate::function::{SSABlock, SSAFunction, SourceSite, SsaArtifact, UseLocation};
 use crate::op::SSAOp;
 use crate::var::SSAVar;
 
@@ -74,27 +73,6 @@ pub trait TaintPolicy {
     /// Return None to use default (union of source taints).
     fn propagate(&self, _op: &SSAOp, _source_taints: &[&TaintSet]) -> Option<TaintSet> {
         None
-    }
-}
-
-const X86_64_SYSV_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-const NO_CALL_ARG_REGS: [&str; 0] = [];
-
-/// Return calling-convention argument registers for the active architecture.
-///
-/// Currently populated only for x86-64 SysV and intentionally empty for all
-/// other/unknown architectures.
-pub fn call_arg_regs(arch: Option<&ArchSpec>) -> &'static [&'static str] {
-    let Some(arch) = arch else {
-        return &NO_CALL_ARG_REGS;
-    };
-    let arch_name = arch.name.to_ascii_lowercase();
-    let looks_x86 = arch_name.contains("x86");
-    let looks_64 = arch.addr_size == 8 || arch_name.contains("64");
-    if looks_x86 && looks_64 {
-        &X86_64_SYSV_ARG_REGS
-    } else {
-        &NO_CALL_ARG_REGS
     }
 }
 
@@ -229,7 +207,14 @@ impl TaintResult {
 pub struct TaintAnalysis<'a, P: TaintPolicy> {
     func: &'a SSAFunction,
     policy: P,
-    call_arg_regs: Vec<&'static str>,
+    /// The only authority allowed to add implicit call operands to a sink.
+    ///
+    /// A detached SSA function has no proof of the ABI at any callsite, so
+    /// `None` deliberately means that calls expose only their explicit SSA
+    /// operands. The artifact path below reads source-owned, prepared callsite
+    /// certificates instead of deriving argument roles from architecture or
+    /// register spellings.
+    artifact: Option<&'a SsaArtifact>,
 }
 
 impl<'a, P: TaintPolicy> TaintAnalysis<'a, P> {
@@ -238,16 +223,20 @@ impl<'a, P: TaintPolicy> TaintAnalysis<'a, P> {
         Self {
             func,
             policy,
-            call_arg_regs: Vec::new(),
+            artifact: None,
         }
     }
 
-    /// Create a taint analysis with architecture-aware call argument handling.
-    pub fn with_arch(func: &'a SSAFunction, policy: P, arch: Option<&ArchSpec>) -> Self {
+    /// Create an analysis bound to one prepared artifact.
+    ///
+    /// Implicit call arguments are included only when that exact artifact has a
+    /// complete source-owned callsite certificate. Missing, incomplete or
+    /// mismatched source authority fails closed at the individual callsite.
+    pub fn from_artifact(artifact: &'a SsaArtifact, policy: P) -> Self {
         Self {
-            func,
+            func: artifact.function(),
             policy,
-            call_arg_regs: call_arg_regs(arch).to_vec(),
+            artifact: Some(artifact),
         }
     }
 
@@ -489,8 +478,8 @@ impl<'a, P: TaintPolicy> TaintAnalysis<'a, P> {
 
     /// Collect source variables relevant for sink checking.
     ///
-    /// For call sinks, we include both call target source(s) and the latest
-    /// in-block argument register setup before the call.
+    /// For call sinks, exact prepared callsite certificates may add implicit
+    /// argument values beside the call target's explicit source.
     fn sink_sources_for_op(&self, block: &SSABlock, op_idx: usize, op: &SSAOp) -> Vec<SSAVar> {
         let mut sink_sources: Vec<SSAVar> = op.sources().into_iter().cloned().collect();
         if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
@@ -502,60 +491,24 @@ impl<'a, P: TaintPolicy> TaintAnalysis<'a, P> {
         sink_sources
     }
 
-    /// Collect inferred call argument variables set before a call.
+    /// Collect exact source-owned call argument values for one callsite.
     ///
-    /// NOTE: This is intentionally intra-block only. Optimized binaries may
-    /// prepare call arguments in predecessor blocks; cross-block reaching-def
-    /// recovery is a follow-up.
+    /// The prepared certificate already owns reaching-definition recovery and
+    /// canonical storage validation. Re-scanning register writes here would
+    /// create a second ABI answerer and would reintroduce spelling dependence.
     fn collect_call_arg_vars(&self, block: &SSABlock, call_op_idx: usize) -> Vec<SSAVar> {
-        if self.call_arg_regs.is_empty() || call_op_idx == 0 {
+        let Some(artifact) = self.artifact else {
             return Vec::new();
-        }
-
-        let mut found: HashMap<&'static str, SSAVar> = HashMap::new();
-        let mut idx = call_op_idx;
-        while idx > 0 {
-            idx -= 1;
-            let prev = &block.ops[idx];
-
-            if matches!(prev, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-                break;
-            }
-
-            let Some(dst) = prev.dst() else {
-                continue;
-            };
-            let Some(canonical) = Self::canonical_x86_64_arg_reg(&dst.name) else {
-                continue;
-            };
-            if !self.call_arg_regs.contains(&canonical) {
-                continue;
-            }
-
-            // Backward scan: first match per arg is the last chronological write.
-            found.entry(canonical).or_insert_with(|| dst.clone());
-        }
-
-        let mut ordered = Vec::new();
-        for reg in &self.call_arg_regs {
-            if let Some(var) = found.remove(reg) {
-                ordered.push(var);
-            }
-        }
-        ordered
-    }
-
-    fn canonical_x86_64_arg_reg(name: &str) -> Option<&'static str> {
-        let base = name.split('_').next().unwrap_or(name).to_ascii_lowercase();
-        match base.as_str() {
-            "rdi" | "edi" | "di" | "dil" => Some("rdi"),
-            "rsi" | "esi" | "si" | "sil" => Some("rsi"),
-            "rdx" | "edx" | "dx" | "dl" | "dh" => Some("rdx"),
-            "rcx" | "ecx" | "cx" | "cl" | "ch" => Some("rcx"),
-            "r8" | "r8d" | "r8w" | "r8b" => Some("r8"),
-            "r9" | "r9d" | "r9w" | "r9b" => Some("r9"),
-            _ => None,
-        }
+        };
+        let Some(callsite) = artifact.callsite_certificate_for_op(block.addr, call_op_idx) else {
+            return Vec::new();
+        };
+        callsite
+            .argument_values
+            .iter()
+            .filter_map(|value| artifact.graph().value(*value))
+            .map(|value| value.var.clone())
+            .collect()
     }
 }
 
@@ -563,6 +516,11 @@ impl<'a, P: TaintPolicy> TaintAnalysis<'a, P> {
 mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    use crate::{
+        CanonicalStorageId, CanonicalStorageSpace, SourceCallArgumentSpec, SourceCallResult,
+        SourceCallSiteIdentity, SourceCallSiteInterface,
+    };
 
     fn make_var(name: &str, version: u32) -> SSAVar {
         SSAVar::new(name, version, 8)
@@ -584,26 +542,6 @@ mod tests {
             size,
             meta: None,
         }
-    }
-
-    fn make_x86_64_arch() -> ArchSpec {
-        let mut arch = ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(RegisterDef::new("rax", 0, 8));
-        arch.add_register(RegisterDef::new("eax", 0, 4));
-        arch.add_register(RegisterDef::new("rsi", 32, 8));
-        arch.add_register(RegisterDef::new("esi", 32, 4));
-        arch.add_register(RegisterDef::new("rdi", 56, 8));
-        arch.add_register(RegisterDef::new("edi", 56, 4));
-        arch.add_register(RegisterDef::new("rdx", 64, 8));
-        arch.add_register(RegisterDef::new("edx", 64, 4));
-        arch.add_register(RegisterDef::new("rcx", 80, 8));
-        arch.add_register(RegisterDef::new("ecx", 80, 4));
-        arch.add_register(RegisterDef::new("r8", 88, 8));
-        arch.add_register(RegisterDef::new("r8d", 88, 4));
-        arch.add_register(RegisterDef::new("r9", 96, 8));
-        arch.add_register(RegisterDef::new("r9d", 96, 4));
-        arch
     }
 
     #[test]
@@ -750,59 +688,16 @@ mod tests {
         assert!(!set.contains(&TaintLabel::new("src3")));
     }
 
-    #[test]
-    fn call_sink_uses_last_intrablock_arg_write() {
-        let arch = make_x86_64_arch();
-        let blocks = vec![R2ILBlock {
-            addr: 0x1000,
-            size: 3,
-            switch_info: None,
-            op_metadata: Default::default(),
-            ops: vec![
-                R2ILOp::Copy {
-                    dst: make_reg(56, 8), // rdi
-                    src: make_reg(0, 8),  // rax
-                },
-                R2ILOp::Copy {
-                    dst: make_reg(56, 4), // edi (later write to same arg register)
-                    src: make_reg(0, 4),  // eax
-                },
-                R2ILOp::Call {
-                    target: make_const(0x401000, 8),
-                },
-            ],
-        }];
-
-        let func = SSAFunction::from_blocks_raw(&blocks, Some(&arch))
-            .expect("Failed to build SSA function");
-        let policy = DefaultTaintPolicy::all_inputs().with_sink_stores(false);
-        let analysis = TaintAnalysis::with_arch(&func, policy, Some(&arch));
-        let result = analysis.analyze();
-
-        let call_hit = result
-            .sink_hits
-            .iter()
-            .find(|hit| matches!(hit.op, SSAOp::Call { .. }))
-            .expect("Expected a call sink hit");
-        let names: Vec<String> = call_hit
-            .tainted_vars
-            .iter()
-            .map(|(var, _)| var.display_name())
-            .collect();
-
-        assert!(
-            names.iter().any(|name| name == "EDI_1"),
-            "Backward scan should pick the latest intrablock write to arg register"
-        );
-        assert!(
-            !names.iter().any(|name| name == "RDI_1"),
-            "Earlier arg write should be ignored when a later write exists"
-        );
-    }
-
-    #[test]
-    fn call_sink_detects_tainted_arg_when_target_not_tainted() {
-        let arch = make_x86_64_arch();
+    fn exact_call_argument_fixture() -> (
+        ArchSpec,
+        Vec<R2ILBlock>,
+        SourceCallSiteInterface,
+        CanonicalStorageId,
+    ) {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("untrusted_payload", 32, 8));
+        arch.add_register(RegisterDef::new("outbound_payload", 56, 8));
         let blocks = vec![R2ILBlock {
             addr: 0x2000,
             size: 2,
@@ -810,43 +705,87 @@ mod tests {
             op_metadata: Default::default(),
             ops: vec![
                 R2ILOp::Copy {
-                    dst: make_reg(56, 8), // rdi
-                    src: make_reg(32, 8), // rsi
+                    dst: make_reg(56, 8),
+                    src: make_reg(32, 8),
                 },
                 R2ILOp::Call {
                     target: make_const(0x402000, 8),
                 },
             ],
         }];
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 56,
+            size: 8,
+        };
+        let call_interface = SourceCallSiteInterface::new(
+            b"taint-exact-callsite".to_vec(),
+            SourceCallSiteIdentity::new(
+                0x2000,
+                1,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x402000,
+                    size: 8,
+                },
+            ),
+            true,
+            "source-owned-convention",
+            [SourceCallArgumentSpec::new(0, argument_storage)],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("exact callsite interface");
+        (arch, blocks, call_interface, argument_storage)
+    }
 
-        let func = SSAFunction::from_blocks_raw(&blocks, Some(&arch))
-            .expect("Failed to build SSA function");
-        let policy = DefaultTaintPolicy::new()
-            .with_source("rsi")
-            .with_sink_stores(false);
-        let analysis = TaintAnalysis::with_arch(&func, policy, Some(&arch));
-        let result = analysis.analyze();
+    #[test]
+    fn source_owned_callsite_certificate_drives_call_sink_without_abi_names() {
+        let (arch, blocks, call_interface, argument_storage) = exact_call_argument_fixture();
+        let artifact = SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            None,
+            vec![call_interface],
+        )
+        .expect("prepared exact SSA artifact");
+        let policy = DefaultTaintPolicy::all_inputs().with_sink_stores(false);
+        let result = TaintAnalysis::from_artifact(&artifact, policy).analyze();
 
         let call_hit = result
             .sink_hits
             .iter()
             .find(|hit| matches!(hit.op, SSAOp::Call { .. }))
-            .expect("Expected a call sink hit from tainted argument setup");
-        let names: Vec<String> = call_hit
-            .tainted_vars
-            .iter()
-            .map(|(var, _)| var.display_name())
-            .collect();
+            .expect("exact argument certificate must expose the tainted call operand");
+        assert!(call_hit.tainted_vars.iter().any(|(var, _)| {
+            artifact
+                .graph()
+                .value_id_for_var(var)
+                .and_then(|value| artifact.graph().value(value))
+                .is_some_and(|value| value.canonical_storage == Some(argument_storage))
+        }));
+    }
+
+    #[test]
+    fn prepared_function_without_source_callsite_authority_fails_closed() {
+        let (_, blocks, _, _) = exact_call_argument_fixture();
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rsi", 32, 8));
+        arch.add_register(RegisterDef::new("rdi", 56, 8));
+
+        let artifact = SsaArtifact::for_decompile(&blocks, Some(&arch))
+            .expect("prepared SSA without source interface");
+        let policy = DefaultTaintPolicy::all_inputs().with_sink_stores(false);
+        let result = TaintAnalysis::from_artifact(&artifact, policy).analyze();
 
         assert!(
-            names.iter().any(|name| name == "RDI_1"),
-            "Call sink should include tainted call argument register"
-        );
-        assert!(
-            !names.iter().any(|name| {
-                crate::var::SSAVarNameKind::classify(&name.to_ascii_lowercase()).is_constant()
-            }),
-            "Call target constant should not be treated as a tainted argument source"
+            result
+                .sink_hits
+                .iter()
+                .all(|hit| !matches!(hit.op, SSAOp::Call { .. })),
+            "an architecture label and register spellings are not callsite authority"
         );
     }
 
