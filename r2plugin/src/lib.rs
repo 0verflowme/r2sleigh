@@ -2585,6 +2585,7 @@ pub(crate) struct EngineV2Output {
     pub(crate) metrics: r2engine::EngineMetrics,
     pub(crate) diagnostics: r2engine::EngineDiagnostics,
     pub(crate) binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
+    pub(crate) effect_obligations: Option<r2engine::EffectObligationAudit>,
 }
 
 /// The name the source gives this function, when it gives one.
@@ -2645,6 +2646,7 @@ fn r2sleigh_engine_decompile_trusted_output(
         metrics: response.metrics,
         diagnostics: response.diagnostics,
         binding_audit: Some(response.binding_audit),
+        effect_obligations: Some(response.effect_obligations),
     })
 }
 
@@ -2699,6 +2701,7 @@ fn r2sleigh_engine_type_function_trusted_output(
                 metrics: *refusal.metrics,
                 diagnostics: *refusal.diagnostics,
                 binding_audit: None,
+                effect_obligations: None,
             });
         }
     };
@@ -2726,6 +2729,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         metrics,
         diagnostics,
         binding_audit: None,
+        effect_obligations: None,
     })
 }
 
@@ -2766,6 +2770,7 @@ fn r2sleigh_engine_proven_facts_trusted_output(
         metrics: r2engine::EngineMetrics::default(),
         diagnostics: r2engine::EngineDiagnostics::default(),
         binding_audit: None,
+        effect_obligations: None,
     })
 }
 
@@ -4923,6 +4928,27 @@ mod tests {
             !rust_decompiler_source.contains("failed to spawn decompiler thread")
                 && !rust_decompiler_source.contains("decompilation panicked"),
             "Rust plugin decompile wrapper must fail closed instead of owning decompile error text"
+        );
+    }
+
+    #[test]
+    fn c_plugin_emits_one_versioned_sidecar_with_both_independent_audits() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+        let emitter = c_source
+            .split("static void sleigh_engine_v2_emit_binding_audit")
+            .nth(1)
+            .expect("typed audit sidecar emitter");
+
+        assert!(emitter.contains("r_json_get (diagnostics, \"binding_audit\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"effect_obligations\")"));
+        assert!(emitter.contains("effect_obligations->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 3)"));
+        assert!(emitter.contains("pj_k (pj, \"audit\")"));
+        assert!(emitter.contains("pj_k (pj, \"effect_obligations\")"));
+        assert_eq!(
+            emitter.matches("SLEIGH_BINDING_AUDIT_PREFIX").count(),
+            1,
+            "the corpus receives one atomic marker envelope per decompile"
         );
     }
 
@@ -8404,14 +8430,14 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
-        // Legacy facts stay inspectable and the render stays honest about its
-        // status: the output carries its proof note rather than being withheld.
+        // Certified facts stay inspectable even when the effect ledger refuses
+        // executable C and the engine replaces only the route with a comment.
         assert!(
-            (response.output.contains("r2dec residual:")
-                || response.output.contains("r2dec proof:"))
+            response.output.starts_with("/* r2dec fallback:")
+                && response.output.contains("native effect obligations refused:")
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
-            "legacy facts must remain inspectable without authorizing production executable C; output={} render_facts={:?}",
+            "certified facts must remain inspectable while a refused effect audit leaves only a fallback comment; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );

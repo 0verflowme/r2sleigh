@@ -35,7 +35,8 @@ pub use route::{
 pub use r2dec::{
     BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
     BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
-    BindingShadowAuditOutcome, BindingShadowDomainAudit,
+    BindingShadowAuditOutcome, BindingShadowDomainAudit, EffectObligationAudit,
+    EffectObligationDisposition, DecompileRenderRefusal,
 };
 #[cfg(test)]
 use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
@@ -4075,6 +4076,8 @@ impl EngineTypeAnalysisResponse {
 pub struct EngineDecompileResponse {
     pub output: String,
     pub binding_audit: BindingShadowAuditOutcome,
+    pub effect_obligations: EffectObligationAudit,
+    pub render_refusal: Option<DecompileRenderRefusal>,
     pub function_facts: FunctionFacts,
     pub input_quality: Option<r2types::FunctionInputQualityFacts>,
     pub metrics: EngineMetrics,
@@ -4406,36 +4409,49 @@ impl EngineSession {
         let mut metrics = analyze_response.metrics;
         let analyze_diagnostics = analyze_response.diagnostics;
         let artifact = analyze_response.artifact;
+        let analyzed_function_facts = artifact.function_facts().clone();
         let Some(render_target) = EngineRenderTarget::for_prepared(artifact.ssa_func()) else {
             metrics.refuse_from(EnginePhase::Normalization);
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 "source-owned machine context cannot define an exact render target",
                 input_quality_facts,
                 metrics,
                 analyze_diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                None,
             );
         };
         if render_target != requested_render_target {
             metrics.refuse_from(EnginePhase::Normalization);
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 "requested render target does not match the source-owned machine context",
                 input_quality_facts,
                 metrics,
                 analyze_diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                None,
             );
         }
 
         if let Err(refusal) =
             poll_engine_execution(&execution, EnginePhase::Normalization, &metrics)
         {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 &refusal.reason,
                 input_quality_facts,
                 *refusal.metrics,
                 *refusal.diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                None,
             );
         }
         let normalization_started = Instant::now();
@@ -4464,12 +4480,16 @@ impl EngineSession {
             Ok(facts) => facts,
             Err(_) => {
                 metrics.refuse_from(EnginePhase::Normalization);
-                return refused_decompile_response_with_metrics(
+                return refused_decompile_response_with_metrics_and_audits(
                     &display_name,
                     "requested decompile route is incompatible with source-owned facts",
                     input_quality_facts,
                     metrics,
                     analyze_diagnostics,
+                    Some(analyzed_function_facts),
+                    BindingShadowAuditOutcome::NotRun,
+                    EffectObligationAudit::NOT_RUN,
+                    None,
                 );
             }
         };
@@ -4531,12 +4551,16 @@ impl EngineSession {
         if request.trusted_ssa.as_deref().is_some_and(|trusted| {
             !trusted.shares_artifact(&request.source_owned_facts.shared_source())
         }) {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 "trusted SSA does not match the source-owned function facts",
                 input_quality.clone(),
                 request.metrics,
                 EngineDiagnostics::default(),
+                Some(response_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                None,
             );
         }
         let mut diagnostics = decompile_diagnostics_from_function_facts(request.function_facts());
@@ -4547,12 +4571,16 @@ impl EngineSession {
             EnginePhase::Certification,
             &request.metrics,
         ) {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 &refusal.reason,
                 input_quality.clone(),
                 *refusal.metrics,
                 *refusal.diagnostics,
+                Some(response_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                None,
             );
         }
 
@@ -4568,14 +4596,19 @@ impl EngineSession {
                     render_time,
                 );
                 let binding_audit = stop.binding_audit;
+                let effect_obligations = stop.effect_obligations;
+                let render_refusal = stop.render_refusal;
                 let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
-                return refused_decompile_response_with_metrics_and_binding_audit(
+                return refused_decompile_response_with_metrics_and_audits(
                     &request.function_name,
                     &refusal.reason,
                     input_quality.clone(),
                     *refusal.metrics,
                     *refusal.diagnostics,
+                    Some(response_function_facts),
                     binding_audit,
+                    effect_obligations,
+                    render_refusal,
                 );
             }
         };
@@ -4623,22 +4656,65 @@ impl EngineSession {
         }
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
+        let rendering_stopped = rendered.stopped.is_some();
+        let (output, binding_audit, effect_obligations, render_refusal) = rendered.product.finalize();
+        if !rendering_stopped && let Some(refusal) = render_refusal {
+            let reason = render_refusal_reason(refusal);
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                Some(refusal),
+            );
+        }
+        if !rendering_stopped && let Some(reason) = effect_obligation_refusal_reason(effect_obligations) {
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                &reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                None,
+            );
+        }
         if let Err(refusal) =
             poll_engine_execution(&request.execution, EnginePhase::FfiConversion, &metrics)
         {
-            return refused_decompile_response_with_metrics_and_binding_audit(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 &refusal.reason,
                 input_quality,
                 *refusal.metrics,
                 *refusal.diagnostics,
-                BindingShadowAuditOutcome::NotRun,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                None,
             );
         }
-        let (output, binding_audit) = rendered.product.finalize();
         EngineDecompileResponse {
             output,
             binding_audit,
+            effect_obligations,
+            render_refusal,
             function_facts: response_function_facts,
             input_quality,
             metrics,
@@ -5154,6 +5230,29 @@ fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
     }
 }
 
+fn effect_obligation_refusal_reason(audit: EffectObligationAudit) -> Option<String> {
+    (matches!(audit.disposition, EffectObligationDisposition::Refused)
+        || audit.refused != 0
+        || audit.unaccounted != 0
+        || audit.conflicts != 0).then(|| {
+        format!(
+            "native effect obligations refused: {} refused, {} unaccounted, {} conflicts",
+            audit.refused, audit.unaccounted, audit.conflicts
+        )
+    })
+}
+
+fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
+    match refusal {
+        DecompileRenderRefusal::MissingMachineProjectionAuthorization => {
+            "native rendering refused: missing machine projection authorization"
+        }
+        DecompileRenderRefusal::UnrepresentableOperation => {
+            "native rendering refused: unrepresentable operation"
+        }
+    }
+}
+
 fn should_skip_expensive_symbolic_summary(compiled: &r2sym::SemanticArtifact) -> bool {
     compiled.diagnostics.skipped_large_cfg
         || compiled
@@ -5210,6 +5309,8 @@ enum EngineRenderedProduct {
     Ready {
         output: String,
         binding_audit: BindingShadowAuditOutcome,
+        effect_obligations: EffectObligationAudit,
+        render_refusal: Option<DecompileRenderRefusal>,
     },
     Pending(r2dec::PendingDecompileBindingAudit),
 }
@@ -5222,16 +5323,27 @@ impl EngineRenderedProduct {
         }
     }
 
-    fn finalize(self) -> (String, BindingShadowAuditOutcome) {
+    fn finalize(
+        self,
+    ) -> (
+        String,
+        BindingShadowAuditOutcome,
+        EffectObligationAudit,
+        Option<DecompileRenderRefusal>,
+    ) {
         match self {
             Self::Ready {
                 output,
                 binding_audit,
-            } => (output, binding_audit),
+                effect_obligations,
+                render_refusal,
+            } => (output, binding_audit, effect_obligations, render_refusal),
             Self::Pending(pending) => {
                 let audited = pending.finalize();
                 let binding_audit = audited.binding_shadow();
-                (audited.into_output(), binding_audit)
+                let effect_obligations = audited.effect_obligations();
+                let render_refusal = audited.render_refusal();
+                (audited.into_output(), binding_audit, effect_obligations, render_refusal)
             }
         }
     }
@@ -5242,6 +5354,8 @@ struct EngineRenderExecutionStop {
     reason: String,
     phase: EnginePhase,
     binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
     certification_completed: bool,
     normalization_completed: bool,
     structuring_completed: bool,
@@ -5285,6 +5399,8 @@ fn engine_render_stop_reason(
         reason,
         phase,
         binding_audit: BindingShadowAuditOutcome::NotRun,
+        effect_obligations: EffectObligationAudit::NOT_RUN,
+        render_refusal: None,
         certification_completed: false,
         normalization_completed: false,
         structuring_completed: false,
@@ -5315,6 +5431,8 @@ fn poll_engine_render_control_with_completion<C: r2ssa::SsaWorkControl + ?Sized>
 fn engine_render_stop_from_decompiler(
     stop: r2dec::DecompileExecutionStop,
     binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
 ) -> EngineRenderExecutionStop {
     let phase = match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => EnginePhase::Normalization,
@@ -5323,6 +5441,8 @@ fn engine_render_stop_from_decompiler(
     };
     let mut mapped = engine_render_stop_reason(stop.reason(), phase);
     mapped.binding_audit = binding_audit;
+    mapped.effect_obligations = effect_obligations;
+    mapped.render_refusal = render_refusal;
     match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => {}
         r2dec::DecompileWorkPhase::Structuring => {
@@ -5351,6 +5471,8 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
             product: EngineRenderedProduct::Ready {
                 output,
                 binding_audit: BindingShadowAuditOutcome::NotRun,
+                effect_obligations: EffectObligationAudit::NOT_RUN,
+                render_refusal: None,
             },
             semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
@@ -5367,8 +5489,18 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     {
         Ok(pending) => pending,
         Err((stop, Some(partial))) if !partial.output().trim().is_empty() => {
+            let audited = partial.finalize();
+            let binding_audit = audited.binding_shadow();
+            let effect_obligations = audited.effect_obligations();
+            let render_refusal = audited.render_refusal();
+            let output = audited.into_output();
             return Ok(EngineRenderedDecompile {
-                product: EngineRenderedProduct::Pending(partial),
+                product: EngineRenderedProduct::Ready {
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    render_refusal,
+                },
                 semantic_kernel_warnings: vec![format!(
                     "rendering stopped in {:?}: {}; the body above is what was reached",
                     stop.phase(),
@@ -5377,17 +5509,33 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                 structuring_executed: true,
                 stopped: Some(engine_render_stop_from_decompiler(
                     stop,
-                    BindingShadowAuditOutcome::NotRun,
+                    binding_audit,
+                    effect_obligations,
+                    render_refusal,
                 )),
             });
         }
         Err((stop, partial)) => {
-            let binding_audit = partial
+            let (binding_audit, effect_obligations, render_refusal) = partial
                 .map(r2dec::PendingDecompileBindingAudit::finalize)
-                .map_or(BindingShadowAuditOutcome::NotRun, |audit| {
-                    audit.binding_shadow()
-                });
-            return Err(engine_render_stop_from_decompiler(stop, binding_audit));
+                .map_or(
+                    (
+                        BindingShadowAuditOutcome::NotRun,
+                        EffectObligationAudit::NOT_RUN,
+                        None,
+                    ),
+                    |audit| (
+                        audit.binding_shadow(),
+                        audit.effect_obligations(),
+                        audit.render_refusal(),
+                    ),
+                );
+            return Err(engine_render_stop_from_decompiler(
+                stop,
+                binding_audit,
+                effect_obligations,
+                render_refusal,
+            ));
         }
     };
     if !audited.output().trim().is_empty() {
@@ -5399,6 +5547,10 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
         });
     }
 
+    let audited = audited.finalize();
+    let binding_audit = audited.binding_shadow();
+    let effect_obligations = audited.effect_obligations();
+    let render_refusal = audited.render_refusal();
     Ok(EngineRenderedDecompile {
         product: EngineRenderedProduct::Ready {
             output: decompile_route_output_from_function_facts(
@@ -5406,7 +5558,9 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
                 request.function_facts(),
             )
             .unwrap_or_default(),
-            binding_audit: audited.finalize().binding_shadow(),
+            binding_audit,
+            effect_obligations,
+            render_refusal,
         },
         semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
@@ -5445,25 +5599,35 @@ fn refused_decompile_response_with_metrics(
     metrics: EngineMetrics,
     diagnostics: EngineDiagnostics,
 ) -> EngineDecompileResponse {
-    refused_decompile_response_with_metrics_and_binding_audit(
+    refused_decompile_response_with_metrics_and_audits(
         function_name,
         reason,
         input_quality,
         metrics,
         diagnostics,
+        None,
         BindingShadowAuditOutcome::NotRun,
+        EffectObligationAudit::NOT_RUN,
+        None,
     )
 }
 
-fn refused_decompile_response_with_metrics_and_binding_audit(
+fn refused_decompile_response_with_metrics_and_audits(
     function_name: &str,
     reason: &str,
     input_quality: Option<r2types::FunctionInputQualityFacts>,
     metrics: EngineMetrics,
     mut diagnostics: EngineDiagnostics,
+    existing_function_facts: Option<FunctionFacts>,
     binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
 ) -> EngineDecompileResponse {
-    let function_facts = refused_decompile_function_facts(function_name, reason);
+    let function_facts = seal_refused_decompile_function_facts(
+        existing_function_facts.unwrap_or_default(),
+        function_name,
+        reason,
+    );
     let output = decompile_route_output_from_function_facts(function_name, &function_facts)
         .expect("refused decompile response must stamp a fallback route");
     let route_diagnostics = decompile_diagnostics_from_function_facts(&function_facts);
@@ -5473,6 +5637,8 @@ fn refused_decompile_response_with_metrics_and_binding_audit(
     EngineDecompileResponse {
         output,
         binding_audit,
+        effect_obligations,
+        render_refusal,
         function_facts,
         input_quality,
         metrics,
@@ -5480,7 +5646,11 @@ fn refused_decompile_response_with_metrics_and_binding_audit(
     }
 }
 
-fn refused_decompile_function_facts(function_name: &str, reason: &str) -> FunctionFacts {
+fn seal_refused_decompile_function_facts(
+    function_facts: FunctionFacts,
+    function_name: &str,
+    reason: &str,
+) -> FunctionFacts {
     let output = artifact_guard_fallback_comment(function_name, reason);
     let route = r2types::DecompileRouteFacts {
         kind: r2types::DecompileRouteKind::FallbackComment,
@@ -5489,7 +5659,7 @@ fn refused_decompile_function_facts(function_name: &str, reason: &str) -> Functi
         skip_runtime_type_inference: true,
         use_prepared_semantic_view: false,
     };
-    FunctionFacts::default().with_decompile_route(route)
+    function_facts.with_decompile_route(route)
 }
 
 fn decompile_route_output_from_function_facts(
@@ -8241,7 +8411,7 @@ mod tests {
     }
 
     #[test]
-    fn r2dec_inner_stops_map_to_engine_refusals_and_keep_what_rendering_reached() {
+    fn r2dec_inner_stops_map_to_engine_refusals_and_keep_exact_audits() {
         let session = EngineSession::new();
         let request = controlled_r2dec_render_request();
         let decompiler_input = decompiler_input_for_engine_request(&request);
@@ -8249,13 +8419,25 @@ mod tests {
             .decompile_input(&decompiler_input);
         let counting = CountingRenderControl::default();
         let controlled = session.decompile_with_r2dec_control(request.clone(), &counting);
-        assert_eq!(controlled.output, legacy_output);
+        assert!(legacy_output.contains("source effect closure refused native C"));
+        assert!(controlled.output.starts_with("/* r2dec fallback:"));
         assert_ne!(
             controlled.binding_audit,
             BindingShadowAuditOutcome::NotRun,
             "the completed native render must retain its exact r2dec audit"
         );
+        assert_ne!(
+            controlled.effect_obligations,
+            EffectObligationAudit::NOT_RUN,
+            "the completed native render must retain its exact effect audit"
+        );
+        assert_eq!(
+            controlled.render_refusal,
+            None,
+            "the opaque fixture is refused by its effect ledger, not a renderer-boundary failure"
+        );
         let completed_binding_audit = controlled.binding_audit;
+        let completed_effect_obligations = controlled.effect_obligations;
         let total_polls = counting.polls.get();
         assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
 
@@ -8340,35 +8522,31 @@ mod tests {
             );
             assert_eq!(
                 response.diagnostics.route_reason.as_deref(),
-                Some(expected_reason.as_str())
+                Some(expected_reason.as_str()),
+                "an execution stop remains primary over audits retained from the partial render"
             );
-            assert!(
-                response
-                    .diagnostics
-                    .refusal
-                    .as_deref()
-                    .is_some_and(|refusal| refusal.contains(&expected_reason))
-            );
-            // A stop while normalizing has no body to keep, so it still falls
-            // back to a comment. A stop while rendering does: the C function is
-            // built by then, and discarding it reported a run that ran out of
-            // budget as one that produced nothing. The stop is still fully
-            // recorded above -- phase refused, route reason, refusal -- so what
-            // changed is that the reader also gets what was reached.
             if phase == EnginePhase::Rendering {
                 assert_eq!(response.binding_audit, completed_binding_audit);
+                assert_eq!(response.effect_obligations, completed_effect_obligations);
                 assert!(
-                    response.output.contains("sym.r2dec_controlled"),
-                    "a rendering-phase stop keeps the body it reached: {}",
-                    response.output
+                    !response.output.trim().is_empty(),
+                    "the stopped render retains the partial output it reached"
                 );
                 assert!(
-                    !response.output.starts_with("/* r2dec fallback:"),
-                    "and it is a body, not a fallback comment: {}",
+                    response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(&expected_reason)),
+                    "the execution stop must remain the response refusal: {}",
                     response.output
                 );
             } else {
                 assert_eq!(response.binding_audit, BindingShadowAuditOutcome::NotRun);
+                assert_eq!(response.effect_obligations, EffectObligationAudit::NOT_RUN);
+                assert!(
+                    response
+                        .diagnostics
+                        .refusal
+                        .as_deref()
+                        .is_some_and(|refusal| refusal.contains(&expected_reason))
+                );
                 assert_eq!(
                     response
                         .function_facts
@@ -8407,9 +8585,29 @@ mod tests {
                 let mapped = engine_render_stop_from_decompiler(
                     r2dec::DecompileExecutionStop::new(decompile_phase, reason),
                     BindingShadowAuditOutcome::NotRun,
+                    EffectObligationAudit {
+                        disposition: EffectObligationDisposition::Refused,
+                        total: 11,
+                        rendered: 5,
+                        justified_elision: 2,
+                        refused: 1,
+                        unaccounted: 2,
+                        conflicts: 1,
+                    },
+                    Some(DecompileRenderRefusal::UnrepresentableOperation),
                 );
                 assert_eq!(mapped.phase, engine_phase);
                 assert_eq!(mapped.binding_audit, BindingShadowAuditOutcome::NotRun);
+                assert_eq!(mapped.effect_obligations.total, 11);
+                assert_eq!(mapped.effect_obligations.rendered, 5);
+                assert_eq!(mapped.effect_obligations.justified_elision, 2);
+                assert_eq!(mapped.effect_obligations.refused, 1);
+                assert_eq!(mapped.effect_obligations.unaccounted, 2);
+                assert_eq!(mapped.effect_obligations.conflicts, 1);
+                assert_eq!(
+                    mapped.render_refusal,
+                    Some(DecompileRenderRefusal::UnrepresentableOperation)
+                );
                 assert_eq!(
                     mapped.normalization_completed,
                     !matches!(decompile_phase, r2dec::DecompileWorkPhase::Normalization)
@@ -8440,6 +8638,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn refused_effect_obligations_produce_a_typed_engine_refusal() {
+        let effect_obligations = EffectObligationAudit {
+            disposition: EffectObligationDisposition::Refused,
+            total: 9,
+            rendered: 4,
+            justified_elision: 1,
+            refused: 2,
+            unaccounted: 1,
+            conflicts: 1,
+        };
+        let reason = effect_obligation_refusal_reason(effect_obligations)
+            .expect("refused effects must refuse the native engine outcome");
+        let render_time = Duration::from_micros(17);
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            render_time,
+        );
+        let sentinel_quality = r2types::FunctionInputQualityFacts {
+            expected_blocks: 7,
+            lifted_blocks: 7,
+            actual_lifted_blocks: 7,
+            read_failures: 0,
+            invalid_blocks: 0,
+            null_lift_failures: 0,
+            truncated_blocks: 0,
+            refusal_reason: None,
+        };
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.effect_refusal",
+            &reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            Some(FunctionFacts::default().with_input_quality(sentinel_quality.clone())),
+            BindingShadowAuditOutcome::NotRun,
+            effect_obligations,
+            None,
+        );
+
+        assert_eq!(response.effect_obligations, effect_obligations);
+        assert_eq!(response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused);
+        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason.as_str()));
+        assert!(response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(&reason)));
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(effect_obligation_refusal_reason(EffectObligationAudit::NOT_RUN).is_none());
+        assert_eq!(
+            response.function_facts.input_quality(),
+            Some(&sentinel_quality),
+            "late effect refusal replaces only the route and retains existing function facts"
+        );
+        assert!(effect_obligation_refusal_reason(EffectObligationAudit {
+            disposition: EffectObligationDisposition::Admitted,
+            total: 1,
+            rendered: 0,
+            justified_elision: 0,
+            refused: 1,
+            unaccounted: 0,
+            conflicts: 0,
+        }).is_some(), "nonzero refusal counts fail closed independently of disposition");
+    }
+
+    #[test]
+    fn renderer_boundary_refusal_produces_a_typed_engine_refusal() {
+        let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization;
+        let reason = render_refusal_reason(render_refusal);
+        let render_time = Duration::from_micros(19);
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            render_time,
+        );
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.render_refusal",
+            reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            None,
+            BindingShadowAuditOutcome::NotRun,
+            EffectObligationAudit::NOT_RUN,
+            Some(render_refusal),
+        );
+
+        assert_eq!(response.render_refusal, Some(render_refusal));
+        assert_eq!(response.effect_obligations, EffectObligationAudit::NOT_RUN);
+        assert_eq!(response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused);
+        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason));
+        assert!(response.diagnostics.refusal.as_deref().is_some_and(|value| value.contains(reason)));
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(!response.output.contains("() {"));
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(

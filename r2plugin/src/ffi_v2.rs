@@ -1641,7 +1641,8 @@ fn binding_observation_journal_failure_json(
         }
         Failure::BindingPlanDispositionCount { expected, actual }
         | Failure::BindingPlanBindingCount { expected, actual }
-        | Failure::BindingPlanStackObjectCount { expected, actual } => {
+        | Failure::BindingPlanStackObjectCount { expected, actual }
+        | Failure::BindingPlanParameterCount { expected, actual } => {
             cause.insert("expected_count".to_string(), serde_json::json!(expected));
             cause.insert("actual_count".to_string(), serde_json::json!(actual));
         }
@@ -1680,6 +1681,33 @@ fn binding_observation_journal_failure_json(
             binding_index,
         } => {
             cause.insert("object_id".to_string(), serde_json::json!(object.0));
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Failure::BindingPlanUnexpectedParameterDisposition { slot } => {
+            cause.insert("parameter_slot".to_string(), serde_json::json!(slot));
+        }
+        Failure::BindingPlanParameterCertificate {
+            slot,
+            binding_index,
+        }
+        | Failure::BindingPlanParameterDeclarationWidth {
+            slot,
+            binding_index,
+        }
+        | Failure::BindingPlanParameterRole {
+            slot,
+            binding_index,
+        } => {
+            cause.insert("parameter_slot".to_string(), serde_json::json!(slot));
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Failure::BindingPlanBindingRole { binding_index } => {
             cause.insert(
                 "binding_index".to_string(),
                 serde_json::json!(binding_index),
@@ -1737,6 +1765,9 @@ fn binding_observation_journal_failure_json(
         | Failure::ExactWriteRequiresRenderedOccurrence { inst }
         | Failure::ConflictingWrite { inst } => {
             cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+        }
+        Failure::InvalidEffectObligation { obligation } => {
+            cause.insert("obligation".to_string(), serde_json::json!(obligation));
         }
         Failure::InvalidNormalizedSite { block, op_idx }
         | Failure::MissingNormalizedOutput { block, op_idx } => {
@@ -1879,8 +1910,9 @@ fn binding_audit_json(audit: Option<r2engine::BindingShadowAuditOutcome>) -> ser
 fn response_diagnostics_json(
     diagnostics: &r2engine::EngineDiagnostics,
     binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
+    effect_obligations: Option<r2engine::EffectObligationAudit>,
 ) -> Result<String, BoundaryError> {
-    let outcome = match response_outcome(diagnostics) {
+    let outcome = match response_outcome(diagnostics, effect_obligations) {
         R2SLEIGH_OUTCOME_COMPLETED_V2 => "completed",
         R2SLEIGH_OUTCOME_REFUSED_V2 => "refused",
         _ => unreachable!("response outcome is a closed V2 enum"),
@@ -1892,16 +1924,51 @@ fn response_diagnostics_json(
         "warnings": &diagnostics.warnings,
         "refusal": diagnostics.refusal.as_deref(),
         "binding_audit": binding_audit_json(binding_audit),
+        "effect_obligations": effect_obligations_json(effect_obligations),
     })
     .to_string())
 }
 
-fn response_outcome(diagnostics: &r2engine::EngineDiagnostics) -> u32 {
+fn effect_obligations_json(
+    audit: Option<r2engine::EffectObligationAudit>,
+) -> serde_json::Value {
+    let Some(audit) = audit else {
+        return serde_json::Value::Null;
+    };
+    let status = match audit.disposition {
+        r2engine::EffectObligationDisposition::Admitted => "admitted",
+        r2engine::EffectObligationDisposition::Refused => "refused",
+        r2engine::EffectObligationDisposition::NotRun => "not_run",
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "status": status,
+        "total": audit.total,
+        "rendered": audit.rendered,
+        "justified_elision": audit.justified_elision,
+        "refused": audit.refused,
+        "unaccounted": audit.unaccounted,
+        "conflicts": audit.conflicts,
+    })
+}
+
+fn response_outcome(
+    diagnostics: &r2engine::EngineDiagnostics,
+    effect_obligations: Option<r2engine::EffectObligationAudit>,
+) -> u32 {
     if diagnostics.refusal.is_some()
         || matches!(
             diagnostics.plan,
             Some(r2engine::EnginePlan::RefuseWithEvidence)
         )
+        || effect_obligations.is_some_and(|audit| {
+            matches!(
+                audit.disposition,
+                r2engine::EffectObligationDisposition::Refused
+            ) || audit.refused != 0
+                || audit.unaccounted != 0
+                || audit.conflicts != 0
+        })
     {
         R2SLEIGH_OUTCOME_REFUSED_V2
     } else {
@@ -1942,13 +2009,17 @@ unsafe extern "C" fn execute(
             let diagnostics_json = response_diagnostics_json(
                 &response.output.diagnostics,
                 response.output.binding_audit,
+                response.output.effect_obligations,
             )?;
             if diagnostics_json.len() > MAX_RESPONSE_BYTES {
                 return Err(BoundaryError::limit("response diagnostics exceed byte cap"));
             }
             let diagnostics = CString::new(diagnostics_json)
                 .map_err(|_| BoundaryError::engine("diagnostics contain an interior NUL"))?;
-            let outcome = response_outcome(&response.output.diagnostics);
+            let outcome = response_outcome(
+                &response.output.diagnostics,
+                response.output.effect_obligations,
+            );
             let phase_timings = response_phase_timings(&response.output.metrics);
             let mut owned_response = Box::new(R2SleighResponseV2 {
                 bytes,
@@ -4206,9 +4277,12 @@ mod tests {
         ];
 
         for (audit, status, unaccounted, refused) in cases {
-            let raw =
-                response_diagnostics_json(&r2engine::EngineDiagnostics::default(), Some(audit))
-                    .expect("diagnostics JSON");
+            let raw = response_diagnostics_json(
+                &r2engine::EngineDiagnostics::default(),
+                Some(audit),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+            )
+            .expect("diagnostics JSON");
             let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
             assert_eq!(parsed["outcome"], "completed");
             let payload = &parsed["binding_audit"];
@@ -4238,11 +4312,98 @@ mod tests {
         let raw = response_diagnostics_json(
             &diagnostics,
             Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(r2engine::EffectObligationAudit::NOT_RUN),
         )
         .expect("diagnostics JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
 
         assert_eq!(parsed["outcome"], "refused");
-        assert_eq!(response_outcome(&diagnostics), R2SLEIGH_OUTCOME_REFUSED_V2);
+        assert_eq!(
+            response_outcome(
+                &diagnostics,
+                Some(r2engine::EffectObligationAudit::NOT_RUN)
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2
+        );
+    }
+
+    #[test]
+    fn diagnostics_json_exposes_exact_effect_obligations_and_refuses_failed_native_audits() {
+        let admitted = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Admitted,
+            total: 13,
+            rendered: 7,
+            justified_elision: 6,
+            refused: 0,
+            unaccounted: 0,
+            conflicts: 0,
+        };
+        let admitted_json = effect_obligations_json(Some(admitted));
+        assert_eq!(admitted_json["schema_version"], 1);
+        assert_eq!(admitted_json["status"], "admitted");
+        assert_eq!(admitted_json["total"], 13);
+        assert_eq!(admitted_json["rendered"], 7);
+        assert_eq!(admitted_json["justified_elision"], 6);
+        assert_eq!(admitted_json["refused"], 0);
+        assert_eq!(admitted_json["unaccounted"], 0);
+        assert_eq!(admitted_json["conflicts"], 0);
+        assert_eq!(admitted_json.as_object().map(serde_json::Map::len), Some(8));
+
+        let refused = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Refused,
+            total: 9,
+            rendered: 4,
+            justified_elision: 1,
+            refused: 2,
+            unaccounted: 1,
+            conflicts: 1,
+        };
+        let raw = response_diagnostics_json(
+            &r2engine::EngineDiagnostics::default(),
+            Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(refused),
+        )
+        .expect("effect diagnostics JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "refused");
+        assert_eq!(parsed["effect_obligations"]["status"], "refused");
+        assert_eq!(parsed["effect_obligations"]["refused"], 2);
+        assert_eq!(parsed["effect_obligations"]["unaccounted"], 1);
+        assert_eq!(parsed["effect_obligations"]["conflicts"], 1);
+        assert_eq!(
+            response_outcome(&r2engine::EngineDiagnostics::default(), Some(refused)),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "an effect-refused native audit is a typed plugin refusal"
+        );
+        let inconsistent_admission = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Admitted,
+            total: 1,
+            rendered: 0,
+            justified_elision: 0,
+            refused: 1,
+            unaccounted: 0,
+            conflicts: 0,
+        };
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(inconsistent_admission)
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "nonzero refusal counts fail closed independently of disposition"
+        );
+
+        let not_run = effect_obligations_json(Some(r2engine::EffectObligationAudit::NOT_RUN));
+        assert_eq!(not_run["status"], "not_run");
+        assert_eq!(not_run["total"], 0);
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::EffectObligationAudit::NOT_RUN)
+            ),
+            R2SLEIGH_OUTCOME_COMPLETED_V2,
+            "a non-native route is not refused merely because the audit did not run"
+        );
+        assert!(effect_obligations_json(None).is_null());
     }
 }

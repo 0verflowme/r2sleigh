@@ -883,10 +883,10 @@ static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 vie
 	free (text);
 }
 
-// Emit the typed binding audit only for explicit diagnostic runs. Keeping the
-// sidecar out of ordinary pdd output preserves the user-facing renderer bytes;
-// the corpus enables it and associates the one JSON record with its surrounding
-// function markers.
+// Emit the two independent typed audits only for explicit diagnostic runs.
+// Keeping the sidecar out of ordinary pdd output preserves the user-facing
+// renderer bytes; the corpus enables it and associates the one JSON record with
+// its surrounding function markers.
 static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
 	if (!r_sys_getenv_asbool (SLEIGH_BINDING_AUDIT_ENV)
 		|| !view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
@@ -904,17 +904,23 @@ static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
 	const RJson *audit = diagnostics && diagnostics->type == R_JSON_OBJECT
 		? r_json_get (diagnostics, "binding_audit")
 		: NULL;
+	const RJson *effect_obligations = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "effect_obligations")
+		: NULL;
 	if (outcome && outcome->type == R_JSON_STRING && outcome->str_value
 		&& (!strcmp (outcome->str_value, "completed")
 			|| !strcmp (outcome->str_value, "refused"))
-		&& audit && audit->type == R_JSON_OBJECT) {
+		&& audit && audit->type == R_JSON_OBJECT
+		&& effect_obligations && effect_obligations->type == R_JSON_OBJECT) {
 		PJ *pj = pj_new ();
 		if (pj) {
 			pj_o (pj);
-			pj_kn (pj, "schema_version", 2);
+			pj_kn (pj, "schema_version", 3);
 			pj_ks (pj, "request_status", outcome->str_value);
 			pj_k (pj, "audit");
 			pj_rj (pj, (RJson *)audit);
+			pj_k (pj, "effect_obligations");
+			pj_rj (pj, (RJson *)effect_obligations);
 			pj_end (pj);
 			char *json = pj_drain (pj);
 			if (json) {
