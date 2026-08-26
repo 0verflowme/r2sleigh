@@ -3375,6 +3375,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assignment_lhs_expr(&self, dst: &SSAVar) -> CExpr {
+        match self.planned_current_output_expr() {
+            Ok(Some(planned)) => return planned,
+            Ok(None) => {}
+            Err(error) => self.retain_first_observation_error(error),
+        }
         let rendered = self.var_name(dst);
         if dst.version > 0 && is_generic_arg_name(&rendered) {
             if let Some(alias) = self.var_aliases_map().get(&dst.display_name())
@@ -12373,7 +12378,7 @@ impl<'a> FoldingContext<'a> {
                     .get(return_op_idx)
                     .filter(|producer| producer.dst().is_some())
                     .map_or(final_expr.clone(), |producer| {
-                        self.observe_normalized_computed_expr(
+                        self.observe_normalized_result_expr(
                             producer,
                             block.addr,
                             return_op_idx,
@@ -12526,7 +12531,7 @@ impl<'a> FoldingContext<'a> {
                             .get(op_idx)
                             .filter(|producer| producer.dst().is_some())
                             .map_or(final_expr.clone(), |producer| {
-                                self.observe_normalized_computed_expr(
+                                self.observe_normalized_result_expr(
                                     producer,
                                     block.addr,
                                     op_idx,

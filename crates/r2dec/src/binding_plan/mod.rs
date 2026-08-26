@@ -297,7 +297,9 @@ mod construction;
 mod name_resolution;
 mod seal;
 
-pub(crate) use name_resolution::{BindingNameResolution, BindingNameResolutionError};
+pub(crate) use name_resolution::{
+    BindingNameResolution, BindingNameResolutionError, PlannedValueSymbol,
+};
 pub(crate) use seal::build_upstream_shadow_oracle;
 
 #[cfg(test)]

@@ -796,6 +796,17 @@ impl LowerFrame {
         }
     }
 
+    /// Expression lowering whose operands retain their exact AST positions.
+    fn for_observed_expr(normalized_site: Option<crate::normalize::NormalizedOpSite>) -> Self {
+        Self {
+            mode: LowerMode::Expr,
+            observe_inputs: true,
+            normalized_site,
+            source_call_site: None,
+            with_call_args: false,
+        }
+    }
+
     fn for_stmt(
         normalized_site: Option<crate::normalize::NormalizedOpSite>,
         source_call_site: Option<(u64, usize)>,

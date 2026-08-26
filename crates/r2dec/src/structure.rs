@@ -3453,7 +3453,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let mut stmts = Vec::new();
         Self::append_stmt_body_flat(&mut stmts, stmt);
-        stmts.push(CStmt::Return(Some(expr)));
+        stmts.push(CStmt::Return(Some(
+            expr.clone_without_render_observations(),
+        )));
         Some(if stmts.len() == 1 {
             stmts.into_iter().next().unwrap_or(CStmt::Empty)
         } else {
@@ -3504,7 +3506,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let mut stmts = Vec::new();
         Self::append_stmt_body_flat(&mut stmts, stmt);
-        stmts.push(CStmt::Return(Some(expr)));
+        stmts.push(CStmt::Return(Some(
+            expr.clone_without_render_observations(),
+        )));
         self.record_return_value_render_proof(proof_block, proof_op, proof_value);
         Some(if stmts.len() == 1 {
             stmts.into_iter().next().unwrap_or(CStmt::Empty)
@@ -3639,13 +3643,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             // A proven frame-slot merge is authoritative for this region tail.
             // Once structure has matched the if/else -> merge-slot -> return pattern,
             // do not let an earlier synthesized return expression beat the merged value.
-            CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(merged.clone()))),
+            CStmt::Return(Some(_current)) => Some(CStmt::Return(Some(
+                merged.clone_without_render_observations(),
+            ))),
             CStmt::Comment(reason)
                 if reason.starts_with(
                     "r2sleigh residual: unresolved value return for control-only exit",
                 ) =>
             {
-                Some(CStmt::Return(Some(merged.clone())))
+                Some(CStmt::Return(Some(
+                    merged.clone_without_render_observations(),
+                )))
             }
             CStmt::Block(stmts) => {
                 let (last, prefix) = stmts.split_last()?;
@@ -5837,6 +5845,40 @@ mod tests {
             structurer.unique_region_predecessor_to_merge(&Region::Block(0x1000), 0x1020),
             None
         );
+    }
+
+    #[test]
+    fn merged_return_synthesis_does_not_clone_source_occurrence_observations() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (merged_id, merged) = owner
+            .observe_expr(CExpr::IntLit(1))
+            .expect("merged source occurrence");
+        let source_stmt = CStmt::Block(vec![
+            assign(&symbols, "acc", merged.clone()),
+            CStmt::Return(Some(CExpr::IntLit(0))),
+        ]);
+        let plain_stmt = CStmt::Block(vec![
+            assign(&symbols, "acc", CExpr::IntLit(1)),
+            CStmt::Return(Some(CExpr::IntLit(0))),
+        ]);
+
+        let func = function_with_switch_block_and_unrelated_sub();
+        let ctx = FoldingContext::new(64);
+        let structurer = ControlFlowStructurer::new(&func, &ctx);
+        let rewritten = structurer
+            .rewrite_trailing_return_with_merged_expr(&source_stmt, &merged)
+            .expect("trailing return rewrite");
+        let plain = structurer
+            .rewrite_trailing_return_with_merged_expr(&plain_stmt, &CExpr::IntLit(1))
+            .expect("plain trailing return rewrite");
+        let (stripped, reachable) = strip_test_observations(&owner, rewritten);
+
+        assert!(
+            reachable.contains(merged_id),
+            "the source assignment must retain its exact observation"
+        );
+        assert_eq!(stripped, plain);
     }
 
     #[test]

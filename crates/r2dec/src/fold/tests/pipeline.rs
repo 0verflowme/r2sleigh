@@ -1446,6 +1446,29 @@ mod tests {
         else {
             panic!("integer addition must lower to a rendered expression");
         };
+        let CExpr::Binary { left: lhs, right: rhs, .. } = expr.unobserved() else {
+            panic!("integer addition must retain its binary operand positions");
+        };
+        let input_value = graph_inst.inputs[0];
+        let input_symbol = names
+            .symbol_for_value(input_value)
+            .expect("bound input symbol");
+        assert!(
+            matches!(lhs.as_ref(), CExpr::Observed { .. }),
+            "left input observations must stay on the left occurrence"
+        );
+        assert!(
+            matches!(rhs.as_ref(), CExpr::Observed { .. }),
+            "right input observations must stay on the right occurrence"
+        );
+        assert!(
+            matches!(lhs.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol),
+            "the exact bound value must render through its planned symbol"
+        );
+        assert!(
+            matches!(rhs.unobserved(), CExpr::Var(symbol) if *symbol == input_symbol),
+            "equal operands must independently use the same planned binding"
+        );
         assert_eq!(*ctx.observation_error.borrow(), None);
         let symbols = Rc::clone(&ctx.symbols);
         drop(ctx);

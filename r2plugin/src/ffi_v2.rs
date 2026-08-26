@@ -1711,8 +1711,18 @@ fn binding_observation_journal_failure_json(
         }
         Failure::InvalidValue { value }
         | Failure::RenderedValueRequired { value }
+        | Failure::PlannedElidedValueRendered { value }
+        | Failure::PlannedRefusedValueRendered { value }
+        | Failure::MissingPlannedValue { value }
         | Failure::ConflictingValue { value } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
+        }
+        Failure::InvalidPlannedInline { value, expr_index } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert(
+                "expression_index".to_string(),
+                serde_json::json!(expr_index),
+            );
         }
         Failure::InvalidUse { site }
         | Failure::RefusedRenderedUse { site }
@@ -3836,24 +3846,31 @@ mod tests {
             Failure::RefusedRenderedUse { site },
             Failure::RefusedRenderedWrite { inst },
             Failure::RenderedValueRequired { value },
+            Failure::PlannedElidedValueRendered { value },
+            Failure::PlannedRefusedValueRendered { value },
+            Failure::MissingPlannedValue { value },
+            Failure::InvalidPlannedInline {
+                value,
+                expr_index: 66,
+            },
             Failure::ExactUseRequiresRenderedOccurrence { site },
             Failure::ExactWriteRequiresRenderedOccurrence { inst },
             Failure::SymbolTableMismatch,
-            Failure::UnownedBindingSymbol { symbol_index: 66 },
+            Failure::UnownedBindingSymbol { symbol_index: 67 },
             Failure::ConflictingValue { value },
             Failure::ConflictingUse { site },
             Failure::ConflictingWrite { inst },
-            Failure::ObservationDomainTooLarge { expected_count: 67 },
-            Failure::ObservationCapacityUnavailable { expected_count: 68 },
+            Failure::ObservationDomainTooLarge { expected_count: 68 },
+            Failure::ObservationCapacityUnavailable { expected_count: 69 },
             Failure::ObservationOutOfRange {
-                observation_id: 69,
-                expected_count: 70,
+                observation_id: 70,
+                expected_count: 71,
             },
-            Failure::DuplicateObservation { observation_id: 71 },
+            Failure::DuplicateObservation { observation_id: 72 },
         ]);
         assert_eq!(
             cases.len(),
-            89,
+            93,
             "public journal wire-leaf inventory drifted"
         );
         cases
@@ -3899,7 +3916,7 @@ mod tests {
             }
             causes.push(expected_cause);
         }
-        assert_eq!(kinds.len(), 89);
+        assert_eq!(kinds.len(), 93);
 
         let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/corpus/check_binding_audit_schema.py");
@@ -3924,7 +3941,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "89");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "93");
     }
 
     #[test]
@@ -4007,6 +4024,31 @@ mod tests {
                     value: r2ssa::ValueId(31),
                 },
                 "rendered_value_required",
+            ),
+            (
+                Failure::PlannedElidedValueRendered {
+                    value: r2ssa::ValueId(32),
+                },
+                "planned_elided_value_rendered",
+            ),
+            (
+                Failure::PlannedRefusedValueRendered {
+                    value: r2ssa::ValueId(33),
+                },
+                "planned_refused_value_rendered",
+            ),
+            (
+                Failure::MissingPlannedValue {
+                    value: r2ssa::ValueId(34),
+                },
+                "missing_planned_value",
+            ),
+            (
+                Failure::InvalidPlannedInline {
+                    value: r2ssa::ValueId(35),
+                    expr_index: 36,
+                },
+                "invalid_planned_inline",
             ),
             (
                 Failure::ExactUseRequiresRenderedOccurrence { site },

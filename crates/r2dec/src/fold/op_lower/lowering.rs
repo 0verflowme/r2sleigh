@@ -2,6 +2,180 @@ use super::calls::CertifiedCallArgs;
 use super::*;
 
 impl<'a> FoldingContext<'a> {
+    fn planned_value_expr(
+        &self,
+        value: ValueId,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                    value,
+                ),
+            );
+        };
+        match names.resolve_value(value) {
+            crate::binding_plan::PlannedValueSymbol::Bound(symbol) => Ok(CExpr::Var(symbol)),
+            crate::binding_plan::PlannedValueSymbol::Inline(expr) => {
+                let Some(machine_expr) = names.inline_expr(expr) else {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                            value,
+                            expr,
+                        },
+                    );
+                };
+                let r2ssa::MachineExprKind::Constant {
+                    binding,
+                    value: literal,
+                } = machine_expr.kind()
+                else {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                            value,
+                            expr,
+                        },
+                    );
+                };
+                if binding.value() != value {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                            value,
+                            expr,
+                        },
+                    );
+                }
+                let bits = literal.bits();
+                Ok(if bits > i64::MAX as u64 {
+                    CExpr::UIntLit(bits)
+                } else {
+                    CExpr::IntLit(bits as i64)
+                })
+            }
+            crate::binding_plan::PlannedValueSymbol::Elided(reason) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            crate::binding_plan::PlannedValueSymbol::Refused(reason) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            crate::binding_plan::PlannedValueSymbol::Absent => Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            ),
+        }
+    }
+
+    fn planned_input_expr(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let site = frame.normalized_site.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        let prepared = self.inputs.prepared_ssa.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        let projection = self
+            .inputs
+            .normalization_origins
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            )?
+            .projection(site, prepared)
+            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
+                    site,
+                ),
+            )?;
+        let value = projection
+            .inputs
+            .get(input_idx)
+            .map(|input| input.value)
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                    site,
+                    input_idx,
+                },
+            )?;
+        self.planned_value_expr(value)
+    }
+
+    pub(super) fn planned_current_output_expr(
+        &self,
+    ) -> Result<Option<CExpr>, crate::observation_journal::LegacyObservationJournalError> {
+        if self.inputs.observation_journal.is_none() {
+            return Ok(None);
+        }
+        let Some(block_addr) = self.current_block_addr.get() else {
+            return Ok(None);
+        };
+        let Some(op_idx) = self.current_op_idx.get() else {
+            return Ok(None);
+        };
+        let site = self.normalized_site(block_addr, op_idx).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedBlock(
+                block_addr,
+            ),
+        )?;
+        let prepared = self.inputs.prepared_ssa.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        let projection = self
+            .inputs
+            .normalization_origins
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            )?
+            .projection(site, prepared)
+            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
+                    site,
+                ),
+            )?;
+        let value = projection.output.map(|output| output.value).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedOutput(
+                site,
+            ),
+        )?;
+        match self.inputs.binding_names.map(|names| names.resolve_value(value)) {
+            Some(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
+                Ok(Some(CExpr::Var(symbol)))
+            }
+            Some(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                    value,
+                    expr,
+                },
+            ),
+            Some(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Some(crate::binding_plan::PlannedValueSymbol::Refused(reason)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Some(crate::binding_plan::PlannedValueSymbol::Absent) | None => Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            ),
+        }
+    }
+
     pub(super) fn observed_input(
         &self,
         frame: &LowerFrame,
@@ -9,6 +183,13 @@ impl<'a> FoldingContext<'a> {
         expr: CExpr,
     ) -> CExpr {
         if frame.observe_inputs {
+            let expr = match self.planned_input_expr(frame, input_idx) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    self.retain_first_observation_error(error);
+                    return expr;
+                }
+            };
             self.observe_optional_normalized_input_expr(frame.normalized_site, input_idx, expr)
         } else {
             expr
@@ -202,19 +383,16 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> LoweredExprAt {
-        // Occurrence identity must not alter semantic lowering. Lower through
-        // the exact marker-free expression path, then decorate that answer.
-        let mut frame = LowerFrame::for_expr();
+        // Operand observations are attached while their exact expression
+        // positions still exist. Wrapping the completed expression once per
+        // input would falsely make every operand own the same aggregate node.
+        let mut frame = LowerFrame::for_observed_expr(self.normalized_site(block_addr, op_idx));
         let lowered = self.lower_op(op, &mut frame);
         let lowered = match lowered {
             LoweredOp::Expr(expr) => LoweredExprAt::Rendered(expr),
-            LoweredOp::Assign { lhs, rhs } => {
-                LoweredExprAt::Rendered(CExpr::assign(lhs, rhs))
-            }
+            LoweredOp::Assign { lhs, rhs } => LoweredExprAt::Rendered(CExpr::assign(lhs, rhs)),
             LoweredOp::FinalizedStmt(CStmt::Expr(expr)) => LoweredExprAt::Rendered(expr),
-            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => {
-                LoweredExprAt::Rendered(expr)
-            }
+            LoweredOp::FinalizedStmt(CStmt::Return(Some(expr))) => LoweredExprAt::Rendered(expr),
             LoweredOp::FinalizedStmt(_) => LoweredExprAt::DestinationFallback(CExpr::External {
                 name: "__unhandled_op__".to_string(),
                 kind: crate::symbol::ExternalKind::Intrinsic,
@@ -236,30 +414,30 @@ impl<'a> FoldingContext<'a> {
             }
         };
         match lowered {
-            LoweredExprAt::Rendered(expr) => LoweredExprAt::Rendered(
-                self.observe_normalized_computed_expr(op, block_addr, op_idx, expr),
+            LoweredExprAt::Rendered(expr) if op.dst().is_some() => LoweredExprAt::Rendered(
+                self.observe_normalized_output_expr(block_addr, op_idx, expr),
             ),
+            LoweredExprAt::Rendered(expr) => LoweredExprAt::Rendered(expr),
             fallback @ LoweredExprAt::DestinationFallback(_) => fallback,
         }
     }
 
-    /// Attach exact input/output identities to a custom expression that
-    /// represents one normalized computation but bypassed ordinary opcode
-    /// lowering (currently the tracked return-register path).
-    pub(crate) fn observe_normalized_computed_expr(
+    /// Attach only the exact result identity to a custom producer expression.
+    ///
+    /// Its operand positions no longer correspond to ordinary opcode lowering,
+    /// so claiming them on the aggregate expression would relocate every input.
+    pub(crate) fn observe_normalized_result_expr(
         &self,
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-        mut expr: CExpr,
+        expr: CExpr,
     ) -> CExpr {
-        for input_idx in 0..op.sources().len() {
-            expr = self.observe_normalized_input_expr(block_addr, op_idx, input_idx, expr);
-        }
         if op.dst().is_some() {
-            expr = self.observe_normalized_output_expr(block_addr, op_idx, expr);
+            self.observe_normalized_output_expr(block_addr, op_idx, expr)
+        } else {
+            expr
         }
-        expr
     }
 
     /// Convert an SSA operation to a C statement, with call argument context.

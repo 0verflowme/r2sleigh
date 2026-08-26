@@ -3088,6 +3088,19 @@ pub enum BindingObservationJournalFailure {
     RenderedValueRequired {
         value: r2ssa::ValueId,
     },
+    PlannedElidedValueRendered {
+        value: r2ssa::ValueId,
+    },
+    PlannedRefusedValueRendered {
+        value: r2ssa::ValueId,
+    },
+    MissingPlannedValue {
+        value: r2ssa::ValueId,
+    },
+    InvalidPlannedInline {
+        value: r2ssa::ValueId,
+        expr_index: usize,
+    },
     ExactUseRequiresRenderedOccurrence {
         site: r2ssa::UseSite,
     },
@@ -3184,6 +3197,10 @@ impl BindingObservationJournalFailure {
             Self::RefusedRenderedUse { .. } => "refused_rendered_use",
             Self::RefusedRenderedWrite { .. } => "refused_rendered_write",
             Self::RenderedValueRequired { .. } => "rendered_value_required",
+            Self::PlannedElidedValueRendered { .. } => "planned_elided_value_rendered",
+            Self::PlannedRefusedValueRendered { .. } => "planned_refused_value_rendered",
+            Self::MissingPlannedValue { .. } => "missing_planned_value",
+            Self::InvalidPlannedInline { .. } => "invalid_planned_inline",
             Self::ExactUseRequiresRenderedOccurrence { .. } => {
                 "exact_use_requires_rendered_occurrence"
             }

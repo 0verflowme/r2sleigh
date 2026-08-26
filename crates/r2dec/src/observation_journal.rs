@@ -107,6 +107,19 @@ pub(crate) enum LegacyObservationJournalError {
     RefusedRenderedUse(UseSite),
     RefusedRenderedWrite(InstId),
     RenderedValueRequired(ValueId),
+    PlannedElidedValueRendered {
+        value: ValueId,
+        reason: r2ssa::ledger::ElisionReason,
+    },
+    PlannedRefusedValueRendered {
+        value: ValueId,
+        reason: crate::binding_plan::ValueRefusal,
+    },
+    MissingPlannedValue(ValueId),
+    InvalidPlannedInline {
+        value: ValueId,
+        expr: r2ssa::MachineExprId,
+    },
     ExactUseRequiresRenderedOccurrence(UseSite),
     ExactWriteRequiresRenderedOccurrence(InstId),
     SymbolTableMismatch,
@@ -385,6 +398,21 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             }
             LegacyObservationJournalError::RenderedValueRequired(value) => {
                 Self::RenderedValueRequired { value: *value }
+            }
+            LegacyObservationJournalError::PlannedElidedValueRendered { value, .. } => {
+                Self::PlannedElidedValueRendered { value: *value }
+            }
+            LegacyObservationJournalError::PlannedRefusedValueRendered { value, .. } => {
+                Self::PlannedRefusedValueRendered { value: *value }
+            }
+            LegacyObservationJournalError::MissingPlannedValue(value) => {
+                Self::MissingPlannedValue { value: *value }
+            }
+            LegacyObservationJournalError::InvalidPlannedInline { value, expr } => {
+                Self::InvalidPlannedInline {
+                    value: *value,
+                    expr_index: expr.index(),
+                }
             }
             LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site) => {
                 Self::ExactUseRequiresRenderedOccurrence { site: *site }
@@ -1582,7 +1610,7 @@ mod tests {
 
     use super::*;
     use crate::ast::{CLocal, CType};
-    use crate::binding_plan::{BindingId, ValueDisposition};
+    use crate::binding_plan::{BindingId, ValueDisposition, ValueRefusal};
     use crate::symbol::{SymbolOrigin, SymbolRole};
 
     fn source_owned() -> SourceOwnedFunctionFacts {
@@ -1997,6 +2025,20 @@ mod tests {
             op_idx: 7,
         };
         let marker = test_render_observation_id(11);
+        let inline_expr = {
+            let source = source_owned();
+            let plan = BindingPlan::build_shadow(&source).expect("sealed binding plan");
+            source
+                .source()
+                .graph()
+                .values
+                .iter()
+                .find_map(|value| match plan.disposition(value.id) {
+                    Some(ValueDisposition::Inline { expr, .. }) => Some(*expr),
+                    _ => None,
+                })
+                .expect("fixture inline expression")
+        };
         let cases = [
             (
                 LegacyObservationJournalError::SourceAuthority,
@@ -2078,6 +2120,42 @@ mod tests {
             (
                 LegacyObservationJournalError::RenderedValueRequired(ValueId(31)),
                 BindingObservationJournalFailure::RenderedValueRequired { value: ValueId(31) },
+            ),
+            (
+                LegacyObservationJournalError::PlannedElidedValueRendered {
+                    value: ValueId(32),
+                    reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
+                },
+                BindingObservationJournalFailure::PlannedElidedValueRendered {
+                    value: ValueId(32),
+                },
+            ),
+            (
+                LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value: ValueId(33),
+                    reason: ValueRefusal::MissingBindingCertificate {
+                        value: ValueId(33),
+                    },
+                },
+                BindingObservationJournalFailure::PlannedRefusedValueRendered {
+                    value: ValueId(33),
+                },
+            ),
+            (
+                LegacyObservationJournalError::MissingPlannedValue(ValueId(34)),
+                BindingObservationJournalFailure::MissingPlannedValue {
+                    value: ValueId(34),
+                },
+            ),
+            (
+                LegacyObservationJournalError::InvalidPlannedInline {
+                    value: ValueId(35),
+                    expr: inline_expr,
+                },
+                BindingObservationJournalFailure::InvalidPlannedInline {
+                    value: ValueId(35),
+                    expr_index: inline_expr.index(),
+                },
             ),
             (
                 LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site),

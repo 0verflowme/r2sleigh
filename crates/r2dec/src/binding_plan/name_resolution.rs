@@ -125,6 +125,11 @@ impl BindingNameResolution {
         self.by_binding.get(binding.index()).copied()
     }
 
+    /// Resolve one plan-owned inline expression without exposing the plan.
+    pub(crate) fn inline_expr(&self, expr: MachineExprId) -> Option<&r2ssa::MachineExpr> {
+        self.plan.machine_projection().expr(expr)
+    }
+
     pub(crate) fn symbol_for_value(&self, value: ValueId) -> Option<SymbolId> {
         match self.resolve_value(value) {
             PlannedValueSymbol::Bound(symbol) => Some(symbol),

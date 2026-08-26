@@ -535,7 +535,7 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
-    fn retain_first_observation_error(
+    pub(super) fn retain_first_observation_error(
         &self,
         error: crate::observation_journal::LegacyObservationJournalError,
     ) {
