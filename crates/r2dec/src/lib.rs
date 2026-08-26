@@ -2779,6 +2779,7 @@ impl EffectObligationAudit {
 pub enum PlacementAuditRefusal {
     MissingStructuredRegionArtifact,
     ObservationJournalUnavailable,
+    SourceAuthorityMismatch,
     BindingOutsidePlan {
         binding_index: usize,
     },
@@ -2914,6 +2915,7 @@ impl PlacementAuditRefusal {
         match self {
             Self::MissingStructuredRegionArtifact => "missing_structured_region_artifact",
             Self::ObservationJournalUnavailable => "observation_journal_unavailable",
+            Self::SourceAuthorityMismatch => "source_authority_mismatch",
             Self::BindingOutsidePlan { .. } => "binding_outside_plan",
             Self::RegionOutsideArtifact { .. } => "region_outside_artifact",
             Self::BlockOutsideFunction { .. } => "block_outside_function",
@@ -4453,8 +4455,6 @@ impl Decompiler {
                 }
             }
         }
-        structuring_work.poll()?;
-        fold_ctx.analyze_function_structure(func);
         structuring_work.poll()?;
         // Structure control flow (primary path: folded)
         let mut structurer =

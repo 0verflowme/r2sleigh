@@ -9,9 +9,7 @@
 use std::collections::HashMap;
 use std::collections::BTreeSet;
 
-use r2ssa::{
-    DecompilePrepFacts, SSAFunction, SSAOp, SSAVar, SsaArtifact, ValueId,
-};
+use r2ssa::{DecompilePrepFacts, SSAOp, SSAVar, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::normalize_callee_name;
 use r2types::{

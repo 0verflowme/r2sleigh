@@ -3292,8 +3292,11 @@ mod tests {
             "predicate-less fixture should residualize, got {rendered:?}"
         );
         assert!(
-            stmt_contains_comment(&rendered, "unrendered"),
-            "the refusal should name the blocks it could not cover, got {rendered:?}"
+            stmt_contains_comment(
+                &rendered,
+                "missing canonical control facts for block 0x401490"
+            ),
+            "the refusal should name the first block lacking canonical facts, got {rendered:?}"
         );
     }
 

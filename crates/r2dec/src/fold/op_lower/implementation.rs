@@ -880,8 +880,6 @@ impl<'a> FoldingContext<'a> {
         self.inputs.function_facts = Box::leak(Box::new(function_facts));
     }
 
-    pub(crate) fn analyze_function_structure(&mut self, _func: &SSAFunction) {}
-
     /// Analyze multiple blocks (for function-level folding).
     #[cfg(test)]
     pub(crate) fn analyze_blocks(&mut self, blocks: &[SSABlock]) {
@@ -929,14 +927,11 @@ impl<'a> FoldingContext<'a> {
             return Ok(());
         }
 
-        // Every shipped decompile carries the prepared artifact the branch above
-        // consumes. Analysing without one was a second pass order over the same
-        // blocks, and a fact added to one builder was invisible to the other.
-        debug_assert!(
-            self.inputs.prepared_ssa.is_some(),
-            "analysis requires the prepared artifact"
-        );
-        Ok(control.poll()?)
+        // There is no second, renderer-owned analysis path. Without the exact
+        // prepared source artifact, operation lowering has no authority for
+        // machine projections or value identities and must refuse in release
+        // builds just as it does in debug builds.
+        Err(OpLoweringRefusal::MissingMachineProjectionAuthorization.into())
     }
 
     pub(super) fn synthesized_call_expr_for_source_call(

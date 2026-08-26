@@ -103,6 +103,9 @@ pub(crate) fn collect_final_placement_occurrences(
     expected_observations: usize,
     mut target_for: impl FnMut(RenderObservationId) -> Option<PlacementObservationTarget>,
 ) -> Result<FinalPlacementOccurrences, PlacementAnalysisError> {
+    if !regions.matches_source(source.authority()) {
+        return Err(PlacementAnalysisError::SourceAuthorityMismatch);
+    }
     crate::structured_region::validate_final_region_marker_tree(&function.body, regions)
         .map_err(PlacementAnalysisError::RegionMarkers)?;
     let mut targets = vec![None; expected_observations];
@@ -142,7 +145,7 @@ pub(crate) fn collect_final_placement_occurrences(
         crate::ast::RenderObservationInspectError::Observer(error) => error,
     })?;
 
-    let scoped = collect_final_observation_scopes(&function.body, regions, expected_observations);
+    let scoped = collect_final_observation_scopes(&function.body, regions, &targets);
 
     for (index, target) in targets.iter().copied().enumerate() {
         if matches!(
@@ -292,12 +295,19 @@ fn assigned_symbol(statement: &CStmt) -> Option<crate::symbol::SymbolId> {
 fn collect_final_observation_scopes(
     statements: &[CStmt],
     regions: &SealedStructuredRegionArtifact,
-    expected_observations: usize,
+    targets: &[Option<PlacementObservationTarget>],
 ) -> Vec<Option<FinalObservationScope>> {
-    let mut scoped = vec![None; expected_observations];
+    let mut scoped = vec![None; targets.len()];
     let mut order = 0_u64;
     for statement in statements {
-        collect_stmt_observation_scopes(statement, None, regions, &mut order, &mut scoped);
+        collect_stmt_observation_scopes(
+            statement,
+            None,
+            regions,
+            targets,
+            &mut order,
+            &mut scoped,
+        );
     }
     scoped
 }
@@ -309,6 +319,9 @@ fn record_observation_group(
     order: &mut u64,
     scoped: &mut [Option<FinalObservationScope>],
 ) {
+    if ids.is_empty() {
+        return;
+    }
     let current = FinalOccurrenceOrder(*order);
     *order = order.saturating_add(1);
     let Some(region) = region else { return };
@@ -324,28 +337,220 @@ fn record_observation_group(
     }
 }
 
-fn collect_expr_observation_ids(expr: &CExpr) -> Vec<RenderObservationId> {
-    let mut ids = Vec::new();
-    visit_expr_observations(expr, &mut |id| ids.push(id));
-    ids
+fn observation_target(
+    targets: &[Option<PlacementObservationTarget>],
+    id: RenderObservationId,
+) -> Option<PlacementObservationTarget> {
+    targets.get(id.index() as usize).copied().flatten()
 }
 
-fn record_exact_expr_group(
+fn observation_is_placement_relevant(
+    targets: &[Option<PlacementObservationTarget>],
+    id: RenderObservationId,
+) -> bool {
+    matches!(
+        observation_target(targets, id),
+        Some(
+            PlacementObservationTarget::Use(_)
+                | PlacementObservationTarget::CertifiedValueRead { .. }
+                | PlacementObservationTarget::Write(_)
+        )
+    )
+}
+
+fn observation_is_write(
+    targets: &[Option<PlacementObservationTarget>],
+    id: RenderObservationId,
+) -> bool {
+    matches!(
+        observation_target(targets, id),
+        Some(PlacementObservationTarget::Write(_))
+    )
+}
+
+fn expression_has_placement_write(
     expr: &CExpr,
-    leading: &mut Vec<RenderObservationId>,
+    targets: &[Option<PlacementObservationTarget>],
+) -> bool {
+    let mut has_write = false;
+    visit_expr_observations(expr, &mut |id| {
+        has_write |= observation_is_write(targets, id);
+    });
+    has_write
+}
+
+fn record_completion_observations(
+    ids: &[RenderObservationId],
+    current: Option<RegionId>,
+    targets: &[Option<PlacementObservationTarget>],
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    let (writes, reads): (Vec<_>, Vec<_>) = ids
+        .iter()
+        .copied()
+        .partition(|id| observation_is_write(targets, *id));
+    record_observation_group(&reads, current, false, order, scoped);
+    record_observation_group(&writes, current, false, order, scoped);
+}
+
+fn record_control_observations(
+    ids: &[RenderObservationId],
+    current: Option<RegionId>,
+    targets: &[Option<PlacementObservationTarget>],
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    let ambiguous = ids
+        .iter()
+        .copied()
+        .any(|id| observation_is_placement_relevant(targets, id));
+    record_observation_group(ids, current, ambiguous, order, scoped);
+}
+
+fn record_ambiguous_expr_group<'a>(
+    exprs: impl IntoIterator<Item = &'a CExpr>,
     current: Option<RegionId>,
     order: &mut u64,
     scoped: &mut [Option<FinalObservationScope>],
 ) {
-    let mut ids = std::mem::take(leading);
-    ids.extend(collect_expr_observation_ids(expr));
-    record_observation_group(&ids, current, false, order, scoped);
+    let mut ids = Vec::new();
+    for expr in exprs {
+        visit_expr_observations(expr, &mut |id| ids.push(id));
+    }
+    record_observation_group(&ids, current, true, order, scoped);
+}
+
+fn collect_expr_observation_scopes(
+    expr: &CExpr,
+    current: Option<RegionId>,
+    targets: &[Option<PlacementObservationTarget>],
+    order: &mut u64,
+    scoped: &mut [Option<FinalObservationScope>],
+) {
+    let mut leading = Vec::new();
+    let mut semantic = expr;
+    while let CExpr::Observed { id, expr } = semantic {
+        leading.push(*id);
+        semantic = expr;
+    }
+
+    match semantic {
+        CExpr::Observed { .. } => unreachable!("leading observations were consumed"),
+        CExpr::Comma(items) => {
+            for item in items {
+                collect_expr_observation_scopes(item, current, targets, order, scoped);
+            }
+        }
+        CExpr::Binary { op, left, right }
+            if matches!(op, BinaryOp::And | BinaryOp::Or) =>
+        {
+            collect_expr_observation_scopes(left, current, targets, order, scoped);
+            if expression_has_placement_write(right, targets) {
+                record_ambiguous_expr_group([right.as_ref()], current, order, scoped);
+            } else {
+                collect_expr_observation_scopes(right, current, targets, order, scoped);
+            }
+        }
+        CExpr::Binary { left, right, .. } => {
+            if expression_has_placement_write(left, targets)
+                || expression_has_placement_write(right, targets)
+            {
+                record_ambiguous_expr_group(
+                    [left.as_ref(), right.as_ref()],
+                    current,
+                    order,
+                    scoped,
+                );
+            } else {
+                collect_expr_observation_scopes(left, current, targets, order, scoped);
+                collect_expr_observation_scopes(right, current, targets, order, scoped);
+            }
+        }
+        CExpr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_observation_scopes(cond, current, targets, order, scoped);
+            if expression_has_placement_write(then_expr, targets)
+                || expression_has_placement_write(else_expr, targets)
+            {
+                record_ambiguous_expr_group(
+                    [then_expr.as_ref(), else_expr.as_ref()],
+                    current,
+                    order,
+                    scoped,
+                );
+            } else {
+                collect_expr_observation_scopes(then_expr, current, targets, order, scoped);
+                collect_expr_observation_scopes(else_expr, current, targets, order, scoped);
+            }
+        }
+        CExpr::Call { func, args, .. } => {
+            if expression_has_placement_write(func, targets)
+                || args
+                    .iter()
+                    .any(|arg| expression_has_placement_write(arg, targets))
+            {
+                record_ambiguous_expr_group(
+                    std::iter::once(func.as_ref()).chain(args.iter()),
+                    current,
+                    order,
+                    scoped,
+                );
+            } else {
+                collect_expr_observation_scopes(func, current, targets, order, scoped);
+                for arg in args {
+                    collect_expr_observation_scopes(arg, current, targets, order, scoped);
+                }
+            }
+        }
+        CExpr::Subscript { base, index } => {
+            if expression_has_placement_write(base, targets)
+                || expression_has_placement_write(index, targets)
+            {
+                record_ambiguous_expr_group(
+                    [base.as_ref(), index.as_ref()],
+                    current,
+                    order,
+                    scoped,
+                );
+            } else {
+                collect_expr_observation_scopes(base, current, targets, order, scoped);
+                collect_expr_observation_scopes(index, current, targets, order, scoped);
+            }
+        }
+        CExpr::Unary { operand, .. }
+        | CExpr::Cast { expr: operand, .. }
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand)
+        | CExpr::Member { base: operand, .. }
+        | CExpr::PtrMember { base: operand, .. } => {
+            collect_expr_observation_scopes(operand, current, targets, order, scoped);
+        }
+        CExpr::Sizeof(operand) => {
+            record_ambiguous_expr_group([operand.as_ref()], current, order, scoped);
+        }
+        CExpr::IntLit(_)
+        | CExpr::UIntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::External { .. }
+        | CExpr::SizeofType(_) => {}
+    }
+
+    record_completion_observations(&leading, current, targets, order, scoped);
 }
 
 fn collect_stmt_observation_scopes(
     statement: &CStmt,
     current: Option<RegionId>,
     regions: &SealedStructuredRegionArtifact,
+    targets: &[Option<PlacementObservationTarget>],
     order: &mut u64,
     scoped: &mut [Option<FinalObservationScope>],
 ) {
@@ -353,7 +558,7 @@ fn collect_stmt_observation_scopes(
         let (region, _) = regions
             .node_for_marker(marker)
             .expect("the final marker tree was validated before scope collection");
-        collect_stmt_observation_scopes(stmt, Some(region), regions, order, scoped);
+        collect_stmt_observation_scopes(stmt, Some(region), regions, targets, order, scoped);
         return;
     }
     let mut leading = Vec::new();
@@ -364,39 +569,42 @@ fn collect_stmt_observation_scopes(
     }
     match semantic {
         CStmt::StructuredRegion { .. } => {
-            record_observation_group(&leading, current, true, order, scoped);
-            collect_stmt_observation_scopes(semantic, current, regions, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
+            collect_stmt_observation_scopes(semantic, current, regions, targets, order, scoped);
         }
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
-            record_exact_expr_group(expr, &mut leading, current, order, scoped);
+            collect_expr_observation_scopes(expr, current, targets, order, scoped);
+            record_completion_observations(&leading, current, targets, order, scoped);
         }
         CStmt::Decl { init, .. } => {
             if let Some(init) = init {
-                record_exact_expr_group(init, &mut leading, current, order, scoped);
-            } else {
-                record_observation_group(&leading, current, false, order, scoped);
+                collect_expr_observation_scopes(init, current, targets, order, scoped);
             }
+            record_completion_observations(&leading, current, targets, order, scoped);
         }
         CStmt::If {
             cond,
             then_body,
             else_body,
         } => {
-            record_exact_expr_group(cond, &mut leading, current, order, scoped);
-            collect_stmt_observation_scopes(then_body, current, regions, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
+            collect_expr_observation_scopes(cond, current, targets, order, scoped);
+            collect_stmt_observation_scopes(then_body, current, regions, targets, order, scoped);
             if let Some(else_body) = else_body {
-                collect_stmt_observation_scopes(else_body, current, regions, order, scoped);
+                collect_stmt_observation_scopes(
+                    else_body, current, regions, targets, order, scoped,
+                );
             }
         }
         CStmt::While { cond, body } => {
-            record_exact_expr_group(cond, &mut leading, current, order, scoped);
-            collect_stmt_observation_scopes(body, current, regions, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
+            collect_expr_observation_scopes(cond, current, targets, order, scoped);
+            collect_stmt_observation_scopes(body, current, regions, targets, order, scoped);
         }
         CStmt::DoWhile { body, cond } => {
-            record_observation_group(&leading, current, true, order, scoped);
-            collect_stmt_observation_scopes(body, current, regions, order, scoped);
-            let ids = collect_expr_observation_ids(cond);
-            record_observation_group(&ids, current, false, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
+            collect_stmt_observation_scopes(body, current, regions, targets, order, scoped);
+            collect_expr_observation_scopes(cond, current, targets, order, scoped);
         }
         CStmt::For {
             init,
@@ -404,18 +612,16 @@ fn collect_stmt_observation_scopes(
             update,
             body,
         } => {
-            record_observation_group(&leading, current, true, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
             if let Some(init) = init {
-                collect_stmt_observation_scopes(init, current, regions, order, scoped);
+                collect_stmt_observation_scopes(init, current, regions, targets, order, scoped);
             }
             if let Some(cond) = cond {
-                let ids = collect_expr_observation_ids(cond);
-                record_observation_group(&ids, current, false, order, scoped);
+                collect_expr_observation_scopes(cond, current, targets, order, scoped);
             }
-            collect_stmt_observation_scopes(body, current, regions, order, scoped);
+            collect_stmt_observation_scopes(body, current, regions, targets, order, scoped);
             if let Some(update) = update {
-                let ids = collect_expr_observation_ids(update);
-                record_observation_group(&ids, current, false, order, scoped);
+                collect_expr_observation_scopes(update, current, targets, order, scoped);
             }
         }
         CStmt::Switch {
@@ -423,24 +629,30 @@ fn collect_stmt_observation_scopes(
             cases,
             default,
         } => {
-            record_exact_expr_group(expr, &mut leading, current, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
+            collect_expr_observation_scopes(expr, current, targets, order, scoped);
             for case in cases {
-                let ids = collect_expr_observation_ids(&case.value);
-                record_observation_group(&ids, current, true, order, scoped);
+                record_ambiguous_expr_group([&case.value], current, order, scoped);
                 for statement in &case.body {
-                    collect_stmt_observation_scopes(statement, current, regions, order, scoped);
+                    collect_stmt_observation_scopes(
+                        statement, current, regions, targets, order, scoped,
+                    );
                 }
             }
             if let Some(default) = default {
                 for statement in default {
-                    collect_stmt_observation_scopes(statement, current, regions, order, scoped);
+                    collect_stmt_observation_scopes(
+                        statement, current, regions, targets, order, scoped,
+                    );
                 }
             }
         }
         CStmt::Block(statements) => {
-            record_observation_group(&leading, current, true, order, scoped);
+            record_control_observations(&leading, current, targets, order, scoped);
             for statement in statements {
-                collect_stmt_observation_scopes(statement, current, regions, order, scoped);
+                collect_stmt_observation_scopes(
+                    statement, current, regions, targets, order, scoped,
+                );
             }
         }
         CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
@@ -451,7 +663,7 @@ fn collect_stmt_observation_scopes(
         | CStmt::Goto(_)
         | CStmt::Label(_)
         | CStmt::Comment(_) => {
-            record_observation_group(&leading, current, false, order, scoped);
+            record_completion_observations(&leading, current, targets, order, scoped);
         }
     }
 }
@@ -1162,6 +1374,7 @@ impl PlacementDecisions {
 /// Structural mismatch between final occurrences and their two authorities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlacementAnalysisError {
+    SourceAuthorityMismatch,
     BindingOutsidePlan { binding: BindingId },
     RegionOutsideArtifact { region: RegionId },
     BlockOutsideFunction { block: u64 },
@@ -1983,7 +2196,8 @@ mod tests {
     use super::*;
     use crate::region::Region;
     use crate::structured_region::{
-        StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
+        StructuredRegionDraft, StructuredRegionKind, StructuredRegionMarker,
+        seal_structured_body_for_test as seal_structured_body,
     };
     use crate::symbol::{SymbolRole, SymbolTable};
 
@@ -2391,7 +2605,8 @@ mod tests {
         ))
         .expect("sealed do-while");
         let (statement, regions) = sealed.into_marked_parts();
-        let scopes = collect_final_observation_scopes(&[statement], &regions, 2);
+        let targets = vec![Some(PlacementObservationTarget::Other); 2];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
         let order_of = |index| match scopes[index] {
             Some(FinalObservationScope::Exact { order, .. }) => order,
             other => panic!("expected exact scope, got {other:?}"),
@@ -2416,7 +2631,8 @@ mod tests {
         ))
         .expect("sealed for");
         let (statement, regions) = sealed.into_marked_parts();
-        let scopes = collect_final_observation_scopes(&[statement], &regions, 4);
+        let targets = vec![Some(PlacementObservationTarget::Other); 4];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
         let order_of = |index| match scopes[index] {
             Some(FinalObservationScope::Exact { order, .. }) => order,
             other => panic!("expected exact scope, got {other:?}"),
@@ -2424,5 +2640,100 @@ mod tests {
         assert!(order_of(0) < order_of(1));
         assert!(order_of(1) < order_of(2));
         assert!(order_of(2) < order_of(3));
+    }
+
+    #[test]
+    fn final_scope_sequences_comma_reads_output_write_and_later_read() {
+        let operand_read = observation(0);
+        let output_write = observation(1);
+        let later_read = observation(2);
+        let expression = CExpr::Comma(vec![
+            CExpr::observed(
+                output_write,
+                CExpr::observed(operand_read, CExpr::UIntLit(1)),
+            ),
+            CExpr::observed(later_read, CExpr::UIntLit(2)),
+        ]);
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Expr(expression),
+        ))
+        .expect("sealed comma expression");
+        let (statement, regions) = sealed.into_marked_parts();
+        let targets = [
+            Some(PlacementObservationTarget::Use(UseSite {
+                inst: InstId(0),
+                input_idx: 0,
+            })),
+            Some(PlacementObservationTarget::Write(InstId(1))),
+            Some(PlacementObservationTarget::Use(UseSite {
+                inst: InstId(2),
+                input_idx: 0,
+            })),
+        ];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
+        let order_of = |index| match scopes[index] {
+            Some(FinalObservationScope::Exact { order, .. }) => order,
+            other => panic!("expected exact scope, got {other:?}"),
+        };
+
+        assert!(order_of(0) < order_of(1));
+        assert!(order_of(1) < order_of(2));
+    }
+
+    #[test]
+    fn final_scope_refuses_alternative_write_phase() {
+        let branch_write = observation(0);
+        let competing_read = observation(1);
+        let expression = CExpr::Ternary {
+            cond: Box::new(CExpr::UIntLit(1)),
+            then_expr: Box::new(CExpr::observed(branch_write, CExpr::UIntLit(2))),
+            else_expr: Box::new(CExpr::observed(competing_read, CExpr::UIntLit(3))),
+        };
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Expr(expression),
+        ))
+        .expect("sealed alternative expression");
+        let (statement, regions) = sealed.into_marked_parts();
+        let targets = [
+            Some(PlacementObservationTarget::Write(InstId(0))),
+            Some(PlacementObservationTarget::Use(UseSite {
+                inst: InstId(1),
+                input_idx: 0,
+            })),
+        ];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
+
+        assert_eq!(scopes[0], Some(FinalObservationScope::Ambiguous));
+        assert_eq!(scopes[1], Some(FinalObservationScope::Ambiguous));
+    }
+
+    #[test]
+    fn final_scope_refuses_unsequenced_write_phase() {
+        let operand_write = observation(0);
+        let competing_read = observation(1);
+        let expression = CExpr::binary(
+            BinaryOp::Add,
+            CExpr::observed(operand_write, CExpr::UIntLit(1)),
+            CExpr::observed(competing_read, CExpr::UIntLit(2)),
+        );
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Expr(expression),
+        ))
+        .expect("sealed unsequenced expression");
+        let (statement, regions) = sealed.into_marked_parts();
+        let targets = [
+            Some(PlacementObservationTarget::Write(InstId(0))),
+            Some(PlacementObservationTarget::Use(UseSite {
+                inst: InstId(1),
+                input_idx: 0,
+            })),
+        ];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
+
+        assert_eq!(scopes[0], Some(FinalObservationScope::Ambiguous));
+        assert_eq!(scopes[1], Some(FinalObservationScope::Ambiguous));
     }
 }

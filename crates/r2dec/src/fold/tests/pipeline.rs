@@ -18,6 +18,7 @@ mod tests {
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
     };
+    use r2ssa::SSAFunction;
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
         std::cell::RefCell::new(crate::symbol::SymbolTable::new())
@@ -2692,6 +2693,24 @@ mod tests {
             !ctx.should_inline(var),
             "certified memory result {} must remain a single evaluated assignment",
             crate::certified_memory_result_name(fact.access)
+        );
+    }
+
+    #[test]
+    fn prepared_runtime_analysis_refuses_without_exact_source_artifact() {
+        let mut ctx = FoldingContext::new(64);
+        let execution = r2ssa::SsaExecutionControl::default();
+        let control = crate::DecompileWorkControl::new(
+            &execution,
+            crate::DecompileWorkPhase::Structuring,
+        );
+
+        assert_eq!(
+            ctx.analyze_blocks_with_control(&[], control),
+            Err(crate::analysis::PreparedRuntimeFactsError::Lowering(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )),
+            "missing exact SSA authority must be a typed refusal, never an empty analysis"
         );
     }
 

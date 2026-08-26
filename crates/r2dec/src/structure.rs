@@ -612,6 +612,113 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         )
     }
 
+    fn exact_control_domain(
+        control_domains: &r2ssa::ControlDomainFacts,
+        block_addr: u64,
+    ) -> Result<r2ssa::ControlDomain, String> {
+        let domain_id = control_domains.by_block.get(&block_addr).ok_or_else(|| {
+            format!("missing canonical control-domain index for block 0x{block_addr:x}")
+        })?;
+        let domain = control_domains.domains.get(domain_id).ok_or_else(|| {
+            format!(
+                "canonical control-domain index for block 0x{block_addr:x} names missing domain {:?}",
+                domain_id
+            )
+        })?;
+        if domain.id != *domain_id {
+            return Err(format!(
+                "canonical control-domain identity mismatch for block 0x{block_addr:x}: index {:?}, domain {:?}",
+                domain_id, domain.id
+            ));
+        }
+        if !domain.complete {
+            return Err(format!(
+                "incomplete canonical control domain for block 0x{block_addr:x}"
+            ));
+        }
+        Ok(domain.clone())
+    }
+
+    fn exact_loop_id_for_header(&self, header: u64) -> Result<LoopId, String> {
+        let facts = self
+            .fold_ctx
+            .control_facts()
+            .ok_or_else(|| format!("missing canonical control facts for loop 0x{header:x}"))?;
+        let mut candidates = facts
+            .loops
+            .iter()
+            .filter(|(_, loop_fact)| loop_fact.header == header);
+        let Some((map_id, loop_fact)) = candidates.next() else {
+            return Err(format!(
+                "missing canonical loop identity for header 0x{header:x}"
+            ));
+        };
+        if candidates.next().is_some() {
+            return Err(format!(
+                "ambiguous canonical loop identity for header 0x{header:x}"
+            ));
+        }
+        if *map_id != loop_fact.loop_id {
+            return Err(format!(
+                "canonical loop identity mismatch for header 0x{header:x}: index {:?}, fact {:?}",
+                map_id, loop_fact.loop_id
+            ));
+        }
+        let expected_proof = r2ssa::ProofNodeId::loop_certificate(header, *map_id).to_string();
+        if loop_fact.proof_node != expected_proof {
+            return Err(format!(
+                "canonical loop proof identity mismatch for header 0x{header:x}"
+            ));
+        }
+        let header_domain = Self::exact_control_domain(&facts.control_domains, header)?;
+        if !header_domain.loops.contains(map_id) {
+            return Err(format!(
+                "canonical loop {:?} is absent from header 0x{header:x} control domain",
+                map_id
+            ));
+        }
+        for block_addr in &loop_fact.body {
+            let domain = Self::exact_control_domain(&facts.control_domains, *block_addr)?;
+            if !domain.loops.contains(map_id) {
+                return Err(format!(
+                    "canonical loop {:?} is absent from body block 0x{block_addr:x} control domain",
+                    map_id
+                ));
+            }
+        }
+        Ok(*map_id)
+    }
+
+    fn exact_rendered_loop_id(
+        &self,
+        header: u64,
+        condition: Option<PredicateId>,
+        condition_value: Option<ValueId>,
+        body: &Region,
+    ) -> Result<LoopId, String> {
+        let loop_id = self.exact_loop_id_for_header(header)?;
+        let facts = self
+            .fold_ctx
+            .control_facts()
+            .ok_or_else(|| format!("missing canonical control facts for loop 0x{header:x}"))?;
+        let loop_fact = facts.loops.get(&loop_id).ok_or_else(|| {
+            format!("missing canonical loop fact {:?} for header 0x{header:x}", loop_id)
+        })?;
+        let rendered = self.loop_render_proof(header, condition, condition_value, body);
+        if loop_fact.condition != rendered.loop_condition
+            || loop_fact.condition_value != rendered.loop_condition_value
+            || loop_fact.body != rendered.loop_body_blocks
+            || loop_fact.latches != rendered.loop_latches
+            || loop_fact.exits != rendered.loop_exits
+        {
+            return Err(format!(
+                "canonical loop fact {:?} does not exactly match rendered loop at 0x{header:x}",
+                loop_id
+            ));
+        }
+        Ok(loop_id)
+    }
+
     fn canonical_loop_body_blocks(&self, anchor: u64, body: &Region) -> Vec<u64> {
         if let Some(loop_body) = self
             .region_analyzer
@@ -701,7 +808,15 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Structure the function's control flow.
     #[cfg(test)]
     pub(crate) fn structure(&mut self) -> ControlFlowStructureResult<CStmt> {
-        self.structure_with_regions().map(SealedStructuredBody::into_stmt)
+        let symbols = &self.fold_ctx.symbols;
+        let stmt = self.structure_preserving_render_proof_identity_impl()?;
+        if let Some(reason) = self.safety_reason.clone() {
+            return Ok(CStmt::comment(format!(
+                "r2dec residual: {}",
+                crate::sanitize_comment_text(&reason)
+            )));
+        }
+        Ok(Self::cleanup(symbols, stmt))
     }
 
     /// Structure the function and retain exact lexical occurrence identity.
@@ -709,23 +824,33 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         &mut self,
     ) -> ControlFlowStructureResult<SealedStructuredBody> {
         let symbols = &self.fold_ctx.symbols;
+        let source_authority = self
+            .fold_ctx
+            .inputs
+            .prepared_ssa
+            .map(r2ssa::SsaArtifact::authority)
+            .ok_or(StructuredRegionBuildError::MissingSourceAuthority)?;
         let stmt = self.structure_preserving_render_proof_identity_marked()?;
         // A refusal that does not say what it refused reads as a function with no body
         if let Some(reason) = self.safety_reason.clone() {
-            return seal_structured_body(CStmt::structured_region(
-                StructuredRegionMarker::unsealed(
-                    self.func.entry,
-                    StructuredRegionKind::FunctionBody,
+            return seal_structured_body(
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(
+                        self.func.entry,
+                        StructuredRegionKind::FunctionBody,
+                    ),
+                    CStmt::comment(format!(
+                        "r2dec residual: {}",
+                        crate::sanitize_comment_text(&reason)
+                    )),
                 ),
-                CStmt::comment(format!(
-                    "r2dec residual: {}",
-                    crate::sanitize_comment_text(&reason)
-                )),
-            ))
+                source_authority,
+            )
             .map_err(ControlFlowStructureError::from);
         }
         // Post-process: flatten, simplify loops, remove redundant control flow.
-        seal_structured_body(Self::cleanup(symbols, stmt)).map_err(ControlFlowStructureError::from)
+        seal_structured_body(Self::cleanup(symbols, stmt), source_authority)
+            .map_err(ControlFlowStructureError::from)
     }
 
     fn structure_preserving_render_proof_identity_marked(
@@ -1004,14 +1129,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if self.loop_needs_condition_inversion(*header, body) {
                     cond = Self::negate_condition(cond);
                 }
+                let loop_id = match self.exact_rendered_loop_id(
+                    *header,
+                    predicate,
+                    condition_value,
+                    body,
+                ) {
+                    Ok(loop_id) => loop_id,
+                    Err(reason) => {
+                        self.safety_reason = Some(reason);
+                        return Ok(CStmt::Empty);
+                    }
+                };
                 self.record_loop_render_proof(*header, predicate, condition_value, body);
 
-                let loop_id = None;
-
                 let outer_domains = self.active_domains.clone();
-                if let Some(loop_id) = loop_id {
-                    self.push_active_loop(loop_id);
-                }
+                self.push_active_loop(loop_id);
                 let prefix = self.structure_block_prefix_stmts(*header)?;
                 let cond = match Self::combine_loop_condition_prefix(prefix, cond) {
                     Ok(cond) => cond,
@@ -1039,14 +1172,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     cond = Self::negate_condition(cond);
                 }
                 let anchor = body.entry();
+                let loop_id = match self.exact_rendered_loop_id(
+                    anchor,
+                    predicate,
+                    condition_value,
+                    body,
+                ) {
+                    Ok(loop_id) => loop_id,
+                    Err(reason) => {
+                        self.safety_reason = Some(reason);
+                        return Ok(CStmt::Empty);
+                    }
+                };
                 self.record_loop_render_proof(anchor, predicate, condition_value, body);
 
-                let loop_id = None;
-
                 let outer_domains = self.active_domains.clone();
-                if let Some(loop_id) = loop_id {
-                    self.push_active_loop(loop_id);
-                }
+                self.push_active_loop(loop_id);
                 let cond_owned_by_body = Self::region_owns_block_emission(body, *cond_block);
                 if !cond_owned_by_body {
                     self.deferred_merge_blocks.push(*cond_block);
@@ -1209,7 +1350,123 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         {
             return Ok(CStmt::Empty);
         }
-        self.structure_region(region)
+        let outer_domains = self.active_domains.clone();
+        if let Err(reason) = self.push_exact_edge_guard(pred_block, region.entry()) {
+            self.safety_reason = Some(reason);
+            return Ok(CStmt::Empty);
+        }
+        let stmt = self.structure_region(region);
+        self.active_domains = outer_domains;
+        stmt
+    }
+
+    fn exact_control_guard_for_edge(
+        &self,
+        predecessor: u64,
+        successor: u64,
+    ) -> Result<Option<ControlGuard>, String> {
+        let facts = self.fold_ctx.control_facts().ok_or_else(|| {
+            format!(
+                "missing canonical control facts for edge 0x{predecessor:x} -> 0x{successor:x}"
+            )
+        })?;
+        Self::exact_control_domain(&facts.control_domains, predecessor)?;
+        Self::exact_control_domain(&facts.control_domains, successor)?;
+        let block = self.func.cfg().get_block(predecessor).ok_or_else(|| {
+            format!("missing CFG block for control edge from 0x{predecessor:x}")
+        })?;
+        match &block.terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } => {
+                let predicate = facts.branch_for_block(predecessor).ok_or_else(|| {
+                    format!("missing canonical branch fact at 0x{predecessor:x}")
+                })?;
+                if predicate.block_addr != predecessor
+                    || predicate.true_target != *true_target
+                    || predicate.false_target != *false_target
+                {
+                    return Err(format!(
+                        "canonical branch fact disagrees with CFG at 0x{predecessor:x}"
+                    ));
+                }
+                let truth = if successor == *true_target {
+                    true
+                } else if successor == *false_target {
+                    false
+                } else {
+                    return Err(format!(
+                        "edge 0x{predecessor:x} -> 0x{successor:x} is absent from canonical branch fact"
+                    ));
+                };
+                Ok(Some(ControlGuard::Branch {
+                    predicate: predicate.id,
+                    truth,
+                }))
+            }
+            BlockTerminator::Switch { cases, default } => {
+                let switch = facts.switch_for_block(predecessor).ok_or_else(|| {
+                    format!("missing canonical switch fact at 0x{predecessor:x}")
+                })?;
+                let mut cfg_cases = cases.clone();
+                cfg_cases.sort_unstable();
+                let mut fact_cases = switch.cases.clone();
+                fact_cases.sort_unstable();
+                if switch.block_addr != predecessor
+                    || fact_cases != cfg_cases
+                    || switch.default != *default
+                {
+                    return Err(format!(
+                        "canonical switch fact disagrees with CFG at 0x{predecessor:x}"
+                    ));
+                }
+                let mut case_values = cases
+                    .iter()
+                    .filter_map(|(value, target)| (*target == successor).then_some(*value))
+                    .collect::<Vec<_>>();
+                case_values.sort_unstable();
+                case_values.dedup();
+                let includes_default = *default == Some(successor);
+                if case_values.is_empty() && !includes_default {
+                    return Err(format!(
+                        "edge 0x{predecessor:x} -> 0x{successor:x} is absent from canonical switch fact"
+                    ));
+                }
+                Ok(Some(ControlGuard::SwitchArm {
+                    block_addr: predecessor,
+                    case_values,
+                    includes_default,
+                }))
+            }
+            BlockTerminator::IndirectBranch if self.func.successors(predecessor).len() > 1 => {
+                Err(format!(
+                    "uncertified indirect control edge 0x{predecessor:x} -> 0x{successor:x}"
+                ))
+            }
+            _ if matches!(
+                self.func.successors(predecessor).as_slice(),
+                [only] if *only == successor
+            ) => Ok(None),
+            _ => Err(format!(
+                "edge 0x{predecessor:x} -> 0x{successor:x} is not an exact CFG edge"
+            )),
+        }
+    }
+
+    fn push_exact_edge_guard(
+        &mut self,
+        predecessor: u64,
+        successor: u64,
+    ) -> Result<(), String> {
+        let guard = self.exact_control_guard_for_edge(predecessor, successor)?;
+        if let Some(guard) = guard {
+            for domain in &mut self.active_domains {
+                domain.guards.push(guard.clone());
+            }
+            Self::normalize_rendered_domains(&mut self.active_domains);
+        }
+        Ok(())
     }
 
     /// Project the exact selector use of the terminal indirect branch.
@@ -1321,7 +1578,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .iter()
                     .any(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
             });
-            let case_stmt = self.structure_region(case_region)?;
+            let case_stmt = match self.push_exact_edge_guard(switch_block, case_region.entry()) {
+                Ok(()) => self.structure_region(case_region)?,
+                Err(reason) => {
+                    self.safety_reason = Some(reason);
+                    self.active_domains = outer_domains;
+                    return Ok(CStmt::Empty);
+                }
+            };
             self.active_domains = outer_domains;
             let body = if falls_through {
                 vec![case_stmt]
@@ -1336,7 +1600,14 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
         let default_body = if let Some(region) = default {
             let outer_domains = self.active_domains.clone();
-            let stmt = self.structure_region(region)?;
+            let stmt = match self.push_exact_edge_guard(switch_block, region.entry()) {
+                Ok(()) => self.structure_region(region)?,
+                Err(reason) => {
+                    self.safety_reason = Some(reason);
+                    self.active_domains = outer_domains;
+                    return Ok(CStmt::Empty);
+                }
+            };
             self.active_domains = outer_domains;
             Some(vec![stmt])
         } else {
@@ -2016,8 +2287,70 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    fn record_transfer_target_domain(&mut self, _loop_header: u64, _target: u64) -> bool {
-        true
+    fn record_transfer_target_domain(&mut self, loop_header: u64, target: u64) -> bool {
+        if self.safety_reason.is_some() {
+            return false;
+        }
+        let result = (|| -> Result<Vec<RenderedBlockDomain>, String> {
+            let loop_id = self.exact_loop_id_for_header(loop_header)?;
+            let facts = self.fold_ctx.control_facts().ok_or_else(|| {
+                format!("missing canonical control facts for transfer target 0x{target:x}")
+            })?;
+            let target_domain = Self::exact_control_domain(&facts.control_domains, target)?;
+            if target_domain.loops.contains(&loop_id) {
+                return Err(format!(
+                    "transfer to 0x{target:x} does not leave canonical loop {:?}",
+                    loop_id
+                ));
+            }
+            if self.active_domains.is_empty() {
+                return Err(format!(
+                    "transfer to 0x{target:x} has no active rendered control domain"
+                ));
+            }
+            let mut transformed = self.active_domains.clone();
+            for domain in &mut transformed {
+                let before = domain.loops.len();
+                domain.loops.retain(|active| *active != loop_id);
+                if domain.loops.len() == before {
+                    return Err(format!(
+                        "transfer to 0x{target:x} is outside active canonical loop {:?}",
+                        loop_id
+                    ));
+                }
+            }
+            Self::normalize_rendered_domains(&mut transformed);
+            for domain in &transformed {
+                if domain.loops != target_domain.loops {
+                    return Err(format!(
+                        "transformed loop domain for transfer to 0x{target:x} is {:?}, canonical target is {:?}",
+                        domain.loops, target_domain.loops
+                    ));
+                }
+                if !target_domain
+                    .guards
+                    .iter()
+                    .all(|guard| domain.guards.contains(guard))
+                {
+                    return Err(format!(
+                        "transformed guard domain for transfer to 0x{target:x} omits canonical target guards"
+                    ));
+                }
+            }
+            Ok(transformed)
+        })();
+        match result {
+            Ok(transformed) => {
+                let target_domains = self.transfer_target_domains.entry(target).or_default();
+                target_domains.extend(transformed);
+                Self::normalize_rendered_domains(target_domains);
+                true
+            }
+            Err(reason) => {
+                self.safety_reason = Some(reason);
+                false
+            }
+        }
     }
 
     fn push_active_loop(&mut self, loop_id: LoopId) {
@@ -2152,7 +2485,55 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Ok(stmts)
     }
 
-    fn validate_certified_block_domain(&mut self, _block_addr: u64, _stmts: &[CStmt]) {}
+    fn validate_certified_block_domain(&mut self, block_addr: u64, _stmts: &[CStmt]) {
+        if self.safety_reason.is_some() {
+            return;
+        }
+        let result = (|| -> Result<RenderedBlockOccurrence, String> {
+            let facts = self.fold_ctx.control_facts().ok_or_else(|| {
+                format!("missing canonical control facts for block 0x{block_addr:x}")
+            })?;
+            let source = Self::exact_control_domain(&facts.control_domains, block_addr)?;
+            if self.active_domains.is_empty() {
+                return Err(format!(
+                    "block 0x{block_addr:x} has no active rendered control domain"
+                ));
+            }
+            let mut alternatives = self.active_domains.clone();
+            Self::normalize_rendered_domains(&mut alternatives);
+            for alternative in &alternatives {
+                if !self.rendered_loop_domain_matches_source(
+                    block_addr,
+                    &source.loops,
+                    &alternative.loops,
+                ) {
+                    return Err(format!(
+                        "rendered loop domain {:?} for block 0x{block_addr:x} does not match canonical domain {:?}",
+                        alternative.loops, source.loops
+                    ));
+                }
+                if !source
+                    .guards
+                    .iter()
+                    .all(|guard| alternative.guards.contains(guard))
+                {
+                    return Err(format!(
+                        "rendered guard domain {:?} for block 0x{block_addr:x} omits canonical guards {:?}",
+                        alternative.guards, source.guards
+                    ));
+                }
+            }
+            Ok(RenderedBlockOccurrence { alternatives })
+        })();
+        match result {
+            Ok(occurrence) => self
+                .rendered_block_domains
+                .entry(block_addr)
+                .or_default()
+                .push(occurrence),
+            Err(reason) => self.safety_reason = Some(reason),
+        }
+    }
 
     /// Every block the source has must be covered by the region that was structured.
     ///
@@ -2196,15 +2577,40 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .copied()
             .filter(|addr| !rendered.contains(addr) && !self.block_is_proven_dead(*addr))
             .collect::<Vec<_>>();
-        let Some(first) = missing.first().copied() else {
+        if let Some(first) = missing.first().copied() {
+            self.safety_reason = Some(format!(
+                "structuring covered {} of {} source blocks, leaving 0x{first:x} and {} others unrendered",
+                rendered.len(),
+                source.len(),
+                missing.len().saturating_sub(1)
+            ));
             return;
-        };
-        self.safety_reason = Some(format!(
-            "structuring covered {} of {} source blocks, leaving 0x{first:x} and {} others unrendered",
-            rendered.len(),
-            source.len(),
-            missing.len().saturating_sub(1)
-        ));
+        }
+
+        let occurrences = self
+            .rendered_block_domains
+            .iter()
+            .map(|(block_addr, occurrences)| (*block_addr, occurrences.clone()))
+            .collect::<Vec<_>>();
+        for (block_addr, occurrences) in occurrences {
+            match self.rendered_branch_occurrences_cover_source(block_addr, &occurrences) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.safety_reason = Some(format!(
+                        "rendered control-domain occurrences do not exactly cover block 0x{block_addr:x}"
+                    ));
+                    return;
+                }
+                Err(reason) => {
+                    if self.stop_reason.get().is_none() {
+                        self.safety_reason = Some(format!(
+                            "control-domain coverage proof failed for block 0x{block_addr:x}: {reason}"
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     fn rendered_loop_domain_matches_source(
@@ -2247,6 +2653,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .fold_ctx
             .control_facts()
             .ok_or_else(|| "missing canonical control facts".to_string())?;
+        let source_domain = Self::exact_control_domain(&facts.control_domains, block_addr)?;
+        let has_switch_guard = source_domain
+            .guards
+            .iter()
+            .chain(
+                occurrences
+                    .iter()
+                    .flat_map(|occurrence| &occurrence.alternatives)
+                    .flat_map(|alternative| &alternative.guards),
+            )
+            .any(|guard| matches!(guard, ControlGuard::SwitchArm { .. }));
+        // The binary BDD below intentionally has no encoding for multi-way
+        // selector partitions. In a switch-bearing CFG, accept only a single
+        // occurrence whose canonical guard vector is exactly reproduced;
+        // duplicated/unioned switch domains remain a typed safety residual.
+        if has_switch_guard || !facts.switches.is_empty() {
+            let [occurrence] = occurrences else {
+                return Err(
+                    "multiple switch-domain occurrences require a representable disjoint-union proof"
+                        .to_string(),
+                );
+            };
+            let [alternative] = occurrence.alternatives.as_slice() else {
+                return Err(
+                    "switch-domain coverage requires one exact rendered alternative".to_string(),
+                );
+            };
+            return Ok(alternative.guards == source_domain.guards);
+        }
         // A predicate in a completed inner loop is evaluated once per dynamic
         // iteration, not once per static CFG node. Project those predicates out
         // before comparing path coverage at a block outside that loop. Loop
@@ -4371,6 +4806,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 mod tests {
     use super::{
         BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructureError, ControlFlowStructurer,
+        RenderedBlockDomain,
     };
     use crate::ast::{
         BinaryOp, CExpr, CFunction, CStmt, CType, RenderObservationOwner, UnaryOp,
@@ -4383,8 +4819,11 @@ mod tests {
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, Varnode,
     };
-    use r2ssa::{BlockTerminator, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar, SsaArtifact};
-    use std::collections::{BTreeSet, HashMap};
+    use r2ssa::{
+        BlockTerminator, ControlGuard, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar,
+        SsaArtifact,
+    };
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
     /// The names a fixture in this module declares.
@@ -4421,6 +4860,131 @@ mod tests {
                 .expect("existential projection"),
             stable_true
         );
+    }
+
+    #[test]
+    fn incomplete_or_mismatched_control_domain_fails_closed() {
+        let domain_id = r2ssa::ControlDomainId(0);
+        let incomplete = r2ssa::ControlDomainFacts {
+            domains: BTreeMap::from([(
+                domain_id,
+                r2ssa::ControlDomain {
+                    id: domain_id,
+                    guards: Vec::new(),
+                    loops: Vec::new(),
+                    complete: false,
+                },
+            )]),
+            by_block: BTreeMap::from([(0x1000, domain_id)]),
+        };
+        assert!(
+            ControlFlowStructurer::<'_, '_>::exact_control_domain(&incomplete, 0x1000)
+                .expect_err("incomplete domain must be refused")
+                .contains("incomplete canonical control domain")
+        );
+
+        let mismatched = r2ssa::ControlDomainFacts {
+            domains: BTreeMap::from([(
+                domain_id,
+                r2ssa::ControlDomain {
+                    id: r2ssa::ControlDomainId(1),
+                    guards: Vec::new(),
+                    loops: Vec::new(),
+                    complete: true,
+                },
+            )]),
+            by_block: BTreeMap::from([(0x1000, domain_id)]),
+        };
+        assert!(
+            ControlFlowStructurer::<'_, '_>::exact_control_domain(&mismatched, 0x1000)
+                .expect_err("mismatched domain authority must be refused")
+                .contains("identity mismatch")
+        );
+    }
+
+    #[test]
+    fn exact_branch_edge_guard_certifies_rendered_block_domain() {
+        let mut cond = R2ILBlock::new(0x1000, 4);
+        cond.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1010, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut false_block = R2ILBlock::new(0x1004, 4);
+        false_block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let mut true_block = R2ILBlock::new(0x1010, 4);
+        true_block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let blocks = [cond, false_block, true_block];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let predicate = ctx
+            .control_facts()
+            .and_then(|control| control.branch_for_block(0x1000))
+            .expect("canonical branch fact")
+            .id;
+
+        structurer
+            .push_exact_edge_guard(0x1000, 0x1010)
+            .expect("exact true edge guard");
+        assert_eq!(
+            structurer.active_domains,
+            vec![RenderedBlockDomain {
+                guards: vec![ControlGuard::Branch {
+                    predicate,
+                    truth: true,
+                }],
+                loops: Vec::new(),
+            }]
+        );
+
+        structurer.validate_certified_block_domain(0x1010, &[CStmt::Empty]);
+        assert!(structurer.safety_reason().is_none());
+        assert_eq!(
+            structurer
+                .rendered_block_domains
+                .get(&0x1010)
+                .expect("certified block occurrence")[0]
+                .alternatives,
+            structurer.active_domains
+        );
+        let occurrences = structurer
+            .rendered_block_domains
+            .get(&0x1010)
+            .expect("certified block occurrence")
+            .clone();
+        assert_eq!(
+            structurer
+                .rendered_branch_occurrences_cover_source(0x1010, &occurrences),
+            Ok(true),
+            "the recorded exact branch guard must cover the canonical source domain"
+        );
+
+        let mut unguarded = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        unguarded.validate_certified_block_domain(0x1010, &[CStmt::Empty]);
+        assert!(
+            unguarded
+                .safety_reason()
+                .is_some_and(|reason| reason.contains("omits canonical guards")),
+            "a source branch arm emitted outside its proven guard must fail closed"
+        );
+    }
+
+    #[test]
+    fn uncertified_edge_guard_fails_closed() {
+        let func = function_with_terminating_if_and_shared_merge();
+        let ctx = FoldingContext::new(64);
+        let mut structurer = ControlFlowStructurer::new(&func, &ctx);
+
+        let reason = structurer
+            .push_exact_edge_guard(0x1000, 0x1010)
+            .expect_err("an edge without canonical facts must be refused");
+
+        assert!(reason.contains("missing canonical control facts"));
+        assert_eq!(structurer.active_domains, vec![RenderedBlockDomain::default()]);
     }
 
     /// A reference declared in the table the code under test reads, because an
@@ -5077,6 +5641,67 @@ mod tests {
             structurer.control_render_proofs()[0].loop_latches,
             vec![0x1004]
         );
+
+        let loop_id = structurer
+            .exact_loop_id_for_header(0x1000)
+            .expect("one canonical loop identity");
+        structurer.active_domains = vec![RenderedBlockDomain::default()];
+        structurer.push_active_loop(loop_id);
+        structurer
+            .push_exact_edge_guard(0x1004, 0x1008)
+            .expect("exact loop-exit edge guard");
+        assert!(
+            structurer.record_transfer_target_domain(0x1000, 0x1008),
+            "an exact transfer must retain its transformed target domain"
+        );
+        let transferred = structurer
+            .transfer_target_domains
+            .get(&0x1008)
+            .expect("recorded transfer target");
+        assert_eq!(transferred.len(), 1);
+        assert!(transferred[0].loops.is_empty());
+        assert!(
+            transferred[0].guards.iter().any(|guard| matches!(
+                guard,
+                ControlGuard::Branch {
+                    truth: false,
+                    ..
+                }
+            )),
+            "the exact exit predicate must survive loop-domain projection"
+        );
+    }
+
+    #[test]
+    fn transfer_without_active_canonical_loop_fails_closed() {
+        let mut header = R2ILBlock::new(0x1000, 4);
+        header.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut latch = R2ILBlock::new(0x1004, 4);
+        latch.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1000, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut exit = R2ILBlock::new(0x1008, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let blocks = [header, latch, exit];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        structurer
+            .push_exact_edge_guard(0x1004, 0x1008)
+            .expect("exact loop-exit edge guard");
+
+        assert!(!structurer.record_transfer_target_domain(0x1000, 0x1008));
+        assert!(
+            structurer
+                .safety_reason()
+                .is_some_and(|reason| reason.contains("outside active canonical loop"))
+        );
+        assert!(!structurer.transfer_target_domains.contains_key(&0x1008));
     }
 
     #[test]

@@ -45,11 +45,21 @@ impl RegionEmissionAnchor {
 
 /// Run-local identity of one sealed structured-region artifact.
 #[derive(Clone)]
-pub(crate) struct StructuredRegionArtifactAuthority(Arc<()>);
+pub(crate) struct StructuredRegionArtifactAuthority {
+    tree: Arc<()>,
+    source: r2ssa::SsaArtifactAuthority,
+}
 
 impl StructuredRegionArtifactAuthority {
-    fn new() -> Self {
-        Self(Arc::new(()))
+    fn new(source: &r2ssa::SsaArtifactAuthority) -> Self {
+        Self {
+            tree: Arc::new(()),
+            source: source.clone(),
+        }
+    }
+
+    fn matches_source(&self, source: &r2ssa::SsaArtifactAuthority) -> bool {
+        &self.source == source
     }
 }
 
@@ -61,7 +71,7 @@ impl std::fmt::Debug for StructuredRegionArtifactAuthority {
 
 impl PartialEq for StructuredRegionArtifactAuthority {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.tree, &other.tree)
     }
 }
 
@@ -69,7 +79,7 @@ impl Eq for StructuredRegionArtifactAuthority {}
 
 impl std::hash::Hash for StructuredRegionArtifactAuthority {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&Arc::as_ptr(&self.0), state);
+        std::hash::Hash::hash(&Arc::as_ptr(&self.tree), state);
     }
 }
 
@@ -186,6 +196,10 @@ impl SealedStructuredRegionArtifact {
         &self.authority
     }
 
+    pub(crate) fn matches_source(&self, source: &r2ssa::SsaArtifactAuthority) -> bool {
+        self.authority.matches_source(source)
+    }
+
     #[cfg(test)]
     pub(crate) const fn root(&self) -> RegionId {
         self.root
@@ -252,6 +266,7 @@ pub(crate) enum StructuredRegionBuildError {
     MissingFunctionBodyMarker,
     NestedFunctionBodyMarker,
     MarkerAlreadySealed,
+    MissingSourceAuthority,
 }
 
 /// Final marker tree no longer matches the artifact sealed from it.
@@ -422,8 +437,9 @@ impl StructuredRegionDraft {
         function_entry: u64,
         region: &Region,
     ) -> Result<Self, StructuredRegionBuildError> {
+        let source = test_source_authority();
         let mut draft = Self {
-            authority: StructuredRegionArtifactAuthority::new(),
+            authority: StructuredRegionArtifactAuthority::new(&source),
             #[cfg(test)]
             root: RegionId(0),
             nodes: Vec::new(),
@@ -658,6 +674,7 @@ impl<'a> ScopedStructuredStatement<'a> {
 /// Seal exact region markers after all structurer-local shape rewrites.
 pub(crate) fn seal_structured_body(
     mut stmt: CStmt,
+    source: &r2ssa::SsaArtifactAuthority,
 ) -> Result<SealedStructuredBody, StructuredRegionBuildError> {
     let CStmt::StructuredRegion {
         marker: root_marker,
@@ -674,7 +691,7 @@ pub(crate) fn seal_structured_body(
     }
 
     let mut draft = StructuredRegionDraft {
-        authority: StructuredRegionArtifactAuthority::new(),
+        authority: StructuredRegionArtifactAuthority::new(source),
         #[cfg(test)]
         root: RegionId(0),
         nodes: Vec::new(),
@@ -692,6 +709,26 @@ pub(crate) fn seal_structured_body(
     seal_stmt_children(root_stmt, root, &mut draft)?;
     let regions = draft.seal();
     Ok(SealedStructuredBody { stmt, regions })
+}
+
+#[cfg(test)]
+pub(crate) fn seal_structured_body_for_test(
+    stmt: CStmt,
+) -> Result<SealedStructuredBody, StructuredRegionBuildError> {
+    let source = test_source_authority();
+    seal_structured_body(stmt, &source)
+}
+
+#[cfg(test)]
+fn test_source_authority() -> r2ssa::SsaArtifactAuthority {
+    let mut block = r2il::R2ILBlock::new(0x1000, 1);
+    block.push(r2il::R2ILOp::Return {
+        target: r2il::Varnode::constant(0, 8),
+    });
+    r2ssa::SsaArtifact::raw(&[block], None)
+        .expect("test source artifact")
+        .authority()
+        .clone()
 }
 
 fn seal_stmt_children(
@@ -1029,6 +1066,7 @@ fn direct_children(region: &Region) -> Vec<&Region> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::seal_structured_body_for_test as seal_structured_body;
     use crate::region::RegionTransferKind;
 
     fn node_signature(
@@ -1200,6 +1238,23 @@ mod tests {
                 .is_none()
         );
         assert_eq!(node_signature(&first), node_signature(&second));
+    }
+
+    #[test]
+    fn sealed_artifact_retains_the_exact_ssa_source_authority() {
+        let first_source = test_source_authority();
+        let second_source = test_source_authority();
+        let sealed = super::seal_structured_body(
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+                CStmt::Empty,
+            ),
+            &first_source,
+        )
+        .expect("source-bound region artifact");
+
+        assert!(sealed.regions().matches_source(&first_source));
+        assert!(!sealed.regions().matches_source(&second_source));
     }
 
     #[test]

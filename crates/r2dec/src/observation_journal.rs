@@ -769,6 +769,7 @@ fn placement_analysis_refusal(
     use crate::placement::PlacementAnalysisError as Error;
 
     match error {
+        Error::SourceAuthorityMismatch => Refusal::SourceAuthorityMismatch,
         Error::BindingOutsidePlan { binding } => Refusal::BindingOutsidePlan {
             binding_index: binding.index(),
         },
@@ -2634,13 +2635,16 @@ mod tests {
             panic!("journal returns an observed expression")
         };
         let forged_after_allocation = CExpr::observed(id, CExpr::IntLit(7));
-        let sealed = seal_structured_body(CStmt::structured_region(
-            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+        let sealed = seal_structured_body(
             CStmt::structured_region(
-                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
-                CStmt::Return(Some(forged_after_allocation)),
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+                    CStmt::Return(Some(forged_after_allocation)),
+                ),
             ),
-        ))
+            source.source().authority(),
+        )
         .expect("sealed marked return");
         let (statement, regions) = sealed.into_marked_parts();
         function.body = vec![statement];
