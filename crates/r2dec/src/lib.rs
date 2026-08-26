@@ -3109,6 +3109,7 @@ pub enum BindingObservationJournalFailure {
     },
     SymbolTableMismatch,
     UnownedBindingSymbol {
+        value: r2ssa::ValueId,
         symbol_index: usize,
     },
     ConflictingValue {

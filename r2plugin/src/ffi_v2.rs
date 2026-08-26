@@ -1755,7 +1755,11 @@ fn binding_observation_journal_failure_json(
             cause.insert("op_index".to_string(), serde_json::json!(op_idx));
             cause.insert("input_index".to_string(), serde_json::json!(input_idx));
         }
-        Failure::UnownedBindingSymbol { symbol_index } => {
+        Failure::UnownedBindingSymbol {
+            value,
+            symbol_index,
+        } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
             cause.insert("symbol_index".to_string(), serde_json::json!(symbol_index));
         }
         Failure::ObservationDomainTooLarge { expected_count }
@@ -3856,7 +3860,10 @@ mod tests {
             Failure::ExactUseRequiresRenderedOccurrence { site },
             Failure::ExactWriteRequiresRenderedOccurrence { inst },
             Failure::SymbolTableMismatch,
-            Failure::UnownedBindingSymbol { symbol_index: 67 },
+            Failure::UnownedBindingSymbol {
+                value,
+                symbol_index: 67,
+            },
             Failure::ConflictingValue { value },
             Failure::ConflictingUse { site },
             Failure::ConflictingWrite { inst },
@@ -4062,7 +4069,10 @@ mod tests {
             ),
             (Failure::SymbolTableMismatch, "symbol_table_mismatch"),
             (
-                Failure::UnownedBindingSymbol { symbol_index: 41 },
+                Failure::UnownedBindingSymbol {
+                    value: r2ssa::ValueId(40),
+                    symbol_index: 41,
+                },
                 "unowned_binding_symbol",
             ),
             (

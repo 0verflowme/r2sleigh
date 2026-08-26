@@ -200,7 +200,7 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     ),
     "exact_write_requires_rendered_occurrence": frozenset({"instruction_id"}),
     "symbol_table_mismatch": frozenset(),
-    "unowned_binding_symbol": frozenset({"symbol_index"}),
+    "unowned_binding_symbol": frozenset({"value_id", "symbol_index"}),
     "conflicting_value": frozenset({"value_id"}),
     "conflicting_use": frozenset({"instruction_id", "input_index"}),
     "conflicting_write": frozenset({"instruction_id"}),

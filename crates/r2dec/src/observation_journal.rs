@@ -123,7 +123,10 @@ pub(crate) enum LegacyObservationJournalError {
     ExactUseRequiresRenderedOccurrence(UseSite),
     ExactWriteRequiresRenderedOccurrence(InstId),
     SymbolTableMismatch,
-    UnownedBindingSymbol(SymbolId),
+    UnownedBindingSymbol {
+        value: ValueId,
+        symbol: SymbolId,
+    },
     ConflictingValue(ValueId),
     ConflictingUse(UseSite),
     ConflictingWrite(InstId),
@@ -421,8 +424,9 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
                 Self::ExactWriteRequiresRenderedOccurrence { inst: *inst }
             }
             LegacyObservationJournalError::SymbolTableMismatch => Self::SymbolTableMismatch,
-            LegacyObservationJournalError::UnownedBindingSymbol(symbol) => {
+            LegacyObservationJournalError::UnownedBindingSymbol { value, symbol } => {
                 Self::UnownedBindingSymbol {
+                    value: *value,
                     symbol_index: symbol.index(),
                 }
             }
@@ -1463,14 +1467,14 @@ fn classify_value_node(
     let (expr, statement_level) = match node {
         RenderObservationNode::Expr(expr) => (expr.unobserved(), false),
         RenderObservationNode::Stmt(stmt) => match stmt.unobserved() {
-            CStmt::Decl { name, .. } => return classify_symbol(*name, symbol_bindings),
+            CStmt::Decl { name, .. } => return classify_symbol(value, *name, symbol_bindings),
             CStmt::Expr(expr) => (expr.unobserved(), true),
             CStmt::Return(Some(expr)) => (expr.unobserved(), false),
             _ => return Ok(LegacyValueObservation::InlineNonLiteral),
         },
     };
     if let CExpr::Var(symbol) = expr {
-        return classify_symbol(*symbol, symbol_bindings);
+        return classify_symbol(value, *symbol, symbol_bindings);
     }
     if let CExpr::Binary { op, left, .. } = expr
         && (*op == BinaryOp::Assign
@@ -1490,7 +1494,7 @@ fn classify_value_node(
                 )))
         && let CExpr::Var(symbol) = left.unobserved()
     {
-        return classify_symbol(*symbol, symbol_bindings);
+        return classify_symbol(value, *symbol, symbol_bindings);
     }
     let source_literal = value_is_literal
         .get(value.0 as usize)
@@ -1513,13 +1517,17 @@ fn classify_value_node(
 }
 
 fn classify_symbol(
+    value: ValueId,
     symbol: SymbolId,
     symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
 ) -> Result<LegacyValueObservation, LegacyObservationJournalError> {
     let binding = symbol_bindings
         .get(&symbol)
         .copied()
-        .ok_or(LegacyObservationJournalError::UnownedBindingSymbol(symbol))?;
+        .ok_or(LegacyObservationJournalError::UnownedBindingSymbol {
+            value,
+            symbol,
+        })?;
     Ok(LegacyValueObservation::Bound { binding })
 }
 
@@ -2172,8 +2180,12 @@ mod tests {
                 BindingObservationJournalFailure::SymbolTableMismatch,
             ),
             (
-                LegacyObservationJournalError::UnownedBindingSymbol(symbol),
+                LegacyObservationJournalError::UnownedBindingSymbol {
+                    value: ValueId(40),
+                    symbol,
+                },
                 BindingObservationJournalFailure::UnownedBindingSymbol {
+                    value: ValueId(40),
                     symbol_index: symbol.index(),
                 },
             ),
@@ -2451,7 +2463,7 @@ mod tests {
     #[test]
     fn invalid_or_duplicate_markers_leave_ast_unchanged() {
         let (source, plan, mut duplicate_function, mut duplicate_journal) = journal_fixture();
-        let (_value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
         let symbol = declare_legacy_symbol(&duplicate_function, &plan, binding, "duplicate_value");
         let marked = duplicate_journal
             .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
@@ -2602,7 +2614,10 @@ mod tests {
         let unchanged = ready.function_for_marker_test().clone();
         assert_eq!(
             journal.seal(&source, &mut ready),
-            Err(LegacyObservationJournalError::UnownedBindingSymbol(symbol))
+            Err(LegacyObservationJournalError::UnownedBindingSymbol {
+                value,
+                symbol,
+            })
         );
         assert_eq!(ready.function_for_marker_test(), &unchanged);
     }
