@@ -1958,6 +1958,7 @@ pub(crate) fn derive_placement_decisions(
     function: &SSAFunction,
     binding_count: usize,
     externally_declared: &BTreeSet<BindingId>,
+    entry_declared: &BTreeSet<BindingId>,
     reads: &[FinalBindingRead],
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementDecisions, PlacementAnalysisError> {
@@ -1966,6 +1967,7 @@ pub(crate) fn derive_placement_decisions(
         function,
         binding_count,
         externally_declared,
+        entry_declared,
         reads,
         writes,
     )
@@ -2006,6 +2008,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
     cfg: &C,
     binding_count: usize,
     externally_declared: &BTreeSet<BindingId>,
+    entry_declared: &BTreeSet<BindingId>,
     reads: &[FinalBindingRead],
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementDecisions, PlacementAnalysisError> {
@@ -2074,13 +2077,20 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         binding_occurrences.sort_by_key(Occurrence::sort_key);
     }
 
+    // Both a parameter and a caller-supplied entry value hold a value when the
+    // function starts, so both are already assigned on entry to the entry
+    // block. Only where they are *declared* differs.
+    let assigned_on_entry = externally_declared
+        .union(entry_declared)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let must_in = match must_assignment_inputs(
         cfg,
         binding_count,
         &block_addrs,
         &block_indices,
         &occurrences,
-        externally_declared,
+        &assigned_on_entry,
     ) {
         Ok(inputs) => inputs,
         Err(mismatch) => {
@@ -2109,7 +2119,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             decisions[binding_index] = Some(PlacementDecision::ExternallyDeclared);
             continue;
         }
-        if writes_for_binding.is_empty() {
+        if writes_for_binding.is_empty() && !entry_declared.contains(&binding) {
             decisions[binding_index] = Some(PlacementDecision::Refused(
                 PlacementRefusal::MissingDefinition { binding },
             ));
@@ -2724,8 +2734,16 @@ mod tests {
             order: FinalOccurrenceOrder(3),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
-            .expect("placement");
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &writes,
+        )
+        .expect("placement");
         let sequence = regions.source_root();
         assert_eq!(
             decisions.decision(binding),
@@ -2761,8 +2779,16 @@ mod tests {
             order: FinalOccurrenceOrder(2),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
-            .expect("placement");
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &writes,
+        )
+        .expect("placement");
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Refused(
@@ -2802,8 +2828,16 @@ mod tests {
             inline_eligible: true,
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
-            .expect("typed placement result");
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &writes,
+        )
+        .expect("typed placement result");
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::Refused(
@@ -2830,6 +2864,7 @@ mod tests {
             &regions,
             &cfg,
             1,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &[FinalBindingRead {
                 binding,
@@ -2879,15 +2914,31 @@ mod tests {
             order: FinalOccurrenceOrder(0),
         }];
 
-        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::from([binding]), &reads, &[])
-            .expect("parameter placement");
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::from([binding]),
+            &BTreeSet::new(),
+            &reads,
+            &[],
+        )
+        .expect("parameter placement");
         assert_eq!(
             decisions.decision(binding),
             Some(PlacementDecision::ExternallyDeclared)
         );
 
-        let uncertified = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &[])
-            .expect("uncertified placement");
+        let uncertified = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &[],
+        )
+        .expect("uncertified placement");
         assert_eq!(
             uncertified.decision(binding),
             Some(PlacementDecision::Refused(

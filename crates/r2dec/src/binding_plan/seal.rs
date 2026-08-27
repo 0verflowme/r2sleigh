@@ -149,8 +149,11 @@ pub(super) fn seal_binding_components(
     let graph = source.graph();
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
+    let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
+    let stack_frame_values = certified_stack_frame_values(source);
+    let stack_geometry_values = certified_stack_geometry_values(source);
     let structural_unused =
         source
             .obligations()
@@ -164,8 +167,11 @@ pub(super) fn seal_binding_components(
         .map(|value| {
             value.var.constant_bits().is_none()
                 && !unobserved_merges.contains(value.id)
+                && !unobserved_values.contains(&value.id)
                 && !return_controls.contains(&value.id)
                 && !direct_control_targets.contains(&value.id)
+                && !stack_frame_values.contains(&value.id)
+                && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)
         })
         .collect::<Vec<_>>();
@@ -388,6 +394,9 @@ pub(crate) fn build_upstream_shadow_oracle(
         .map_err(BindingPlanBuildError::MachineProjection)?;
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
+    let stack_frame_values = certified_stack_frame_values(source);
+    let stack_geometry_values = certified_stack_geometry_values(source);
+    let unobserved_values = source.unobserved_values();
     let structural_unused =
         source
             .obligations()
@@ -428,9 +437,27 @@ pub(crate) fn build_upstream_shadow_oracle(
             ));
             continue;
         }
+        if stack_frame_values.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::StackFrame,
+            ));
+            continue;
+        }
+        if stack_geometry_values.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::DeadStackBase,
+            ));
+            continue;
+        }
         if source.unobserved_merges().contains(graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::UnobservedMerge,
+            ));
+            continue;
+        }
+        if unobserved_values.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::UnobservedValue,
             ));
             continue;
         }
@@ -513,8 +540,11 @@ impl BindingPlan {
 
         let expected = seal_binding_components(source_owned)?;
         let unobserved_merges = source.unobserved_merges();
+        let unobserved_values = source.unobserved_values();
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
+        let stack_frame_values = certified_stack_frame_values(source);
+        let stack_geometry_values = certified_stack_geometry_values(source);
         let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
             BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
         )?;
@@ -574,14 +604,23 @@ impl BindingPlan {
                 ValueDisposition::Refused { .. }
                     if graph_value.var.constant_bits().is_none()
                         && !unobserved_merges.contains(value)
+                        && !unobserved_values.contains(&value)
                         && !return_controls.contains(&value)
                         && !direct_control_targets.contains(&value)
+                        && !stack_frame_values.contains(&value)
+                        && !stack_geometry_values.contains(&value)
                         && !structural_unused.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnobservedMerge
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && unobserved_merges.contains(value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::UnobservedValue
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && unobserved_values.contains(&value)
+                        && !unobserved_merges.contains(value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::ReturnControl
                         && proof.authority == *source.authority()
@@ -592,6 +631,16 @@ impl BindingPlan {
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && direct_control_targets.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::StackFrame
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && stack_frame_values.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::DeadStackBase
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && stack_geometry_values.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnusedStructuralValue
                         && proof.authority == *source.authority()
@@ -618,8 +667,15 @@ impl BindingPlan {
                     let binding = &self.bindings[binding_index];
                     let actual = &actual_by_binding[binding_index];
                     let expected_sources = component.sources.iter().copied().collect::<Vec<_>>();
+                    // Re-derive whether the caller supplies a member rather
+                    // than trusting the plan's own answer.
+                    let expected_caller_supplied = component
+                        .members
+                        .iter()
+                        .any(|value| graph.def_inst(*value).is_none());
                     if actual != &component.members
                         || binding.certificate.sources.as_ref() != expected_sources.as_slice()
+                        || binding.caller_supplied != expected_caller_supplied
                     {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::CertificateMembership {
@@ -858,6 +914,21 @@ impl BindingPlan {
                 return Err(BindingPlanBuildError::Seal(
                     BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object },
                 ));
+            }
+            if source
+                .certificates()
+                .stack_frame_round_trips
+                .contains_key(&object)
+            {
+                let expected = StackObjectDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::StackFrame,
+                };
+                if self.stack_object_disposition(object) != Some(expected) {
+                    return Err(BindingPlanBuildError::Seal(
+                        BindingPlanSourceMismatch::UnexpectedStackObjectDisposition { object },
+                    ));
+                }
+                continue;
             }
             let expected_disposition = match (source_slot, callee_allocation) {
                 (None, None) => StackObjectDisposition::Refused {

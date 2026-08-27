@@ -56,8 +56,26 @@ enum BindingCertificateSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BindingRole {
     Local,
-    Parameter { slot: u32 },
-    StackObject { object: r2ssa::ObjectId },
+    Parameter {
+        slot: u32,
+    },
+    StackObject {
+        object: r2ssa::ObjectId,
+    },
+    /// A caller-supplied value that no convention argument slot claims.
+    ///
+    /// SSA renaming gives version 0 to a read with no prior definition in this
+    /// function, so such a value is supplied from outside by construction. The
+    /// scratch registers a compiler reads before writing land here -- `xor ecx,
+    /// ecx` reads `ecx` even though its result does not depend on it -- and so
+    /// does any incoming register outside the convention's argument slots.
+    ///
+    /// The object therefore exists from function entry holding an indeterminate
+    /// value, exactly as the machine does. Treating it as a local and demanding
+    /// an assignment before its first read asks for a definition that cannot
+    /// exist, which refused the whole function for saying what the program
+    /// actually does.
+    EntryValue,
 }
 
 /// One rendered C object. The name hint is presentation only, never identity.
@@ -66,6 +84,12 @@ pub(crate) struct Binding {
     declaration_type: CType,
     certificate: BindingCertificate,
     presentation_name_hint: Option<String>,
+    /// Whether some member of this binding is supplied by the caller.
+    ///
+    /// Derived from the graph -- a value with no defining instruction -- and
+    /// re-derived independently by the sealing oracle, never from a name or a
+    /// register spelling.
+    caller_supplied: bool,
 }
 
 impl Binding {
@@ -164,7 +188,7 @@ pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTr
 pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
     let graph = source.graph();
     let sites = certified_return_control_sites(source);
-    sites
+    let mut values = sites
         .iter()
         .filter_map(|site| graph.inst(site.inst)?.inputs.get(site.input_idx).copied())
         .collect::<BTreeSet<_>>()
@@ -173,7 +197,15 @@ pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BT
             let uses = graph.use_sites(*value);
             !uses.is_empty() && uses.iter().all(|site| sites.contains(site))
         })
-        .collect()
+        .collect::<BTreeSet<_>>();
+    values.extend(
+        source
+            .certificates()
+            .machine_return_controls
+            .values()
+            .flat_map(|certificate| certificate.values.iter().copied()),
+    );
+    values
 }
 
 /// Exact direct-branch target uses already represented by CFG topology.
@@ -223,6 +255,22 @@ pub(super) fn certified_direct_control_target_values(
         .collect()
 }
 
+/// Values whose complete use domain belongs to an exact upstream frame
+/// save/reload certificate. The certificate collector already proved the
+/// closure; this is only its renderer-facing projection.
+pub(super) fn certified_stack_frame_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    source
+        .certificates()
+        .stack_frame_round_trips
+        .values()
+        .flat_map(|certificate| certificate.values.iter().copied())
+        .collect()
+}
+
+pub(super) fn certified_stack_geometry_values(source: &r2ssa::SsaArtifact) -> &BTreeSet<ValueId> {
+    &source.certificates().stack_geometry.values
+}
+
 /// Failure of declaration placement or reaching-definition validation.
 ///
 /// Placement itself is deliberately absent: it is derived from the sealed
@@ -231,6 +279,8 @@ pub(super) fn certified_direct_control_target_values(
 pub(crate) enum PlacementRead {
     Use(UseSite),
     CertifiedValue { value: ValueId, at: InstId },
+    StackAccess(r2ssa::StructuredAccessId),
+    PreservedCarrierWrite(InstId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,8 +305,15 @@ pub(crate) enum PlacementRefusal {
 /// reconstructed from an offset or a rendered local name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StackObjectDisposition {
-    Bound { binding: BindingId },
-    Refused { reason: StackObjectRefusal },
+    Bound {
+        binding: BindingId,
+    },
+    Elided {
+        reason: r2ssa::ledger::ElisionReason,
+    },
+    Refused {
+        reason: StackObjectRefusal,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,13 +621,35 @@ impl BindingPlan {
                 _ => None,
             }
         });
-        let role = roles.next().unwrap_or(BindingRole::Local);
+        // A certified entity is the stronger claim and decides on its own. An
+        // argument slot is a caller-supplied value too, so the entity role has
+        // to be consulted first or every parameter would answer `EntryValue`.
+        let Some(role) = roles.next() else {
+            return Some(if binding.caller_supplied {
+                BindingRole::EntryValue
+            } else {
+                BindingRole::Local
+            });
+        };
         roles.all(|other| other == role).then_some(role)
     }
 
+    /// Whether the function signature declares this object, so the body must
+    /// not declare it again.
     pub(crate) fn binding_is_externally_declared(&self, binding: BindingId) -> Option<bool> {
         self.binding_role(binding)
             .map(|role| matches!(role, BindingRole::Parameter { .. }))
+    }
+
+    /// Whether the caller supplies this object's value without the signature
+    /// naming it.
+    ///
+    /// The body still declares it, because no parameter does, but it holds a
+    /// value on entry and therefore cannot be required to be assigned before
+    /// its first read.
+    pub(crate) fn binding_is_entry_declared(&self, binding: BindingId) -> Option<bool> {
+        self.binding_role(binding)
+            .map(|role| matches!(role, BindingRole::EntryValue))
     }
 
     pub(crate) fn stack_object_disposition(

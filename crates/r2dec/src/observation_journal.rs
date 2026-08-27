@@ -987,10 +987,18 @@ impl MarkedNativeDraft {
         )
         .map_err(NativePlacementFailure::Analysis)?;
         let mut externally_declared = BTreeSet::new();
+        let mut entry_declared = BTreeSet::new();
         for (binding, _) in placement.names.plan().bindings() {
             match placement.names.binding_is_externally_declared(binding) {
                 Some(true) => {
                     externally_declared.insert(binding);
+                }
+                Some(false) => {}
+                None => return Err(NativePlacementFailure::MissingBindingRole { binding }),
+            }
+            match placement.names.binding_is_entry_declared(binding) {
+                Some(true) => {
+                    entry_declared.insert(binding);
                 }
                 Some(false) => {}
                 None => return Err(NativePlacementFailure::MissingBindingRole { binding }),
@@ -1001,6 +1009,7 @@ impl MarkedNativeDraft {
             source.source().function(),
             placement.names.plan().binding_count(),
             &externally_declared,
+            &entry_declared,
             occurrences.reads(),
             occurrences.writes(),
         )

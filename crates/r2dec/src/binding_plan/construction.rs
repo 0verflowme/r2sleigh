@@ -195,8 +195,11 @@ pub(super) fn binding_components(
     let graph = source.graph();
     let value_count = graph.values.len();
     let unobserved_merges = source.unobserved_merges();
+    let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
+    let stack_frame_values = certified_stack_frame_values(source);
+    let stack_geometry_values = certified_stack_geometry_values(source);
     let structural_unused =
         source
             .obligations()
@@ -210,8 +213,11 @@ pub(super) fn binding_components(
         .map(|value| {
             value.var.constant_bits().is_none()
                 && !unobserved_merges.contains(value.id)
+                && !unobserved_values.contains(&value.id)
                 && !return_controls.contains(&value.id)
                 && !direct_control_targets.contains(&value.id)
+                && !stack_frame_values.contains(&value.id)
+                && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)
         })
         .collect::<Vec<_>>();
@@ -479,6 +485,9 @@ impl BindingPlan {
         let graph = source.graph();
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
+        let stack_frame_values = certified_stack_frame_values(source);
+        let stack_geometry_values = certified_stack_geometry_values(source);
+        let unobserved_values = source.unobserved_values();
         let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
             BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
         )?;
@@ -526,9 +535,33 @@ impl BindingPlan {
                         value: graph_value.id,
                     },
                 };
+            } else if stack_frame_values.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::StackFrame,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if stack_geometry_values.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DeadStackBase,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
             } else if source.unobserved_merges().contains(graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::UnobservedMerge,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if unobserved_values.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::UnobservedValue,
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,
@@ -590,6 +623,12 @@ impl BindingPlan {
                 .ok_or(BindingPlanBuildError::Seal(
                     BindingPlanSourceMismatch::CertificateMembership { binding },
                 ))?;
+            // A member with no defining instruction entered this function
+            // already holding its value, so the object exists from entry.
+            let caller_supplied = component
+                .members
+                .iter()
+                .any(|value| graph.def_inst(*value).is_none());
             bindings.push(Binding {
                 declaration_type: CType::machine_bits(width_bits),
                 certificate: BindingCertificate {
@@ -600,6 +639,7 @@ impl BindingPlan {
                         .into_boxed_slice(),
                 },
                 presentation_name_hint: Some(first.var.display_name()),
+                caller_supplied,
             });
         }
 
@@ -669,6 +709,7 @@ impl BindingPlan {
                             sources: Box::new([BindingCertificateSource::CertifiedEntity(entity)]),
                         },
                         presentation_name_hint: None,
+                        caller_supplied: false,
                     });
                     binding
                 }
@@ -696,6 +737,19 @@ impl BindingPlan {
                 else {
                     continue;
                 };
+                if source
+                    .certificates()
+                    .stack_frame_round_trips
+                    .contains_key(object)
+                {
+                    stack_objects.insert(
+                        *object,
+                        StackObjectDisposition::Elided {
+                            reason: r2ssa::ledger::ElisionReason::StackFrame,
+                        },
+                    );
+                    continue;
+                }
                 if source_slot.is_none() && callee_allocation.is_none()
                     || source_slot.is_some() && callee_allocation.is_some()
                 {
@@ -760,6 +814,7 @@ impl BindingPlan {
                         } else {
                             format!("stack_p{}", certificate.entry_offset.unsigned_abs())
                         }),
+                        caller_supplied: false,
                     });
                     stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
                     continue;
@@ -802,6 +857,7 @@ impl BindingPlan {
                             } else {
                                 format!("stack_p{}", offset.unsigned_abs())
                             }),
+                            caller_supplied: false,
                         });
                         stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
                     }

@@ -73,6 +73,10 @@ pub(crate) enum RenderedIdentityRefusal {
         object: ObjectId,
         reason: StackObjectRefusal,
     },
+    StackObjectElided {
+        object: ObjectId,
+        reason: r2ssa::ledger::ElisionReason,
+    },
     MachineUse {
         site: UseSite,
         reason: MachineUseRefusal,
@@ -215,7 +219,10 @@ impl BindingNameResolution {
                         }
                     }
                 }
-                Some(BindingRole::Local) => SymbolRole::Carrier,
+                // An incoming machine value renders as an ordinary object; the
+                // role only says the declaration comes from entry rather than
+                // from a statement.
+                Some(BindingRole::Local | BindingRole::EntryValue) => SymbolRole::Carrier,
                 None => {
                     return Err(BindingNameResolutionError::ConflictingCertifiedRoles(
                         binding_id,
@@ -315,19 +322,13 @@ impl BindingNameResolution {
         self.plan.binding_is_externally_declared(binding)
     }
 
+    pub(crate) fn binding_is_entry_declared(&self, binding: BindingId) -> Option<bool> {
+        self.plan.binding_is_entry_declared(binding)
+    }
+
     /// Resolve one plan-owned inline expression without exposing the plan.
     pub(crate) fn inline_expr(&self, expr: MachineExprId) -> Option<&r2ssa::MachineExpr> {
         self.plan.machine_projection().expr(expr)
-    }
-
-    /// Resolve one exact write projection through the sealed plan. As with
-    /// uses, register geometry remains owned by the source-backed machine
-    /// projection rather than being reconstructed from a rendered name.
-    pub(crate) fn write_disposition(
-        &self,
-        inst: r2ssa::InstId,
-    ) -> Option<&r2ssa::MachineWriteDisposition> {
-        self.plan.write_disposition(inst)
     }
 
     /// Require the exact sealed answer for one SSA value.
@@ -387,6 +388,9 @@ impl BindingNameResolution {
                 .symbol_for_binding(binding)
                 .map(PlannedStackSymbol::Bound)
                 .ok_or(RenderedIdentityRefusal::MissingBinding { binding }),
+            Some(StackObjectDisposition::Elided { reason }) => {
+                Err(RenderedIdentityRefusal::StackObjectElided { object, reason })
+            }
             Some(StackObjectDisposition::Refused { reason }) => {
                 Err(RenderedIdentityRefusal::StackObject { object, reason })
             }
