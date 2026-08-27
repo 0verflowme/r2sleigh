@@ -49,7 +49,7 @@ fi
 
 install_log="$artifact_root/plugin-install.log"
 make -C "$repo_root/r2plugin" RUST_FEATURES=all-archs install 2>&1 | tee "$install_log"
-if ! rg -q '^Installed to ' "$install_log"; then
+if ! grep -q '^Installed to ' "$install_log"; then
     echo "plugin install did not report its destination" >&2
     exit 70
 fi

@@ -279,6 +279,12 @@ PLACEMENT_AUDIT_CAUSE_FIELDS = {
     "certified_value_read_before_assignment": frozenset(
         {"binding_index", "value_id", "instruction_id"}
     ),
+    "stack_access_read_before_assignment": frozenset(
+        {"binding_index", "instruction_id", "access_ordinal"}
+    ),
+    "preserved_carrier_read_before_assignment": frozenset(
+        {"binding_index", "instruction_id"}
+    ),
     "unprovable_execution_order": frozenset({"binding_index"}),
     "ambiguous_observation_execution_order": frozenset({"observation_id"}),
     "missing_binding": frozenset({"binding_index"}),
@@ -979,6 +985,17 @@ def _score_render_refusal(envelope: dict[str, Any]) -> dict[str, Any]:
             if cause["kind"] != kind:
                 raise BindingAuditFormatError(
                     "placement render refusal kind disagrees with its cause"
+                )
+        elif kind in BINDING_AUDIT_JOURNAL_CAUSE_FIELDS:
+            refusal = _exact_object(
+                refusal,
+                {"schema_version", "status", "kind", "cause"},
+                context="observation-journal render refusal",
+            )
+            cause = _validate_binding_journal_cause(refusal["cause"])
+            if cause["kind"] != kind:
+                raise BindingAuditFormatError(
+                    "observation-journal render refusal kind disagrees with its cause"
                 )
         elif kind in RENDER_REFUSAL_KINDS:
             _exact_object(

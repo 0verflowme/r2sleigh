@@ -1416,8 +1416,18 @@ fn debug_log_ledger(prepared: &r2ssa::SsaArtifact, ledger: &r2ssa::ledger::Oblig
             .map(|((layer, reason), count)| (format!("{layer}/{reason}"), count))
             .collect(),
     );
+    let refused_ids = ledger
+        .entries()
+        .filter_map(|(id, outcome)| match outcome {
+            r2ssa::ledger::Outcome::Refused { layer, reason } => {
+                Some(format!("{id}={layer}/{reason}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let message = format!(
-        "LEDGER fn={:#x} total={} rendered={} elided={} refused={} unaccounted={} conflicts={} | unaccounted-kinds: {} | elided: {} | refused: {}",
+        "LEDGER fn={:#x} total={} rendered={} elided={} refused={} unaccounted={} conflicts={} | unaccounted-kinds: {} | elided: {} | refused: {} | refused-ids: {}",
         prepared.function().entry,
         closure.total,
         closure.rendered,
@@ -1428,6 +1438,7 @@ fn debug_log_ledger(prepared: &r2ssa::SsaArtifact, ledger: &r2ssa::ledger::Oblig
         ranked(ledger.unattributed_by_kind()),
         ranked(ledger.elisions_by_reason()),
         refusals,
+        refused_ids,
     );
     let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
         .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
@@ -1438,6 +1449,30 @@ fn debug_log_ledger(prepared: &r2ssa::SsaArtifact, ledger: &r2ssa::ledger::Oblig
     {
         use std::io::Write;
         let _ = writeln!(file, "{message}");
+    }
+}
+
+fn debug_log_render_contract_error(
+    prepared: &r2ssa::SsaArtifact,
+    stage: &str,
+    error: &impl std::fmt::Debug,
+) {
+    if !unowned_report_requested() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "RENDER_CONTRACT fn={:#x} stage={stage} error={error:?}",
+            prepared.function().entry
+        );
     }
 }
 
@@ -2874,6 +2909,15 @@ pub enum PlacementAuditRefusal {
         value_id: u32,
         instruction_id: u32,
     },
+    StackAccessReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+        access_ordinal: u32,
+    },
+    PreservedCarrierReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+    },
     UnprovableExecutionOrder {
         binding_index: usize,
     },
@@ -2947,6 +2991,10 @@ impl PlacementAuditRefusal {
             Self::CertifiedValueReadBeforeAssignment { .. } => {
                 "certified_value_read_before_assignment"
             }
+            Self::StackAccessReadBeforeAssignment { .. } => "stack_access_read_before_assignment",
+            Self::PreservedCarrierReadBeforeAssignment { .. } => {
+                "preserved_carrier_read_before_assignment"
+            }
             Self::UnprovableExecutionOrder { .. } => "unprovable_execution_order",
             Self::AmbiguousObservationExecutionOrder { .. } => {
                 "ambiguous_observation_execution_order"
@@ -2984,6 +3032,13 @@ impl PlacementAudit {
 pub enum DecompileRenderRefusal {
     MissingMachineProjectionAuthorization,
     MissingProgramVariableAuthorization,
+    /// The legacy observation journal could not be constructed.
+    ///
+    /// The journal already computes a precise typed cause. Reporting this as a
+    /// missing machine-projection authorization named a different authority
+    /// than the one that actually failed, so the corpus attributed every such
+    /// cell to the projection seam and the real cause was never counted.
+    ObservationJournal(BindingObservationJournalFailure),
     DeclarationPlacement(PlacementAuditRefusal),
     RefusedBindingDisposition {
         observations: BindingObservationAudit,
@@ -3002,6 +3057,7 @@ impl DecompileRenderRefusal {
                 "missing_machine_projection_authorization"
             }
             Self::MissingProgramVariableAuthorization => "missing_program_variable_authorization",
+            Self::ObservationJournal(failure) => failure.kind(),
             Self::DeclarationPlacement(refusal) => refusal.kind(),
             Self::RefusedBindingDisposition { .. } => "refused_binding_disposition",
             Self::NormalizationOriginUnavailable => "normalization_origin_unavailable",
@@ -3038,11 +3094,16 @@ impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
             BindingShadowAuditFailure::NonQualityObservations { observations } => {
                 Self::RefusedBindingDisposition { observations }
             }
+            // Each journal failure already carries the exact obligation that
+            // could not be sealed. Collapsing them into a machine-projection
+            // refusal named an authority that had not failed, so every such
+            // cell was attributed to the projection seam and the real cause
+            // was only visible in the separate shadow-audit record.
+            BindingShadowAuditFailure::JournalConstruction(failure)
+            | BindingShadowAuditFailure::JournalRecording(failure)
+            | BindingShadowAuditFailure::JournalSeal(failure) => Self::ObservationJournal(failure),
             BindingShadowAuditFailure::PlanBuild
             | BindingShadowAuditFailure::SourcePairing
-            | BindingShadowAuditFailure::JournalConstruction(_)
-            | BindingShadowAuditFailure::JournalRecording(_)
-            | BindingShadowAuditFailure::JournalSeal(_)
             | BindingShadowAuditFailure::Report
             | BindingShadowAuditFailure::IncompleteObservations { .. }
             | BindingShadowAuditFailure::NonQuality { .. } => {
@@ -3093,6 +3154,7 @@ fn rendered_identity_refusal_category(
         }
         | RenderedIdentityRefusal::Parameter { .. }
         | RenderedIdentityRefusal::StackObject { .. }
+        | RenderedIdentityRefusal::StackObjectElided { .. }
         | RenderedIdentityRefusal::MissingBinding { .. }
         | RenderedIdentityRefusal::MissingValueDisposition { .. }
         | RenderedIdentityRefusal::MissingParameterDisposition { .. }
@@ -3994,11 +4056,12 @@ impl Decompiler {
             } => fold_ctx
                 .extract_condition_from_block(block)
                 .map(|cond| {
-                    CStmt::if_stmt(
+                    let stmt = CStmt::if_stmt(
                         cond,
                         CStmt::Goto(Self::linear_block_label(*true_target)),
                         Some(CStmt::Goto(Self::linear_block_label(*false_target))),
-                    )
+                    );
+                    Self::observe_linearized_control_terminator(fold_ctx, block, stmt)
                 })
                 .or_else(|| {
                     Some(CStmt::comment(format!(
@@ -4008,7 +4071,11 @@ impl Decompiler {
                     )))
                 }),
             BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
-                Some(CStmt::Goto(Self::linear_block_label(*target)))
+                Some(Self::observe_linearized_control_terminator(
+                    fold_ctx,
+                    block,
+                    CStmt::Goto(Self::linear_block_label(*target)),
+                ))
             }
             BlockTerminator::Call {
                 fallthrough: Some(target),
@@ -4045,6 +4112,23 @@ impl Decompiler {
         }
     }
 
+    fn observe_linearized_control_terminator(
+        fold_ctx: &FoldingContext<'_>,
+        block: &r2ssa::FunctionSSABlock,
+        stmt: CStmt,
+    ) -> CStmt {
+        let Some(op_idx) = block.ops.len().checked_sub(1) else {
+            return stmt;
+        };
+        let obligations = fold_ctx.exact_effect_obligations_for_normalized_value(
+            crate::fold::context::EffectOccurrenceKind::Expression,
+            block.addr,
+            op_idx,
+            None,
+        );
+        fold_ctx.observe_effect_stmt(&obligations, stmt)
+    }
+
     fn build_function_internal_with_control<'a>(
         &self,
         input: &'a DecompilerInput,
@@ -4062,7 +4146,7 @@ impl Decompiler {
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             let graph = prepared.graph();
             let live = prepared.live_out();
-            let dead = r2ssa::deadphi::DeadPhis::find(func, graph, live);
+            let dead = prepared.unobserved_merges();
             let total: usize = func.blocks().map(|b| b.phis.len()).sum();
             eprintln!(
                 "MERGES fn={:#x} phis={} unobserved={} live_out={} unresolved={}",
@@ -4225,6 +4309,7 @@ impl Decompiler {
             match crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts()) {
                 Ok(plan) => std::rc::Rc::new(plan),
                 Err(error) => {
+                    debug_log_render_contract_error(prepared, "binding-plan", &error);
                     let refusal = match error {
                         crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
                         | crate::binding_plan::BindingPlanBuildError::Seal(
@@ -4248,6 +4333,7 @@ impl Decompiler {
             input.source_owned_facts(),
             &binding_plan,
         ) {
+            debug_log_render_contract_error(prepared, "planned-lowering-input", &error);
             let refusal = match error {
                 crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_) => {
                     DecompileRenderRefusal::MissingMachineProjectionAuthorization
@@ -4272,6 +4358,7 @@ impl Decompiler {
         ) {
             Ok(names) => std::rc::Rc::new(names),
             Err(error) => {
+                debug_log_render_contract_error(prepared, "binding-name-resolution", &error);
                 let refusal = match error {
                     crate::binding_plan::BindingNameResolutionError::Source(
                         crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
@@ -4302,12 +4389,14 @@ impl Decompiler {
             input.source_owned_facts(),
             &normalized_func,
             &normalization_origins,
-            Rc::clone(&binding_plan),
+            Rc::clone(&binding_names),
             Rc::clone(&symbol_table),
         ) {
             Ok(journal) => std::cell::RefCell::new(journal),
-            Err(_) => {
-                let refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization;
+            Err(error) => {
+                let refusal = DecompileRenderRefusal::ObservationJournal(
+                    BindingObservationJournalFailure::from(&error),
+                );
                 return Ok(InternalBuildProduct::refused(
                     residual_function_for_render_boundary(
                         &func_name,
@@ -4319,6 +4408,10 @@ impl Decompiler {
         };
         work.poll()?;
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!(
+                "SOURCE_INTERFACE {:?}",
+                prepared.machine_context().function_interface()
+            );
             // What materialisation left behind, so a carrier update that renders
             // more than once shows which ops the fold was handed.
             for block in normalized_func.blocks() {
@@ -4326,8 +4419,29 @@ impl Decompiler {
                     let op: &r2ssa::SSAOp = op;
                     let kind = format!("{op:?}");
                     let kind = kind.split([' ', '{']).next().unwrap_or("?");
+                    let origin = prepared
+                        .graph()
+                        .block_id_for_addr(block.addr)
+                        .and_then(|block| {
+                            normalization_origins.origin(crate::normalize::NormalizedOpSite {
+                                block,
+                                op_idx: index,
+                            })
+                        })
+                        .map(|origin| match origin {
+                            crate::normalize::NormalizedOpOrigin::Original(inst) => {
+                                format!("original:{}", inst.0)
+                            }
+                            crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(_) => {
+                                "phi-edge-copy".to_string()
+                            }
+                            crate::normalize::NormalizedOpOrigin::RelocatedInitializer(_) => {
+                                "relocated-initializer".to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "missing".to_string());
                     eprintln!(
-                        "NORMOP block={:#x} idx={index} kind={kind} dst={:?} srcs={:?}",
+                        "NORMOP block={:#x} idx={index} origin={origin} kind={kind} dst={:?} srcs={:?}",
                         block.addr,
                         op.dst().map(|var| var.display_name()),
                         op.sources()
@@ -4417,6 +4531,7 @@ impl Decompiler {
         ) {
             Ok(view) => view,
             Err(error) => {
+                debug_log_render_contract_error(prepared, "prepared-semantic-view", &error);
                 let refusal = match error {
                     analysis::prepared_semantic::PreparedSemanticViewBuildError::RenderedIdentity(
                         refusal,
@@ -4469,6 +4584,7 @@ impl Decompiler {
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
         let structuring_work = work.with_phase(DecompileWorkPhase::Structuring);
         if let Err(error) = fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work) {
+            debug_log_render_contract_error(prepared, "fold-analysis", &error);
             match error {
                 analysis::PreparedRuntimeFactsError::ExecutionStop(stop) => return Err(stop),
                 analysis::PreparedRuntimeFactsError::Lowering(refusal) => {
@@ -4486,14 +4602,23 @@ impl Decompiler {
         // Structure control flow (primary path: folded)
         let mut structurer =
             ControlFlowStructurer::new_with_control(func, &fold_ctx, structuring_work)?;
+        let tentative_observation_checkpoint = observation_journal.borrow().checkpoint();
+        let tentative_observation_error = fold_ctx.observation_error.borrow().clone();
 
         let routed_body = match consumer_structured::primary_body_for_semantic_route(
             semantic_route,
             &mut structurer,
             || self.linearize_function_body(func, &fold_ctx),
+            || {
+                observation_journal
+                    .borrow_mut()
+                    .rollback(tentative_observation_checkpoint);
+                *fold_ctx.observation_error.borrow_mut() = tentative_observation_error.clone();
+            },
         ) {
             Ok(body) => body,
             Err(structure::ControlFlowStructureError::Lowering(refusal)) => {
+                debug_log_render_contract_error(prepared, "control-structure-lowering", &refusal);
                 let function = residual_function_for_render_boundary(
                     &func
                         .name
@@ -4504,6 +4629,7 @@ impl Decompiler {
                 return Ok(InternalBuildProduct::refused(function, refusal.into()));
             }
             Err(structure::ControlFlowStructureError::StructuredRegion(error)) => {
+                debug_log_render_contract_error(prepared, "structured-region", &error);
                 return Ok(InternalBuildProduct::refused(
                     residual_function_for_render_boundary(
                         &func
@@ -4563,7 +4689,10 @@ impl Decompiler {
 
         let strings = self.context.function_facts.display_names().strings();
         fold_constant_arithmetic_in_function(&mut c_function, strings);
-        if single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names).is_err() {
+        if let Err(error) =
+            single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names)
+        {
+            debug_log_render_contract_error(prepared, "single-evaluation", &error);
             let refusal = DecompileRenderRefusal::MissingProgramVariableAuthorization;
             return Ok(InternalBuildProduct::refused(
                 residual_function_for_render_boundary(
@@ -4931,6 +5060,9 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
                 out.push(*id);
             }
             match stmt {
+                CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
+                    walk(std::slice::from_ref(stmt.as_ref()), out)
+                }
                 CStmt::Block(inner) => walk(inner, out),
                 CStmt::If {
                     then_body,
@@ -4967,6 +5099,9 @@ fn debug_assigned_locals(func: &CFunction, after: &str) {
                 n += 1;
             }
             match stmt {
+                CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
+                    n += count_returns(std::slice::from_ref(stmt.as_ref()))
+                }
                 CStmt::Block(inner) => n += count_returns(inner),
                 CStmt::If {
                     then_body,

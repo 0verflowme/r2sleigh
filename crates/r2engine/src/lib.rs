@@ -79,6 +79,7 @@ const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
 pub struct EngineSourceSnapshot {
     revision_identity: Box<[u8]>,
     function_interface: Option<r2ssa::SourceFunctionInterface>,
+    machine_roles: r2ssa::SourceMachineRoles,
     call_site_interfaces: Box<[r2ssa::SourceCallSiteInterface]>,
 }
 
@@ -103,6 +104,20 @@ impl EngineSourceSnapshot {
     pub fn new(
         revision_identity: impl Into<Vec<u8>>,
         function_interface: Option<r2ssa::SourceFunctionInterface>,
+        call_site_interfaces: impl IntoIterator<Item = r2ssa::SourceCallSiteInterface>,
+    ) -> Result<Self, EngineSourceSnapshotError> {
+        Self::new_with_machine_roles(
+            revision_identity,
+            function_interface,
+            r2ssa::SourceMachineRoles::default(),
+            call_site_interfaces,
+        )
+    }
+
+    pub fn new_with_machine_roles(
+        revision_identity: impl Into<Vec<u8>>,
+        function_interface: Option<r2ssa::SourceFunctionInterface>,
+        machine_roles: r2ssa::SourceMachineRoles,
         call_site_interfaces: impl IntoIterator<Item = r2ssa::SourceCallSiteInterface>,
     ) -> Result<Self, EngineSourceSnapshotError> {
         let revision_identity = revision_identity.into();
@@ -136,6 +151,7 @@ impl EngineSourceSnapshot {
         Ok(Self {
             revision_identity: revision_identity.into_boxed_slice(),
             function_interface,
+            machine_roles,
             call_site_interfaces: call_site_interfaces.into_boxed_slice(),
         })
     }
@@ -146,6 +162,10 @@ impl EngineSourceSnapshot {
 
     pub const fn function_interface(&self) -> Option<&r2ssa::SourceFunctionInterface> {
         self.function_interface.as_ref()
+    }
+
+    pub const fn machine_roles(&self) -> &r2ssa::SourceMachineRoles {
+        &self.machine_roles
     }
 
     pub const fn call_site_interfaces(&self) -> &[r2ssa::SourceCallSiteInterface] {
@@ -5330,6 +5350,9 @@ fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
         DecompileRenderRefusal::MissingProgramVariableAuthorization => {
             "native rendering refused: missing program-variable authorization"
         }
+        DecompileRenderRefusal::ObservationJournal(_) => {
+            "native rendering refused: observation journal"
+        }
         DecompileRenderRefusal::DeclarationPlacement(_) => {
             "native rendering refused: declaration placement"
         }
@@ -5841,10 +5864,11 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
     control: &C,
 ) -> Result<EngineAnalysis, r2ssa::SsaPrepareError> {
     let ssa_func = Arc::new(
-        r2ssa::SsaArtifact::for_decompile_with_interfaces_and_control(
+        r2ssa::SsaArtifact::for_decompile_with_interfaces_machine_roles_and_control(
             blocks,
             arch,
             source_snapshot.function_interface().cloned(),
+            *source_snapshot.machine_roles(),
             source_snapshot.call_site_interfaces().to_vec(),
             control,
         )?
