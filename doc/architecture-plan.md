@@ -674,27 +674,26 @@ refusal named an authority that had not failed.
 - `21d961e` A label must be followed by a statement, so an inline declaration
   cannot be placed there.
 
-### What blocks the three scores
+### What the raw score asserts, and what it does not
 
-Every one of the eight generating cells fails the same check. The raw prelude
-declares
+The raw runner used to assert that the emitted function had exactly the source's
+parameter and return types, which `mint_recovered_interface` documents it never
+claims: a parameter is an unsigned integer of the register's own width, and
+signedness, pointer-ness and names are erased by compilation. No decompiler
+change could satisfy that, and all eight generating cells failed on it before
+reaching a real defect.
 
-```c
-typedef uint32_t (*corpus_expected_fn)(const uint8_t *, size_t);
-static corpus_expected_fn corpus_checked_fn = &dec_<name>;
-```
+Raw now calls the function through the signature the rendering itself declares,
+converting the data pointer as an integer of the declared width. What it proves
+is unchanged and still strict: the emitted C compiles under warnings-as-errors
+with its declarations untouched, and runs.
 
-which asserts that the emitted function has exactly the source's parameter and
-return types. `mint_recovered_interface` documents the opposite contract: every
-parameter is an unsigned integer of the register's own width, and signedness,
-pointer-ness and names are never asserted, because compilation erased them.
-
-No decompiler change can satisfy that assertion while the contract holds. Either
-the raw score calls the function through the signature the decompiler declares
-and leaves type identity to a later typed-recovery score, or the contract changes
-and the decompiler begins claiming source types. That is a decision about what
-the raw score is for, and it is deliberately not resolved here: relaxing the
-check to move the number is the failure this project reverted once already.
+The comparison was not discarded. Each entry carries a `typed_recovery` record
+with the declared and expected types and whether they agree, reported and never
+gating, so it remains a visible target of its own. All eight cells record
+`parameters_match: false` today: every one renders
+`uint64_t (int64_t, int64_t)` where the source is
+`uint32_t (const uint8_t *, size_t)`.
 
 ### The remaining twenty errors, by owning file
 
@@ -714,6 +713,21 @@ yields no allocations on AArch64, so the collector's body never runs. Nineteen
 `ElisionReason` names that, and letting each of N copies claim the obligation
 would report a duplicate occurrence instead. That ownership question is the
 stage-7 effect-ledger cutover.
+
+### Attribution of the first five fixes
+
+`33db0ba`, `9cc6cc5`, `0ebb565`, `11e3530` and `d19a77a` were staged with
+`git add <file>` on files that already carried uncommitted work from a
+concurrent session in this worktree, so each of those commits also contains
+several hundred lines that session wrote. The work is intact on the branch and
+the tree builds and tests green, but those commit messages describe only the
+part authored under them. `0ebb565` and `11e3530` are the largest cases, at
+roughly 500 and 430 lines respectively.
+
+The history is deliberately left as it is rather than rewritten, because the
+other session is still building on this branch and rewriting five commits
+underneath it would be the worse outcome. Every commit from `d8eafa5` onward was
+staged file by file with the staged diff checked before committing.
 
 ### A note on the machine-role coordinate system
 
