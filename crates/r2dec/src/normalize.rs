@@ -103,6 +103,16 @@ pub(crate) struct NormalizedOutputProjection {
 pub(crate) struct NormalizedOpProjection {
     pub(crate) inputs: Box<[NormalizedInputProjection]>,
     pub(crate) output: Option<NormalizedOutputProjection>,
+    /// Address of the normalized block this operation is emitted in.
+    ///
+    /// Normalization materializes one phi definition as a copy on each incoming
+    /// edge, so several emitted operations project onto one original
+    /// instruction and each lives in the predecessor that supplies its edge; a
+    /// relocated initializer likewise lives where it was moved to. The original
+    /// `InstId` therefore says what an operation implements and not where it
+    /// is, so anything that needs the location has to be told it rather than
+    /// recover it from the instruction's own block.
+    pub(crate) block: u64,
 }
 
 /// Original phi instruction removed after all of its edges were materialized.
@@ -278,6 +288,7 @@ impl NormalizationOrigins {
         site: NormalizedOpSite,
         graph: &SsaGraph,
     ) -> Option<NormalizedOpProjection> {
+        let emitted_block = self.blocks.get(site.block.0 as usize)?.address;
         match self.origin(site)? {
             NormalizedOpOrigin::Original(inst) => {
                 let source = graph.inst(*inst)?;
@@ -299,7 +310,11 @@ impl NormalizationOrigins {
                 let output = source
                     .output
                     .map(|value| NormalizedOutputProjection { inst: *inst, value });
-                Some(NormalizedOpProjection { inputs, output })
+                Some(NormalizedOpProjection {
+                    inputs,
+                    output,
+                    block: emitted_block,
+                })
             }
             NormalizedOpOrigin::PhiEdgeCopy(origin) => {
                 let highest_input = origin.guarded.map_or(origin.incoming_input_idx, |guarded| {
@@ -335,6 +350,7 @@ impl NormalizationOrigins {
                         inst: origin.definition.inst,
                         value: origin.definition.value,
                     }),
+                    block: emitted_block,
                 })
             }
             NormalizedOpOrigin::RelocatedInitializer(origin) => Some(NormalizedOpProjection {
@@ -347,6 +363,7 @@ impl NormalizationOrigins {
                     inst: origin.definition.inst,
                     value: origin.definition.value,
                 }),
+                block: emitted_block,
             }),
         }
     }
@@ -390,6 +407,18 @@ impl NormalizationOrigins {
                     && origin.target == successor
                     && origin.guarded.is_none()
         )
+    }
+
+    /// Whether this exact normalized operation was introduced to materialize a
+    /// source phi edge.
+    ///
+    /// Operation shape is not evidence for synthetic origin: an original
+    /// program `Copy` may have the same source and destination binding after
+    /// carrier coalescing.  Consumers that suppress materialization plumbing
+    /// must consult this sealed sidecar instead of reclassifying the operation.
+    #[cfg(test)]
+    pub(crate) fn is_phi_edge_copy(&self, site: NormalizedOpSite) -> bool {
+        matches!(self.origin(site), Some(NormalizedOpOrigin::PhiEdgeCopy(_)))
     }
 
     pub(crate) fn validate(
@@ -1161,8 +1190,7 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     // `DeadPhis` already says which merges nothing observes; those stay merges
     // and cost nothing.
     let graph = prepared.graph();
-    let live = prepared.live_out();
-    let dead = r2ssa::deadphi::DeadPhis::find(func, graph, live);
+    let dead = prepared.unobserved_merges();
     materialize_phis_where_with_control(
         func,
         graph,
@@ -2437,6 +2465,10 @@ mod tests {
         else {
             panic!("guarded select must stay typed synthetic")
         };
+        assert!(origins.is_phi_edge_copy(NormalizedOpSite {
+            block: latch_id,
+            op_idx: select_idx,
+        }));
         assert_eq!(
             edge.incoming.input_idx, 1,
             "backedge is the second phi input"
@@ -2455,6 +2487,13 @@ mod tests {
             }),
             Some(NormalizedOpOrigin::Original(inst)) if *inst == original_terminator
         ));
+        assert!(
+            !origins.is_phi_edge_copy(NormalizedOpSite {
+                block: latch_id,
+                op_idx: latch.ops.len() - 1,
+            }),
+            "an original operation must never be reclassified from its shape"
+        );
         let mut forged = origins.clone();
         forged.rows_mut(latch_id).expect("latch origin rows").pop();
         assert_eq!(

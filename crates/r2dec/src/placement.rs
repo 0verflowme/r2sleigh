@@ -66,14 +66,39 @@ pub(crate) struct FinalBindingWrite {
 /// Placement-relevant projection of the observation journal's private target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementObservationTarget {
-    Use(UseSite),
+    Use {
+        site: UseSite,
+        /// Where the normalized operation consuming this use is emitted, which
+        /// is not the consuming instruction's own block when normalization
+        /// materialized that operation on an edge.
+        block: u64,
+    },
     CertifiedValueRead {
         value: r2ssa::ValueId,
         at: InstId,
         binding: BindingId,
         symbol: crate::symbol::SymbolId,
     },
-    Write(InstId),
+    Write {
+        inst: InstId,
+        projection: r2ssa::MachineWriteProjection,
+        /// Where the normalized definition is emitted.
+        ///
+        /// Normalization materializes one phi definition as a copy on each
+        /// incoming edge, so several emitted operations implement one original
+        /// instruction and each lives in the predecessor that supplies its
+        /// edge. Taking the block from `inst` gave every copy the phi's own
+        /// block, which put an occurrence in a region whose entry cannot
+        /// dominate it.
+        block: u64,
+    },
+    StackAccess {
+        access: r2ssa::StructuredAccessId,
+        object: r2ssa::ObjectId,
+        binding: BindingId,
+        symbol: crate::symbol::SymbolId,
+        is_write: bool,
+    },
     Other,
 }
 
@@ -130,6 +155,37 @@ pub(crate) fn collect_final_placement_occurrences(
                 return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
             }
         }
+        if let PlacementObservationTarget::StackAccess {
+            access,
+            object,
+            binding,
+            symbol,
+            is_write,
+        } = target
+        {
+            if !stack_access_matches(source, names, access, object, binding, symbol, is_write) {
+                return Err(PlacementAnalysisError::InvalidUse {
+                    site: UseSite {
+                        inst: access.inst,
+                        input_idx: 0,
+                    },
+                });
+            }
+            let RenderObservationNode::Expr(expr) = node else {
+                return Err(if is_write {
+                    PlacementAnalysisError::UnobservedBindingWrite { binding }
+                } else {
+                    PlacementAnalysisError::UnobservedBindingRead { binding }
+                });
+            };
+            if !expr_reads_symbol(expr, symbol) {
+                return Err(if is_write {
+                    PlacementAnalysisError::UnobservedBindingWrite { binding }
+                } else {
+                    PlacementAnalysisError::UnobservedBindingRead { binding }
+                });
+            }
+        }
         let index = id.index() as usize;
         targets[index] = Some(target);
         statement_assignment[index] = match node {
@@ -151,9 +207,10 @@ pub(crate) fn collect_final_placement_occurrences(
         if matches!(
             target,
             Some(
-                PlacementObservationTarget::Use(_)
+                PlacementObservationTarget::Use { .. }
                     | PlacementObservationTarget::CertifiedValueRead { .. }
-                    | PlacementObservationTarget::Write(_)
+                    | PlacementObservationTarget::Write { .. }
+                    | PlacementObservationTarget::StackAccess { .. }
             )
         ) {
             match scoped[index] {
@@ -181,7 +238,7 @@ pub(crate) fn collect_final_placement_occurrences(
         };
         let observation = RenderObservationId::from_dense_index(index);
         match target.expect("only reachable observations receive a scope") {
-            PlacementObservationTarget::Use(site) => {
+            PlacementObservationTarget::Use { site, block } => {
                 let inst = graph
                     .inst(site.inst)
                     .ok_or(PlacementAnalysisError::InvalidUse { site })?;
@@ -190,10 +247,6 @@ pub(crate) fn collect_final_placement_occurrences(
                     .get(site.input_idx)
                     .ok_or(PlacementAnalysisError::InvalidUse { site })?;
                 if let Some(binding) = bound_value(names, value)? {
-                    let block = graph
-                        .block(inst.block)
-                        .ok_or(PlacementAnalysisError::InvalidUse { site })?
-                        .addr;
                     reads.push(FinalBindingRead {
                         binding,
                         source: PlacementRead::Use(site),
@@ -226,7 +279,11 @@ pub(crate) fn collect_final_placement_occurrences(
                     });
                 }
             }
-            PlacementObservationTarget::Write(inst_id) => {
+            PlacementObservationTarget::Write {
+                inst: inst_id,
+                projection,
+                block,
+            } => {
                 let inst = graph
                     .inst(inst_id)
                     .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?;
@@ -234,10 +291,15 @@ pub(crate) fn collect_final_placement_occurrences(
                     .output
                     .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?;
                 if let Some(binding) = bound_value(names, value)? {
-                    let block = graph
-                        .block(inst.block)
-                        .ok_or(PlacementAnalysisError::InvalidWrite { inst: inst_id })?
-                        .addr;
+                    if matches!(projection, r2ssa::MachineWriteProjection::Insert { .. }) {
+                        reads.push(FinalBindingRead {
+                            binding,
+                            source: PlacementRead::PreservedCarrierWrite(inst_id),
+                            region,
+                            block,
+                            order,
+                        });
+                    }
                     writes.push(FinalBindingWrite {
                         binding,
                         inst: inst_id,
@@ -247,6 +309,50 @@ pub(crate) fn collect_final_placement_occurrences(
                         observation,
                         inline_eligible: statement_assignment[index]
                             == names.symbol_for_binding(binding),
+                    });
+                }
+            }
+            PlacementObservationTarget::StackAccess {
+                access,
+                object: _,
+                binding,
+                symbol: _,
+                is_write,
+            } => {
+                let inst = graph
+                    .inst(access.inst)
+                    .ok_or(PlacementAnalysisError::InvalidUse {
+                        site: UseSite {
+                            inst: access.inst,
+                            input_idx: 0,
+                        },
+                    })?;
+                let block = graph
+                    .block(inst.block)
+                    .ok_or(PlacementAnalysisError::InvalidUse {
+                        site: UseSite {
+                            inst: access.inst,
+                            input_idx: 0,
+                        },
+                    })?
+                    .addr;
+                if is_write {
+                    writes.push(FinalBindingWrite {
+                        binding,
+                        inst: access.inst,
+                        region,
+                        block,
+                        order,
+                        observation,
+                        inline_eligible: false,
+                    });
+                } else {
+                    reads.push(FinalBindingRead {
+                        binding,
+                        source: PlacementRead::StackAccess(access),
+                        region,
+                        block,
+                        order,
                     });
                 }
             }
@@ -344,9 +450,10 @@ fn observation_is_placement_relevant(
     matches!(
         observation_target(targets, id),
         Some(
-            PlacementObservationTarget::Use(_)
+            PlacementObservationTarget::Use { .. }
                 | PlacementObservationTarget::CertifiedValueRead { .. }
-                | PlacementObservationTarget::Write(_)
+                | PlacementObservationTarget::Write { .. }
+                | PlacementObservationTarget::StackAccess { .. }
         )
     )
 }
@@ -357,7 +464,10 @@ fn observation_is_write(
 ) -> bool {
     matches!(
         observation_target(targets, id),
-        Some(PlacementObservationTarget::Write(_))
+        Some(
+            PlacementObservationTarget::Write { .. }
+                | PlacementObservationTarget::StackAccess { is_write: true, .. }
+        )
     )
 }
 
@@ -370,6 +480,51 @@ fn expression_has_placement_write(
         has_write |= observation_is_write(targets, id);
     });
     has_write
+}
+
+/// Return the exact stack-write markers on a direct variable assignment
+/// target.
+///
+/// A certified stack-object lvalue is already a `BindingId`-owned C variable,
+/// so evaluating that lvalue has no address computation or side effect.  C
+/// sequences the assignment itself after the right-hand value computation;
+/// retaining this narrow shape lets placement order the stack write without
+/// pretending that arbitrary binary operands have a defined evaluation order.
+fn direct_stack_assignment_writes(
+    expr: &CExpr,
+    targets: &[Option<PlacementObservationTarget>],
+) -> Option<Vec<RenderObservationId>> {
+    fn collect(
+        expr: &CExpr,
+        targets: &[Option<PlacementObservationTarget>],
+        writes: &mut Vec<RenderObservationId>,
+    ) -> bool {
+        match expr {
+            CExpr::Observed { id, expr }
+                if matches!(
+                    observation_target(targets, *id),
+                    Some(PlacementObservationTarget::StackAccess { is_write: true, .. })
+                ) =>
+            {
+                writes.push(*id);
+                collect(expr, targets, writes)
+            }
+            CExpr::Observed { id, expr }
+                if matches!(
+                    observation_target(targets, *id),
+                    Some(PlacementObservationTarget::Other)
+                ) =>
+            {
+                collect(expr, targets, writes)
+            }
+            CExpr::Paren(expr) => collect(expr, targets, writes),
+            CExpr::Var(_) => true,
+            _ => false,
+        }
+    }
+
+    let mut writes = Vec::new();
+    (collect(expr, targets, &mut writes) && !writes.is_empty()).then_some(writes)
 }
 
 fn record_completion_observations(
@@ -444,6 +599,28 @@ fn collect_expr_observation_scopes(
             if expression_has_placement_write(right, targets) {
                 record_ambiguous_expr_group([right.as_ref()], current, order, scoped);
             } else {
+                collect_expr_observation_scopes(right, current, targets, order, scoped);
+            }
+        }
+        CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        } => {
+            if let Some(writes) = direct_stack_assignment_writes(left, targets) {
+                collect_expr_observation_scopes(right, current, targets, order, scoped);
+                record_observation_group(&writes, current, false, order, scoped);
+            } else if expression_has_placement_write(left, targets)
+                || expression_has_placement_write(right, targets)
+            {
+                record_ambiguous_expr_group(
+                    [left.as_ref(), right.as_ref()],
+                    current,
+                    order,
+                    scoped,
+                );
+            } else {
+                collect_expr_observation_scopes(left, current, targets, order, scoped);
                 collect_expr_observation_scopes(right, current, targets, order, scoped);
             }
         }
@@ -1185,7 +1362,7 @@ fn target_authorizes_binding(
 ) -> bool {
     let graph = source.graph();
     match (target, access) {
-        (PlacementObservationTarget::Use(site), SymbolAccess::Read) => graph
+        (PlacementObservationTarget::Use { site, .. }, SymbolAccess::Read) => graph
             .inst(site.inst)
             .and_then(|inst| inst.inputs.get(site.input_idx))
             .and_then(|value| names.disposition_for_value(*value))
@@ -1211,20 +1388,30 @@ fn target_authorizes_binding(
                     symbol,
                 )
         }
-        (PlacementObservationTarget::Write(inst), SymbolAccess::Write) => graph
+        (
+            PlacementObservationTarget::Write {
+                inst,
+                projection: _,
+                block: _,
+            },
+            SymbolAccess::Write,
+        ) => graph
             .inst(inst)
             .and_then(|inst| inst.output)
             .and_then(|value| names.disposition_for_value(value))
             .is_some_and(|disposition| {
                 matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
             }),
-        (PlacementObservationTarget::Write(inst), SymbolAccess::Read) => {
-            matches!(
-                names.write_disposition(inst),
-                Some(r2ssa::MachineWriteDisposition::Exact(
-                    r2ssa::MachineWriteProjection::Insert { .. }
-                ))
-            ) && graph
+        (
+            PlacementObservationTarget::Write {
+                inst,
+                projection,
+                block: _,
+            },
+            SymbolAccess::Read,
+        ) => {
+            matches!(projection, r2ssa::MachineWriteProjection::Insert { .. })
+                && graph
                 .inst(inst)
                 .and_then(|inst| inst.output)
                 .and_then(|value| names.disposition_for_value(value))
@@ -1232,7 +1419,51 @@ fn target_authorizes_binding(
                     matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
                 })
         }
-        (PlacementObservationTarget::Use(_), SymbolAccess::Write)
+        (
+            PlacementObservationTarget::StackAccess {
+                access,
+                object,
+                binding: stack_binding,
+                symbol,
+                is_write,
+            },
+            SymbolAccess::Write,
+        ) => {
+            is_write
+                && stack_binding == binding
+                && stack_access_matches(
+                    source,
+                    names,
+                    access,
+                    object,
+                    stack_binding,
+                    symbol,
+                    true,
+                )
+        }
+        (
+            PlacementObservationTarget::StackAccess {
+                access,
+                object,
+                binding: stack_binding,
+                symbol,
+                is_write,
+            },
+            SymbolAccess::Read,
+        ) => {
+            !is_write
+                && stack_binding == binding
+                && stack_access_matches(
+                    source,
+                    names,
+                    access,
+                    object,
+                    stack_binding,
+                    symbol,
+                    false,
+                )
+        }
+        (PlacementObservationTarget::Use { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::CertifiedValueRead { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::Other, _) => false,
     }
@@ -1272,6 +1503,35 @@ fn certified_value_read_matches(
         && matches!(
             names.disposition_for_value(value),
             Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
+        )
+        && names.symbol_for_binding(binding) == Some(symbol)
+}
+
+/// Revalidate one stack-object occurrence without resolving a stack offset or
+/// inspecting a presentation spelling.
+fn stack_access_matches(
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    access: r2ssa::StructuredAccessId,
+    object: r2ssa::ObjectId,
+    binding: BindingId,
+    symbol: crate::symbol::SymbolId,
+    is_write: bool,
+) -> bool {
+    source
+        .structured()
+        .memory_accesses
+        .get(&access)
+        .is_some_and(|fact| {
+            fact.id == access
+                && fact.object == object
+                && fact.is_write == is_write
+                && fact.provenance_complete
+        })
+        && matches!(
+            names.plan().stack_object_disposition(object),
+            Some(crate::binding_plan::StackObjectDisposition::Bound { binding: owner })
+                if owner == binding
         )
         && names.symbol_for_binding(binding) == Some(symbol)
 }
@@ -1986,6 +2246,17 @@ impl Occurrence {
                 at.0,
                 value.0 as usize,
             ),
+            OccurrenceKind::Read(PlacementRead::StackAccess(access)) => (
+                self.order,
+                0,
+                self.block,
+                self.region.index(),
+                access.inst.0,
+                access.ordinal as usize,
+            ),
+            OccurrenceKind::Read(PlacementRead::PreservedCarrierWrite(inst)) => {
+                (self.order, 0, self.block, self.region.index(), inst.0, 0)
+            }
             OccurrenceKind::Write { inst, .. } => {
                 (self.order, 1, self.block, self.region.index(), inst.0, 0)
             }
@@ -2504,6 +2775,47 @@ mod tests {
     }
 
     #[test]
+    fn inserted_carrier_write_reads_before_its_same_occurrence_write() {
+        let region = Region::Block(0x1000);
+        let regions = StructuredRegionDraft::from_region(0x1000, &region)
+            .expect("single block region")
+            .seal();
+        let cfg = TestCfg::new(0x1000, &[]);
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let block_region = region_with_entry(&regions, 0x1000, StructuredRegionKind::Block);
+        let inst = InstId(0);
+        let order = FinalOccurrenceOrder(0);
+        let reads = [FinalBindingRead {
+            binding,
+            source: PlacementRead::PreservedCarrierWrite(inst),
+            region: block_region,
+            block: 0x1000,
+            order,
+        }];
+        let writes = [FinalBindingWrite {
+            binding,
+            inst,
+            region: block_region,
+            block: 0x1000,
+            order,
+            observation: observation(0),
+            inline_eligible: true,
+        }];
+
+        let decisions = derive_with_cfg(&regions, &cfg, 1, &BTreeSet::new(), &reads, &writes)
+            .expect("typed placement result");
+        assert_eq!(
+            decisions.decision(binding),
+            Some(PlacementDecision::Refused(
+                PlacementRefusal::ReadBeforeAssignment {
+                    binding,
+                    read: PlacementRead::PreservedCarrierWrite(inst),
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn one_dominating_write_is_inlined_at_its_exact_assignment() {
         let region = Region::Sequence(vec![Region::Block(0x1000), Region::Block(0x1010)]);
         let regions = StructuredRegionDraft::from_region(0x1000, &region)
@@ -2734,15 +3046,25 @@ mod tests {
         .expect("sealed comma expression");
         let (statement, regions) = sealed.into_marked_parts();
         let targets = [
-            Some(PlacementObservationTarget::Use(UseSite {
-                inst: InstId(0),
-                input_idx: 0,
-            })),
-            Some(PlacementObservationTarget::Write(InstId(1))),
-            Some(PlacementObservationTarget::Use(UseSite {
-                inst: InstId(2),
-                input_idx: 0,
-            })),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(0),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Write {
+                inst: InstId(1),
+                projection: r2ssa::MachineWriteProjection::Full,
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(2),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
         ];
         let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
         let order_of = |index| match scopes[index] {
@@ -2770,11 +3092,18 @@ mod tests {
         .expect("sealed alternative expression");
         let (statement, regions) = sealed.into_marked_parts();
         let targets = [
-            Some(PlacementObservationTarget::Write(InstId(0))),
-            Some(PlacementObservationTarget::Use(UseSite {
-                inst: InstId(1),
-                input_idx: 0,
-            })),
+            Some(PlacementObservationTarget::Write {
+                inst: InstId(0),
+                projection: r2ssa::MachineWriteProjection::Full,
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(1),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
         ];
         let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
 
@@ -2798,15 +3127,77 @@ mod tests {
         .expect("sealed unsequenced expression");
         let (statement, regions) = sealed.into_marked_parts();
         let targets = [
-            Some(PlacementObservationTarget::Write(InstId(0))),
-            Some(PlacementObservationTarget::Use(UseSite {
-                inst: InstId(1),
-                input_idx: 0,
-            })),
+            Some(PlacementObservationTarget::Write {
+                inst: InstId(0),
+                projection: r2ssa::MachineWriteProjection::Full,
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(1),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
         ];
         let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
 
         assert_eq!(scopes[0], Some(FinalObservationScope::Ambiguous));
         assert_eq!(scopes[1], Some(FinalObservationScope::Ambiguous));
+    }
+
+    #[test]
+    fn final_scope_sequences_direct_stack_assignment_after_its_value() {
+        let stack_write = observation(0);
+        let elided_address_use = observation(1);
+        let value_read = observation(2);
+        let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
+        let symbol = symbols.borrow_mut().declare(
+            "stack_m16",
+            crate::ast::CType::UInt(32),
+            SymbolRole::StackLocal(-16),
+        );
+        let expression = CExpr::assign(
+            CExpr::observed(
+                elided_address_use,
+                CExpr::observed(stack_write, CExpr::Var(symbol)),
+            ),
+            CExpr::observed(value_read, CExpr::UIntLit(7)),
+        );
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Expr(expression),
+        ))
+        .expect("sealed stack assignment");
+        let (statement, regions) = sealed.into_marked_parts();
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let targets = [
+            Some(PlacementObservationTarget::StackAccess {
+                access: r2ssa::StructuredAccessId {
+                    inst: InstId(0),
+                    ordinal: 0,
+                },
+                object: r2ssa::ObjectId(0),
+                binding,
+                symbol,
+                is_write: true,
+            }),
+            Some(PlacementObservationTarget::Other),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(0),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
+        ];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
+        let order_of = |index| match scopes[index] {
+            Some(FinalObservationScope::Exact { order, .. }) => order,
+            other => panic!("expected exact scope, got {other:?}"),
+        };
+
+        assert!(order_of(2) < order_of(0));
+        assert_eq!(scopes[1], None);
     }
 }

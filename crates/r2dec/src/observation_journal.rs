@@ -88,10 +88,15 @@ enum ObservationTarget {
     Use {
         site: UseSite,
         observation: LegacyUseObservation,
+        /// Where the normalized operation consuming this use is emitted.
+        block: u64,
     },
     Write {
         inst: InstId,
         observation: LegacyWriteObservation,
+        /// Where the normalized definition is emitted, which is not the
+        /// original instruction's block when normalization materialized it.
+        block: u64,
     },
     StackAccess {
         access: r2ssa::StructuredAccessId,
@@ -1249,19 +1254,27 @@ impl LegacyObservationJournal {
                     symbol: *symbol,
                 },
             ),
-            ObservationTarget::Use { site, .. } => Some(
+            ObservationTarget::Use { site, block, .. } => Some(
                 self.source
                     .graph()
                     .inst(site.inst)
                     .and_then(|inst| inst.inputs.get(site.input_idx))
                     .and_then(|value| self.plan.disposition(*value))
                     .and_then(|disposition| {
-                        matches!(disposition, ValueDisposition::Bound { .. })
-                            .then_some(crate::placement::PlacementObservationTarget::Use(*site))
+                        matches!(disposition, ValueDisposition::Bound { .. }).then_some(
+                            crate::placement::PlacementObservationTarget::Use {
+                                site: *site,
+                                block: *block,
+                            },
+                        )
                     })
                     .unwrap_or(crate::placement::PlacementObservationTarget::Other),
             ),
-            ObservationTarget::Write { inst, observation } => Some(
+            ObservationTarget::Write {
+                inst,
+                observation,
+                block,
+            } => Some(
                 self.source
                     .graph()
                     .inst(*inst)
@@ -1274,6 +1287,7 @@ impl LegacyObservationJournal {
                                     crate::placement::PlacementObservationTarget::Write {
                                         inst: *inst,
                                         projection: *projection,
+                                        block: *block,
                                     }
                                 }
                                 _ => crate::placement::PlacementObservationTarget::Other,
@@ -1847,7 +1861,11 @@ impl LegacyObservationJournal {
         &mut self,
         site: NormalizedOpSite,
     ) -> Result<(RenderObservationId, RenderObservationId), LegacyObservationJournalError> {
-        let output = self.normalized_output(site)?;
+        let projection = self.normalized_projection(site)?;
+        let block = projection.block;
+        let output = projection
+            .output
+            .ok_or(LegacyObservationJournalError::MissingNormalizedOutput(site))?;
         self.value_slot(output.value)?;
         let write = self.rendered_write_observation(output.inst)?;
         self.allocate_pair(
@@ -1855,6 +1873,7 @@ impl LegacyObservationJournal {
             ObservationTarget::Write {
                 inst: output.inst,
                 observation: write,
+                block,
             },
         )
     }
@@ -2056,8 +2075,9 @@ impl LegacyObservationJournal {
         input_idx: usize,
         expr: CExpr,
     ) -> Result<CExpr, LegacyObservationJournalError> {
-        let input = self
-            .normalized_projection(site)?
+        let projection = self.normalized_projection(site)?;
+        let block = projection.block;
+        let input = projection
             .inputs
             .get(input_idx)
             .cloned()
@@ -2068,6 +2088,7 @@ impl LegacyObservationJournal {
             targets.push(ObservationTarget::Use {
                 site: use_site,
                 observation,
+                block,
             });
         }
         let mut marked = expr;
@@ -2226,15 +2247,6 @@ impl LegacyObservationJournal {
 
     pub(crate) fn is_coalesced_carrier_copy(&self, site: NormalizedOpSite) -> bool {
         self.coalesced_carrier_copy_sites.contains(&site)
-    }
-
-    fn normalized_output(
-        &self,
-        site: NormalizedOpSite,
-    ) -> Result<crate::normalize::NormalizedOutputProjection, LegacyObservationJournalError> {
-        self.normalized_projection(site)?
-            .output
-            .ok_or(LegacyObservationJournalError::MissingNormalizedOutput(site))
     }
 
     fn rendered_use_observation(
@@ -2413,14 +2425,14 @@ impl LegacyObservationJournal {
                                 )
                             })
                     }
-                    ObservationTarget::Use { site, observation } => {
-                        record_same(&mut uses[site.inst.0 as usize][site.input_idx], observation)
-                            .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))
-                    }
-                    ObservationTarget::Write { inst, observation } => {
-                        record_same(&mut writes[inst.0 as usize], observation)
-                            .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst))
-                    }
+                    ObservationTarget::Use {
+                        site, observation, ..
+                    } => record_same(&mut uses[site.inst.0 as usize][site.input_idx], observation)
+                        .map_err(|()| LegacyObservationJournalError::ConflictingUse(site)),
+                    ObservationTarget::Write {
+                        inst, observation, ..
+                    } => record_same(&mut writes[inst.0 as usize], observation)
+                        .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst)),
                     ObservationTarget::StackAccess { .. } => Ok(()),
                     ObservationTarget::Effect(id) => {
                         let occurrences = effect_occurrences
