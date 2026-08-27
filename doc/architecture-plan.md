@@ -802,6 +802,31 @@ its operands must never be demanded. Five attempts have each removed one more
 reason the value is still reached; this is the sixth and it is the one that
 decides whether the approach works at all.
 
+### Attempts six and seven, and what to do instead
+
+Guarding both lowering modes leaves the plan build itself failing, and
+`R2SLEIGH_DEBUG_UNOWNED` names it exactly:
+`Seal(InvalidElisionProof { value: ValueId(223) })`. The sealing oracle
+re-derives every elision reason independently and `DeadFlagOnly` had no arm.
+Adding one lets the plan build and moves the refusal on to
+`exact_use_requires_rendered_occurrence`. Eliding the uses and writes of
+unrendered values in turn takes generation from eight functions to zero.
+
+Three pieces are worth keeping when someone returns to this. Narrowing
+eligibility to flag consumers -- a register-spaced output of a single byte,
+which a loop carrier's merge can never be -- is sound and does remove the unused
+variables. The `DeadFlagOnly` arm in the seal's proof validator is correct and
+required. The `lower_op` guard is in the right place.
+
+What is not understood is how many consumers still demand these values. Seven
+attempts each found exactly one more, serially, at a build and corpus cycle
+apiece, and the last showed the failure is not monotonic: three functions
+regressing became nothing rendering in a single step. The next attempt should
+enumerate rather than iterate -- instrument every producer of
+`MissingProgramVariableAuthorization` and
+`exact_use_requires_rendered_occurrence` at once and take the whole list in one
+run before changing anything.
+
 ### A note on the machine-role coordinate system
 
 `SourceMachineRoles` storages arrive from radare2's register profile
