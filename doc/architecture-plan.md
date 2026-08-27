@@ -762,10 +762,30 @@ unobserved and structural-unused reasons. The premise is unsound. An unobserved
 be unobserved while the update feeding it is genuinely rendered -- so "every use
 feeds something unobserved" does not imply dead.
 
-What remains true is the first observation: the plan and the renderer disagree
-about these values, and only the renderer is consulted. Closing that is the
-stage-5 naming cutover, and it has to be done by making the fold ask, not by
-making the plan assert harder.
+**Excluding the value from the binding domain at all.** Restricting the closure
+to flag consumers -- a register-spaced output of a single byte, which a carrier
+merge can never be -- is sound where the broader rules were not, and it does
+remove the unused variables. It still regresses: generation falls from eight
+functions to five, and djb2, sdbm and adler32 refuse with
+`missing_program_variable_authorization`.
+
+That refusal is the answer the four attempts were circling. The fold does not
+skip a value it has no binding for; it *demands* one.
+`analysis::lower::LowerCtx::bound_program_symbol` maps
+`PlannedValueSymbol::Elided` onto `MissingProgramVariableAuthorization`, while
+the `require_value` it calls documents the opposite in its own comment: "Inline
+and elided values are successful answers: neither authorizes a C program
+variable, but both are complete plan dispositions." One of the two is wrong, and
+it is the caller.
+
+So the order is fixed, and it is the reverse of what all four attempts assumed.
+The fold has to gain a no-emit path first -- `bound_program_symbol` returning
+"this value has no rendered occurrence" rather than a refusal, threaded out
+through `var_name` and `assignment_lhs_expr` to the `LoweredOp::None` that
+`lower_op` already has -- and only then can the plan stop binding the value.
+Removing the binding first is what every one of these attempts did, and it is
+why every one of them failed. `analysis/lower.rs` is not held by the concurrent
+session.
 
 ### A note on the machine-role coordinate system
 
