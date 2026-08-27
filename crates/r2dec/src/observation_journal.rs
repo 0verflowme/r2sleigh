@@ -20,10 +20,14 @@ use crate::ast::{
     BinaryOp, CExpr, CFunction, CStmt, RenderObservationInspectError, RenderObservationNode,
     RenderObservationStripError, inspect_render_observations,
 };
-use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch, ValueDisposition};
+use crate::binding_plan::{
+    BindingNameResolution, BindingPlan, BindingPlanSourceMismatch, StackObjectDisposition,
+    ValueDisposition,
+};
 use crate::codegen::{EmissionReadyFunction, prepare_function_for_emission};
 use crate::normalize::{
-    NormalizationOriginError, NormalizationOrigins, NormalizedOpProjection, NormalizedOpSite,
+    NormalizationOriginError, NormalizationOrigins, NormalizedOpOrigin, NormalizedOpProjection,
+    NormalizedOpSite,
 };
 use crate::shadow_report::{
     LegacyAnalysisSnapshot, LegacyBindingId, LegacyUseCell, LegacyUseObservation, LegacyValueCell,
@@ -88,6 +92,13 @@ enum ObservationTarget {
     Write {
         inst: InstId,
         observation: LegacyWriteObservation,
+    },
+    StackAccess {
+        access: r2ssa::StructuredAccessId,
+        object: r2ssa::ObjectId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+        is_write: bool,
     },
     /// One exact cell from the source-owned semantic obligation inventory.
     ///
@@ -614,11 +625,30 @@ impl SealedLegacyObservations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SurvivingEffectObservations {
     occurrences: BTreeMap<SemanticObligationId, usize>,
+    coalesced_carriers: Box<CoalescedCarrierEffectElisions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoalescedCarrierEffectElisions {
+    coalesced_carrier_uses: BTreeSet<UseSite>,
+    coalesced_carrier_phis: BTreeSet<InstId>,
 }
 
 impl SurvivingEffectObservations {
     pub(crate) fn occurrence_count(&self, id: SemanticObligationId) -> Option<usize> {
         self.occurrences.get(&id).copied()
+    }
+
+    pub(crate) fn is_coalesced_carrier_use(&self, site: UseSite) -> bool {
+        self.coalesced_carriers
+            .coalesced_carrier_uses
+            .contains(&site)
+    }
+
+    pub(crate) fn is_coalesced_carrier_phi(&self, inst: InstId) -> bool {
+        self.coalesced_carriers
+            .coalesced_carrier_phis
+            .contains(&inst)
     }
 
     #[cfg(test)]
@@ -634,7 +664,16 @@ pub(crate) struct LegacyObservationJournal {
     authority: SsaArtifactAuthority,
     source: std::sync::Arc<SsaArtifact>,
     plan: Rc<BindingPlan>,
+    names: Rc<BindingNameResolution>,
     normalized_projections: Vec<Box<[NormalizedOpProjection]>>,
+    /// Synthetic carrier copies whose exact incoming use is discharged by
+    /// binding coalescing. Lowering queries this same derived answer before it
+    /// suppresses the `x = x` operation.
+    coalesced_carrier_copy_sites: BTreeSet<NormalizedOpSite>,
+    coalesced_carrier_uses: BTreeSet<UseSite>,
+    /// Removed carrier phis for which every incoming edge is already accounted
+    /// by SSA identity or one of `coalesced_carrier_copy_sites`.
+    coalesced_carrier_phi_writes: BTreeSet<InstId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -643,6 +682,14 @@ pub(crate) struct LegacyObservationJournal {
     writes: Box<[Option<LegacyWriteObservation>]>,
     effect_occurrences: BTreeMap<SemanticObligationId, usize>,
     targets: Vec<ObservationTarget>,
+}
+
+/// Transaction boundary for render markers allocated by one tentative AST
+/// route. The source V/U/W domains are immutable after journal construction;
+/// only the dense target tail changes while lowering candidate trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationJournalCheckpoint {
+    target_len: usize,
 }
 
 enum LegacyObservationSeal {
@@ -758,6 +805,21 @@ fn placement_refusal(
             binding_index: binding.index(),
             value_id: value.0,
             instruction_id: at.0,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::StackAccess(access),
+        } => Public::StackAccessReadBeforeAssignment {
+            binding_index: binding.index(),
+            instruction_id: access.inst.0,
+            access_ordinal: access.ordinal,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::PreservedCarrierWrite(inst),
+        } => Public::PreservedCarrierReadBeforeAssignment {
+            binding_index: binding.index(),
+            instruction_id: inst.0,
         },
         Private::UnprovableExecutionOrder { binding } => Public::UnprovableExecutionOrder {
             binding_index: binding.index(),
@@ -999,6 +1061,22 @@ impl MarkedNativeDraft {
                 BindingObservationJournalFailure::from(&error),
             ));
         }
+        // A placement that ran and refused is reported before the seal, because
+        // it is the cause of the seal failure it produces rather than an
+        // independent finding. When placement cannot declare a binding, the
+        // seal then observes a rendered name that owns no declaration and
+        // refuses with `UnownedBindingSymbol`, naming the symbol instead of the
+        // phase that failed to declare it. Sealing first reported that symptom
+        // and discarded the cause.
+        //
+        // A draft carrying no placement input at all is a different case: no
+        // placement ran, so nothing links its absence to what the seal finds,
+        // and the seal keeps precedence.
+        if self.placement.is_some()
+            && let Some(refusal) = placement_failure
+        {
+            return Err(BindingShadowAuditFailure::Placement(refusal));
+        }
         let observations = match self.journal.seal_preserving_effects(source, &mut ready) {
             Ok(LegacyObservationSeal::Complete(observations)) => observations,
             Ok(LegacyObservationSeal::BindingFailure(error)) | Err(error) => {
@@ -1130,6 +1208,25 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
+    pub(crate) fn checkpoint(&self) -> ObservationJournalCheckpoint {
+        ObservationJournalCheckpoint {
+            target_len: self.targets.len(),
+        }
+    }
+
+    /// Discard markers allocated by a candidate tree that will not be emitted.
+    ///
+    /// The checkpoint comes from this journal immediately before the candidate
+    /// route. Dense observation IDs allocated after it are unreachable once
+    /// that tree is dropped, so truncating the tail preserves all earlier IDs.
+    pub(crate) fn rollback(&mut self, checkpoint: ObservationJournalCheckpoint) {
+        assert!(
+            checkpoint.target_len <= self.targets.len(),
+            "an observation checkpoint cannot point past its issuing journal"
+        );
+        self.targets.truncate(checkpoint.target_len);
+    }
+
     pub(crate) fn placement_target_count(&self) -> usize {
         self.targets.len()
     }
@@ -1152,12 +1249,52 @@ impl LegacyObservationJournal {
                     symbol: *symbol,
                 },
             ),
-            ObservationTarget::Use { site, .. } => {
-                Some(crate::placement::PlacementObservationTarget::Use(*site))
-            }
-            ObservationTarget::Write { inst, .. } => {
-                Some(crate::placement::PlacementObservationTarget::Write(*inst))
-            }
+            ObservationTarget::Use { site, .. } => Some(
+                self.source
+                    .graph()
+                    .inst(site.inst)
+                    .and_then(|inst| inst.inputs.get(site.input_idx))
+                    .and_then(|value| self.plan.disposition(*value))
+                    .and_then(|disposition| {
+                        matches!(disposition, ValueDisposition::Bound { .. })
+                            .then_some(crate::placement::PlacementObservationTarget::Use(*site))
+                    })
+                    .unwrap_or(crate::placement::PlacementObservationTarget::Other),
+            ),
+            ObservationTarget::Write { inst, observation } => Some(
+                self.source
+                    .graph()
+                    .inst(*inst)
+                    .and_then(|inst| inst.output)
+                    .and_then(|value| self.plan.disposition(value))
+                    .and_then(|disposition| {
+                        matches!(disposition, ValueDisposition::Bound { .. }).then(|| {
+                            match observation {
+                                LegacyWriteObservation::Exact(projection) => {
+                                    crate::placement::PlacementObservationTarget::Write {
+                                        inst: *inst,
+                                        projection: *projection,
+                                    }
+                                }
+                                _ => crate::placement::PlacementObservationTarget::Other,
+                            }
+                        })
+                    })
+                    .unwrap_or(crate::placement::PlacementObservationTarget::Other),
+            ),
+            ObservationTarget::StackAccess {
+                access,
+                object,
+                binding,
+                symbol,
+                is_write,
+            } => Some(crate::placement::PlacementObservationTarget::StackAccess {
+                access: *access,
+                object: *object,
+                binding: *binding,
+                symbol: *symbol,
+                is_write: *is_write,
+            }),
             ObservationTarget::Value(_) | ObservationTarget::Effect(_) => {
                 Some(crate::placement::PlacementObservationTarget::Other)
             }
@@ -1168,11 +1305,15 @@ impl LegacyObservationJournal {
         source: &SourceOwnedFunctionFacts,
         normalized: &SSAFunction,
         origins: &NormalizationOrigins,
-        plan: Rc<BindingPlan>,
+        names: Rc<BindingNameResolution>,
         symbols: Rc<RefCell<SymbolTable>>,
     ) -> Result<Self, LegacyObservationJournalError> {
+        let plan = Rc::clone(names.plan());
         plan.validate_source(source.source())
             .map_err(LegacyObservationJournalError::BindingPlan)?;
+        if !names.owns_symbol_table(&symbols) {
+            return Err(LegacyObservationJournalError::SymbolTableMismatch);
+        }
         origins
             .validate(normalized, source.source(), source.report().render())
             .map_err(LegacyObservationJournalError::Normalization)?;
@@ -1208,6 +1349,82 @@ impl LegacyObservationJournal {
             .map(|value| value.var.constant_bits().is_some())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let mut coalesced_carrier_copy_sites = BTreeSet::new();
+        for block_id in graph.block_order.iter().copied() {
+            let Some(block) = graph
+                .block(block_id)
+                .and_then(|block| normalized.get_block(block.addr))
+            else {
+                return Err(LegacyObservationJournalError::Normalization(
+                    NormalizationOriginError::BlockTopology,
+                ));
+            };
+            for (op_idx, op) in block.ops.iter().enumerate() {
+                let site = NormalizedOpSite {
+                    block: block_id,
+                    op_idx,
+                };
+                let Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) = origins.origin(site) else {
+                    continue;
+                };
+                if !matches!(
+                    origin.certified_entity,
+                    Some(r2ssa::SemanticId::LoopCarrier(_))
+                ) || !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0)
+                {
+                    continue;
+                }
+                let projection = &normalized_projections[block_id.0 as usize][op_idx];
+                let Some(output) = projection.output else {
+                    continue;
+                };
+                let Some(input) = projection
+                    .inputs
+                    .iter()
+                    .find(|input| input.uses.contains(&origin.incoming))
+                else {
+                    continue;
+                };
+                if matches!(
+                    (plan.disposition(input.value), plan.disposition(output.value)),
+                    (
+                        Some(ValueDisposition::Bound { binding: input }),
+                        Some(ValueDisposition::Bound { binding: output }),
+                    ) if input == output
+                ) {
+                    coalesced_carrier_copy_sites.insert(site);
+                }
+            }
+        }
+        let coalesced_carrier_uses = coalesced_carrier_copy_sites
+            .iter()
+            .filter_map(|site| {
+                normalized_projections
+                    .get(site.block.0 as usize)
+                    .and_then(|rows| rows.get(site.op_idx))
+            })
+            .flat_map(|projection| {
+                projection
+                    .inputs
+                    .iter()
+                    .flat_map(|input| input.uses.iter().copied())
+            })
+            .collect::<BTreeSet<_>>();
+        let coalesced_carrier_phi_writes = origins
+            .removed_phis()
+            .iter()
+            .filter(|removed| {
+                source
+                    .report()
+                    .render()
+                    .and_then(|render| render.loop_carrier_for_value(removed.definition.value))
+                    .is_some()
+                    && removed.incoming_sites.iter().all(|site| {
+                        removed.noop_sites().contains(site) || coalesced_carrier_uses.contains(site)
+                    })
+            })
+            .map(|removed| removed.definition.inst)
+            .collect::<BTreeSet<_>>();
         let values = vec![None; graph.values.len()].into_boxed_slice();
         let uses = graph
             .insts
@@ -1234,7 +1451,11 @@ impl LegacyObservationJournal {
             authority: source.source().authority().clone(),
             source: source.shared_source(),
             plan,
+            names,
             normalized_projections,
+            coalesced_carrier_copy_sites,
+            coalesced_carrier_uses,
+            coalesced_carrier_phi_writes,
             symbols,
             value_is_literal,
             values,
@@ -1271,6 +1492,128 @@ impl LegacyObservationJournal {
             std::collections::BTreeMap::<UseSite, r2ssa::ledger::ElisionReason>::new();
         let mut elided_writes =
             std::collections::BTreeMap::<InstId, r2ssa::ledger::ElisionReason>::new();
+        for certificate in source
+            .source()
+            .certificates()
+            .stack_frame_round_trips
+            .values()
+        {
+            for inst in &certificate.insts {
+                let Some(definition) = graph.inst(*inst) else {
+                    return Err(LegacyObservationJournalError::InvalidWrite(*inst));
+                };
+                for input_idx in 0..definition.inputs.len() {
+                    let site = UseSite {
+                        inst: *inst,
+                        input_idx,
+                    };
+                    match elided_uses.insert(site, r2ssa::ledger::ElisionReason::StackFrame) {
+                        Some(r2ssa::ledger::ElisionReason::StackFrame) | None => {}
+                        Some(_) => {
+                            return Err(LegacyObservationJournalError::ConflictingUse(site));
+                        }
+                    }
+                }
+                if definition.output.is_some() {
+                    match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::StackFrame) {
+                        Some(r2ssa::ledger::ElisionReason::StackFrame) | None => {}
+                        Some(_) => {
+                            return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
+                        }
+                    }
+                }
+            }
+        }
+        for certificate in source
+            .source()
+            .certificates()
+            .machine_return_controls
+            .values()
+        {
+            for site in &certificate.uses {
+                match elided_uses.insert(*site, r2ssa::ledger::ElisionReason::ReturnControl) {
+                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
+                    Some(_) => {
+                        return Err(LegacyObservationJournalError::ConflictingUse(*site));
+                    }
+                }
+            }
+            for inst in &certificate.insts {
+                let Some(definition) = graph.inst(*inst) else {
+                    return Err(LegacyObservationJournalError::InvalidWrite(*inst));
+                };
+                if definition.output.is_some() {
+                    match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::ReturnControl) {
+                        Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
+                        Some(_) => {
+                            return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
+                        }
+                    }
+                }
+            }
+        }
+        for site in &source.source().certificates().stack_geometry.uses {
+            // A stack-root value has no standalone C occurrence, but an exact
+            // stack-object address operand still has its own contextual
+            // per-use projection.  The value and use ledgers are independent:
+            // seed only geometry uses that disappear with their defining
+            // operation, and let the rendered memory-address marker account
+            // for the surviving operand.
+            if matches!(
+                self.plan.use_disposition(*site),
+                Some(MachineUseDisposition::MemoryAddress(_))
+            ) {
+                continue;
+            }
+            match elided_uses.insert(*site, r2ssa::ledger::ElisionReason::DeadStackBase) {
+                Some(r2ssa::ledger::ElisionReason::DeadStackBase) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(*site)),
+            }
+        }
+        for inst in &source.source().certificates().stack_geometry.insts {
+            let Some(definition) = graph.inst(*inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(*inst));
+            };
+            if definition.output.is_some() {
+                match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::DeadStackBase) {
+                    Some(r2ssa::ledger::ElisionReason::DeadStackBase) | None => {}
+                    Some(_) => {
+                        return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
+                    }
+                }
+            }
+        }
+        // The SSA liveness owner publishes the complete pure domain outside
+        // the transitive observation slice.  Seed non-phi operations here;
+        // dead merges retain their more specific reason below.  Earlier
+        // machine/frame certificates win deterministically when domains
+        // overlap.
+        for site in source.source().unobserved_merges().unobserved_uses() {
+            if source
+                .source()
+                .graph()
+                .inst(site.inst)
+                .is_some_and(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+            {
+                continue;
+            }
+            elided_uses
+                .entry(*site)
+                .or_insert(r2ssa::ledger::ElisionReason::UnobservedValue);
+        }
+        for inst in source.source().unobserved_merges().unobserved_insts() {
+            let Some(definition) = graph.inst(*inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(*inst));
+            };
+            if matches!(definition.payload, r2ssa::InstPayload::Phi { .. }) {
+                continue;
+            }
+            if definition.output.is_some() {
+                elided_writes
+                    .entry(*inst)
+                    .or_insert(r2ssa::ledger::ElisionReason::UnobservedValue);
+            }
+        }
         for value in source.source().unobserved_merges().iter() {
             let Some(inst) = graph.def_inst(value) else {
                 return Err(LegacyObservationJournalError::InvalidValue(value));
@@ -1307,6 +1650,23 @@ impl LegacyObservationJournal {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge) {
                 Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
+        let coalesced_carrier_uses = self
+            .coalesced_carrier_uses
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for site in coalesced_carrier_uses {
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCarrierEdge) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCarrierEdge) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
+        for inst in self.coalesced_carrier_phi_writes.iter().copied() {
+            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedCarrierPhi) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCarrierPhi) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
             }
         }
         let removed_phis = origins
@@ -1591,6 +1951,65 @@ impl LegacyObservationJournal {
         Ok(CExpr::observed(read_id, CExpr::observed(value_id, expr)))
     }
 
+    /// Mark one exact rendered access to a source-owned stack-object binding.
+    ///
+    /// The structured access owns the object, the binding plan owns the
+    /// object-to-binding projection, and name resolution owns the symbol. A
+    /// non-stack memory access returns unchanged; no address spelling or stack
+    /// offset is consulted here.
+    pub(crate) fn observe_stack_access_expr(
+        &mut self,
+        access: r2ssa::StructuredAccessId,
+        is_write: bool,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        let fact = self
+            .source
+            .structured()
+            .memory_accesses
+            .get(&access)
+            .filter(|fact| {
+                fact.id == access && fact.is_write == is_write && fact.provenance_complete
+            })
+            .ok_or(LegacyObservationJournalError::InvalidUse(UseSite {
+                inst: access.inst,
+                input_idx: 0,
+            }))?;
+        let Some(disposition) = self.plan.stack_object_disposition(fact.object) else {
+            return Ok(expr);
+        };
+        let StackObjectDisposition::Bound { binding } = disposition else {
+            return Err(LegacyObservationJournalError::InvalidUse(UseSite {
+                inst: access.inst,
+                input_idx: 0,
+            }));
+        };
+        let symbol = self.names.symbol_for_binding(binding).ok_or(
+            LegacyObservationJournalError::InvalidUse(UseSite {
+                inst: access.inst,
+                input_idx: 0,
+            }),
+        )?;
+        if !crate::placement::expr_reads_symbol(&expr, symbol) {
+            return Err(LegacyObservationJournalError::InvalidUse(UseSite {
+                inst: access.inst,
+                input_idx: 0,
+            }));
+        }
+        let id = self
+            .allocate_many(vec![ObservationTarget::StackAccess {
+                access,
+                object: fact.object,
+                binding,
+                symbol,
+                is_write,
+            }])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(id, expr))
+    }
+
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
         for (index, observation) in self.values.iter().enumerate() {
             if observation.is_none() {
@@ -1805,6 +2224,10 @@ impl LegacyObservationJournal {
             .ok_or(LegacyObservationJournalError::InvalidNormalizedSite(site))
     }
 
+    pub(crate) fn is_coalesced_carrier_copy(&self, site: NormalizedOpSite) -> bool {
+        self.coalesced_carrier_copy_sites.contains(&site)
+    }
+
     fn normalized_output(
         &self,
         site: NormalizedOpSite,
@@ -1895,6 +2318,10 @@ impl LegacyObservationJournal {
         })?;
         Ok(SurvivingEffectObservations {
             occurrences: effect_occurrences,
+            coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
+                coalesced_carrier_uses: self.coalesced_carrier_uses,
+                coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
+            }),
         })
     }
 
@@ -1994,6 +2421,7 @@ impl LegacyObservationJournal {
                         record_same(&mut writes[inst.0 as usize], observation)
                             .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst))
                     }
+                    ObservationTarget::StackAccess { .. } => Ok(()),
                     ObservationTarget::Effect(id) => {
                         let occurrences = effect_occurrences
                             .get_mut(&id)
@@ -2162,6 +2590,10 @@ impl LegacyObservationJournal {
         let coverage = self.final_coverage();
         let effects = SurvivingEffectObservations {
             occurrences: std::mem::take(&mut self.effect_occurrences),
+            coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
+                coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
+                coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
+            }),
         };
         let snapshot = self.into_snapshot(source);
         SealedLegacyObservations {
@@ -2531,6 +2963,17 @@ mod tests {
         journal_fixture_for_source(source_owned())
     }
 
+    fn test_binding_names(
+        source: &SourceOwnedFunctionFacts,
+        plan: Rc<BindingPlan>,
+        symbols: Rc<RefCell<SymbolTable>>,
+    ) -> Rc<BindingNameResolution> {
+        Rc::new(
+            BindingNameResolution::build(source, plan, symbols)
+                .expect("authority-bound test binding names"),
+        )
+    }
+
     fn journal_fixture_for_source(
         source: SourceOwnedFunctionFacts,
     ) -> (
@@ -2543,11 +2986,13 @@ mod tests {
         let function = CFunction::new("journal", CType::Void);
         let normalized = source.source().function().clone();
         let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let names =
+            test_binding_names(&source, Rc::new(plan.clone()), Rc::clone(&function.symbols));
         let journal = LegacyObservationJournal::new(
             &source,
             &normalized,
             &origins,
-            Rc::new(plan.clone()),
+            names,
             Rc::clone(&function.symbols),
         )
         .expect("authority-bound journal");
@@ -2588,11 +3033,12 @@ mod tests {
         let normalized = source.source().function().clone();
         let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
         let function = CFunction::new("mixed_return_control", CType::Void);
+        let names = test_binding_names(&source, Rc::new(plan), Rc::clone(&function.symbols));
         let journal = LegacyObservationJournal::new(
             &source,
             &normalized,
             &origins,
-            Rc::new(plan),
+            names,
             Rc::clone(&function.symbols),
         )
         .expect("mixed-use journal");
@@ -2654,7 +3100,7 @@ mod tests {
             &source,
             &normalized,
             &origins,
-            Rc::clone(&plan),
+            Rc::clone(&names),
             Rc::clone(&function.symbols),
         )
         .expect("return observation journal");
@@ -2898,6 +3344,10 @@ mod tests {
             target: Varnode::constant(0x100c, 8),
         });
         let mut join = R2ILBlock::new(0x100c, 4);
+        join.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(0, 8),
+        });
         join.push(R2ILOp::Return {
             target: Varnode::register(0x30, 8),
         });
@@ -2928,15 +3378,23 @@ mod tests {
             .expect("dead merge instruction")
             .inputs
             .len();
+        let support_values = source
+            .source()
+            .graph()
+            .inst(definition)
+            .expect("dead merge instruction")
+            .inputs
+            .clone();
         let plan = Rc::new(BindingPlan::build_shadow(&source).expect("dead-merge-aware plan"));
         let function = CFunction::new("dead_phi", CType::Void);
         let normalized = source.source().function().clone();
         let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let names = test_binding_names(&source, plan, Rc::clone(&function.symbols));
         let journal = LegacyObservationJournal::new(
             &source,
             &normalized,
             &origins,
-            plan,
+            names,
             Rc::clone(&function.symbols),
         )
         .expect("journal seeds exact dead-phi cells");
@@ -2946,6 +3404,15 @@ mod tests {
                 r2ssa::ledger::ElisionReason::UnobservedMerge
             ))
         );
+        for support in support_values {
+            assert_eq!(
+                journal.values[support.0 as usize],
+                Some(LegacyValueObservation::Elided(
+                    r2ssa::ledger::ElisionReason::UnobservedValue
+                )),
+                "a pure value used only by the dead merge is certified non-rendered"
+            );
+        }
         for input_idx in 0..input_count {
             assert_eq!(
                 journal.uses[definition.0 as usize][input_idx],
@@ -3026,11 +3493,12 @@ mod tests {
         let function = CFunction::new("coalesced_phi", CType::Int(64));
         let normalized = source.source().function().clone();
         let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
+        let names = test_binding_names(&source, plan, Rc::clone(&function.symbols));
         let journal = LegacyObservationJournal::new(
             &source,
             &normalized,
             &origins,
-            plan,
+            names,
             Rc::clone(&function.symbols),
         )
         .expect("journal certifies immutable coalesced phi");
@@ -3109,11 +3577,12 @@ mod tests {
 
         let plan = Rc::new(BindingPlan::build_shadow(&source).expect("sealed plan"));
         let function = CFunction::new("identity_phi", CType::Void);
+        let names = test_binding_names(&source, plan, Rc::clone(&function.symbols));
         let journal = LegacyObservationJournal::new(
             &source,
             &normalized,
             &origins,
-            plan,
+            names,
             Rc::clone(&function.symbols),
         )
         .expect("normalization-backed journal");
@@ -3123,6 +3592,38 @@ mod tests {
                 r2ssa::ledger::ElisionReason::RedundantPhiEdge
             ))
         );
+        assert!(
+            !journal.coalesced_carrier_copy_sites.is_empty(),
+            "the non-entry carrier update must derive one coalesced edge disposition"
+        );
+        for site in journal.coalesced_carrier_copy_sites.iter().copied() {
+            for source_use in journal
+                .normalized_projection(site)
+                .expect("sealed carrier projection")
+                .inputs
+                .iter()
+                .flat_map(|input| input.uses.iter().copied())
+            {
+                assert_eq!(
+                    journal.uses[source_use.inst.0 as usize][source_use.input_idx],
+                    Some(LegacyUseObservation::Elided(
+                        r2ssa::ledger::ElisionReason::CoalescedCarrierEdge
+                    ))
+                );
+            }
+        }
+        assert!(
+            !journal.coalesced_carrier_phi_writes.is_empty(),
+            "all certified carrier edges in the fixture are identities after coalescing"
+        );
+        for inst in journal.coalesced_carrier_phi_writes.iter().copied() {
+            assert_eq!(
+                journal.writes[inst.0 as usize],
+                Some(LegacyWriteObservation::Elided(
+                    r2ssa::ledger::ElisionReason::CoalescedCarrierPhi
+                ))
+            );
+        }
         let coverage = journal.final_coverage();
         assert!(coverage.equations_hold());
         assert!(coverage.uses.justified_elision >= 1);
