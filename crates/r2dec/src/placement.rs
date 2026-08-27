@@ -201,6 +201,8 @@ pub(crate) fn collect_final_placement_occurrences(
         crate::ast::RenderObservationInspectError::Observer(error) => error,
     })?;
 
+    let mut after_label = BTreeSet::new();
+    observations_directly_after_a_label(&function.body, &mut after_label);
     let scoped = collect_final_observation_scopes(&function.body, regions, &targets);
 
     for (index, target) in targets.iter().copied().enumerate() {
@@ -308,7 +310,8 @@ pub(crate) fn collect_final_placement_occurrences(
                         order,
                         observation,
                         inline_eligible: statement_assignment[index]
-                            == names.symbol_for_binding(binding),
+                            == names.symbol_for_binding(binding)
+                            && !after_label.contains(&observation),
                     });
                 }
             }
@@ -409,6 +412,91 @@ fn collect_final_observation_scopes(
         collect_stmt_observation_scopes(statement, None, regions, targets, &mut order, &mut scoped);
     }
     scoped
+}
+
+/// Observations carried by a statement that directly follows a label.
+///
+/// C requires a label to be followed by a statement, so a declaration cannot be
+/// emitted there. A write in that position therefore cannot become a
+/// declaration with an initializer; it keeps its assignment and takes its
+/// declaration from the enclosing region, which is where a jump to the label
+/// needs the object to already exist in any case.
+///
+/// Every observation of the following statement is collected. Being generous
+/// here only falls back to a lexical declaration, which is legal in every
+/// position an inline declaration is.
+fn observations_directly_after_a_label(
+    statements: &[CStmt],
+    after: &mut BTreeSet<RenderObservationId>,
+) {
+    let mut previous_was_label = false;
+    for statement in statements {
+        if previous_was_label {
+            collect_statement_observations(statement, after);
+        }
+        previous_was_label = matches!(statement.unobserved(), CStmt::Label(_));
+        visit_nested_statement_lists(statement, after);
+    }
+}
+
+/// Every observation marker carried by one statement, including its own.
+fn collect_statement_observations(statement: &CStmt, into: &mut BTreeSet<RenderObservationId>) {
+    match statement {
+        CStmt::Observed { id, stmt } => {
+            into.insert(*id);
+            collect_statement_observations(stmt, into);
+        }
+        CStmt::StructuredRegion { stmt, .. } => collect_statement_observations(stmt, into),
+        CStmt::Expr(expr) => {
+            visit_expr_observations(expr, &mut |id| {
+                into.insert(id);
+            });
+        }
+        CStmt::Decl {
+            init: Some(expr), ..
+        } => {
+            visit_expr_observations(expr, &mut |id| {
+                into.insert(id);
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Walk into every statement list a statement owns.
+fn visit_nested_statement_lists(statement: &CStmt, after: &mut BTreeSet<RenderObservationId>) {
+    match statement.unobserved() {
+        CStmt::Block(statements) => observations_directly_after_a_label(statements, after),
+        CStmt::StructuredRegion { stmt, .. } => visit_nested_statement_lists(stmt, after),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            visit_nested_statement_lists(then_body, after);
+            if let Some(else_body) = else_body {
+                visit_nested_statement_lists(else_body, after);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            visit_nested_statement_lists(body, after);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                visit_nested_statement_lists(init, after);
+            }
+            visit_nested_statement_lists(body, after);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                observations_directly_after_a_label(&case.body, after);
+            }
+            if let Some(default) = default {
+                observations_directly_after_a_label(default, after);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn record_observation_group(
