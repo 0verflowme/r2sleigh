@@ -787,6 +787,21 @@ Removing the binding first is what every one of these attempts did, and it is
 why every one of them failed. `analysis/lower.rs` is not held by the concurrent
 session.
 
+**The fifth attempt narrows it once more.** Marking the flag-only values
+`Elided { DeadFlagOnly }` -- a successful plan answer rather than the
+placeholder refusal -- and adding the `lower_op` guard so their definitions are
+never lowered still leaves djb2, sdbm and adler32 refusing
+`missing_program_variable_authorization`. The demand does not come from lowering
+the dead value's own definition at all. It comes from lowering the *flag
+operation*, which is still emitted and resolves its operands, and operand
+resolution runs in `LowerMode::Expr` where the statement-mode guard never fires.
+
+So the no-emit path has to cover the consumer as well as the definition: an
+operation whose output the plan elided must not be lowered in either mode, and
+its operands must never be demanded. Five attempts have each removed one more
+reason the value is still reached; this is the sixth and it is the one that
+decides whether the approach works at all.
+
 ### A note on the machine-role coordinate system
 
 `SourceMachineRoles` storages arrive from radare2's register profile
