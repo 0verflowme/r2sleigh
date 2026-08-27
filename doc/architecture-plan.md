@@ -729,6 +729,44 @@ other session is still building on this branch and rewriting five commits
 underneath it would be the worse outcome. Every commit from `d8eafa5` onward was
 staged file by file with the staged diff checked before committing.
 
+### The unused-variable class, and three attempts that failed
+
+Thirteen of the raw errors are declarations no statement reads --
+`uint32_t tmp_11f00_3 = stack_m28;` in djb2 is the shape. The values have
+exactly one graph use, and the machine disposition of that use is `Exact`, so
+the plan says it renders. What actually happens is that the load feeds a
+condition code nothing reads: `ValueId(223)` is consumed only by an `IntCarry`
+whose output is already `Elided { UnobservedValue }`.
+
+Three attempts were measured and all three reverted.
+
+**Marking the value elided in the plan.** A fixpoint over dispositions -- a
+value every use of which feeds an elided value is elided -- fires correctly and
+marks both loads. The emitted C is byte-identical. The reason is an ordering
+bug in the attempt itself: `binding_components` recomputes eligibility from a
+vector captured before the fixpoint and then assigns `Bound` over the result.
+Anything that sets a disposition before components are built is overwritten.
+
+**Making the fold consult the plan.** `lower_op` does see these operations in
+statement mode with the right `ValueId`s, so a guard there is well placed. It
+was inert only because the disposition it read had been overwritten as above.
+Worth knowing regardless: the fold consults `ValueDisposition` at no call site
+anywhere under `crates/r2dec/src/fold/`, so the plan can mark a value elided and
+the renderer will still emit it, and the journal does not object.
+
+**Closing eligibility over dead uses.** Widening the ineligibility set instead,
+so components never form, regresses badly: generation falls from eight functions
+to three seeded from raw ineligibility, and to four when seeded only from the
+unobserved and structural-unused reasons. The premise is unsound. An unobserved
+*output* does not mean its operands are unrendered -- a loop carrier's merge can
+be unobserved while the update feeding it is genuinely rendered -- so "every use
+feeds something unobserved" does not imply dead.
+
+What remains true is the first observation: the plan and the renderer disagree
+about these values, and only the renderer is consulted. Closing that is the
+stage-5 naming cutover, and it has to be done by making the fold ask, not by
+making the plan assert harder.
+
 ### A note on the machine-role coordinate system
 
 `SourceMachineRoles` storages arrive from radare2's register profile
