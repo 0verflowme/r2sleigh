@@ -843,6 +843,38 @@ change over roughly seventy demand sites, four of the nine files belong to a
 concurrent session, and it is the stage-5 naming cutover in full rather than a
 defect that can be fixed.
 
+### The four smaller refusal classes, traced
+
+Nineteen refusals sat in four classes that had never been looked at. They
+resolve into two families and one unknown.
+
+**Eight are the dead-value class again.** Six
+`exact_write_requires_rendered_occurrence` and two
+`exact_use_requires_rendered_occurrence` are a write or a use whose machine
+disposition is `Exact` and for which no occurrence was rendered -- the same
+disagreement between the plan and the renderer described above, seen from the
+use and write ledgers instead of the value ledger. They are gated by the same
+seventy-site cutover.
+
+**Five are the narrow-write projection.**
+`preserved_carrier_read_before_assignment` is
+`PlacementRefusal::ReadBeforeAssignment` where the read is a
+`PlacementRead::PreservedCarrierWrite`: the implied read of the bytes a partial
+write preserves, occurring before the binding is ever assigned. On x86-64 a
+32-bit register write clears the upper half, so there is no preserved read at
+all and the projection should be `ZeroExtend` rather than `Insert`. That
+decision lives in `r2ssa::machine::exact_zero_extend_write`, which the
+concurrent session is extending -- `machine.rs` carries 176 uncommitted lines
+including a second zero-extend path inserted directly after it.
+
+**Two are unknown.** `missing_machine_projection_authorization` on
+`crc32_bitwise` and `xxhash32` at AArch64 -O2 report a null cause and need a
+probe.
+
+So of the fifty-four cells, everything except those two is now traced to a named
+cause, and every remaining fix lands either in the seventy-site cutover or in a
+file the concurrent session holds.
+
 ### A note on the machine-role coordinate system
 
 `SourceMachineRoles` storages arrive from radare2's register profile
