@@ -629,6 +629,107 @@ Known causal examples remain useful for routing, not accounting:
 
 ---
 
+## 10b. Measured state at 21d961e
+
+Seven fixes landed since the stage-0 baseline, each traced to its source before
+any code was written. Three further changes were measured inert and reverted;
+five hypotheses were disproven by trace before code.
+
+| | baseline | now |
+|---|---:|---:|
+| workspace tests | 2236 pass / 2 fail | 2238 pass / 0 fail |
+| generation present | 7 of 54 | 8 of 54 |
+| raw / diagnostic / differential | 0 of 54 | 0 of 54 |
+| placement audit refused | 33 | 5 |
+| placement audit passed | 7 | 27 |
+| binding audit failed | 41 | 27 |
+| binding audit passed | 7 | 21 |
+| raw errors that are not the signature check | 30 | 20 |
+
+Refusal classes cleared outright: `region_does_not_dominate_occurrence` (18),
+`read_before_assignment` (18), `ambiguous_observation_execution_order` (6),
+`label followed by a declaration` (12 compiler errors), and the 41 cells whose
+refusal named an authority that had not failed.
+
+### What each fix was
+
+- `33db0ba` The install guard used `rg`, which is absent from a plain shell, so
+  every measurement aborted after a successful install. Separately, three sites
+  collapsed typed journal failures into a machine-projection refusal, so 41 of 47
+  cells were filed against the wrong authority.
+- `9cc6cc5` Live-out matched the full `CanonicalStorageId` of a return slot, so a
+  value composed by `xor eax, eax` and `sete al` was seen only as the zero, and
+  `recover_interface` recovered no parameters at all.
+- `0ebb565` A placement refusal was computed, held aside, and reported only after
+  the seal it had caused, so the seal's symptom hid it.
+- `11e3530` Normalization materializes a phi as one copy per incoming edge, and
+  placement took each copy's block from the original phi rather than from the
+  predecessor the copy lives in.
+- `d19a77a` `BindingRole` had no name for a caller-supplied value outside the
+  convention's argument slots, so placement demanded an assignment for a value
+  the caller had already supplied.
+- `d8eafa5` A stack assignment's target is an lvalue whose address reads are
+  ordered against its own store; treating them as unsequenced operands marked
+  six functions ambiguous.
+- `21d961e` A label must be followed by a statement, so an inline declaration
+  cannot be placed there.
+
+### What blocks the three scores
+
+Every one of the eight generating cells fails the same check. The raw prelude
+declares
+
+```c
+typedef uint32_t (*corpus_expected_fn)(const uint8_t *, size_t);
+static corpus_expected_fn corpus_checked_fn = &dec_<name>;
+```
+
+which asserts that the emitted function has exactly the source's parameter and
+return types. `mint_recovered_interface` documents the opposite contract: every
+parameter is an unsigned integer of the register's own width, and signedness,
+pointer-ness and names are never asserted, because compilation erased them.
+
+No decompiler change can satisfy that assertion while the contract holds. Either
+the raw score calls the function through the signature the decompiler declares
+and leaves type identity to a later typed-recovery score, or the contract changes
+and the decompiler begins claiming source types. That is a decision about what
+the raw score is for, and it is deliberately not resolved here: relaxing the
+check to move the number is the failure this project reverted once already.
+
+### The remaining twenty errors, by owning file
+
+| Error | Cells | Owner |
+|---|---:|---|
+| `implicit conversion changes signedness` | 6 | `type_from_size` call sites in `r2dec/fold/op_lower/implementation.rs` |
+| unused variable / set-but-not-used | 13 | a value whose readers the fold deleted stays `Bound`; needs transitive dead-value analysis, `r2ssa/semantic.rs` and the fold |
+| `unused label` | 1 | a label minted with no `goto` reaching it, `r2dec/structure.rs` |
+
+Two further classes sit behind the same files. Eight `rendered_value_required`
+cells are the AArch64 link register bound as a program object: no stack-frame
+round trip is certified for it because `collect_callee_stack_allocation_certificates`
+yields no allocations on AArch64, so the collector's body never runs. Nineteen
+`non_quality` cells are effect-obligation refusals where a removed phi's
+`LoopCarriedState` and `LiveValueProducer` obligations are refused
+`BlockNotRendered`: the state is carried by the materialized edge copies, but no
+`ElisionReason` names that, and letting each of N copies claim the obligation
+would report a duplicate occurrence instead. That ownership question is the
+stage-7 effect-ledger cutover.
+
+### A note on the machine-role coordinate system
+
+`SourceMachineRoles` storages arrive from radare2's register profile
+(`libr/anal/function.c`, `*offset = item->offset / 8`) while graph storages are
+Sleigh varnode offsets: on AArch64 the captured return-address role reports
+offset 0 where `x0` is 16384 and `x30` is 16624. Both are tagged
+`CanonicalStorageSpace::Register`, so the type asserts they are comparable when
+they are not. Nothing has broken because every existing comparison is
+capture-against-capture. Any question of the form "is this graph value the
+machine's return address" needs a translation that does not exist: the wire
+carries `name_length` but no name, and radare2's public view struct has no name
+field either.
+
+---
+
 ## 11. The durable statement
 
 > One canonical location per machine place, one certified span per uninterrupted
