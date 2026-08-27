@@ -1223,6 +1223,62 @@ def rendered_arity(source: str) -> int | None:
     return count
 
 
+def rendered_parameter_types(source: str) -> list[str] | None:
+    """The parameter types the rendering itself declares.
+
+    The raw score calls the emitted function through the signature the
+    decompiler wrote, because `mint_recovered_interface` documents that a
+    parameter is an unsigned integer of the register's own width and that
+    signedness, pointer-ness and names are never asserted. Requiring the
+    emitted signature to equal the source's own types tested a claim the
+    decompiler declines to make; that comparison is reported separately as the
+    typed-recovery score instead of gating whether the C compiles and runs.
+    """
+    opening = source.find("(")
+    closing = source.find(")", opening + 1)
+    if opening < 0 or closing < 0:
+        return None
+    params = source[opening + 1 : closing].strip()
+    if not params or params == "void":
+        return []
+    fields: list[str] = []
+    depth = 0
+    current = ""
+    for char in params:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            fields.append(current)
+            current = ""
+        else:
+            current += char
+    fields.append(current)
+    types: list[str] = []
+    for field in fields:
+        field = field.strip()
+        if not field:
+            return None
+        # Strip the declarator name, keeping any pointer stars with the type.
+        match = re.match(r"^(.*?)([A-Za-z_][A-Za-z0-9_]*)$", field)
+        declared = (match.group(1) if match else field).strip()
+        types.append(declared or field)
+    return types
+
+
+def rendered_return_type(source: str, name: str) -> str | None:
+    """The return type the rendering itself declares."""
+    opening = source.find("(")
+    if opening < 0:
+        return None
+    signature = source[:opening]
+    marker = signature.rfind(f"dec_{name}")
+    if marker < 0:
+        return None
+    return signature[:marker].strip() or None
+
+
 def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]], int]:
     rewrites: list[dict[str, Any]] = []
     repaired, linkage = normalize_linkage_name(source, name)
@@ -1497,6 +1553,7 @@ def runner_source(
     cases: list[dict[str, Any]],
     *,
     diagnostic: bool,
+    declared_parameters: list[str] | None = None,
 ) -> str:
     arrays = []
     arms = []
@@ -1511,21 +1568,25 @@ def runner_source(
             args = [f"(long)(uintptr_t){args[0]}", f"(long){args[1]}"] + [
                 f"(long){arg}" for arg in args[2:]
             ]
-        callee = f"dec_{name}" if diagnostic else "corpus_checked_fn"
+        elif declared_parameters is not None and len(declared_parameters) == len(args):
+            # Call through the signature the rendering declares. The pointer is
+            # converted the same way the machine passes it, as an integer of the
+            # declared width.
+            args = [f"({declared_parameters[0]})(uintptr_t){args[0]}"] + [
+                f"({declared_parameters[position]}){arg}"
+                for position, arg in enumerate(args[1:], start=1)
+            ]
+        callee = f"dec_{name}"
         call = f"{callee}({', '.join(args)})"
         arms.append(
             f"case {index}u: printf(\"%0{spec.printf_width}\" PRIx{spec.result_bits} \"\\n\", "
             f"({spec.c_result_type})({call})); return 0;"
         )
-    expected_parameters = "const uint8_t *, size_t"
-    if spec.arity == 3:
-        expected_parameters += ", uint32_t"
-    type_check = []
-    if not diagnostic:
-        type_check = [
-            f"typedef {spec.c_result_type} (*corpus_expected_fn)({expected_parameters});",
-            f"static corpus_expected_fn corpus_checked_fn = &dec_{name};",
-        ]
+    # The raw score proves the emitted C compiles strictly and runs. Whether its
+    # declared signature equals the source's own types is a separate question,
+    # reported as the typed-recovery score, because the decompiler documents
+    # that it never claims pointer-ness or signedness.
+    type_check: list[str] = []
     return "\n".join(
         [
             "#include <inttypes.h>",
@@ -1739,8 +1800,30 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             entries.append(entry)
             continue
 
+        declared_parameters = rendered_parameter_types(normalized)
+        declared_return = rendered_return_type(normalized, name)
+        expected_parameters = ["const uint8_t *", "size_t"]
+        if spec.arity == 3:
+            expected_parameters.append("uint32_t")
+        # Reported, never gating: whether the rendering's own signature equals
+        # the source's types is the typed-recovery question, and the decompiler
+        # documents that it does not claim them.
+        entry["typed_recovery"] = {
+            "declared_parameters": declared_parameters,
+            "declared_return": declared_return,
+            "expected_parameters": expected_parameters,
+            "expected_return": spec.c_result_type,
+            "parameters_match": declared_parameters == expected_parameters,
+            "return_matches": declared_return == spec.c_result_type,
+        }
         raw_program = runner_source(
-            raw_mapped, raw_blobs, name, spec, cases, diagnostic=False
+            raw_mapped,
+            raw_blobs,
+            name,
+            spec,
+            cases,
+            diagnostic=False,
+            declared_parameters=declared_parameters,
         )
         raw_compile = compile_runner(
             raw_program,
