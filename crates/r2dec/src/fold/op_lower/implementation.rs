@@ -1147,13 +1147,15 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Simplify one binary expression while retaining only observations whose
-    /// exact operand occurrence survives the rewrite.
+    /// Simplify one binary expression only when it owns no exact source
+    /// occurrences.
     ///
-    /// Returning an original operand preserves that operand's markers. An
-    /// identity operand or folded constant that disappears takes its markers
-    /// with it, leaving the journal obligation unaccounted unless upstream had
-    /// already certified a non-rendered disposition.
+    /// A constant fold or identity rewrite is semantically valid but does not
+    /// prove that an eliminated [`UseSite`](r2ssa::UseSite) has a non-rendered
+    /// disposition. Moving its marker onto the replacement would falsely call
+    /// the replacement that exact occurrence. Native audited lowering therefore
+    /// keeps the source operation intact; marker-free presentation paths may
+    /// still apply the ordinary simplifier.
     fn identity_simplify_binary_semantic(
         &self,
         op: BinaryOp,
@@ -1161,6 +1163,11 @@ impl<'a> FoldingContext<'a> {
         right: CExpr,
         width_bytes: Option<u32>,
     ) -> CExpr {
+        if crate::ast::expr_has_render_observations(&left)
+            || crate::ast::expr_has_render_observations(&right)
+        {
+            return CExpr::binary(op, left, right);
+        }
         if let Some(value) = self.literal_binary_value(op, &left, &right) {
             return CExpr::IntLit(value);
         }
@@ -1894,6 +1901,29 @@ impl<'a> FoldingContext<'a> {
                 continue;
             }
 
+            if self
+                .source_inst_for_normalized_op(block.addr, op_idx)
+                .is_some_and(|inst| {
+                    self.prepared_ssa().is_some_and(|prepared| {
+                        prepared
+                            .certificates()
+                            .stack_frame_round_trip_by_inst
+                            .contains_key(&inst)
+                            || prepared
+                                .certificates()
+                                .machine_return_control_by_inst
+                                .contains_key(&inst)
+                            || prepared
+                                .certificates()
+                                .stack_geometry
+                                .insts
+                                .contains(&inst)
+                    })
+                })
+            {
+                continue;
+            }
+
             if let SSAOp::Return { .. } = op {
                 let (source_inst, boundary) = self
                     .source_return_boundary_for_normalized_op(block.addr, op_idx)
@@ -2027,7 +2057,7 @@ impl<'a> FoldingContext<'a> {
                 return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
             }
             SSAOp::Copy { dst, src } => {
-                if self.is_carrier_self_copy(dst, src) {
+                if self.current_copy_has_coalesced_carrier_elision() {
                     return Ok(None);
                 }
                 let lhs = self.assignment_lhs_expr(dst)?;
@@ -2305,6 +2335,15 @@ impl<'a> FoldingContext<'a> {
             ),
             SSAOp::IntEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Eq),
             SSAOp::IntNotEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Ne),
+            SSAOp::IntCarry { dst, a, b } => {
+                return self.arithmetic_flag_stmt(frame, dst, a, b, "carry");
+            }
+            SSAOp::IntSCarry { dst, a, b } => {
+                return self.arithmetic_flag_stmt(frame, dst, a, b, "scarry");
+            }
+            SSAOp::IntSBorrow { dst, a, b } => {
+                return self.arithmetic_flag_stmt(frame, dst, a, b, "sborrow");
+            }
             SSAOp::IntNegate { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let rhs = CExpr::unary(UnaryOp::Neg, input(0, src)?);
@@ -2313,6 +2352,18 @@ impl<'a> FoldingContext<'a> {
             SSAOp::IntNot { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let rhs = CExpr::unary(UnaryOp::BitNot, input(0, src)?);
+                self.assign_stmt(lhs, rhs)
+            }
+            SSAOp::PopCount { dst, src } if (1..=8).contains(&src.size) => {
+                let lhs = self.assignment_lhs_expr(dst)?;
+                let rhs = CExpr::call(
+                    CExpr::External {
+                        name: "__builtin_popcountll".to_string(),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    },
+                    vec![CExpr::cast(CType::UInt(64), input(0, src)?)],
+                );
+                let rhs = CExpr::cast(uint_type_from_size(dst.size), rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::BoolAnd { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::And, a, b),
@@ -2324,15 +2375,22 @@ impl<'a> FoldingContext<'a> {
                     .resolve_predicate_rhs_for_var(dst, CExpr::unary(UnaryOp::Not, input(0, src)?));
                 self.assign_stmt(lhs, rhs)
             }
+            // A destination is declared as the unsigned machine word of its own
+            // width, so that is what an assignment to it must produce. The
+            // signed intermediate a sign extension needs is already inside the
+            // operand expression; casting the whole result to the signed type
+            // again made the value's type disagree with the object holding it,
+            // which a strict compile rejects as a signedness-changing
+            // conversion. Zero extension and truncation were never signed.
             SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let ty = type_from_size(dst.size);
+                let ty = uint_type_from_size(dst.size);
                 let rhs = self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)?));
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Trunc { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let ty = type_from_size(dst.size);
+                let ty = uint_type_from_size(dst.size);
                 let rhs = self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)?));
                 self.assign_stmt(lhs, rhs)
             }
@@ -2536,7 +2594,7 @@ impl<'a> FoldingContext<'a> {
             SSAOp::Return { .. } => {
                 return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
             }
-            SSAOp::Branch { .. } | SSAOp::CBranch { .. } => {
+            SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::BranchInd { .. } => {
                 // Handled by control flow structuring
                 None
             }
@@ -2546,7 +2604,7 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::Nop => None,
             SSAOp::Unimplemented => Some(CStmt::comment("Unimplemented operation")),
-            _ => None,
+            _ => return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
         })
     }
 
@@ -2560,6 +2618,45 @@ impl<'a> FoldingContext<'a> {
         op: BinaryOp,
     ) -> Option<CStmt> {
         self.binary_stmt_typed(frame, dst, a, b, op, None)
+    }
+
+    /// Render a typed machine arithmetic flag through the external C prelude.
+    ///
+    /// The helper evaluates each projected source operand once and performs
+    /// the overflow algebra in an unsigned carrier, so the emitted program has
+    /// neither duplicated use occurrences nor signed-overflow UB.
+    fn arithmetic_flag_stmt(
+        &self,
+        frame: &LowerFrame,
+        dst: &SSAVar,
+        a: &SSAVar,
+        b: &SSAVar,
+        operation: &str,
+    ) -> OpLoweringResult<Option<CStmt>> {
+        if a.size != b.size || !matches!(a.size, 1 | 2 | 4 | 8 | 16) {
+            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+        }
+        let lhs = self.assignment_lhs_expr(dst)?;
+        let operand_ty = uint_type_from_size(a.size);
+        let left = CExpr::cast(
+            operand_ty.clone(),
+            self.observed_input(frame, 0, self.get_expr(a)?),
+        );
+        let right = CExpr::cast(
+            operand_ty,
+            self.observed_input(frame, 1, self.get_expr(b)?),
+        );
+        let helper = format!("r2sleigh_int_{operation}_{}", a.size * 8);
+        let rhs = CExpr::call(
+            CExpr::External {
+                name: helper,
+                kind: crate::symbol::ExternalKind::Intrinsic,
+            },
+            vec![left, right],
+        );
+        let rhs = CExpr::cast(uint_type_from_size(dst.size), rhs);
+        let rhs = self.resolve_predicate_rhs_for_var(dst, rhs);
+        Ok(self.assign_stmt(lhs, rhs))
     }
 
     fn binary_stmt_typed(
@@ -2668,6 +2765,46 @@ fn opaque_operations_are_typed_refusals_before_ast_lowering() {
             Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
             "opaque operations must never manufacture an executable AST node"
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unsupported_live_definition_is_a_typed_refusal() {
+    let ctx = FoldingContext::new(64);
+    let frame = LowerFrame::for_expr();
+    let unsupported = SSAOp::Lzcount {
+        dst: SSAVar::new("tmp", 1, 8),
+        src: SSAVar::new("tmp", 0, 8),
+    };
+
+    assert_eq!(
+        ctx.op_to_stmt_impl(&unsupported, &frame),
+        Err(OpLoweringRefusal::MissingMachineProjectionAuthorization)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn unsigned_flag_formulas_match_exhaustive_i8_arithmetic() {
+    for left in u8::MIN..=u8::MAX {
+        for right in u8::MIN..=u8::MAX {
+            let sum = left.wrapping_add(right);
+            let difference = left.wrapping_sub(right);
+            let carry = u8::from(sum < left);
+            let signed_carry = ((!(left ^ right) & (left ^ sum)) >> 7) & 1;
+            let signed_borrow = (((left ^ right) & (left ^ difference)) >> 7) & 1;
+
+            assert_eq!(carry != 0, left.checked_add(right).is_none());
+            assert_eq!(
+                signed_carry != 0,
+                (left as i8).checked_add(right as i8).is_none()
+            );
+            assert_eq!(
+                signed_borrow != 0,
+                (left as i8).checked_sub(right as i8).is_none()
+            );
+        }
     }
 }
 
