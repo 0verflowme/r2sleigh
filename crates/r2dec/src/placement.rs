@@ -490,41 +490,60 @@ fn expression_has_placement_write(
 /// sequences the assignment itself after the right-hand value computation;
 /// retaining this narrow shape lets placement order the stack write without
 /// pretending that arbitrary binary operands have a defined evaluation order.
-fn direct_stack_assignment_writes(
+/// The exact observations carried by a direct stack-slot assignment target.
+///
+/// The destination of `slot = value` is an lvalue, not an operand whose order
+/// against another operand is unspecified: the address it names is evaluated as
+/// part of that lvalue and the store belongs to it. Every observation the target
+/// carries is therefore ordered -- the address reads before the store that uses
+/// them -- and none of them makes the statement ambiguous.
+///
+/// Only a chain that bottoms out in a plain variable qualifies. Anything else is
+/// a computed destination whose order this cannot state, and stays ambiguous.
+fn direct_stack_assignment_observations(
     expr: &CExpr,
     targets: &[Option<PlacementObservationTarget>],
-) -> Option<Vec<RenderObservationId>> {
+) -> Option<(Vec<RenderObservationId>, Vec<RenderObservationId>)> {
     fn collect(
         expr: &CExpr,
         targets: &[Option<PlacementObservationTarget>],
+        reads: &mut Vec<RenderObservationId>,
         writes: &mut Vec<RenderObservationId>,
     ) -> bool {
         match expr {
-            CExpr::Observed { id, expr }
-                if matches!(
-                    observation_target(targets, *id),
-                    Some(PlacementObservationTarget::StackAccess { is_write: true, .. })
-                ) =>
-            {
-                writes.push(*id);
-                collect(expr, targets, writes)
+            CExpr::Observed { id, expr } => {
+                match observation_target(targets, *id) {
+                    Some(PlacementObservationTarget::StackAccess { is_write: true, .. }) => {
+                        writes.push(*id);
+                    }
+                    // The address this destination names, and any value read to
+                    // form it. Both are evaluated before the store they serve.
+                    Some(
+                        PlacementObservationTarget::Use { .. }
+                        | PlacementObservationTarget::CertifiedValueRead { .. }
+                        | PlacementObservationTarget::StackAccess {
+                            is_write: false, ..
+                        },
+                    ) => {
+                        reads.push(*id);
+                    }
+                    Some(PlacementObservationTarget::Other) => {}
+                    // A write that is not this destination's own store, or an
+                    // observation with no target, is not something this can order.
+                    Some(PlacementObservationTarget::Write { .. }) | None => return false,
+                }
+                collect(expr, targets, reads, writes)
             }
-            CExpr::Observed { id, expr }
-                if matches!(
-                    observation_target(targets, *id),
-                    Some(PlacementObservationTarget::Other)
-                ) =>
-            {
-                collect(expr, targets, writes)
-            }
-            CExpr::Paren(expr) => collect(expr, targets, writes),
+            CExpr::Paren(expr) => collect(expr, targets, reads, writes),
             CExpr::Var(_) => true,
             _ => false,
         }
     }
 
+    let mut reads = Vec::new();
     let mut writes = Vec::new();
-    (collect(expr, targets, &mut writes) && !writes.is_empty()).then_some(writes)
+    (collect(expr, targets, &mut reads, &mut writes) && !writes.is_empty())
+        .then_some((reads, writes))
 }
 
 fn record_completion_observations(
@@ -607,8 +626,10 @@ fn collect_expr_observation_scopes(
             left,
             right,
         } => {
-            if let Some(writes) = direct_stack_assignment_writes(left, targets) {
+            if let Some((reads, writes)) = direct_stack_assignment_observations(left, targets) {
                 collect_expr_observation_scopes(right, current, targets, order, scoped);
+                // The destination's address is read before the store that uses it.
+                record_observation_group(&reads, current, false, order, scoped);
                 record_observation_group(&writes, current, false, order, scoped);
             } else if expression_has_placement_write(left, targets)
                 || expression_has_placement_write(right, targets)
