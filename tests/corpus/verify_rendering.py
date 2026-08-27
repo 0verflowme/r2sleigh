@@ -1458,6 +1458,23 @@ def certified_image_literals(
             evidence.append("explicit_pointer_cast")
         if re.match(r"(?:[uUlL]{0,3})\s*\[", suffix):
             evidence.append("subscript_base")
+        # An address the machine loads into a register before indexing it
+        # reaches its dereference through a variable, so neither adjacency test
+        # above sees it. The binding is still an image pointer: the literal
+        # lies inside a mapped section, it initializes a name, and that name
+        # reaches a dereference in the same rendering. All three are required,
+        # and the evidence is recorded under its own kind so the mapping stays
+        # auditable rather than widening the two syntactic rules.
+        assignment = re.search(
+            r"\b([A-Za-z_]\w*)\s*=\s*\(\s*(?:__)?u?int(?:8|16|32|64|128)_t\s*\)\s*$",
+            prefix,
+        )
+        if assignment and re.match(r"(?:[uUlL]{0,3})\s*;", suffix):
+            target = re.escape(assignment.group(1))
+            if re.search(rf"\*\s*\([^()]*\*\s*\)[^;]*\b{target}\b", source) or re.search(
+                rf"\b{target}\b[^;]*?;[\s\S]{{0,4000}}?\*\s*\([^()]*\*\s*\)", source
+            ):
+                evidence.append("pointer_valued_assignment")
         if evidence:
             certified.append(
                 {
