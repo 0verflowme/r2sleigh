@@ -1279,6 +1279,38 @@ def rendered_return_type(source: str, name: str) -> str | None:
     return signature[:marker].strip() or None
 
 
+def rendered_parameter_names(source: str) -> list[str] | None:
+    """The parameter names the rendering itself declares."""
+    opening = source.find("(")
+    closing = source.find(")", opening + 1)
+    if opening < 0 or closing < 0:
+        return None
+    params = source[opening + 1 : closing].strip()
+    if not params or params == "void":
+        return []
+    names: list[str] = []
+    depth = 0
+    current = ""
+    for char in params:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            names.append(current)
+            current = ""
+        else:
+            current += char
+    names.append(current)
+    declared: list[str] = []
+    for field in names:
+        match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", field.strip())
+        if not match:
+            return None
+        declared.append(match.group(1))
+    return declared
+
+
 def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]], int]:
     rewrites: list[dict[str, Any]] = []
     repaired, linkage = normalize_linkage_name(source, name)
@@ -1291,7 +1323,17 @@ def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]]
     params = signature[signature.find("(") + 1 : -1].strip()
     parameter_count = rendered_arity(repaired) or 0
     if params and params != "void":
-        replacement = ", ".join(f"long arg{index}" for index in range(parameter_count))
+        # Retype the parameters, keep their names. The body refers to each
+        # parameter by the name the rendering declared, so renaming them
+        # positionally left every use undeclared. The diagnostic path widens
+        # types on purpose; it must not rename anything.
+        declared_names = rendered_parameter_names(repaired)
+        if declared_names is not None and len(declared_names) == parameter_count:
+            replacement = ", ".join(f"long {declared}" for declared in declared_names)
+        else:
+            replacement = ", ".join(
+                f"long arg{index}" for index in range(parameter_count)
+            )
         before = signature
         signature = signature[: signature.find("(") + 1] + replacement + ")"
         rewrites.append(
