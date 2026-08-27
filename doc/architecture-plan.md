@@ -827,6 +827,22 @@ enumerate rather than iterate -- instrument every producer of
 `exact_use_requires_rendered_occurrence` at once and take the whole list in one
 run before changing anything.
 
+That enumeration has now been taken, and it settles the question.
+`MissingProgramVariableAuthorization` has sixty-two producers across nine files
+-- twenty-four in `analysis/lower.rs`, fourteen in `op_lower/implementation.rs`,
+nine in `lib.rs`, four in `op_lower/lowering.rs`, three each in
+`op_lower/calls.rs` and `analysis/prepared_semantic.rs`, two each in
+`op_lower/memory_renderer.rs` and `structure.rs`, and one in `fold/stack.rs` --
+and `ExactUseRequiresRenderedOccurrence` adds nine more.
+
+Every one of them is a site that demands a program variable for a value. Making
+a value non-bound turns each into a potential refusal, which is exactly why
+seven serial attempts each discovered precisely one more consumer. There is no
+short chain to walk to its end. Giving the renderer a no-emit path is a contract
+change over roughly seventy demand sites, four of the nine files belong to a
+concurrent session, and it is the stage-5 naming cutover in full rather than a
+defect that can be fixed.
+
 ### A note on the machine-role coordinate system
 
 `SourceMachineRoles` storages arrive from radare2's register profile
