@@ -29,6 +29,23 @@ pub struct FunctionLiveOut {
     unresolved: BTreeSet<u64>,
 }
 
+/// Whether a write puts some of the returned bytes in place.
+///
+/// A `CanonicalLocation` is the register; a `CanonicalStorageId`'s size is only
+/// how much of it one access took. `AL` and `RAX` are one place, so a write to
+/// either contributes to what the caller reads out of that place.
+fn contributes_to(write: CanonicalStorageId, return_storage: CanonicalStorageId) -> bool {
+    write.location() == return_storage.location() && write.size > 0
+}
+
+/// Whether a write supplies every byte the caller reads.
+///
+/// Only such a write ends the backward walk: a narrower one leaves the
+/// remaining bytes to whatever wrote them earlier.
+fn covers_fully(write: CanonicalStorageId, return_storage: CanonicalStorageId) -> bool {
+    write.location() == return_storage.location() && write.size >= return_storage.size
+}
+
 impl FunctionLiveOut {
     /// Work out what leaves through the return registers of every returning block.
     pub fn compute(
@@ -86,33 +103,52 @@ impl FunctionLiveOut {
                 continue;
             };
             let mut defined_here = false;
-            // The last write wins, because that is what the caller sees.
+            // The last write to the *location* wins, and one write need not be
+            // the whole value. `xor eax, eax` followed by `sete al` leaves the
+            // returned `RAX` composed of a full-width zero and a one-byte
+            // result, so matching the return storage by width alone saw only
+            // the zero and left everything the comparison computed observed by
+            // nothing. Walking back until the location is covered names every
+            // definition the caller actually reads.
             for op in block.ops.iter().rev() {
                 let Some(dst) = op.dst() else {
                     continue;
                 };
-                if graph.canonical_storage_for_var(dst) != Some(return_storage) {
+                let Some(storage) = graph.canonical_storage_for_var(dst) else {
+                    continue;
+                };
+                if !contributes_to(storage, return_storage) {
                     continue;
                 }
                 if let Some(value) = graph.value_id_for_var(dst) {
-                    defined_here = true;
                     found |= self.values.insert(value);
+                }
+                if covers_fully(storage, return_storage) {
+                    defined_here = true;
+                    break;
                 }
             }
             for phi in &block.phis {
-                if graph.canonical_storage_for_var(&phi.dst) != Some(return_storage) {
+                let Some(storage) = graph.canonical_storage_for_var(&phi.dst) else {
+                    continue;
+                };
+                if !contributes_to(storage, return_storage) {
                     continue;
                 }
+                // Only a write that covers the whole return storage replaces the
+                // merge. A narrower one leaves the remaining bytes to the phi.
                 let overwritten = block.ops.iter().any(|op| {
                     op.dst().is_some_and(|dst| {
-                        graph.canonical_storage_for_var(dst) == Some(return_storage)
+                        graph
+                            .canonical_storage_for_var(dst)
+                            .is_some_and(|written| covers_fully(written, return_storage))
                     })
                 });
                 if overwritten {
                     continue;
                 }
                 if let Some(value) = graph.value_id_for_var(&phi.dst) {
-                    defined_here = true;
+                    defined_here |= covers_fully(storage, return_storage);
                     found |= self.values.insert(value);
                 }
             }
@@ -252,6 +288,38 @@ mod tests {
         // This is the case the use list alone gets wrong.
         assert!(graph.use_sites(value).is_empty());
         assert!(is_read(&graph, &live, value));
+    }
+
+    #[test]
+    fn only_the_last_write_to_a_return_storage_is_live_out() {
+        let block = R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: reg(0, 8),
+                    src: Varnode::constant(1, 8),
+                },
+                R2ILOp::Copy {
+                    dst: reg(0, 8),
+                    src: Varnode::constant(2, 8),
+                },
+                R2ILOp::Return {
+                    target: reg(0x288, 8),
+                },
+            ],
+            ..R2ILBlock::default()
+        };
+        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
+        let graph = SsaGraph::from_function(&func);
+        let returned = func.blocks().next().expect("one block").ops[1]
+            .dst()
+            .and_then(|value| graph.value_id_for_var(value))
+            .expect("last return-register definition");
+
+        let live = FunctionLiveOut::compute(&func, &graph, &x86_64_return_storages());
+
+        assert_eq!(live.iter().collect::<Vec<_>>(), vec![returned]);
     }
 
     #[test]
