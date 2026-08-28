@@ -4463,14 +4463,18 @@ impl Decompiler {
             .parameters()
             .map(|resolved| {
                 let resolved = resolved?;
-                let ty = usize::try_from(resolved.slot)
-                    .ok()
-                    .and_then(|slot| {
-                        render_signature.and_then(|signature| signature.params.get(slot))
-                    })
-                    .and_then(|parameter| parameter.ty.as_ref())
-                    .map(type_like_to_ctype)
-                    .unwrap_or(resolved.declaration_type);
+                // The parameter is declared as the object the body actually
+                // reads: the unsigned machine word of its register's width.
+                // An inferred signature type disagreed with every use of it,
+                // so a strict compile rejected the whole function as a
+                // signedness-changing conversion on its own argument.
+                //
+                // This is the documented contract -- a parameter is an
+                // unsigned integer of the register's own width, and
+                // signedness, pointer-ness and names are never asserted. How
+                // that compares to the source's own types is reported by the
+                // typed-recovery score instead of being claimed here.
+                let ty = resolved.declaration_type;
                 Ok(ast::CParam {
                     ty,
                     name: resolved.symbol,
