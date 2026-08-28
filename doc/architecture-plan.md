@@ -899,3 +899,58 @@ field either.
 Four of those five already exist upstream. The rewrite is mostly a matter of
 letting the renderer read them instead of re-deriving them — and of deleting what
 it used to re-derive them with, in the same change that stops using it.
+
+## Traced blockers in the concurrent session's files
+
+Three classes remain in the raw score. Each was traced to a specific line
+rather than guessed at, and all three land in files the concurrent session is
+still holding uncommitted, so they are recorded here instead of edited.
+
+### A do-while condition reads a name declared inside its own body
+
+`structure.rs` builds `Region::DoWhileLoop` by taking the condition expression
+from `get_branch_condition_with_predicate(cond_block)` and separately flattening
+the condition block's *statements* into the loop body. When the condition is a
+temporary the block computes, the declaration lands inside the braces and the
+read lands in the `while (...)`, which in C is not in that scope. The same name
+is reported twice: unused inside the body, undeclared at the condition.
+
+This is not a placement defect. Placement's scope walk already collects the
+condition under the enclosing region, and its audit would flag the read -- but
+the audit only covers plan symbols, and this is a renderer temporary, so it
+passes through. The fix belongs where the loop is shaped: either the condition
+block's statements stay with the condition, or the loop is emitted as
+`while (1) { body; if (!cond) break; }` so that the computation and its use
+share a scope.
+
+Eight undeclared identifiers and six unused variables.
+
+### A dead address temporary keeps the stack pointer alive
+
+`SP_0` is correctly classified `EntryValue` -- it is version 0 with no defining
+instruction, so it is supplied from outside and is declared without an
+initializer. That is what the machine does, but it means the emitted
+`SP_0 = SP_0 - 32;` reads an uninitialized object, which a strict compile
+rejects.
+
+The update is only there because one consumer survives: `tmp_6500_2 = SP_0 + 16`,
+which is itself never read. The stack-object rendering replaced every real use of
+that address with the object it addresses (`stack_m16`), and the read of the
+address went with it -- but the occurrence set placement derives its decisions
+from still records that read. So the binding is never decided dead, and both its
+declaration and its update survive into C that nothing consumes.
+
+Re-asking the dead-store question against the finished tree was measured and is
+wrong: it takes generation 26 to 19 and differential 12 to 7. The refusals are
+`rendered_value_required`, because a binding whose symbol no longer appears in
+the tree can still be a value the journal requires rendered. Placement cannot
+tell the two apart on its own.
+
+The fix belongs where the read is eliminated. The stack-object rewrite in
+`fold/stack.rs` and `fold/op_lower/memory_renderer.rs` removes an address
+computation's reader without retracting the occurrence that recorded it. Once
+the occurrence is retracted the existing derivation decides the binding dead by
+itself, with no new rule and no widened removal.
+
+Seven uninitialized reads, plus the set-but-not-used and unused-variable
+reports that hang off the same chain.
