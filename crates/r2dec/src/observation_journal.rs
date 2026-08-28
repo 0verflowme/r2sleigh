@@ -684,6 +684,12 @@ pub(crate) struct LegacyObservationJournal {
     materialized_removed_phis: BTreeSet<InstId>,
     /// Definitions placement dropped because nothing reads what they produce.
     placement_elided_writes: BTreeSet<InstId>,
+    /// Observations that went with the statements placement discarded.
+    ///
+    /// Named exactly, never inferred from what is unaccounted: the seal refuses
+    /// a function whose cells are empty, and filling in whatever is empty would
+    /// answer that check instead of answering to it.
+    placement_elided_observations: BTreeSet<crate::ast::RenderObservationId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -1019,17 +1025,13 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Analysis)?;
-        for (binding, decision) in decisions.iter() {
-            if matches!(
-                decision,
-                Some(crate::placement::PlacementDecision::DeadStore)
-            ) {
-                for occurrence in occurrences.writes().iter().filter(|w| w.binding == binding) {
-                    self.journal.placement_elided_writes.insert(occurrence.inst);
-                }
-            }
-        }
-        crate::placement::apply_placement_decisions(
+        // Which writes lost their statements is only known once the decisions
+        // have been applied: one can be declined because the tree still
+        // mentions the symbol, and one binding's removal can take away the last
+        // reader of another. Asking afterwards is what keeps the obligations
+        // these statements carried closed out against what was actually
+        // emitted rather than against what was planned.
+        let removals = crate::placement::apply_placement_decisions(
             &mut self.function,
             &placement.regions,
             &placement.names,
@@ -1037,6 +1039,14 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Application)?;
+        for binding in removals.bindings {
+            for occurrence in occurrences.writes().iter().filter(|w| w.binding == binding) {
+                self.journal.placement_elided_writes.insert(occurrence.inst);
+            }
+        }
+        self.journal
+            .placement_elided_observations
+            .extend(removals.observations);
         let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&self.function);
         if !undeclared.is_empty() {
             return Err(NativePlacementFailure::UndeclaredNames {
@@ -1508,6 +1518,7 @@ impl LegacyObservationJournal {
             coalesced_carrier_phi_writes,
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
+            placement_elided_observations: BTreeSet::new(),
             symbols,
             value_is_literal,
             values,
@@ -2121,6 +2132,53 @@ impl LegacyObservationJournal {
                 {
                     *slot = Some(LegacyUseObservation::Elided(reason));
                 }
+            }
+        }
+
+        // Every cell the discarded statements carried. Walking the writes
+        // reaches only what a defining instruction produced, and a
+        // caller-supplied value is version zero with no defining instruction at
+        // all -- the stack pointer is exactly that -- so its cell is reachable
+        // only through the observation that named it.
+        //
+        // These are the observations placement reported removing, not the cells
+        // that happen to be empty. Filling in whatever is empty would satisfy
+        // the seal by silencing it, and the seal is the only thing that catches
+        // a value the renderer was supposed to emit and did not.
+        let reason = r2ssa::ledger::ElisionReason::DeadUnreadBinding;
+        for id in self.placement_elided_observations.clone() {
+            let Some(target) = self.targets.get(id.index() as usize).copied() else {
+                continue;
+            };
+            match target {
+                ObservationTarget::Value(value) => {
+                    if let Some(slot) = self.values.get_mut(value.0 as usize)
+                        && slot.is_none()
+                    {
+                        *slot = Some(LegacyValueObservation::Elided(reason));
+                    }
+                }
+                ObservationTarget::Use { site, .. } => {
+                    if let Some(row) = self.uses.get_mut(site.inst.0 as usize)
+                        && let Some(slot) = row.get_mut(site.input_idx)
+                        && slot.is_none()
+                    {
+                        *slot = Some(LegacyUseObservation::Elided(reason));
+                    }
+                }
+                ObservationTarget::Write { inst, .. } => {
+                    if let Some(slot) = self.writes.get_mut(inst.0 as usize)
+                        && slot.is_none()
+                    {
+                        *slot = Some(LegacyWriteObservation::Elided(reason));
+                    }
+                }
+                // A stack access answers through the object it addresses, and a
+                // certified read through the value it reads; an effect answers
+                // to the effect ledger. None of the three owns a cell here.
+                ObservationTarget::StackAccess { .. }
+                | ObservationTarget::CertifiedValueRead { .. }
+                | ObservationTarget::Effect(_) => {}
             }
         }
     }

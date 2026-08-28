@@ -83,6 +83,16 @@ pub enum ElisionReason {
     DeadCallerSaved,
     /// A register write consumed entirely by a rendered call's argument list.
     DeadCallArgument,
+    /// A bound object placement removed because nothing read it.
+    ///
+    /// Distinct from `DeadUnusedTemporary`, which names a lifted temporary with
+    /// no reader outside its own definition. This is the outcome for an object
+    /// that had readers when the decisions were derived and lost them when
+    /// another dead object's statements went: the value still exists in the
+    /// source, and a caller-supplied one has no defining instruction at all, so
+    /// there is no write cell to answer for it. What the removed statements did
+    /// besides producing the value is answered by the effect ledger.
+    DeadUnreadBinding,
     /// A write to the stack base that frame handling accounts for instead.
     DeadStackBase,
     /// A merge no observation depends on, so nothing reads what it decides.
@@ -117,6 +127,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadUnusedTemporary => "dead-unused-temp",
             Self::DeadCallerSaved => "dead-caller-saved",
             Self::DeadCallArgument => "dead-call-arg",
+            Self::DeadUnreadBinding => "dead-unread-binding",
             Self::DeadStackBase => "dead-stack-base",
             Self::UnobservedMerge => "unobserved-merge",
             Self::UnobservedValue => "unobserved-value",

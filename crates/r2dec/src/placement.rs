@@ -1777,14 +1777,26 @@ pub(crate) enum PlacementApplicationError {
 }
 
 /// Apply a decision set transactionally to the exact marker-bearing function.
+/// Apply the derived decisions, reporting which bindings actually lost their
+/// statements.
+///
+/// The caller has to tell the ledger which writes were elided so their
+/// obligations are closed out at the seal. It used to predict that set from the
+/// decisions, before this ran. The prediction and the action can disagree --
+/// a decision can be declined here because the tree still mentions the symbol,
+/// and a binding the derivation never called dead can lose its last reader to
+/// another binding's removal -- so what is reported is what happened, not what
+/// was planned.
 pub(crate) fn apply_placement_decisions(
     function: &mut CFunction,
     regions: &SealedStructuredRegionArtifact,
     names: &BindingNameResolution,
     decisions: &PlacementDecisions,
     writes: &[FinalBindingWrite],
-) -> Result<(), PlacementApplicationError> {
+) -> Result<PlacementRemovals, PlacementApplicationError> {
     let mut candidate = function.clone();
+    let mut discarded_bindings = BTreeSet::new();
+    let mut discarded_observations = BTreeSet::<RenderObservationId>::new();
     let mut declarations =
         BTreeMap::<RegionId, Vec<(BindingId, crate::ast::CType, crate::symbol::SymbolId)>>::new();
     let plan = names.plan();
@@ -1822,14 +1834,20 @@ pub(crate) fn apply_placement_decisions(
                 // which is the one thing this must never do, so the tree itself
                 // is asked before anything is removed.
                 let mut trial = candidate.clone();
+                let mut trial_observations = BTreeSet::new();
                 let mut discarded = 0;
                 for occurrence in writes.iter().filter(|w| w.binding == binding) {
-                    discarded +=
-                        discard_observed_statement(&mut trial.body, occurrence.observation);
+                    discarded += discard_observed_statement(
+                        &mut trial.body,
+                        occurrence.observation,
+                        &mut trial_observations,
+                    );
                 }
                 if discarded > 0 && !function_body_mentions_symbol(&trial.body, symbol) {
                     trial.locals.retain(|local| local.name != symbol);
                     candidate = trial;
+                    discarded_bindings.insert(binding);
+                    discarded_observations.append(&mut trial_observations);
                 }
             }
             Some(PlacementDecision::Inline { write }) => {
@@ -1865,6 +1883,66 @@ pub(crate) fn apply_placement_decisions(
         }
     }
 
+    // Deadness is transitive. Discarding a dead binding's statements discards
+    // the reads they performed, which can leave another binding with no reader
+    // at all -- an address temporary the stack-object rendering had already
+    // replaced everywhere else, and behind it the stack pointer's own update,
+    // which by then reads nothing but itself.
+    //
+    // This is the same rule the derivation applies, asked again once the tree
+    // says something new, not a wider one: a binding is only reconsidered
+    // because a removal took its last mention away, and it is still only
+    // removed when the trial copy shows no mention survives discarding its own
+    // writes. Bindings that were inlined or externally declared are never
+    // reconsidered; their statements are already spoken for.
+    loop {
+        let reconsider = decisions
+            .iter()
+            .filter(|(binding, decision)| {
+                !discarded_bindings.contains(binding)
+                    && matches!(
+                        decision,
+                        None | Some(PlacementDecision::DeadStore)
+                            | Some(PlacementDecision::LexicalDeclaration { .. })
+                    )
+            })
+            .map(|(binding, _)| binding)
+            .collect::<Vec<_>>();
+        let mut removed_any = false;
+        for binding in reconsider {
+            let Some(symbol) = names.symbol_for_binding(binding) else {
+                continue;
+            };
+            if !function_body_mentions_symbol(&candidate.body, symbol) {
+                continue;
+            }
+            let mut trial = candidate.clone();
+            let mut trial_observations = BTreeSet::new();
+            let mut discarded = 0;
+            for occurrence in writes.iter().filter(|w| w.binding == binding) {
+                discarded += discard_observed_statement(
+                    &mut trial.body,
+                    occurrence.observation,
+                    &mut trial_observations,
+                );
+            }
+            if discarded == 0 || function_body_mentions_symbol(&trial.body, symbol) {
+                continue;
+            }
+            trial.locals.retain(|local| local.name != symbol);
+            candidate = trial;
+            discarded_observations.append(&mut trial_observations);
+            for declared in declarations.values_mut() {
+                declared.retain(|(declared, _, _)| *declared != binding);
+            }
+            discarded_bindings.insert(binding);
+            removed_any = true;
+        }
+        if !removed_any {
+            break;
+        }
+    }
+
     for (region, declarations) in &mut declarations {
         declarations.sort_by_key(|(binding, _, _)| *binding);
         let statements = declarations
@@ -1883,7 +1961,23 @@ pub(crate) fn apply_placement_decisions(
     }
 
     *function = candidate;
-    Ok(())
+    Ok(PlacementRemovals {
+        bindings: discarded_bindings,
+        observations: discarded_observations,
+    })
+}
+
+/// What applying the decisions actually removed.
+///
+/// Both halves are needed. The bindings say which writes lost their statements,
+/// which is what the effect ledger keys on. The observations say which cells
+/// those statements carried, which is the only way to reach a caller-supplied
+/// value: it is version zero with no defining instruction, so no write answers
+/// for it.
+#[derive(Debug, Default)]
+pub(crate) struct PlacementRemovals {
+    pub(crate) bindings: BTreeSet<BindingId>,
+    pub(crate) observations: BTreeSet<RenderObservationId>,
 }
 
 fn insert_region_declarations(
@@ -2064,52 +2158,70 @@ fn expr_mentions_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -> bool {
     found
 }
 
-fn discard_observed_statement(statements: &mut [CStmt], target: RenderObservationId) -> usize {
+/// Discard the statement carrying `target`, recording every observation that
+/// went with it.
+///
+/// A statement is removed whole, so the markers nested inside it are removed
+/// too. Their cells would otherwise stay empty and the seal would refuse the
+/// function for a value nothing rendered. Naming them here is what lets the
+/// journal close out exactly what placement dropped, rather than closing out
+/// whatever happens to be unaccounted -- which would answer the check instead
+/// of answering to it.
+fn discard_observed_statement(
+    statements: &mut [CStmt],
+    target: RenderObservationId,
+    discarded: &mut BTreeSet<RenderObservationId>,
+) -> usize {
     let mut removed = 0;
     for statement in statements.iter_mut() {
-        removed += discard_observed_statement_in_stmt(statement, target);
+        removed += discard_observed_statement_in_stmt(statement, target, discarded);
     }
     removed
 }
 
-fn discard_observed_statement_in_stmt(statement: &mut CStmt, target: RenderObservationId) -> usize {
+fn discard_observed_statement_in_stmt(
+    statement: &mut CStmt,
+    target: RenderObservationId,
+    discarded: &mut BTreeSet<RenderObservationId>,
+) -> usize {
     if let CStmt::Observed { id, .. } = statement
         && *id == target
     {
+        collect_statement_observations(statement, discarded);
         *statement = CStmt::Empty;
         return 1;
     }
     match statement {
         CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
-            discard_observed_statement_in_stmt(stmt, target)
+            discard_observed_statement_in_stmt(stmt, target, discarded)
         }
-        CStmt::Block(statements) => discard_observed_statement(statements, target),
+        CStmt::Block(statements) => discard_observed_statement(statements, target, discarded),
         CStmt::If {
             then_body,
             else_body,
             ..
         } => {
-            discard_observed_statement_in_stmt(then_body, target)
-                + else_body
-                    .as_mut()
-                    .map_or(0, |body| discard_observed_statement_in_stmt(body, target))
+            discard_observed_statement_in_stmt(then_body, target, discarded)
+                + else_body.as_mut().map_or(0, |body| {
+                    discard_observed_statement_in_stmt(body, target, discarded)
+                })
         }
         CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            discard_observed_statement_in_stmt(body, target)
+            discard_observed_statement_in_stmt(body, target, discarded)
         }
         CStmt::For { init, body, .. } => {
-            init.as_mut()
-                .map_or(0, |init| discard_observed_statement_in_stmt(init, target))
-                + discard_observed_statement_in_stmt(body, target)
+            init.as_mut().map_or(0, |init| {
+                discard_observed_statement_in_stmt(init, target, discarded)
+            }) + discard_observed_statement_in_stmt(body, target, discarded)
         }
         CStmt::Switch { cases, default, .. } => {
             cases
                 .iter_mut()
-                .map(|case| discard_observed_statement(&mut case.body, target))
+                .map(|case| discard_observed_statement(&mut case.body, target, discarded))
                 .sum::<usize>()
-                + default
-                    .as_mut()
-                    .map_or(0, |body| discard_observed_statement(body, target))
+                + default.as_mut().map_or(0, |body| {
+                    discard_observed_statement(body, target, discarded)
+                })
         }
         _ => 0,
     }
