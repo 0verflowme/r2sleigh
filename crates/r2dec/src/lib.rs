@@ -4875,7 +4875,7 @@ fn void_function_has_value_return(func: &CFunction) -> bool {
     func.body.iter().any(stmt_has_value_return)
 }
 
-fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
+pub(crate) fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
     match expr {
         CExpr::Observed { expr, .. } => collect_expr_var_names(expr, out),
         CExpr::Var(name) => {
@@ -4930,48 +4930,6 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolI
 }
 
 /// Names a statement introduces, wherever it sits in the body.
-pub(crate) fn declarations_in_stmts(stmts: &[CStmt]) -> Vec<crate::symbol::SymbolId> {
-    fn visit(stmt: &CStmt, out: &mut Vec<crate::symbol::SymbolId>) {
-        match stmt {
-            CStmt::StructuredRegion { stmt, .. } => visit(stmt, out),
-            CStmt::Observed { stmt, .. } => visit(stmt, out),
-            CStmt::Decl { name, .. } => out.push(*name),
-            CStmt::Block(body) => body.iter().for_each(|s| visit(s, out)),
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                visit(then_body, out);
-                if let Some(body) = else_body {
-                    visit(body, out);
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => visit(body, out),
-            CStmt::For { init, body, .. } => {
-                if let Some(init) = init {
-                    visit(init, out);
-                }
-                visit(body, out);
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    case.body.iter().for_each(|s| visit(s, out));
-                }
-                if let Some(body) = default {
-                    body.iter().for_each(|s| visit(s, out));
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for stmt in stmts {
-        visit(stmt, &mut out);
-    }
-    out
-}
-
 pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
     fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {

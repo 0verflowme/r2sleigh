@@ -228,20 +228,174 @@ fn drop_labels_outside(
 /// removed it. What it finds is a name the reader has no declaration for: the
 /// table knows it, the C does not. A value with more than one reader is
 /// supposed to become a typed local, and this is the check that it did.
+/// Names the function mentions that no enclosing scope declares.
+///
+/// The property being checked is that every emitted identifier is declared
+/// once, in a scope that dominates every surviving read of it. This used to be
+/// approximated by collecting every declaration anywhere in the function and
+/// every mention anywhere, then subtracting -- which answers the much weaker
+/// question of whether the name is declared *somewhere*.
+///
+/// The two differ wherever C's scopes do not follow the nesting of the tree.
+/// A `do { ... } while (cond)` is the case that matters here: the condition is
+/// written inside the loop but evaluated in the scope that encloses it, so a
+/// temporary the body declares is not in scope for the test that reads it. The
+/// flat check saw the declaration and the mention and was satisfied; the
+/// compiler saw one name undeclared at the condition and another unused inside
+/// the body, and rejected the function.
+///
+/// Reporting that is the point. A name resolved by a scope that does not
+/// dominate its read is not a rendering that happens to be untidy, it is C
+/// that does not compile, and the caller refuses the function rather than
+/// emitting it.
 pub(crate) fn names_mentioned_without_a_declaration(
     func: &CFunction,
 ) -> Vec<crate::symbol::SymbolId> {
-    let mut declared = func
+    let outermost = func
         .params
         .iter()
         .map(|param| param.name)
         .chain(func.locals.iter().map(|local| local.name))
         .collect::<std::collections::HashSet<_>>();
-    declared.extend(crate::declarations_in_stmts(&func.body));
-    let mut undeclared = crate::collect_stmt_var_names(&func.body)
-        .into_iter()
-        .filter(|name| !declared.contains(name))
-        .collect::<Vec<_>>();
+    let mut scopes = vec![outermost];
+    let mut undeclared = std::collections::HashSet::new();
+    check_scope(&func.body, &mut scopes, &mut undeclared);
+    let mut undeclared = undeclared.into_iter().collect::<Vec<_>>();
     undeclared.sort_unstable();
     undeclared
+}
+
+/// Whether any open scope declares this name.
+fn in_scope(
+    scopes: &[std::collections::HashSet<crate::symbol::SymbolId>],
+    name: crate::symbol::SymbolId,
+) -> bool {
+    scopes.iter().any(|scope| scope.contains(&name))
+}
+
+fn check_expr(
+    expr: &crate::ast::CExpr,
+    scopes: &[std::collections::HashSet<crate::symbol::SymbolId>],
+    undeclared: &mut std::collections::HashSet<crate::symbol::SymbolId>,
+) {
+    let mut mentioned = std::collections::HashSet::new();
+    crate::collect_expr_var_names(expr, &mut mentioned);
+    for name in mentioned {
+        if !in_scope(scopes, name) {
+            undeclared.insert(name);
+        }
+    }
+}
+
+/// Check one statement list as a nested scope.
+fn check_nested(
+    statements: &[CStmt],
+    scopes: &mut Vec<std::collections::HashSet<crate::symbol::SymbolId>>,
+    undeclared: &mut std::collections::HashSet<crate::symbol::SymbolId>,
+) {
+    scopes.push(std::collections::HashSet::new());
+    check_scope(statements, scopes, undeclared);
+    scopes.pop();
+}
+
+fn check_nested_stmt(
+    statement: &CStmt,
+    scopes: &mut Vec<std::collections::HashSet<crate::symbol::SymbolId>>,
+    undeclared: &mut std::collections::HashSet<crate::symbol::SymbolId>,
+) {
+    check_nested(std::slice::from_ref(statement), scopes, undeclared);
+}
+
+/// Check statements in order within the innermost open scope.
+///
+/// Order matters: a declaration is in scope for what follows it, not for what
+/// precedes it, and its own initializer is checked before the name it binds
+/// becomes visible.
+fn check_scope(
+    statements: &[CStmt],
+    scopes: &mut Vec<std::collections::HashSet<crate::symbol::SymbolId>>,
+    undeclared: &mut std::collections::HashSet<crate::symbol::SymbolId>,
+) {
+    for statement in statements {
+        match statement {
+            // Neither wrapper is a C scope; both are transparent here.
+            CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+                check_scope(std::slice::from_ref(stmt), scopes, undeclared);
+            }
+            CStmt::Block(inner) => check_nested(inner, scopes, undeclared),
+            CStmt::Decl { name, init, .. } => {
+                if let Some(init) = init {
+                    check_expr(init, scopes, undeclared);
+                }
+                if let Some(scope) = scopes.last_mut() {
+                    scope.insert(*name);
+                }
+            }
+            CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+                check_expr(expr, scopes, undeclared);
+            }
+            CStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                check_expr(cond, scopes, undeclared);
+                check_nested_stmt(then_body, scopes, undeclared);
+                if let Some(else_body) = else_body {
+                    check_nested_stmt(else_body, scopes, undeclared);
+                }
+            }
+            CStmt::While { cond, body } => {
+                check_expr(cond, scopes, undeclared);
+                check_nested_stmt(body, scopes, undeclared);
+            }
+            // The body is a scope of its own and the condition is not inside
+            // it, however the source is laid out.
+            CStmt::DoWhile { body, cond } => {
+                check_nested_stmt(body, scopes, undeclared);
+                check_expr(cond, scopes, undeclared);
+            }
+            CStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                // The initializer's declarations are in scope for the condition,
+                // the update and the body, and nowhere after the loop.
+                scopes.push(std::collections::HashSet::new());
+                if let Some(init) = init {
+                    check_scope(std::slice::from_ref(init), scopes, undeclared);
+                }
+                if let Some(cond) = cond {
+                    check_expr(cond, scopes, undeclared);
+                }
+                if let Some(update) = update {
+                    check_expr(update, scopes, undeclared);
+                }
+                check_nested_stmt(body, scopes, undeclared);
+                scopes.pop();
+            }
+            CStmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                check_expr(expr, scopes, undeclared);
+                for case in cases {
+                    check_nested(&case.body, scopes, undeclared);
+                }
+                if let Some(default) = default {
+                    check_nested(default, scopes, undeclared);
+                }
+            }
+            CStmt::Empty
+            | CStmt::Return(None)
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Comment(_) => {}
+        }
+    }
 }
