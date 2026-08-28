@@ -552,7 +552,7 @@ impl CodeGenerator {
                     self.output.push(' ');
                     self.emit_expr(&positive_rhs, my_prec + 1);
                 } else {
-                    self.emit_expr(left, my_prec);
+                    self.emit_expr(left, operand_precedence_floor(*op, left, my_prec));
                     self.output.push(' ');
                     self.output.push_str(op.as_str());
                     self.output.push(' ');
@@ -575,7 +575,7 @@ impl CodeGenerator {
                     } else {
                         my_prec + 1
                     };
-                    self.emit_expr(right, right_prec);
+                    self.emit_expr(right, operand_precedence_floor(*op, right, right_prec));
                 }
             }
             CExpr::Ternary {
@@ -1462,5 +1462,40 @@ mod tests {
             code.contains("acc++;\n    acc--;"),
             "zero-sum definitions must not disappear without an elision proof:\n{code}"
         );
+    }
+}
+
+/// Whether C's own precedence would regroup this operand away from the reader.
+///
+/// `a | b & c` parses exactly as the model means it -- `&` binds tighter --
+/// but a strict compile rejects the line, because the standard's grouping here
+/// is not the one a reader arrives at unaided. The same holds for a shift
+/// alongside an addition and for `&&` inside `||`.
+///
+/// Where that is the case the printer states the grouping rather than relying
+/// on it. This never changes what the expression means; it removes the reader's
+/// obligation to have memorised the table.
+fn grouping_must_be_explicit(parent: BinaryOp, operand: &CExpr) -> bool {
+    let CExpr::Binary { op: inner, .. } = operand.unobserved() else {
+        return false;
+    };
+    let bitwise = |op| matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor);
+    let shift = |op| matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+    let additive = |op| matches!(op, BinaryOp::Add | BinaryOp::Sub);
+
+    (bitwise(parent) && bitwise(*inner) && parent != *inner)
+        || (shift(parent) && additive(*inner))
+        || (parent == BinaryOp::Or && *inner == BinaryOp::And)
+}
+
+/// The precedence floor an operand is emitted under.
+///
+/// Normally the parent's own precedence, raised just past the operand's when
+/// the pairing is one C reads differently than a person does.
+fn operand_precedence_floor(parent: BinaryOp, operand: &CExpr, default: u8) -> u8 {
+    if grouping_must_be_explicit(parent, operand) {
+        operand.precedence().saturating_add(1)
+    } else {
+        default
     }
 }
