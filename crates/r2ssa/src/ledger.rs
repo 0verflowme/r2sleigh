@@ -65,6 +65,14 @@ pub enum ElisionReason {
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
     CoalescedImmutablePhi,
+    /// A certified loop-carrier edge whose incoming value and merge output are
+    /// one renderer binding. The update already writes that binding, so the
+    /// synthetic edge copy would only spell `x = x`.
+    CoalescedCarrierEdge,
+    /// Every incoming edge of a certified loop carrier is either an SSA
+    /// identity or coalesced to the carrier binding, so the removed phi itself
+    /// needs no standalone C write.
+    CoalescedCarrierPhi,
     /// A condition-code write no rendered predicate reads.
     DeadCpuFlag,
     /// A value only ever read to compute a flag that is itself elided.
@@ -79,12 +87,18 @@ pub enum ElisionReason {
     DeadStackBase,
     /// A merge no observation depends on, so nothing reads what it decides.
     UnobservedMerge,
+    /// A pure value outside the complete transitive observation slice.
+    UnobservedValue,
     /// A source-classified structural instruction produced a value with no
     /// graph use and owns no semantic obligation.
     UnusedStructuralValue,
     /// A removed merge input already names the merge result, so its edge copy
     /// would be the identity assignment `x = x`.
     RedundantPhiEdge,
+    /// Every input of a removed merge is written by a copy on its own incoming
+    /// edge, so the state the merge carried is carried by those copies and the
+    /// merge itself needs no standalone C operation.
+    MaterializedPhiEdges,
     /// Proven dead, with no rule yet naming which kind of dead it is.
     DeadUnclassified,
 }
@@ -96,6 +110,8 @@ impl std::fmt::Display for ElisionReason {
             Self::ReturnControl => "return-control",
             Self::DirectControlTarget => "direct-control-target",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
+            Self::CoalescedCarrierEdge => "coalesced-carrier-edge",
+            Self::CoalescedCarrierPhi => "coalesced-carrier-phi",
             Self::DeadCpuFlag => "dead-cpu-flag",
             Self::DeadFlagOnly => "dead-flag-only",
             Self::DeadUnusedTemporary => "dead-unused-temp",
@@ -103,8 +119,10 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadCallArgument => "dead-call-arg",
             Self::DeadStackBase => "dead-stack-base",
             Self::UnobservedMerge => "unobserved-merge",
+            Self::UnobservedValue => "unobserved-value",
             Self::UnusedStructuralValue => "unused-structural-value",
             Self::RedundantPhiEdge => "redundant-phi-edge",
+            Self::MaterializedPhiEdges => "materialized-phi-edges",
             Self::DeadUnclassified => "dead-unclassified",
         })
     }

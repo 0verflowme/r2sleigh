@@ -32,6 +32,7 @@ fn rendered_site(id: SemanticObligationId) -> Option<(u64, usize)> {
 fn upstream_zero_occurrence_outcome(
     prepared: &SsaArtifact,
     origins: &NormalizationOrigins,
+    effects: &SurvivingEffectObservations,
     id: SemanticObligationId,
 ) -> Outcome {
     if matches!(
@@ -50,6 +51,26 @@ fn upstream_zero_occurrence_outcome(
         .instructions()
         .get(&id.instruction)
         .and_then(|disposition| disposition.source.graph_inst());
+    if source_inst.is_some_and(|inst| {
+        prepared
+            .certificates()
+            .stack_frame_round_trip_by_inst
+            .contains_key(&inst)
+    }) {
+        return Outcome::Elided(ElisionReason::StackFrame);
+    }
+    if source_inst.is_some_and(|inst| {
+        prepared
+            .certificates()
+            .machine_return_control_by_inst
+            .contains_key(&inst)
+    }) {
+        return Outcome::Elided(ElisionReason::ReturnControl);
+    }
+    if source_inst.is_some_and(|inst| prepared.certificates().stack_geometry.insts.contains(&inst))
+    {
+        return Outcome::Elided(ElisionReason::DeadStackBase);
+    }
     if matches!(id.instruction.site, CanonicalInstructionSite::Phi(_))
         && source_inst
             .and_then(|inst| graph.inst(inst))
@@ -57,6 +78,26 @@ fn upstream_zero_occurrence_outcome(
             .is_some_and(|value| prepared.unobserved_merges().contains(value))
     {
         return Outcome::Elided(ElisionReason::UnobservedMerge);
+    }
+
+    if let Some(inst) = source_inst
+        && effects.is_coalesced_carrier_phi(inst)
+        && matches!(
+            id.kind,
+            SemanticObligationKind::LoopCarriedState | SemanticObligationKind::LiveValueProducer
+        )
+    {
+        return Outcome::Elided(ElisionReason::CoalescedCarrierPhi);
+    }
+    if id.kind == SemanticObligationKind::LiveStateTransition
+        && prepared
+            .obligations()
+            .obligations()
+            .get(&id)
+            .and_then(|obligation| obligation.edge_use)
+            .is_some_and(|site| effects.is_coalesced_carrier_use(site))
+    {
+        return Outcome::Elided(ElisionReason::CoalescedCarrierEdge);
     }
 
     if let Some(inst) = source_inst
@@ -86,6 +127,25 @@ fn upstream_zero_occurrence_outcome(
             {
                 return Outcome::Elided(ElisionReason::RedundantPhiEdge);
             }
+            // Every input the merge had is written by a copy on its own
+            // incoming edge, so the state it carried is carried by those
+            // copies. Refusing here reported the merge as unrendered when what
+            // it stood for is rendered, just as several assignments rather than
+            // one merge.
+            (
+                SemanticObligationKind::LoopCarriedState
+                | SemanticObligationKind::LiveValueProducer,
+                _,
+            ) if {
+                let materialized = origins.materialized_phi_edges(inst);
+                removed
+                    .incoming_sites
+                    .iter()
+                    .all(|site| removed.noop_sites().contains(site) || materialized.contains(site))
+            } =>
+            {
+                return Outcome::Elided(ElisionReason::MaterializedPhiEdges);
+            }
             _ => {}
         }
     }
@@ -109,7 +169,9 @@ pub(crate) fn build_obligation_ledger(
             .occurrence_count(id)
             .expect("effect observation domain is opened from this source inventory");
         let outcome = match count {
-            0 => Some(upstream_zero_occurrence_outcome(prepared, origins, id)),
+            0 => Some(upstream_zero_occurrence_outcome(
+                prepared, origins, effects, id,
+            )),
             1 => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
             _ => Some(Outcome::Refused {
