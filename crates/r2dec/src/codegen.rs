@@ -372,9 +372,15 @@ impl CodeGenerator {
                 self.output.push_str(";\n");
             }
             CStmt::Label(label) => {
-                // Labels are not indented
+                // Labels are not indented.
+                //
+                // The empty statement is written down rather than left to what
+                // follows. A label labels a statement, and a declaration is not
+                // one before C23, so a label landing on a declaration is
+                // rejected by a strict compile. Saying `;` makes the label's
+                // statement explicit wherever it lands.
                 self.output.push_str(label);
-                self.output.push_str(":\n");
+                self.output.push_str(": ;\n");
             }
             CStmt::Comment(text) => {
                 if self.config.emit_comments {

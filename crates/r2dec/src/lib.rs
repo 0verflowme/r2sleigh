@@ -4022,18 +4022,39 @@ impl Decompiler {
         fold_ctx: &FoldingContext<'_>,
     ) -> structure::ControlFlowStructureResult<Vec<CStmt>> {
         let blocks: Vec<_> = func.blocks().cloned().collect();
-        let mut stmts = Vec::new();
+        let mut labelled = Vec::new();
 
         for block in &blocks {
-            stmts.push(CStmt::Label(Self::linear_block_label(block.addr)));
+            let mut body = Vec::new();
             for stmt in fold_ctx.fold_block(block, block.addr)? {
                 if !matches!(stmt, CStmt::Empty) {
-                    stmts.push(stmt);
+                    body.push(stmt);
                 }
             }
             if let Some(terminator_stmt) = Self::linearized_terminator_stmt(func, fold_ctx, block) {
-                stmts.push(terminator_stmt);
+                body.push(terminator_stmt);
             }
+            labelled.push((Self::linear_block_label(block.addr), body));
+        }
+
+        // A block gets a label only if something jumps to it. Labelling every
+        // block is how the linear form used to be written, and it emits names
+        // no `goto` mentions, which a strict compile rejects. The set has to be
+        // collected across the whole body first, because a jump backwards is
+        // the normal case here.
+        let mut targets = std::collections::BTreeSet::new();
+        for (_, body) in &labelled {
+            for stmt in body {
+                collect_goto_targets(stmt, &mut targets);
+            }
+        }
+
+        let mut stmts = Vec::new();
+        for (label, body) in labelled {
+            if targets.contains(&label) {
+                stmts.push(CStmt::Label(label));
+            }
+            stmts.extend(body);
         }
 
         Ok(stmts)
@@ -10182,5 +10203,61 @@ mod tests {
             Err(DecompileRenderRefusal::UnrepresentableControlFlow),
             "release builds must not admit a partially represented region domain"
         );
+    }
+}
+
+/// Every label a `goto` in this statement names.
+fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet<String>) {
+    match statement {
+        CStmt::Goto(label) => {
+            into.insert(label.clone());
+        }
+        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+            collect_goto_targets(stmt, into);
+        }
+        CStmt::Block(statements) => {
+            for statement in statements {
+                collect_goto_targets(statement, into);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_goto_targets(then_body, into);
+            if let Some(else_body) = else_body {
+                collect_goto_targets(else_body, into);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            collect_goto_targets(body, into);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_goto_targets(init, into);
+            }
+            collect_goto_targets(body, into);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for statement in &case.body {
+                    collect_goto_targets(statement, into);
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    collect_goto_targets(statement, into);
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
     }
 }
