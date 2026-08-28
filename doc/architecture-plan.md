@@ -900,36 +900,47 @@ Four of those five already exist upstream. The rewrite is mostly a matter of
 letting the renderer read them instead of re-deriving them — and of deleting what
 it used to re-derive them with, in the same change that stops using it.
 
-## Traced blockers in the concurrent session's files
+## What is left, and exactly where it lives
 
-Each remaining raw error class was traced to a line rather than guessed at.
-What follows is what is left after everything reachable from our own files was
-fixed, and what the measurements say about each.
+Raw errors are down to two. Everything else was traced to a cause and fixed
+there. What follows is the state after that, with the measurement behind each
+claim.
+
+### The scores
+
+Generation 15, raw 14, diagnostic 12, differential 12, of 54.
+
+Generation is deliberately below raw. It counts cells that produced a
+rendering, and eleven of them were producing C that does not compile while
+reporting it as rendered. The undeclared-name check now resolves a name
+against the scope that has to declare it rather than against the function as a
+whole, so those cells refuse instead. Raw, diagnostic and differential did not
+move when that landed, because none of those functions was compiling anyway.
+
+A cell that renders and a cell that compiles are now much closer to the same
+thing, which is the direction that matters. Generation rises again when the
+loop shape below is fixed.
 
 ### A do-while condition reads a name declared inside its own body
 
-`structure.rs` builds `Region::DoWhileLoop` by taking the condition expression
-from `get_branch_condition_with_predicate(cond_block)` and separately
-flattening the condition block's *statements* into the loop body. When the
-condition is a temporary that block computes, the declaration lands inside the
-braces and the read lands in the `while (...)`, which in C is not in that
-scope. The same name is reported twice: unused inside the body, undeclared at
-the condition.
+`structure.rs`'s `Region::DoWhileLoop` takes its condition expression from
+`get_branch_condition_with_predicate(cond_block)` and separately flattens that
+block's *statements* into the loop body. When the condition is a temporary the
+block computes, the declaration lands inside the braces and the read lands in
+the `while (...)`, which in C is not in that scope.
 
-This is not a placement defect. Placement's scope walk already collects the
-condition under the enclosing region. Its audit would flag the read, but the
-audit covers plan symbols and this is a renderer temporary, so it passes
-through -- and `names_mentioned_without_a_declaration`, which does refuse on
-undeclared names, does not model the condition's scope either.
+The fix belongs there: either the condition block's statements stay with the
+condition, or the loop is emitted as `while (1) { body; if (!cond) break; }` so
+the computation and its use share a scope. Repairing the scope downstream --
+hoisting the declaration out after the fact -- would be compensating at the
+symptom, and the AST node would still be one C cannot express.
 
-The fix belongs where the loop is shaped: either the condition block's
-statements stay with the condition, or the loop is emitted as
-`while (1) { body; if (!cond) break; }` so the computation and its use share a
-scope. Repairing the scope afterwards by hoisting the declaration would be
-compensating at the symptom.
+This is not edited here because the concurrent session is rewriting that exact
+call: its diff changes `observe_control_ownership(*cond_block, CStmt::DoWhile
+{ ... })` into `observe_loop_control_ownership(loop_id, *cond_block,
+CStmt::DoWhile { ... })`, which is the expression that would have to change.
 
-Twenty-two of the twenty-four remaining raw errors, across `tmp_a00_2`,
-`tmp_12800_2` and `X9_2`.
+Eleven generation cells.
 
 ### `xor r, r` reads the register it does not depend on
 
@@ -942,24 +953,18 @@ The identity that removes it already exists: `simplify_op` folds `IntXor` with
 `a == b` to zero. It does not run, because `DecompilePrepConfig` disables
 `enable_inst_combine` on the decompile path.
 
-Enabling it was measured. Raw goes 14 to 16 and raw errors 24 to 22, and
-`adler32/arm64_O0` stops rendering, taking differential from 12 to 11. It is
-not a miscompile: the function refuses with `missing machine projection
-authorization`, from `fold/op_lower/memory_renderer.rs`, because simplifying
-the operand chain produces a memory access whose projection was never
-authorized. Trading a differential cell for two raw cells is the wrong
-direction, so the flag stays off until that refusal is answered.
+Enabling it was measured: raw 14 to 16, and `adler32/arm64_O0` stops rendering,
+taking differential 12 to 11. The refusal is `missing machine projection
+authorization` from `certified_memory_access_expr` in
+`fold/op_lower/memory_renderer.rs`, which requires `fact.address == address`.
+The certified memory-access facts are keyed on the `ValueId`s the address
+computation had *before* prep ran, so any prep pass that rewrites that
+computation invalidates the certificate that authorizes it. The flag is not the
+defect; the ordering is.
+
+Fixing it means deriving those certificates after prep, or carrying them across
+it -- which is `semantic.rs`, also the concurrent session's. Until then the
+flag stays off, because trading a differential cell for two raw cells is the
+wrong direction.
 
 The two remaining raw errors.
-
-### Already fixed, recorded here because an earlier revision named them
-
-An earlier revision of this section listed the stack pointer's uninitialised
-read as belonging to `fold/stack.rs` and `memory_renderer.rs`. That was wrong.
-The occurrence set placement derives from is collected from the finished tree,
-not from a stale pre-render model, so the reader that kept `SP_0` alive was
-removed by placement itself, in the same pass. Deadness is transitive and the
-derivation cannot see it; applying the same rule again once the tree says
-something new is what removes it, and reporting what was actually removed --
-rather than what was predicted from the decisions -- is what keeps the ledger
-answering for it.
