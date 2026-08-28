@@ -902,55 +902,64 @@ it used to re-derive them with, in the same change that stops using it.
 
 ## Traced blockers in the concurrent session's files
 
-Three classes remain in the raw score. Each was traced to a specific line
-rather than guessed at, and all three land in files the concurrent session is
-still holding uncommitted, so they are recorded here instead of edited.
+Each remaining raw error class was traced to a line rather than guessed at.
+What follows is what is left after everything reachable from our own files was
+fixed, and what the measurements say about each.
 
 ### A do-while condition reads a name declared inside its own body
 
 `structure.rs` builds `Region::DoWhileLoop` by taking the condition expression
-from `get_branch_condition_with_predicate(cond_block)` and separately flattening
-the condition block's *statements* into the loop body. When the condition is a
-temporary the block computes, the declaration lands inside the braces and the
-read lands in the `while (...)`, which in C is not in that scope. The same name
-is reported twice: unused inside the body, undeclared at the condition.
+from `get_branch_condition_with_predicate(cond_block)` and separately
+flattening the condition block's *statements* into the loop body. When the
+condition is a temporary that block computes, the declaration lands inside the
+braces and the read lands in the `while (...)`, which in C is not in that
+scope. The same name is reported twice: unused inside the body, undeclared at
+the condition.
 
 This is not a placement defect. Placement's scope walk already collects the
-condition under the enclosing region, and its audit would flag the read -- but
-the audit only covers plan symbols, and this is a renderer temporary, so it
-passes through. The fix belongs where the loop is shaped: either the condition
-block's statements stay with the condition, or the loop is emitted as
-`while (1) { body; if (!cond) break; }` so that the computation and its use
-share a scope.
+condition under the enclosing region. Its audit would flag the read, but the
+audit covers plan symbols and this is a renderer temporary, so it passes
+through -- and `names_mentioned_without_a_declaration`, which does refuse on
+undeclared names, does not model the condition's scope either.
 
-Eight undeclared identifiers and six unused variables.
+The fix belongs where the loop is shaped: either the condition block's
+statements stay with the condition, or the loop is emitted as
+`while (1) { body; if (!cond) break; }` so the computation and its use share a
+scope. Repairing the scope afterwards by hoisting the declaration would be
+compensating at the symptom.
 
-### A dead address temporary keeps the stack pointer alive
+Twenty-two of the twenty-four remaining raw errors, across `tmp_a00_2`,
+`tmp_12800_2` and `X9_2`.
 
-`SP_0` is correctly classified `EntryValue` -- it is version 0 with no defining
-instruction, so it is supplied from outside and is declared without an
-initializer. That is what the machine does, but it means the emitted
-`SP_0 = SP_0 - 32;` reads an uninitialized object, which a strict compile
-rejects.
+### `xor r, r` reads the register it does not depend on
 
-The update is only there because one consumer survives: `tmp_6500_2 = SP_0 + 16`,
-which is itself never read. The stack-object rendering replaced every real use of
-that address with the object it addresses (`stack_m16`), and the read of the
-address went with it -- but the occurrence set placement derives its decisions
-from still records that read. So the binding is never decided dead, and both its
-declaration and its update survive into C that nothing consumes.
+`crc32_bitwise` on x64 emits `EAX_0 = EAX_0 ^ EAX_0`. `EAX_0` is correctly an
+`EntryValue` -- version zero with no defining instruction -- so it is declared
+without an initializer, and reading it is what the machine does. A strict
+compile rejects it.
 
-Re-asking the dead-store question against the finished tree was measured and is
-wrong: it takes generation 26 to 19 and differential 12 to 7. The refusals are
-`rendered_value_required`, because a binding whose symbol no longer appears in
-the tree can still be a value the journal requires rendered. Placement cannot
-tell the two apart on its own.
+The identity that removes it already exists: `simplify_op` folds `IntXor` with
+`a == b` to zero. It does not run, because `DecompilePrepConfig` disables
+`enable_inst_combine` on the decompile path.
 
-The fix belongs where the read is eliminated. The stack-object rewrite in
-`fold/stack.rs` and `fold/op_lower/memory_renderer.rs` removes an address
-computation's reader without retracting the occurrence that recorded it. Once
-the occurrence is retracted the existing derivation decides the binding dead by
-itself, with no new rule and no widened removal.
+Enabling it was measured. Raw goes 14 to 16 and raw errors 24 to 22, and
+`adler32/arm64_O0` stops rendering, taking differential from 12 to 11. It is
+not a miscompile: the function refuses with `missing machine projection
+authorization`, from `fold/op_lower/memory_renderer.rs`, because simplifying
+the operand chain produces a memory access whose projection was never
+authorized. Trading a differential cell for two raw cells is the wrong
+direction, so the flag stays off until that refusal is answered.
 
-Seven uninitialized reads, plus the set-but-not-used and unused-variable
-reports that hang off the same chain.
+The two remaining raw errors.
+
+### Already fixed, recorded here because an earlier revision named them
+
+An earlier revision of this section listed the stack pointer's uninitialised
+read as belonging to `fold/stack.rs` and `memory_renderer.rs`. That was wrong.
+The occurrence set placement derives from is collected from the finished tree,
+not from a stale pre-render model, so the reader that kept `SP_0` alive was
+removed by placement itself, in the same pass. Deadness is transitive and the
+derivation cannot see it; applying the same rule again once the tree says
+something new is what removes it, and reporting what was actually removed --
+rather than what was predicted from the decisions -- is what keeps the ledger
+answering for it.
