@@ -150,6 +150,26 @@ fn upstream_zero_occurrence_outcome(
         }
     }
 
+    // An unconditional branch is a transfer the structured form expresses by
+    // where the block sits, not by a statement of its own. AArch64 at -O0 emits
+    // one wherever x86 would fall through, so six functions were refused for a
+    // transfer that is rendered -- as the ordering of the regions around it.
+    //
+    // Only the unconditional case. A conditional transfer has to render as an
+    // `if`, and if no statement owns it then it genuinely did not render.
+    if id.kind == SemanticObligationKind::ControlTransfer
+        && source_inst
+            .and_then(|inst| graph.inst(inst))
+            .is_some_and(|inst| {
+                matches!(
+                    &inst.payload,
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. })
+                )
+            })
+    {
+        return Outcome::Elided(ElisionReason::DirectControlTarget);
+    }
+
     Outcome::Refused {
         layer: LedgerLayer::Codegen,
         reason: RefusalReason::BlockNotRendered,
