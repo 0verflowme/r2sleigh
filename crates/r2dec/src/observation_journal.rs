@@ -679,6 +679,9 @@ pub(crate) struct LegacyObservationJournal {
     /// Removed carrier phis for which every incoming edge is already accounted
     /// by SSA identity or one of `coalesced_carrier_copy_sites`.
     coalesced_carrier_phi_writes: BTreeSet<InstId>,
+    /// Merges normalization removed by materializing every incoming edge, so
+    /// the copies on those edges are what write them.
+    materialized_removed_phis: BTreeSet<InstId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -1470,6 +1473,18 @@ impl LegacyObservationJournal {
             .copied()
             .map(|id| (id, 0))
             .collect();
+        let materialized_removed_phis = origins
+            .removed_phis()
+            .iter()
+            .filter(|removed| {
+                let materialized = origins.materialized_phi_edges(removed.definition.inst);
+                removed
+                    .incoming_sites
+                    .iter()
+                    .all(|site| removed.noop_sites().contains(site) || materialized.contains(site))
+            })
+            .map(|removed| removed.definition.inst)
+            .collect::<BTreeSet<_>>();
         let mut journal = Self {
             authority: source.source().authority().clone(),
             source: source.shared_source(),
@@ -1479,6 +1494,7 @@ impl LegacyObservationJournal {
             coalesced_carrier_copy_sites,
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
+            materialized_removed_phis,
             symbols,
             value_is_literal,
             values,
@@ -2038,6 +2054,33 @@ impl LegacyObservationJournal {
         Ok(CExpr::observed(id, expr))
     }
 
+    /// Account the merge a normalization removed by materializing its edges.
+    ///
+    /// The copies on those edges are what write the merge, so the phi itself
+    /// has no occurrence of its own. This fills only slots the renderer left
+    /// empty: where the phi does still render, that observation already stands
+    /// and is not replaced, which is why this cannot be declared up front.
+    fn account_materialized_phi_occurrences(&mut self) {
+        let graph = self.source.graph();
+        for inst in self.materialized_removed_phis.clone() {
+            let reason = r2ssa::ledger::ElisionReason::MaterializedPhiEdges;
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
+                && slot.is_none()
+            {
+                *slot = Some(LegacyWriteObservation::Elided(reason));
+            }
+            let inputs = graph.inst(inst).map_or(0, |inst| inst.inputs.len());
+            for input_idx in 0..inputs {
+                if let Some(row) = self.uses.get_mut(inst.0 as usize)
+                    && let Some(slot) = row.get_mut(input_idx)
+                    && slot.is_none()
+                {
+                    *slot = Some(LegacyUseObservation::Elided(reason));
+                }
+            }
+        }
+    }
+
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
         for (index, observation) in self.values.iter().enumerate() {
             if observation.is_none() {
@@ -2476,6 +2519,7 @@ impl LegacyObservationJournal {
         self.uses = uses;
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
+        self.account_materialized_phi_occurrences();
         if let Some(error) = self.first_unaccounted_render_observation() {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
