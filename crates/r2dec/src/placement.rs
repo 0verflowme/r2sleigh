@@ -1893,8 +1893,14 @@ pub(crate) fn apply_placement_decisions(
     // says something new, not a wider one: a binding is only reconsidered
     // because a removal took its last mention away, and it is still only
     // removed when the trial copy shows no mention survives discarding its own
-    // writes. Bindings that were inlined or externally declared are never
-    // reconsidered; their statements are already spoken for.
+    // writes.
+    //
+    // An inlined binding is reconsidered along with the rest. Inlining turns its
+    // write into a declaration that carries the value, which is spoken for only
+    // as long as something still reads it -- once the reader goes, what is left
+    // is a declaration nothing consumes. Externally declared bindings are the
+    // exception: a parameter is named by the signature and cannot be dropped
+    // just because the body stopped mentioning it.
     loop {
         let reconsider = decisions
             .iter()
@@ -1904,12 +1910,12 @@ pub(crate) fn apply_placement_decisions(
                         decision,
                         None | Some(PlacementDecision::DeadStore)
                             | Some(PlacementDecision::LexicalDeclaration { .. })
+                            | Some(PlacementDecision::Inline { .. })
                     )
             })
-            .map(|(binding, _)| binding)
             .collect::<Vec<_>>();
         let mut removed_any = false;
-        for binding in reconsider {
+        for (binding, _) in reconsider {
             let Some(symbol) = names.symbol_for_binding(binding) else {
                 continue;
             };
