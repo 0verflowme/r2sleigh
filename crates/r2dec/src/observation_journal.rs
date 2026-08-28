@@ -682,6 +682,8 @@ pub(crate) struct LegacyObservationJournal {
     /// Merges normalization removed by materializing every incoming edge, so
     /// the copies on those edges are what write them.
     materialized_removed_phis: BTreeSet<InstId>,
+    /// Definitions placement dropped because nothing reads what they produce.
+    placement_elided_writes: BTreeSet<InstId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -1017,6 +1019,16 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Analysis)?;
+        for (binding, decision) in decisions.iter() {
+            if matches!(
+                decision,
+                Some(crate::placement::PlacementDecision::DeadStore)
+            ) {
+                for occurrence in occurrences.writes().iter().filter(|w| w.binding == binding) {
+                    self.journal.placement_elided_writes.insert(occurrence.inst);
+                }
+            }
+        }
         crate::placement::apply_placement_decisions(
             &mut self.function,
             &placement.regions,
@@ -1495,6 +1507,7 @@ impl LegacyObservationJournal {
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
             materialized_removed_phis,
+            placement_elided_writes: BTreeSet::new(),
             symbols,
             value_is_literal,
             values,
@@ -2071,6 +2084,37 @@ impl LegacyObservationJournal {
             }
             let inputs = graph.inst(inst).map_or(0, |inst| inst.inputs.len());
             for input_idx in 0..inputs {
+                if let Some(row) = self.uses.get_mut(inst.0 as usize)
+                    && let Some(slot) = row.get_mut(input_idx)
+                    && slot.is_none()
+                {
+                    *slot = Some(LegacyUseObservation::Elided(reason));
+                }
+            }
+        }
+
+        // Definitions placement dropped because nothing reads what they
+        // produce. What they did besides producing that value is answered by
+        // the effect ledger, which is why removing the statement does not lose
+        // an obligation; here only the value, use and write cells they carried
+        // are closed out.
+        let reason = r2ssa::ledger::ElisionReason::DeadUnusedTemporary;
+        for inst in self.placement_elided_writes.clone() {
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
+                && slot.is_none()
+            {
+                *slot = Some(LegacyWriteObservation::Elided(reason));
+            }
+            let Some(instruction) = graph.inst(inst) else {
+                continue;
+            };
+            if let Some(output) = instruction.output
+                && let Some(slot) = self.values.get_mut(output.0 as usize)
+                && slot.is_none()
+            {
+                *slot = Some(LegacyValueObservation::Elided(reason));
+            }
+            for input_idx in 0..instruction.inputs.len() {
                 if let Some(row) = self.uses.get_mut(inst.0 as usize)
                     && let Some(slot) = row.get_mut(input_idx)
                     && slot.is_none()

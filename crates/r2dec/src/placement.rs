@@ -1705,6 +1705,10 @@ pub(crate) enum PlacementDecision {
     LexicalDeclaration { region: RegionId },
     /// Replace the sole dominating assignment with a declaration initializer.
     Inline { write: InstId },
+    /// Nothing reads this object, so it needs no declaration and its writes
+    /// need no statement. The obligations those statements carried are
+    /// accounted as elided when the journal seals.
+    DeadStore,
     /// Honest C cannot be emitted for this binding.
     Refused(PlacementRefusal),
 }
@@ -1809,6 +1813,24 @@ pub(crate) fn apply_placement_decisions(
                     binding_fact.declaration_type().clone(),
                     symbol,
                 ));
+            }
+            Some(PlacementDecision::DeadStore) => {
+                // The occurrence set records placement-relevant reads, which is
+                // not the same as every mention: a read folded into another
+                // expression leaves no occurrence but still names the symbol.
+                // Dropping the declaration then emits an undeclared identifier,
+                // which is the one thing this must never do, so the tree itself
+                // is asked before anything is removed.
+                let mut trial = candidate.clone();
+                let mut discarded = 0;
+                for occurrence in writes.iter().filter(|w| w.binding == binding) {
+                    discarded +=
+                        discard_observed_statement(&mut trial.body, occurrence.observation);
+                }
+                if discarded > 0 && !function_body_mentions_symbol(&trial.body, symbol) {
+                    trial.locals.retain(|local| local.name != symbol);
+                    candidate = trial;
+                }
             }
             Some(PlacementDecision::Inline { write }) => {
                 candidate.locals.retain(|local| local.name != symbol);
@@ -1957,6 +1979,139 @@ fn insert_region_declarations_in_stmt(
         | CStmt::Goto(_)
         | CStmt::Label(_)
         | CStmt::Comment(_) => 0,
+    }
+}
+
+/// Replace one observed statement with nothing.
+///
+/// The markers go with it: the obligations they carried are filled in as elided
+/// when the journal seals, which is the only point at which what the renderer
+/// actually emitted is known.
+/// Whether any statement still names this symbol.
+fn function_body_mentions_symbol(statements: &[CStmt], symbol: crate::symbol::SymbolId) -> bool {
+    statements
+        .iter()
+        .any(|statement| statement_mentions_symbol(statement, symbol))
+}
+
+fn statement_mentions_symbol(statement: &CStmt, symbol: crate::symbol::SymbolId) -> bool {
+    match statement {
+        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+            statement_mentions_symbol(stmt, symbol)
+        }
+        CStmt::Block(statements) => function_body_mentions_symbol(statements, symbol),
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => expr_mentions_symbol(expr, symbol),
+        CStmt::Decl { name, init, .. } => {
+            *name == symbol
+                || init
+                    .as_ref()
+                    .is_some_and(|init| expr_mentions_symbol(init, symbol))
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr_mentions_symbol(cond, symbol)
+                || statement_mentions_symbol(then_body, symbol)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|body| statement_mentions_symbol(body, symbol))
+        }
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            expr_mentions_symbol(cond, symbol) || statement_mentions_symbol(body, symbol)
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            init.as_ref()
+                .is_some_and(|init| statement_mentions_symbol(init, symbol))
+                || cond
+                    .as_ref()
+                    .is_some_and(|c| expr_mentions_symbol(c, symbol))
+                || update
+                    .as_ref()
+                    .is_some_and(|s| expr_mentions_symbol(s, symbol))
+                || statement_mentions_symbol(body, symbol)
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            expr_mentions_symbol(expr, symbol)
+                || cases
+                    .iter()
+                    .any(|case| function_body_mentions_symbol(&case.body, symbol))
+                || default
+                    .as_ref()
+                    .is_some_and(|body| function_body_mentions_symbol(body, symbol))
+        }
+        _ => false,
+    }
+}
+
+fn expr_mentions_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -> bool {
+    let mut found = false;
+    expr.visit(&mut |node| {
+        if matches!(node, CExpr::Var(name) if *name == symbol) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn discard_observed_statement(statements: &mut [CStmt], target: RenderObservationId) -> usize {
+    let mut removed = 0;
+    for statement in statements.iter_mut() {
+        removed += discard_observed_statement_in_stmt(statement, target);
+    }
+    removed
+}
+
+fn discard_observed_statement_in_stmt(statement: &mut CStmt, target: RenderObservationId) -> usize {
+    if let CStmt::Observed { id, .. } = statement
+        && *id == target
+    {
+        *statement = CStmt::Empty;
+        return 1;
+    }
+    match statement {
+        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+            discard_observed_statement_in_stmt(stmt, target)
+        }
+        CStmt::Block(statements) => discard_observed_statement(statements, target),
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            discard_observed_statement_in_stmt(then_body, target)
+                + else_body
+                    .as_mut()
+                    .map_or(0, |body| discard_observed_statement_in_stmt(body, target))
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            discard_observed_statement_in_stmt(body, target)
+        }
+        CStmt::For { init, body, .. } => {
+            init.as_mut()
+                .map_or(0, |init| discard_observed_statement_in_stmt(init, target))
+                + discard_observed_statement_in_stmt(body, target)
+        }
+        CStmt::Switch { cases, default, .. } => {
+            cases
+                .iter_mut()
+                .map(|case| discard_observed_statement(&mut case.body, target))
+                .sum::<usize>()
+                + default
+                    .as_mut()
+                    .map_or(0, |body| discard_observed_statement(body, target))
+        }
+        _ => 0,
     }
 }
 
@@ -2235,6 +2390,17 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
 
+        // Nothing reads the object, so no declaration is owed and no statement
+        // has to survive to assign it. The effect ledger answers separately for
+        // anything those statements did besides producing this value, which is
+        // what makes dropping them safe rather than a guess.
+        if binding_occurrences
+            .iter()
+            .all(|occurrence| matches!(occurrence.kind, OccurrenceKind::Write { .. }))
+        {
+            decisions[binding_index] = Some(PlacementDecision::DeadStore);
+            continue;
+        }
         if !occurrence_regions_have_proven_order(regions, binding_occurrences) {
             decisions[binding_index] = Some(PlacementDecision::Refused(
                 PlacementRefusal::UnprovableExecutionOrder { binding },
