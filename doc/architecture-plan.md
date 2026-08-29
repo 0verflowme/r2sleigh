@@ -1157,3 +1157,109 @@ and no base is needed to separate them.
 Everything stack-related depends on this, so the corpus will move before it
 settles. That is expected, and it is why each stage has a gate rather than one
 measurement at the end.
+
+---
+
+# Revision 3: finishing the rewrite
+
+Revision 2 described the model and eight stages. Stages 0, 1, 3 and most of 7
+landed, and the corpus became honest -- generation, raw, diagnostic and
+differential all agree, with no raw errors and nothing rendered wrong. The
+central defect of section 3 was reduced and not removed, and property 2's
+internal half was never established.
+
+This revision says what remains and when it is finished. It is written because
+a partial rewrite is worse than no rewrite: the tree then carries both the old
+shape and the new one, and every later change has to satisfy both.
+
+## What done means
+
+All four properties of section 1 proved by their stated method, the section 3
+defect removed, and the corpus at parity across optimization levels: every one
+of the fifty-four cells rendering, with generation, raw, diagnostic and
+differential equal.
+
+Parity at -O2 needs work revision 2 explicitly excluded -- `callother`
+lowering, sibling-function linking, struct typing. Those are carried here as
+their own track rather than folded into the rewrite, because they are separate
+defects that happen to stand between us and the same number.
+
+## Track A -- remove the many answerers
+
+`UseInfo` is thirty-one fields. Several are one fact keyed several ways, each
+independently writable: `value_ids_by_var` against `value_ids_by_name` against
+`vars_by_value_id`; the ambiguity set under three key types;
+`definitions_by_value` against `formatted_defs`; `stable_memory_values` against
+`stable_memory_values_by_value`. `unkeyed_writes` counts the drift between two
+of them and still ships.
+
+**A1.** Classify every field: answerable upstream, derivable from another
+field, or a genuinely stored fact with one writer. *Gate:* every field
+classified, each naming the upstream fact or the field it derives from.
+
+**A2.** Delete the string-keyed half and the drift counter it measures.
+*Gate:* ledger balances on all fifty-four; corpus reported, never gating.
+
+**A3.** Collapse each multi-directional relation to one stored direction with
+derived accessors. *Gate:* no field is written by more than one pass.
+
+**A4.** Delete the alias ladder -- `carrier_alias`, `var_alias`,
+`param_alias` -- in the same change that stops reading it. *Gate:* one source
+of an identifier, which is `ValueDisposition::Bound`.
+
+## Track B -- make inference unrepresentable
+
+Property 2 has two gates and only the external one holds. `cast_expr_if_needed`
+infers an operand type from a hint and drops it when the hint is absent, which
+is how the sign flag came to be compared as unsigned and `crc32_bitwise`
+returned a CRC of nothing while compiling cleanly.
+
+**B1.** A cast on the render path cannot be constructed without a projection
+that only the upstream fact layer can make. The compiler then enumerates every
+inferred site, exactly as it enumerated every unrecorded refusal. *Gate:* it
+compiles, and the enumeration is the work list.
+
+**B2.** Convert each site to carry its projection, or refuse where upstream
+has no fact to carry. *Gate:* zero inferred casts on the render path; raw stays
+at zero errors.
+
+## Track C -- finish what was started
+
+**C1.** Definitions classified `Insert` that are narrow writes clearing their
+carrier should be `ZeroExtend`. This is revision 2's stage 2, left unfinished.
+*Gate:* the five `preserved_carrier_read_before_assignment` cells resolve or
+name a different cause.
+
+**C2.** Collapse `stack_address_roots` and `entry_stack_address_roots` into one
+map and delete `rebase_declared_frame_pointer`. *Gate:* rendering of passing
+cells byte-identical, which the determinism test can check.
+
+**C3.** Binding components stay derived twice, because the independence is a
+cross-check rather than a copy. Each *rule* moves to one place both derivations
+call, so they cannot drift on a rule while still checking each other's result.
+*Gate:* no rule stated twice; the seal still rejects a plan whose components
+disagree.
+
+## Track D -- the corpus to parity
+
+**D1.** Clear the remaining refusal classes, largest first, each traced to a
+cause before any change.
+
+**D2.** The named analysis gaps: call-result facts for an unresolved external
+callee, `callother` lowering, sibling-function linking, struct typing.
+
+*Gate:* fifty-four of fifty-four, with generation, raw, diagnostic and
+differential equal, and O0, O1 and O2 at parity.
+
+## Order, and why
+
+A and B first. Revision 2's section 8 says not to chase corpus failures before
+the naming and width families dissolve, because fixing them individually means
+fixing them twice, and three of six inert fixes were exactly that. That
+reasoning has not changed. C runs alongside, since each item is independent. D
+last.
+
+Expect the corpus to fall during A and B. It is a canary, and the ledger is the
+instrument: `rendered + justified_elision + refused = total`, `unaccounted = 0`,
+`defects = 0` on accepted output. A fall with the ledger balanced is the rewrite
+working; a rise with it unbalanced is the rewrite being cheated.
