@@ -1704,7 +1704,16 @@ pub(crate) enum PlacementDecision {
     /// each surviving write occurrence.
     LexicalDeclaration { region: RegionId },
     /// Replace the sole dominating assignment with a declaration initializer.
-    Inline { write: InstId },
+    ///
+    /// `region` is where the binding is declared if the inline turns out not to
+    /// be expressible. Folding a write into a declaration moves the declaration
+    /// to wherever that write is written, and C's scopes do not always follow
+    /// the nesting of the tree: a `do { ... } while (cond)` evaluates its
+    /// condition outside the braces, so a write inside the body becomes a
+    /// declaration the condition's read cannot see. Whether that has happened
+    /// is a fact about the emitted tree, so it is settled after the decisions
+    /// are applied, and this is what the binding falls back to.
+    Inline { write: InstId, region: RegionId },
     /// Nothing reads this object, so it needs no declaration and its writes
     /// need no statement. The obligations those statements carried are
     /// accounted as elided when the journal seals.
@@ -1794,6 +1803,57 @@ pub(crate) fn apply_placement_decisions(
     decisions: &PlacementDecisions,
     writes: &[FinalBindingWrite],
 ) -> Result<PlacementRemovals, PlacementApplicationError> {
+    // Inlining a write moves the binding's declaration to wherever that write
+    // is written, and whether the result is in scope for the reads is a fact
+    // about the emitted tree, not about the occurrence set the decisions were
+    // derived from. So the tree is asked: apply, check the property, and demote
+    // any inline the check reports to the lexical declaration it carries as its
+    // fallback. A demotion can only ever turn an inline into a declaration, so
+    // the loop terminates.
+    let original = function.clone();
+    let mut demoted = BTreeMap::<BindingId, PlacementDecision>::new();
+    loop {
+        let mut candidate = original.clone();
+        let removals =
+            apply_decisions_once(&mut candidate, regions, names, decisions, writes, &demoted)?;
+        let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&candidate);
+        let mut progressed = false;
+        for symbol in undeclared {
+            let Some((binding, region)) =
+                decisions
+                    .iter()
+                    .find_map(|(binding, decision)| match decision {
+                        Some(PlacementDecision::Inline { region, .. })
+                            if names.symbol_for_binding(binding) == Some(symbol) =>
+                        {
+                            Some((binding, region))
+                        }
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            if demoted.contains_key(&binding) {
+                continue;
+            }
+            demoted.insert(binding, PlacementDecision::LexicalDeclaration { region });
+            progressed = true;
+        }
+        if !progressed {
+            *function = candidate;
+            return Ok(removals);
+        }
+    }
+}
+
+fn apply_decisions_once(
+    function: &mut CFunction,
+    regions: &SealedStructuredRegionArtifact,
+    names: &BindingNameResolution,
+    decisions: &PlacementDecisions,
+    writes: &[FinalBindingWrite],
+    demoted: &BTreeMap<BindingId, PlacementDecision>,
+) -> Result<PlacementRemovals, PlacementApplicationError> {
     let mut candidate = function.clone();
     let mut discarded_bindings = BTreeSet::new();
     let mut discarded_observations = BTreeSet::<RenderObservationId>::new();
@@ -1802,6 +1862,7 @@ pub(crate) fn apply_placement_decisions(
     let plan = names.plan();
 
     for (binding, decision) in decisions.iter() {
+        let decision = demoted.get(&binding).copied().or(decision);
         let symbol = names
             .symbol_for_binding(binding)
             .ok_or(PlacementApplicationError::MissingBindingSymbol { binding })?;
@@ -1850,7 +1911,7 @@ pub(crate) fn apply_placement_decisions(
                     discarded_observations.append(&mut trial_observations);
                 }
             }
-            Some(PlacementDecision::Inline { write }) => {
+            Some(PlacementDecision::Inline { write, .. }) => {
                 candidate.locals.retain(|local| local.name != symbol);
                 let matching = writes
                     .iter()
@@ -2550,7 +2611,10 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
                         && cfg.dominates(write.block, occurrence.block))
             })
         {
-            decisions[binding_index] = Some(PlacementDecision::Inline { write: *inst });
+            decisions[binding_index] = Some(PlacementDecision::Inline {
+                write: *inst,
+                region,
+            });
         } else {
             decisions[binding_index] = Some(PlacementDecision::LexicalDeclaration { region });
         }
@@ -3283,7 +3347,14 @@ mod tests {
 
         assert_eq!(
             decisions.decision(binding),
-            Some(PlacementDecision::Inline { write })
+            Some(PlacementDecision::Inline {
+                write,
+                // The fallback the inline carries if the emitted tree turns out
+                // to put its declaration out of scope: the lowest region that
+                // dominates both the write and the read.
+                region: lowest_common_ancestor(&regions, write_region, read_region)
+                    .expect("common ancestor"),
+            })
         );
     }
 
