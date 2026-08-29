@@ -1051,3 +1051,81 @@ not refuse is now never generated. Property 2 is tripwired by the raw gate,
 which is at zero errors. Property 3 has a test and passes it. Property 4 was
 already enforced, and is the check that caught every regression made against
 this branch.
+
+## Redesign: one stack coordinate system, and identity we prove ourselves
+
+Nine cells refuse with `missing program-variable authorization`. The refusal is
+retained in `fold/stack.rs` when `require_stack` fails, the reason is
+`MissingSourceIdentity`, and the object it names is an ordinary local. What
+follows is why that happens, and what to build instead.
+
+### What is there now
+
+Stack addresses are tracked as roots in two parallel maps.
+`stack_address_roots` allows either base; `entry_stack_address_roots` allows
+only the stack pointer. Every arm of the propagation fixpoint is written twice,
+once per map, differing in a size gate and in one call -- about two hundred and
+forty lines in which each operation is handled two ways.
+
+The one call is `rebase_declared_frame_pointer`, which resets a declared frame
+pointer's root to `(FramePointer, 0)`. After `push rbp; mov rbp, rsp` the frame
+pointer genuinely *is* the entry stack pointer less eight, and this discards
+that. From then on there are two coordinate systems for the same addresses with
+no way to compare them, and `record_entry_stack_root` treats two spellings of
+one slot as a contradiction: it deletes the root and marks the object
+permanently ambiguous.
+
+Separately, an object's size and identity are taken from radare2's declared
+slot table, with a callee-allocation certificate as the only fallback. When
+neither answers, `size` is `None`, the object has no identity, and every use of
+it refuses the whole function.
+
+### What the measurements say
+
+Removing the rebase was tried and is measured neutral: generation, raw,
+diagnostic and differential all stay at 29. It is not sufficient on its own, so
+the coordinate split is the smaller half of the problem.
+
+The larger half is that identity is outsourced. `murmur3_32` at -O0 has fourteen
+stack objects and radare2 reports no stack variables at all for it -- `afvj`
+returns only two register arguments. `fnv1a32`, which renders, gets its objects
+from callee-allocation certificates instead, and those succeed there only
+because it is a leaf function with no explicit frame allocation.
+
+This is the same failure as the parameter that was dropped earlier today, where
+radare2 counted a register the function writes without reading. An external
+opinion is being used for something the analysis can prove.
+
+### What to build
+
+One coordinate system. Every stack address root is expressed relative to the
+entry stack pointer. The frame pointer stops being a base and becomes an
+ordinary value whose root is `(entry stack pointer, -k)`, learned from the copy
+that establishes it. `StackAddressBase::FramePointer` survives only as the form
+radare2's declared slots arrive in, converted into our coordinates at ingest.
+
+One root map, and the duplicated arms collapse into it.
+
+Identity derived from the object's own accesses. An object accessed at a
+consistent width through a proven entry-relative address is a stack object of
+that size, and that is a positive fact about the program. Radare2's slot table
+becomes a naming and typing hint, never the source of identity, and
+`MissingSourceIdentity` comes to mean that the analysis could not prove a
+location rather than that radare2 was silent.
+
+### Stages, each with a gate
+
+Derive the size from the accesses when no declared slot answers, leaving
+everything else alone. The gate is that no differential cell is lost.
+
+Convert declared frame-pointer slots into entry-relative coordinates at ingest,
+so internal roots are stack-pointer-relative only. The gate is generation at or
+above twenty-nine.
+
+Collapse the two root maps and delete `rebase_declared_frame_pointer`. The gate
+is that the rendering of the passing cells is byte-identical, which the
+determinism property test is already able to check.
+
+Everything stack-related depends on this, so the corpus will move before it
+settles. That is expected, and it is why each stage has a gate rather than one
+measurement at the end.
