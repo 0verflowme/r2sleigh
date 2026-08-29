@@ -2010,6 +2010,24 @@ fn apply_decisions_once(
         }
     }
 
+    // A trailing parameter the body never mentions is not one the function has.
+    //
+    // The slot list comes from radare2's argument detection, which counts a
+    // register the function writes without ever reading: `xor edx, edx` at -O2
+    // makes `edx` look like a third argument to `djb2`, which has two. Whether
+    // any read of it survives is a fact about the emitted tree, so it is asked
+    // here rather than assumed from the slot claim, and a strict compile
+    // rejects the whole function over the unused parameter otherwise.
+    //
+    // Only from the end. Dropping a parameter from the middle would renumber
+    // every slot after it, and the caller passes arguments by position.
+    while let Some(last) = candidate.params.last() {
+        if function_body_mentions_symbol(&candidate.body, last.name) {
+            break;
+        }
+        candidate.params.pop();
+    }
+
     for (region, declarations) in &mut declarations {
         declarations.sort_by_key(|(binding, _, _)| *binding);
         let statements = declarations

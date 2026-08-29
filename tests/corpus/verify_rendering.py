@@ -1641,13 +1641,25 @@ def runner_source(
             args = [f"(long)(uintptr_t){args[0]}", f"(long){args[1]}"] + [
                 f"(long){arg}" for arg in args[2:]
             ]
-        elif declared_parameters is not None and len(declared_parameters) == len(args):
+        elif declared_parameters is not None and len(declared_parameters) >= len(args):
             # Call through the signature the rendering declares. The pointer is
             # converted the same way the machine passes it, as an integer of the
             # declared width.
-            args = [f"({declared_parameters[0]})(uintptr_t){args[0]}"] + [
+            #
+            # A rendering may declare more parameters than the source has. The
+            # decompiler recovers the machine's own interface, and radare2's
+            # argument detection counts a register the function writes without
+            # reading -- `xor edx, edx` at -O2 makes `edx` look like an argument.
+            # Slots the corpus has no value for are passed zero, which is what
+            # the caller leaves in a register it never set, and the difference
+            # is reported by the typed-recovery score rather than blocking the
+            # run.
+            positional = [f"({declared_parameters[0]})(uintptr_t){args[0]}"] + [
                 f"({declared_parameters[position]}){arg}"
                 for position, arg in enumerate(args[1:], start=1)
+            ]
+            args = positional + [
+                f"({declared})0" for declared in declared_parameters[len(args) :]
             ]
         callee = f"dec_{name}"
         call = f"{callee}({', '.join(args)})"
@@ -1852,7 +1864,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         entry["generation"]["expected_arity"] = spec.arity
         cases = cases_for(name, spec)
 
-        if arity != spec.arity or linkage_rewrite["count"] != 1:
+        # Fewer parameters than the corpus must pass is a real mismatch: there is
+        # no way to hand the function its inputs. More is recovery imprecision,
+        # measured by the typed-recovery score and called through below.
+        if arity is None or arity < spec.arity or linkage_rewrite["count"] != 1:
             entry["raw"] = {
                 "status": "signature_mismatch",
                 "linkage_rewrite": linkage_rewrite,
