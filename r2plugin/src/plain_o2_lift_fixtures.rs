@@ -356,12 +356,24 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
                 parameter.name
             );
         } else {
-            assert_eq!(
-                r2types::render_signature_type(&inferred.initial_ty, 64),
-                parameter.type_name,
-                "{} {} scalar source type",
+            let source_bits = parameter
+                .type_name
+                .strip_prefix("int")
+                .or_else(|| parameter.type_name.strip_prefix("uint"))
+                .and_then(|bits| bits.strip_suffix("_t"))
+                .and_then(|bits| bits.parse::<u32>().ok())
+                .expect("captured scalar source width");
+            let r2types::CTypeLike::Int { bits, .. } = &inferred.initial_ty else {
+                panic!(
+                    "{} {} must remain scalar-shaped: {inferred:?}",
+                    function.name, parameter.name
+                );
+            };
+            assert!(
+                *bits >= source_bits && *bits <= inferred.ssa_var.size.saturating_mul(8),
+                "{} {} machine-only recovery may conservatively retain its carrier width but may not narrow or widen beyond it: {inferred:?}",
                 function.name,
-                parameter.name
+                parameter.name,
             );
         }
     }

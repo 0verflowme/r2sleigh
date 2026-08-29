@@ -1,5 +1,5 @@
 use crate::ast::CExpr;
-use r2ssa::{ObjectId, SSAVar};
+use r2ssa::ObjectId;
 
 use super::context::FoldingContext;
 
@@ -17,8 +17,8 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Resolve a stack offset only from the prepared source-owned object model.
-    /// Whether a copy restates a carrier update the block has already rendered.
+    /// Whether a certified synthetic copy restates a carrier update the block
+    /// has already rendered.
     ///
     /// Materialising a merge replaces it with a copy on every predecessor edge,
     /// so a loop carries its update back to the header as `X8_2 = X8_3`. Once the
@@ -26,34 +26,21 @@ impl<'a> FoldingContext<'a> {
     /// by the carrier's one name and the copy says `x8 = x8`, which the statement
     /// that computed the update has already said.
     ///
-    /// The edge into the loop is the same kind of copy and must be kept, because
-    /// nothing else introduces the carrier there. The two are told apart by
-    /// whether the source is an entry value: a version-0 source is the value the
-    /// function was called with and has no defining statement of its own, so the
-    /// copy is the only place the carrier is given it.
-    pub(super) fn is_carrier_self_copy(&self, dst: &SSAVar, src: &SSAVar) -> bool {
-        if src.version == 0 {
-            return false;
-        }
-        let (Some(dst_value), Some(src_value), Some(names), Some(render)) = (
-            self.prepared_value_id_for_var(dst),
-            self.prepared_value_id_for_var(src),
-            self.inputs.binding_names,
-            self.inputs.render_facts(),
+    /// An original program `Copy` can acquire the same spelling on both sides
+    /// after carrier coalescing.  It remains a real definition and use, so the
+    /// sealed normalization origin is required before any suppression.  The
+    /// edge into the loop is also kept because a version-0 source has no
+    /// defining statement of its own.
+    pub(super) fn current_copy_has_coalesced_carrier_elision(&self) -> bool {
+        let (Some(block), Some(op_idx), Some(journal)) = (
+            self.current_block_id.get(),
+            self.current_op_idx.get(),
+            self.inputs.observation_journal,
         ) else {
             return false;
         };
-        if render.loop_carrier_for_value(dst_value).is_none()
-            || render.loop_carrier_for_value(src_value).is_none()
-        {
-            return false;
-        }
-        matches!(
-            (names.require_value(dst_value), names.require_value(src_value)),
-            (
-                Ok(crate::binding_plan::PlannedValueSymbol::Bound(dst_symbol)),
-                Ok(crate::binding_plan::PlannedValueSymbol::Bound(src_symbol)),
-            ) if dst_symbol == src_symbol
-        )
+        journal
+            .borrow()
+            .is_coalesced_carrier_copy(crate::normalize::NormalizedOpSite { block, op_idx })
     }
 }

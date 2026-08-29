@@ -1086,6 +1086,56 @@ pub struct CalleeStackAllocationCertificate {
     pub uses_implicit_area: bool,
 }
 
+/// Exact proof that one anonymous callee-owned stack object is only a
+/// save/reload carrier for entry machine state.
+///
+/// `insts` is the complete sorted operation domain removed by a consumer: the
+/// same-width copy chain from the entry frame pointer into the store, the
+/// store itself, every reload, and each reload's same-width copy chain back to
+/// the exact entry storage. The collector issues this only when every value in
+/// those chains has no use outside this domain, the object has no other access,
+/// and the storage owns no parameter, result, call-boundary, stack-pointer, or
+/// return-control role. Consumers therefore project an upstream disposition;
+/// they never recognize prologue or epilogue syntax themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackFrameRoundTripCertificate {
+    pub object: ObjectId,
+    pub storage: CanonicalStorageId,
+    pub entry_value: ValueId,
+    pub store_access: StructuredAccessId,
+    pub load_accesses: Box<[StructuredAccessId]>,
+    pub insts: Box<[InstId]>,
+    pub values: Box<[ValueId]>,
+}
+
+/// Closed graph domain used only to form certified stack addresses.
+///
+/// The collector computes the greatest set whose uses stay within pure
+/// stack-root copy/add/sub operations, equal-root merge phis, exact stack-object
+/// address operands, or separately certified frame save/reload operations. Any
+/// call, return-value, comparison, ordinary arithmetic, or other escaping use
+/// removes the value and every dependent computation from this certificate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StackGeometryCertificate {
+    pub insts: BTreeSet<InstId>,
+    pub values: BTreeSet<ValueId>,
+    pub uses: BTreeSet<UseSite>,
+}
+
+/// Exact producer chain for the machine return target consumed by one source
+/// return boundary. The rendered `return` remains outside `insts`; only copies
+/// and an optional exact stack reload whose complete value-use domain ends at
+/// that control operand are certified for non-rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineReturnControlCertificate {
+    pub at: InstId,
+    pub storage: CanonicalStorageId,
+    pub control_value: ValueId,
+    pub insts: BTreeSet<InstId>,
+    pub values: BTreeSet<ValueId>,
+    pub uses: BTreeSet<UseSite>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallsiteCertificate {
     pub call_site: CallSiteId,
@@ -1218,6 +1268,11 @@ pub struct PreparedFunctionCertificates {
     pub memory_accesses: BTreeMap<StructuredAccessId, MemoryAccessCertificate>,
     pub memory_accesses_by_op: BTreeMap<(u64, usize, bool), Vec<StructuredAccessId>>,
     pub stack_slots: BTreeMap<ObjectId, StackSlotCertificate>,
+    pub stack_frame_round_trips: BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
+    pub stack_frame_round_trip_by_inst: BTreeMap<InstId, ObjectId>,
+    pub stack_geometry: StackGeometryCertificate,
+    pub machine_return_controls: BTreeMap<InstId, MachineReturnControlCertificate>,
+    pub machine_return_control_by_inst: BTreeMap<InstId, InstId>,
     pub callsites: BTreeMap<CallSiteId, CallsiteCertificate>,
     pub callsites_by_inst: BTreeMap<InstId, CallSiteId>,
     pub call_results: BTreeMap<ValueId, CallResultCertificate>,
@@ -3458,33 +3513,182 @@ fn call_result_value_after_call(
     }
 }
 
-fn exact_active_stack_pointer_offset_before(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachingStorageState {
+    Unknown,
+    PreservedEntry,
+    Value(ValueId),
+    Conflict,
+}
+
+fn entry_storage_state(graph: &SsaGraph, storage: CanonicalStorageId) -> ReachingStorageState {
+    let candidates = graph
+        .values
+        .iter()
+        .filter(|value| {
+            graph.def_inst(value.id).is_none()
+                && value.var.version == 0
+                && value.var.size == storage.size
+                && value.canonical_storage == Some(storage)
+        })
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [value] => ReachingStorageState::Value(*value),
+        [] => ReachingStorageState::PreservedEntry,
+        _ => ReachingStorageState::Conflict,
+    }
+}
+
+fn storage_phi_value(
     function: &SSAFunction,
     graph: &SsaGraph,
     block_addr: u64,
-    op_index: usize,
-    stack_pointer: CanonicalStorageId,
-) -> Option<i64> {
-    let state = reaching_abi_value_before(
-        function,
-        graph,
-        block_addr,
-        op_index,
-        stack_pointer,
-        &BTreeSet::new(),
-        ReachingAbiPolicy {
-            allow_distinct_phi_inputs: true,
-            calls_are_barriers: false,
-        },
-    )?;
-    match state {
-        ReachingAbiState::PreservedEntry => Some(0),
-        ReachingAbiState::Value(value) => {
-            let root = graph.value(value).and_then(|value| {
-                resolve_entry_stack_root(function.decompile_prep_facts(), &value.var)
-            })?;
-            (root.base == StackAddressBase::StackPointer).then_some(root.offset)
+    storage: CanonicalStorageId,
+) -> Result<Option<ValueId>, ()> {
+    let block = function.get_block(block_addr).ok_or(())?;
+    let values = block
+        .phis
+        .iter()
+        .filter(|phi| phi.canonical_storage == Some(storage))
+        .filter_map(|phi| graph.value_id_for_var(&phi.dst))
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(*value)),
+        _ => Err(()),
+    }
+}
+
+fn block_entry_storage_state(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    exits: &BTreeMap<u64, ReachingStorageState>,
+    block_addr: u64,
+    storage: CanonicalStorageId,
+) -> ReachingStorageState {
+    if block_addr == function.entry {
+        return entry_storage_state(graph, storage);
+    }
+    let predecessors = function.predecessors(block_addr);
+    if predecessors.is_empty() {
+        return ReachingStorageState::Conflict;
+    }
+    let known = predecessors
+        .iter()
+        .filter_map(|predecessor| exits.get(predecessor).copied())
+        .filter(|state| *state != ReachingStorageState::Unknown)
+        .collect::<Vec<_>>();
+    let Some(first) = known.first().copied() else {
+        return ReachingStorageState::Unknown;
+    };
+    if known.contains(&ReachingStorageState::Conflict) {
+        return ReachingStorageState::Conflict;
+    }
+    match storage_phi_value(function, graph, block_addr, storage) {
+        Ok(Some(value)) => ReachingStorageState::Value(value),
+        Err(()) => ReachingStorageState::Conflict,
+        Ok(None) => {
+            if known.iter().all(|state| *state == first) {
+                first
+            } else {
+                ReachingStorageState::Conflict
+            }
         }
+    }
+}
+
+fn transfer_storage_state(
+    graph: &SsaGraph,
+    block_addr: u64,
+    op_index: usize,
+    storage: CanonicalStorageId,
+    state: ReachingStorageState,
+) -> ReachingStorageState {
+    let Some(inst) = graph
+        .inst_id_for_op_site(block_addr, op_index)
+        .and_then(|inst| graph.inst(inst))
+    else {
+        return ReachingStorageState::Conflict;
+    };
+    let Some(written) = inst.canonical_storage else {
+        return state;
+    };
+    if !register_storages_overlap(written, storage) {
+        return state;
+    }
+    if written != storage {
+        return ReachingStorageState::Conflict;
+    }
+    inst.output
+        .map(ReachingStorageState::Value)
+        .unwrap_or(ReachingStorageState::Conflict)
+}
+
+/// Resolve one exact storage state at every source instruction with a sorted
+/// fixpoint. A recursive predecessor walk cannot prove an unchanged value
+/// through a loop backedge: revisiting the header looks like ambiguity even
+/// when SSA carries one definition around the cycle. The finite state above
+/// only moves from unknown to an exact answer or conflict, so the worklist is
+/// deterministic and each block is revisited only when a predecessor answer
+/// changes.
+fn reaching_storage_states_before(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    storage: CanonicalStorageId,
+) -> BTreeMap<InstId, ReachingStorageState> {
+    let block_addrs = function.block_addrs().to_vec();
+    let mut exits = block_addrs
+        .iter()
+        .copied()
+        .map(|addr| (addr, ReachingStorageState::Unknown))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = block_addrs.iter().copied().collect::<BTreeSet<_>>();
+    while let Some(block_addr) = pending.pop_first() {
+        let mut state = block_entry_storage_state(function, graph, &exits, block_addr, storage);
+        let Some(block) = function.get_block(block_addr) else {
+            exits.insert(block_addr, ReachingStorageState::Conflict);
+            continue;
+        };
+        for op_index in 0..block.ops.len() {
+            state = transfer_storage_state(graph, block_addr, op_index, storage, state);
+        }
+        if exits.get(&block_addr).copied() == Some(state) {
+            continue;
+        }
+        exits.insert(block_addr, state);
+        pending.extend(function.successors(block_addr));
+    }
+
+    let mut before = BTreeMap::new();
+    for block_addr in block_addrs {
+        let mut state = block_entry_storage_state(function, graph, &exits, block_addr, storage);
+        let Some(block) = function.get_block(block_addr) else {
+            continue;
+        };
+        for op_index in 0..block.ops.len() {
+            if let Some(inst) = graph.inst_id_for_op_site(block_addr, op_index) {
+                before.insert(inst, state);
+            }
+            state = transfer_storage_state(graph, block_addr, op_index, storage, state);
+        }
+    }
+    before
+}
+
+fn exact_stack_pointer_offset(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    state: ReachingStorageState,
+) -> Option<i64> {
+    match state {
+        ReachingStorageState::PreservedEntry => Some(0),
+        ReachingStorageState::Value(value) => graph
+            .value(value)
+            .and_then(|value| resolve_entry_stack_root(function.decompile_prep_facts(), &value.var))
+            .filter(|root| root.base == StackAddressBase::StackPointer)
+            .map(|root| root.offset),
+        ReachingStorageState::Unknown | ReachingStorageState::Conflict => None,
     }
 }
 
@@ -3511,12 +3715,13 @@ fn collect_callee_stack_allocation_certificates(
     structured: &StructuredDataflowFacts,
     exact_stack_slots: &BTreeMap<(StackAddressBase, i64), SourceStackSlotSpec>,
 ) -> BTreeMap<ObjectId, CalleeStackAllocationCertificate> {
-    let Some(interface) = machine_context.and_then(SourceMachineContext::function_interface) else {
+    let Some(machine_context) = machine_context else {
         return BTreeMap::new();
     };
+    let roles = machine_context.machine_roles();
     let (Some(stack_pointer), Some(contract)) = (
-        interface.stack_pointer_storage(),
-        interface.stack_allocation_contract(),
+        roles.stack_pointer_storage(),
+        roles.stack_allocation_contract(),
     ) else {
         return BTreeMap::new();
     };
@@ -3529,6 +3734,8 @@ fn collect_callee_stack_allocation_certificates(
         })
     });
     let explicit_contract = SourceStackAllocationContract::new(contract.growth());
+    let active_stack_pointer_states =
+        reaching_storage_states_before(function, graph, stack_pointer);
     let mut candidates = BTreeMap::new();
 
     for (object, fact) in &objects.objects {
@@ -3580,13 +3787,11 @@ fn collect_callee_stack_allocation_certificates(
         let mut uses_implicit_area = false;
         let mut complete = true;
         for access in &accesses {
-            let Some(active_sp_offset) = exact_active_stack_pointer_offset_before(
-                function,
-                graph,
-                access.block_addr,
-                access.op_index,
-                stack_pointer,
-            ) else {
+            let Some(active_sp_offset) = active_stack_pointer_states
+                .get(&access.id.inst)
+                .copied()
+                .and_then(|state| exact_stack_pointer_offset(function, graph, state))
+            else {
                 complete = false;
                 break;
             };
@@ -3665,6 +3870,637 @@ fn collect_callee_stack_allocation_certificates(
         })
     });
     candidates
+}
+
+fn exact_copy_chain_to_entry_storage(
+    graph: &SsaGraph,
+    start: ValueId,
+    width: u32,
+) -> Option<(
+    CanonicalStorageId,
+    ValueId,
+    BTreeSet<InstId>,
+    BTreeSet<ValueId>,
+)> {
+    let mut insts = BTreeSet::new();
+    let mut values = BTreeSet::from([start]);
+    let mut current = start;
+    loop {
+        let Some(inst) = graph.def_inst(current) else {
+            let value = graph.value(current)?;
+            let storage = value.canonical_storage?;
+            if value.var.version != 0
+                || value.var.size != width
+                || storage.space != CanonicalStorageSpace::Register
+                || storage.size != width
+            {
+                return None;
+            }
+            return Some((storage, current, insts, values));
+        };
+        let definition = graph.inst(inst)?;
+        let InstPayload::Op(SSAOp::Copy { dst, src }) = &definition.payload else {
+            return None;
+        };
+        let source = graph.value_id_for_var(src)?;
+        if definition.output != Some(current)
+            || definition.inputs.as_slice() != [source]
+            || dst.size != width
+            || src.size != width
+            || !insts.insert(inst)
+            || !values.insert(source)
+        {
+            return None;
+        }
+        current = source;
+    }
+}
+
+fn exact_copy_chain_to_storage(
+    graph: &SsaGraph,
+    start: ValueId,
+    storage: CanonicalStorageId,
+) -> Option<(BTreeSet<InstId>, BTreeSet<ValueId>)> {
+    let mut insts = BTreeSet::new();
+    let mut values = BTreeSet::from([start]);
+    let mut current = start;
+    loop {
+        let value = graph.value(current)?;
+        if value.canonical_storage == Some(storage) {
+            if !graph.use_sites(current).is_empty() {
+                return None;
+            }
+            return Some((insts, values));
+        }
+        let uses = graph.use_sites(current);
+        let [site] = uses else {
+            return None;
+        };
+        let definition = graph.inst(site.inst)?;
+        let InstPayload::Op(SSAOp::Copy { dst, src }) = &definition.payload else {
+            return None;
+        };
+        let output = definition.output?;
+        if site.input_idx != 0
+            || definition.inputs.as_slice() != [current]
+            || graph.value_id_for_var(src) != Some(current)
+            || graph.value_id_for_var(dst) != Some(output)
+            || src.size != storage.size
+            || dst.size != storage.size
+            || !insts.insert(site.inst)
+            || !values.insert(output)
+        {
+            return None;
+        }
+        current = output;
+    }
+}
+
+fn instruction_strictly_precedes(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    first: InstId,
+    second: InstId,
+) -> bool {
+    let Some((first_block, first_op)) = graph.op_site_for_inst(first) else {
+        return false;
+    };
+    let Some((second_block, second_op)) = graph.op_site_for_inst(second) else {
+        return false;
+    };
+    if first_block == second_block {
+        first_op < second_op
+    } else {
+        function.dominates(first_block, second_block)
+    }
+}
+
+fn collect_stack_frame_round_trip_certificates(
+    boundaries: &SourceBoundaryFacts,
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
+    structured: &StructuredDataflowFacts,
+    callee_allocations: &BTreeMap<ObjectId, CalleeStackAllocationCertificate>,
+) -> (
+    BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
+    BTreeMap<InstId, ObjectId>,
+) {
+    let mut certificates = BTreeMap::new();
+    let mut by_inst = BTreeMap::new();
+    for (object, allocation) in callee_allocations {
+        let accesses = structured
+            .memory_accesses
+            .values()
+            .filter(|access| access.object == *object)
+            .collect::<Vec<_>>();
+        let writes = accesses
+            .iter()
+            .copied()
+            .filter(|access| access.is_write)
+            .collect::<Vec<_>>();
+        let reads = accesses
+            .iter()
+            .copied()
+            .filter(|access| !access.is_write)
+            .collect::<Vec<_>>();
+        let [store] = writes.as_slice() else {
+            continue;
+        };
+        if reads.is_empty()
+            || accesses.len() != reads.len().saturating_add(1)
+            || accesses.iter().any(|access| {
+                !access.provenance_complete
+                    || access.space != SpaceId::Ram
+                    || access.width != allocation.size_bytes
+            })
+            || allocation.accesses.as_ref()
+                != accesses
+                    .iter()
+                    .map(|access| access.id)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+        {
+            continue;
+        }
+
+        let Some(store_inst) = graph.inst(store.id.inst) else {
+            continue;
+        };
+        let InstPayload::Op(SSAOp::Store {
+            space: SpaceId::Ram,
+            ..
+        }) = &store_inst.payload
+        else {
+            continue;
+        };
+        let Some(stored_value) = store.value else {
+            continue;
+        };
+        if store_inst.inputs.as_slice() != [store.address, stored_value] {
+            continue;
+        }
+        let Some((storage, entry_value, save_insts, save_values)) =
+            exact_copy_chain_to_entry_storage(graph, stored_value, allocation.size_bytes)
+        else {
+            continue;
+        };
+        let machine_roles = machine_context.map(SourceMachineContext::machine_roles);
+        if machine_roles.is_some_and(|roles| {
+            roles
+                .stack_pointer_storage()
+                .into_iter()
+                .chain(roles.return_address_storage())
+                .any(|reserved| register_storages_overlap(storage, reserved))
+        }) || boundaries.parameters.values().any(|parameter| {
+            parameter.value == entry_value
+                || register_storages_overlap(storage, parameter.graph_storage)
+                || register_storages_overlap(storage, parameter.abi_storage)
+        }) || boundaries.calls.values().any(|boundary| {
+            boundary.arguments.iter().any(|argument| {
+                matches!(argument.value, SourceCallArgumentValue::Value(value) if value == entry_value)
+            })
+        }) || boundaries.returns.values().any(|boundary| {
+            boundary.values.iter().any(|value| value.value == entry_value)
+                || boundary.register_compositions.iter().any(|composition| {
+                    composition
+                        .ordered_definitions()
+                        .any(|definition| definition.value == entry_value)
+                })
+        }) || machine_context
+            .and_then(SourceMachineContext::function_interface)
+            .is_some_and(|interface| {
+                interface.parameters().iter().any(|parameter| {
+                    register_storages_overlap(storage, parameter.storage())
+                }) || matches!(
+                    interface.return_kind(),
+                    SourceFunctionReturn::Register { storage: result }
+                        if register_storages_overlap(storage, result)
+                )
+            })
+        {
+            continue;
+        }
+
+        let mut insts = save_insts;
+        insts.insert(store.id.inst);
+        let mut values = save_values;
+        let mut load_accesses = Vec::with_capacity(reads.len());
+        let mut complete = true;
+        for load in reads {
+            if !instruction_strictly_precedes(function, graph, store.id.inst, load.id.inst) {
+                complete = false;
+                break;
+            }
+            let Some(load_inst) = graph.inst(load.id.inst) else {
+                complete = false;
+                break;
+            };
+            let InstPayload::Op(SSAOp::Load {
+                space: SpaceId::Ram,
+                ..
+            }) = &load_inst.payload
+            else {
+                complete = false;
+                break;
+            };
+            let Some(loaded_value) = load.value else {
+                complete = false;
+                break;
+            };
+            if load_inst.inputs.as_slice() != [load.address]
+                || load_inst.output != Some(loaded_value)
+            {
+                complete = false;
+                break;
+            }
+            let Some((restore_insts, restore_values)) =
+                exact_copy_chain_to_storage(graph, loaded_value, storage)
+            else {
+                complete = false;
+                break;
+            };
+            if insts.contains(&load.id.inst)
+                || restore_insts.iter().any(|inst| insts.contains(inst))
+                || restore_values.iter().any(|value| values.contains(value))
+            {
+                complete = false;
+                break;
+            }
+            insts.insert(load.id.inst);
+            insts.extend(restore_insts);
+            values.extend(restore_values);
+            load_accesses.push(load.id);
+        }
+        if !complete
+            || values.iter().any(|value| {
+                graph
+                    .use_sites(*value)
+                    .iter()
+                    .any(|site| !insts.contains(&site.inst))
+            })
+            || insts.iter().any(|inst| by_inst.contains_key(inst))
+        {
+            continue;
+        }
+
+        let certificate = StackFrameRoundTripCertificate {
+            object: *object,
+            storage,
+            entry_value,
+            store_access: store.id,
+            load_accesses: load_accesses.into_boxed_slice(),
+            insts: insts.iter().copied().collect::<Vec<_>>().into_boxed_slice(),
+            values: values
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+        for inst in &certificate.insts {
+            by_inst.insert(*inst, *object);
+        }
+        certificates.insert(*object, certificate);
+    }
+    (certificates, by_inst)
+}
+
+fn collect_machine_return_control_certificates(
+    boundaries: &SourceBoundaryFacts,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    structured: &StructuredDataflowFacts,
+) -> (
+    BTreeMap<InstId, MachineReturnControlCertificate>,
+    BTreeMap<InstId, InstId>,
+) {
+    let mut certificates = BTreeMap::new();
+    let mut by_inst = BTreeMap::new();
+    for (at, boundary) in &boundaries.returns {
+        let Some(return_address) = boundary.return_address else {
+            continue;
+        };
+        let Some(return_inst) = graph.inst(*at) else {
+            continue;
+        };
+        if return_inst.inputs.first() != Some(&return_address.value)
+            || !matches!(return_inst.payload, InstPayload::Op(SSAOp::Return { .. }))
+        {
+            continue;
+        }
+
+        let mut insts = BTreeSet::new();
+        let mut values = BTreeSet::from([return_address.value]);
+        let mut current = return_address.value;
+        let mut complete = true;
+        loop {
+            let Some(inst) = graph.def_inst(current) else {
+                break;
+            };
+            let Some(definition) = graph.inst(inst) else {
+                complete = false;
+                break;
+            };
+            match &definition.payload {
+                InstPayload::Op(SSAOp::Copy { dst, src }) => {
+                    let Some(source) = graph.value_id_for_var(src) else {
+                        complete = false;
+                        break;
+                    };
+                    if definition.output != Some(current)
+                        || definition.inputs.as_slice() != [source]
+                        || dst.size != return_address.storage.size
+                        || src.size != return_address.storage.size
+                        || !insts.insert(inst)
+                        || !values.insert(source)
+                    {
+                        complete = false;
+                        break;
+                    }
+                    current = source;
+                }
+                InstPayload::Op(SSAOp::Load {
+                    space: SpaceId::Ram,
+                    dst,
+                    ..
+                }) => {
+                    let accesses = structured
+                        .memory_accesses
+                        .values()
+                        .filter(|access| {
+                            access.id.inst == inst
+                                && !access.is_write
+                                && access.value == Some(current)
+                                && access.provenance_complete
+                                && access.space == SpaceId::Ram
+                                && access.width == return_address.storage.size
+                        })
+                        .collect::<Vec<_>>();
+                    let [access] = accesses.as_slice() else {
+                        complete = false;
+                        break;
+                    };
+                    let stack_object = matches!(
+                        objects.object(access.object).map(|object| &object.kind),
+                        Some(
+                            ObjectKind::StackSlot { .. }
+                                | ObjectKind::FrameObject { .. }
+                                | ObjectKind::Parameter { .. }
+                        )
+                    );
+                    if !stack_object
+                        || dst.size != return_address.storage.size
+                        || definition.output != Some(current)
+                        || definition.inputs.as_slice() != [access.address]
+                        || !insts.insert(inst)
+                    {
+                        complete = false;
+                    }
+                    break;
+                }
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        let return_use = UseSite {
+            inst: *at,
+            input_idx: 0,
+        };
+        if !complete
+            || insts.is_empty()
+            || values.iter().any(|value| {
+                graph
+                    .use_sites(*value)
+                    .iter()
+                    .any(|site| *site != return_use && !insts.contains(&site.inst))
+            })
+            || insts.iter().any(|inst| by_inst.contains_key(inst))
+        {
+            continue;
+        }
+        let uses = insts
+            .iter()
+            .flat_map(|inst| {
+                graph.inst(*inst).into_iter().flat_map(move |definition| {
+                    (0..definition.inputs.len()).map(move |input_idx| UseSite {
+                        inst: *inst,
+                        input_idx,
+                    })
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let certificate = MachineReturnControlCertificate {
+            at: *at,
+            storage: return_address.storage,
+            control_value: return_address.value,
+            insts,
+            values,
+            uses,
+        };
+        for inst in &certificate.insts {
+            by_inst.insert(*inst, *at);
+        }
+        certificates.insert(*at, certificate);
+    }
+    (certificates, by_inst)
+}
+
+fn collect_stack_geometry_certificate(
+    boundaries: &SourceBoundaryFacts,
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    structured: &StructuredDataflowFacts,
+    frame_round_trips: &BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
+    return_controls: &BTreeMap<InstId, MachineReturnControlCertificate>,
+) -> StackGeometryCertificate {
+    let Some(prep) = function.decompile_prep_facts() else {
+        return StackGeometryCertificate::default();
+    };
+    let stack_root = |value: ValueId| {
+        graph
+            .value(value)
+            .and_then(|value| resolve_entry_stack_root(Some(prep), &value.var))
+    };
+    let is_constant = |value: ValueId| {
+        graph
+            .value(value)
+            .is_some_and(|value| value.var.constant_bits().is_some())
+    };
+
+    let mut geometry_outputs = BTreeMap::<InstId, ValueId>::new();
+    let mut geometry_inputs = BTreeSet::<ValueId>::new();
+    for inst in &graph.insts {
+        let Some(output) = inst.output.filter(|output| stack_root(*output).is_some()) else {
+            continue;
+        };
+        let output_root = stack_root(output);
+        let exact = match &inst.payload {
+            InstPayload::Phi { predecessors } => {
+                !predecessors.is_empty()
+                    && inst.inputs.len() == predecessors.len()
+                    && inst
+                        .inputs
+                        .iter()
+                        .all(|input| stack_root(*input) == output_root)
+            }
+            InstPayload::Op(SSAOp::Copy { .. }) => {
+                inst.inputs.len() == 1 && stack_root(inst.inputs[0]).is_some()
+            }
+            InstPayload::Op(SSAOp::IntAdd { .. }) => {
+                inst.inputs.len() == 2
+                    && ((stack_root(inst.inputs[0]).is_some() && is_constant(inst.inputs[1]))
+                        || (is_constant(inst.inputs[0]) && stack_root(inst.inputs[1]).is_some()))
+            }
+            InstPayload::Op(SSAOp::IntSub { .. }) => {
+                inst.inputs.len() == 2
+                    && stack_root(inst.inputs[0]).is_some()
+                    && is_constant(inst.inputs[1])
+            }
+            _ => false,
+        };
+        if exact {
+            geometry_outputs.insert(inst.id, output);
+            geometry_inputs.extend(inst.inputs.iter().copied());
+        }
+    }
+
+    let mut stack_address_uses = BTreeSet::new();
+    for access in structured.memory_accesses.values() {
+        let exact_stack_object = access.provenance_complete
+            && matches!(
+                objects.object(access.object).map(|object| &object.kind),
+                Some(
+                    ObjectKind::StackSlot { .. }
+                        | ObjectKind::FrameObject { .. }
+                        | ObjectKind::Parameter { .. }
+                )
+            );
+        let Some(inst) = graph.inst(access.id.inst) else {
+            continue;
+        };
+        if exact_stack_object && inst.inputs.first() == Some(&access.address) {
+            stack_address_uses.insert(UseSite {
+                inst: access.id.inst,
+                input_idx: 0,
+            });
+        }
+    }
+    let frame_uses = frame_round_trips
+        .values()
+        .flat_map(|certificate| certificate.insts.iter())
+        .flat_map(|inst| {
+            graph.inst(*inst).into_iter().flat_map(move |definition| {
+                (0..definition.inputs.len()).map(move |input_idx| UseSite {
+                    inst: *inst,
+                    input_idx,
+                })
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let frame_values = frame_round_trips
+        .values()
+        .flat_map(|certificate| certificate.values.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let return_control_uses = return_controls
+        .values()
+        .flat_map(|certificate| certificate.uses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let return_control_values = return_controls
+        .values()
+        .flat_map(|certificate| certificate.values.iter().copied())
+        .collect::<BTreeSet<_>>();
+
+    let mut program_values = boundaries
+        .parameters
+        .values()
+        .map(|parameter| parameter.value)
+        .collect::<BTreeSet<_>>();
+    for boundary in boundaries.calls.values() {
+        program_values.extend(boundary.arguments.iter().filter_map(
+            |argument| match argument.value {
+                SourceCallArgumentValue::PreservedEntry => None,
+                SourceCallArgumentValue::Value(value) => Some(value),
+            },
+        ));
+        program_values.extend(boundary.results.iter().map(|result| result.value));
+    }
+    for boundary in boundaries.returns.values() {
+        program_values.extend(boundary.values.iter().map(|value| value.value));
+        program_values.extend(
+            boundary
+                .register_compositions
+                .iter()
+                .flat_map(|composition| {
+                    composition
+                        .ordered_definitions()
+                        .map(|definition| definition.value)
+                }),
+        );
+    }
+
+    let mut values = graph
+        .values
+        .iter()
+        .filter(|value| {
+            !program_values.contains(&value.id)
+                && !frame_values.contains(&value.id)
+                && !return_control_values.contains(&value.id)
+                && (stack_root(value.id).is_some() || geometry_inputs.contains(&value.id))
+                && graph
+                    .def_inst(value.id)
+                    .is_none_or(|inst| geometry_outputs.get(&inst).copied() == Some(value.id))
+        })
+        .map(|value| value.id)
+        .collect::<BTreeSet<_>>();
+    loop {
+        let removed = values
+            .iter()
+            .copied()
+            .filter(|value| {
+                graph.use_sites(*value).iter().any(|site| {
+                    !frame_uses.contains(site)
+                        && !return_control_uses.contains(site)
+                        && !stack_address_uses.contains(site)
+                        && !geometry_outputs
+                            .get(&site.inst)
+                            .is_some_and(|output| values.contains(output))
+                })
+            })
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            break;
+        }
+        for value in removed {
+            values.remove(&value);
+        }
+    }
+
+    let insts = geometry_outputs
+        .into_iter()
+        .filter_map(|(inst, output)| values.contains(&output).then_some(inst))
+        .collect::<BTreeSet<_>>();
+    let mut uses = stack_address_uses
+        .difference(&frame_uses)
+        .copied()
+        .filter(|site| !return_control_uses.contains(site))
+        .collect::<BTreeSet<_>>();
+    for inst in &insts {
+        let Some(definition) = graph.inst(*inst) else {
+            continue;
+        };
+        uses.extend((0..definition.inputs.len()).map(|input_idx| UseSite {
+            inst: *inst,
+            input_idx,
+        }));
+    }
+    StackGeometryCertificate {
+        insts,
+        values,
+        uses,
+    }
 }
 
 #[expect(
@@ -3806,6 +4642,26 @@ fn collect_prepared_function_certificates(
         structured,
         &exact_stack_slots,
     );
+    let (stack_frame_round_trips, stack_frame_round_trip_by_inst) =
+        collect_stack_frame_round_trip_certificates(
+            boundaries,
+            function,
+            graph,
+            machine_context,
+            structured,
+            &callee_stack_allocations,
+        );
+    let (machine_return_controls, machine_return_control_by_inst) =
+        collect_machine_return_control_certificates(boundaries, graph, objects, structured);
+    let stack_geometry = collect_stack_geometry_certificate(
+        boundaries,
+        function,
+        graph,
+        objects,
+        structured,
+        &stack_frame_round_trips,
+        &machine_return_controls,
+    );
     let stack_slots = objects
         .objects
         .iter()
@@ -3901,6 +4757,11 @@ fn collect_prepared_function_certificates(
         memory_accesses,
         memory_accesses_by_op,
         stack_slots,
+        stack_frame_round_trips,
+        stack_frame_round_trip_by_inst,
+        stack_geometry,
+        machine_return_controls,
+        machine_return_control_by_inst,
         callsites,
         callsites_by_inst,
         call_results,
@@ -7555,7 +8416,7 @@ mod tests {
         AssumptionSet, AssumptionSubject, AssumptionValue, CanonicalStorageId,
         CanonicalStorageSpace, DecompilePrepFacts, InstId, InstPayload, SSAOp, SSAVar,
         SemanticObligationKind, SourceAbiParameterSpec, SourceCarrierKind, SourceCarrierProjection,
-        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
+        SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles,
         SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotSpec, SourceType,
         SourceTypeGraph, SourceTypeKind, SsaArtifact, StackAddressBase, StackAddressRoot, ValueId,
     };
@@ -8342,16 +9203,19 @@ mod tests {
             })
         );
 
-        let allocated_interface = interface
-            .clone()
-            .with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::LowerAddresses,
-            ))
+        let allocated_roles = SourceMachineRoles::new(Some(storage(16)), Some(storage(0)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                    SourceStackGrowth::LowerAddresses,
+                ))
+            })
             .expect("exact downward allocation contract");
-        let allocated = SsaArtifact::for_decompile_with_interface(
+        let allocated = SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
             &[block.clone()],
             Some(&arch),
-            allocated_interface,
+            Some(interface.clone()),
+            allocated_roles,
+            Vec::new(),
         )
         .expect("allocated dual-coordinate artifact");
         let [allocated_save] = allocated
@@ -8432,15 +9296,19 @@ mod tests {
             "an overlapping exact source object must revoke anonymous allocation authority"
         );
 
-        let wrong_direction_interface = interface
-            .with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::HigherAddresses,
-            ))
+        let wrong_direction_roles = SourceMachineRoles::new(Some(storage(16)), Some(storage(0)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                    SourceStackGrowth::HigherAddresses,
+                ))
+            })
             .expect("exact upward allocation contract");
-        let wrong_direction = SsaArtifact::for_decompile_with_interface(
+        let wrong_direction = SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
             &[block],
             Some(&arch),
-            wrong_direction_interface,
+            Some(interface),
+            wrong_direction_roles,
+            Vec::new(),
         )
         .expect("opposite-direction artifact");
         let [wrong_direction_save] = wrong_direction
@@ -9693,6 +10561,365 @@ mod tests {
                 .is_none()
         );
         assert!(convergent_boundary.complete);
+    }
+
+    #[test]
+    fn callee_stack_allocation_reaches_unchanged_sp_through_loop_fixpoint() {
+        let sp = Varnode::register(32, 8);
+        let mut entry = R2ILBlock::new(0x6080, 4);
+        entry.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+            val: Varnode::register(16, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x6090, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x6090, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x6090, 8),
+            cond: Varnode::register(24, 1),
+        });
+
+        let mut exit = R2ILBlock::new(0x6094, 4);
+        exit.push(R2ILOp::Load {
+            dst: Varnode::unique(0x6080, 8),
+            space: SpaceId::Ram,
+            addr: sp,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        let roles =
+            SourceMachineRoles::new(Some(register_storage(16, 8)), Some(register_storage(32, 8)))
+                .and_then(|roles| {
+                    roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                        SourceStackGrowth::LowerAddresses,
+                    ))
+                })
+                .expect("exact downward stack allocation roles");
+        let artifact = SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &[entry, header, exit],
+            Some(&return_boundary_arch()),
+            Some(preserved_stack_interface()),
+            roles,
+            Vec::new(),
+        )
+        .expect("loop stack allocation artifact");
+        let [store] = artifact
+            .memory_defs_for_op_site(0x6080, 1)
+            .expect("saved stack definition")
+        else {
+            panic!("one saved stack definition")
+        };
+        let [load] = artifact
+            .memory_uses_for_op_site(0x6094, 0)
+            .expect("saved stack use after loop")
+        else {
+            panic!("one saved stack use")
+        };
+        assert_eq!(store.location.object, load.location.object);
+        let certificate = artifact
+            .certificates()
+            .stack_slots
+            .get(&store.location.object)
+            .and_then(|slot| slot.callee_allocation.as_ref())
+            .expect("loop-stable SP must certify the callee allocation");
+        assert_eq!(certificate.entry_offset, -8);
+        assert_eq!(certificate.size_bytes, 8);
+        assert_eq!(certificate.active_sp_offsets.as_ref(), [-8]);
+    }
+
+    #[test]
+    fn frame_pointer_round_trip_certificate_owns_exact_graph_cells() {
+        let sp = Varnode::register(32, 8);
+        let fp = Varnode::register(40, 8);
+        let saved_fp = Varnode::unique(0x60a0, 8);
+        let reloaded_fp = Varnode::unique(0x60a8, 8);
+        let mut entry = R2ILBlock::new(0x60a0, 4);
+        entry.push(R2ILOp::Copy {
+            dst: saved_fp.clone(),
+            src: fp.clone(),
+        });
+        entry.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+            val: saved_fp,
+        });
+        entry.push(R2ILOp::Copy {
+            dst: fp.clone(),
+            src: sp.clone(),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x60b0, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x60b0, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x60b0, 8),
+            cond: Varnode::register(24, 1),
+        });
+
+        let mut exit = R2ILBlock::new(0x60b4, 4);
+        exit.push(R2ILOp::Load {
+            dst: reloaded_fp.clone(),
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+        });
+        exit.push(R2ILOp::IntAdd {
+            dst: sp.clone(),
+            a: sp,
+            b: Varnode::constant(8, 8),
+        });
+        exit.push(R2ILOp::Copy {
+            dst: fp,
+            src: reloaded_fp,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        let frame_storage = register_storage(40, 8);
+        let interface = preserved_stack_interface()
+            .with_frame_pointer_storage(frame_storage)
+            .expect("exact frame-pointer carrier");
+        let roles =
+            SourceMachineRoles::new(Some(register_storage(16, 8)), Some(register_storage(32, 8)))
+                .and_then(|roles| {
+                    roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                        SourceStackGrowth::LowerAddresses,
+                    ))
+                })
+                .expect("exact downward stack allocation roles");
+        let artifact = SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &[entry, header, exit],
+            Some(&return_boundary_arch()),
+            Some(interface),
+            roles,
+            Vec::new(),
+        )
+        .expect("frame round-trip artifact");
+        let [store] = artifact
+            .memory_defs_for_op_site(0x60a0, 2)
+            .expect("frame save")
+        else {
+            panic!("one frame save")
+        };
+        let certificate = artifact
+            .certificates()
+            .stack_frame_round_trips
+            .get(&store.location.object)
+            .expect("exact frame save/reload certificate");
+        let inst_sites = certificate
+            .insts
+            .iter()
+            .filter_map(|inst| artifact.graph().op_site_for_inst(*inst))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(certificate.storage, frame_storage);
+        assert_eq!(
+            artifact
+                .graph()
+                .op_site_for_inst(certificate.store_access.inst),
+            Some((0x60a0, 2))
+        );
+        assert_eq!(certificate.load_accesses.len(), 1);
+        assert_eq!(
+            inst_sites,
+            BTreeSet::from([(0x60a0, 0), (0x60a0, 2), (0x60b4, 0), (0x60b4, 2)])
+        );
+        assert!(certificate.values.iter().all(|value| {
+            artifact
+                .graph()
+                .use_sites(*value)
+                .iter()
+                .all(|site| certificate.insts.contains(&site.inst))
+        }));
+        assert!(certificate.insts.iter().all(|inst| {
+            artifact
+                .certificates()
+                .stack_frame_round_trip_by_inst
+                .get(inst)
+                == Some(&store.location.object)
+        }));
+        let geometry_sites = artifact
+            .certificates()
+            .stack_geometry
+            .insts
+            .iter()
+            .filter_map(|inst| artifact.graph().op_site_for_inst(*inst))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            geometry_sites,
+            BTreeSet::from([(0x60a0, 1), (0x60a0, 3), (0x60b4, 1)])
+        );
+        let stack_sub = artifact
+            .graph()
+            .inst_id_for_op_site(0x60a0, 1)
+            .expect("stack subtraction instruction");
+        assert!(
+            artifact
+                .certificates()
+                .stack_geometry
+                .uses
+                .contains(&crate::UseSite {
+                    inst: stack_sub,
+                    input_idx: 0,
+                })
+        );
+    }
+
+    #[test]
+    fn stack_geometry_certificate_closes_equal_root_merge_phi() {
+        let sp = Varnode::register(32, 8);
+        let address = Varnode::unique(0x60c0, 8);
+        let mut entry = R2ILBlock::new(0x60c0, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x60c8, 8),
+            cond: Varnode::register(24, 1),
+        });
+
+        let mut right = R2ILBlock::new(0x60c4, 4);
+        right.push(R2ILOp::IntSub {
+            dst: address.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(16, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::ram(0x60cc, 8),
+        });
+
+        let mut left = R2ILBlock::new(0x60c8, 4);
+        left.push(R2ILOp::IntSub {
+            dst: address.clone(),
+            a: sp,
+            b: Varnode::constant(16, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::ram(0x60cc, 8),
+        });
+
+        let mut joined = R2ILBlock::new(0x60cc, 4);
+        joined.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address,
+            val: Varnode::constant(7, 8),
+        });
+        joined.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[entry, right, left, joined],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("equal-root stack merge artifact");
+        let phi = artifact
+            .function()
+            .get_block(0x60cc)
+            .and_then(|block| block.phis.first())
+            .expect("stack-address merge phi");
+        let phi_value = artifact
+            .graph()
+            .value_id_for_var(&phi.dst)
+            .expect("stack-address phi value");
+        let phi_inst = artifact
+            .graph()
+            .def_inst(phi_value)
+            .expect("stack-address phi instruction");
+        let geometry = &artifact.certificates().stack_geometry;
+
+        assert_eq!(
+            artifact.entry_stack_address_root_for_value(phi_value),
+            Some(StackAddressRoot {
+                base: StackAddressBase::StackPointer,
+                offset: -16,
+            })
+        );
+        assert!(geometry.values.contains(&phi_value));
+        assert!(geometry.insts.contains(&phi_inst));
+        assert!(artifact.graph().inst(phi_inst).is_some_and(|inst| {
+            matches!(inst.payload, InstPayload::Phi { .. })
+                && inst
+                    .inputs
+                    .iter()
+                    .all(|input| geometry.values.contains(input))
+        }));
+    }
+
+    #[test]
+    fn machine_return_control_certificate_owns_exact_stack_reload() {
+        let sp = Varnode::register(32, 8);
+        let ra = Varnode::register(16, 8);
+        let mut block = R2ILBlock::new(0x60c0, 4);
+        block.push(R2ILOp::Load {
+            dst: ra.clone(),
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: sp.clone(),
+            a: sp,
+            b: Varnode::constant(8, 8),
+        });
+        block.push(R2ILOp::Return { target: ra });
+        let artifact = SsaArtifact::for_decompile_with_interface(
+            &[block],
+            Some(&return_boundary_arch()),
+            preserved_stack_interface(),
+        )
+        .expect("stack return-control artifact");
+        let return_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x60c0, 2)
+            .expect("return instruction");
+        let load_inst = artifact
+            .graph()
+            .inst_id_for_op_site(0x60c0, 0)
+            .expect("return-address load");
+        let certificate = artifact
+            .certificates()
+            .machine_return_controls
+            .get(&return_inst)
+            .expect("machine return-control certificate");
+        assert_eq!(certificate.storage, register_storage(16, 8));
+        assert_eq!(certificate.insts, BTreeSet::from([load_inst]));
+        assert_eq!(
+            certificate.uses,
+            BTreeSet::from([crate::UseSite {
+                inst: load_inst,
+                input_idx: 0,
+            }])
+        );
+        assert_eq!(
+            artifact
+                .certificates()
+                .machine_return_control_by_inst
+                .get(&load_inst),
+            Some(&return_inst)
+        );
+        assert!(
+            !artifact
+                .certificates()
+                .stack_geometry
+                .uses
+                .contains(&crate::UseSite {
+                    inst: load_inst,
+                    input_idx: 0,
+                })
+        );
     }
 
     #[test]

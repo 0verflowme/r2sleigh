@@ -573,7 +573,15 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, prepared, view, origins);
     overlay_prepared_switch_roots(&mut use_info, prepared, view);
-    populate_prepared_render_definitions(symbols, &mut use_info, blocks, env, view)?;
+    populate_prepared_render_definitions(
+        symbols,
+        &mut use_info,
+        blocks,
+        env,
+        prepared,
+        view,
+        origins,
+    )?;
 
     control.poll()?;
     Ok(DecompilerFacts {
@@ -610,15 +618,76 @@ fn populate_prepared_render_definitions(
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     env: &PassEnv<'_>,
+    prepared: &SsaArtifact,
     view: &PreparedSemanticView,
+    origins: &crate::normalize::NormalizationOrigins,
 ) -> Result<(), crate::analysis::lower::OpLoweringRefusal> {
     for block in blocks {
-        for op in &block.ops {
+        let Some(block_id) = prepared.graph().block_id_for_addr(block.addr) else {
+            return Err(
+                crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            );
+        };
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if matches!(
+                origins.origin(crate::normalize::NormalizedOpSite {
+                    block: block_id,
+                    op_idx,
+                }),
+                Some(crate::normalize::NormalizedOpOrigin::Original(inst))
+                    if prepared
+                        .certificates()
+                        .stack_frame_round_trip_by_inst
+                        .contains_key(inst)
+                        || prepared
+                            .certificates()
+                            .machine_return_control_by_inst
+                            .contains_key(inst)
+                        || prepared
+                            .certificates()
+                            .stack_geometry
+                            .insts
+                            .contains(inst)
+                        || prepared
+                            .certificates()
+                            .stack_geometry
+                            .uses
+                            .iter()
+                            .any(|site| site.inst == *inst)
+            ) {
+                continue;
+            }
             let Some(dst) = op.dst() else {
                 continue;
             };
             if !prepared_op_has_render_definition(op) {
                 continue;
+            }
+            if let Some(resolver) = env.binding_names {
+                let Some(value) = use_info.exact_value_id_for_var(dst) else {
+                    return Err(
+                        crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+                    );
+                };
+                match resolver.plan().disposition(value) {
+                    Some(crate::binding_plan::ValueDisposition::Bound { .. }) => {}
+                    Some(
+                        crate::binding_plan::ValueDisposition::Inline { .. }
+                        | crate::binding_plan::ValueDisposition::Elided { .. }
+                        | crate::binding_plan::ValueDisposition::Refused { .. },
+                    ) => {
+                        // Render definitions are an advisory expression cache.
+                        // An output the sealed plan will not render owns no
+                        // cache cell and must not force its operands back into
+                        // the program-variable domain.
+                        continue;
+                    }
+                    None => {
+                        return Err(
+                            crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+                        );
+                    }
+                }
             }
             let expr = {
                 let lower = LowerCtx {
@@ -1681,20 +1750,24 @@ fn populate_predicates(
             continue;
         };
         let compare_width = lhs_var.size.max(rhs_var.size);
-        let lhs = expr_for_compare_operand_with_width(
+        let Some(lhs) = expr_for_compare_operand_with_width(
             symbols,
             inputs,
             lhs_var.clone(),
             view,
             compare_width,
-        );
-        let rhs = expr_for_compare_operand_with_width(
+        ) else {
+            continue;
+        };
+        let Some(rhs) = expr_for_compare_operand_with_width(
             symbols,
             inputs,
             rhs_var.clone(),
             view,
             compare_width,
-        );
+        ) else {
+            continue;
+        };
         let expr = CExpr::binary(binary_op_for_compare(compare.kind), lhs, rhs);
         let Some(cond_var) = prepared_var(inputs.prepared, predicate.condition) else {
             continue;
@@ -1800,9 +1873,9 @@ fn compare_expr_for_sources(
 
     let compare_width = lhs.size.max(rhs.size);
     let lhs =
-        expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width);
+        expr_for_compare_operand_with_width(symbols, inputs, lhs.clone(), view, compare_width)?;
     let rhs =
-        expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width);
+        expr_for_compare_operand_with_width(symbols, inputs, rhs.clone(), view, compare_width)?;
     Some(CExpr::binary(op, lhs, rhs))
 }
 
@@ -1863,18 +1936,19 @@ fn reconstruct_zero_compare_from_nonzero_def(
                 a.clone(),
                 view,
                 compare_width,
-            );
+            )?;
             let rhs = expr_for_compare_operand_with_width(
                 symbols,
                 inputs,
                 b.clone(),
                 view,
                 compare_width,
-            );
+            )?;
             Some(CExpr::binary(op, lhs, rhs))
         }
         SSAOp::IntAnd { a, b, .. } if a == b => {
-            let lhs = expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, a.size);
+            let lhs =
+                expr_for_compare_operand_with_width(symbols, inputs, a.clone(), view, a.size)?;
             Some(CExpr::binary(op, lhs, CExpr::IntLit(0)))
         }
         _ => None,
@@ -1912,7 +1986,7 @@ fn predicate_expr_for_operand_with_depth(
     {
         return Some(expr);
     }
-    let expr = expr_for_compare_operand(symbols, inputs, var.clone(), view);
+    let expr = expr_for_compare_operand(symbols, inputs, var.clone(), view)?;
     let is_self = view
         .admitted_value_symbol(var)
         .is_some_and(|symbol| matches!(expr, CExpr::Var(candidate) if candidate == symbol));
@@ -1996,7 +2070,9 @@ fn populate_switches(
         if let Some(selector_value) = switch.selector
             && let Some(selector) = prepared_var(inputs.prepared, selector_value).cloned()
         {
-            let expr = expr_for_compare_operand(symbols, inputs, selector, view);
+            let Some(expr) = expr_for_compare_operand(symbols, inputs, selector, view) else {
+                continue;
+            };
             view.switch_selector_value_by_block
                 .insert(*block_addr, selector_value);
             view.switch_selector_expr_by_block.insert(*block_addr, expr);
@@ -2608,7 +2684,7 @@ fn expr_for_compare_operand(
     inputs: &PreparedSemanticViewInputs<'_>,
     var: SSAVar,
     view: &PreparedSemanticView,
-) -> CExpr {
+) -> Option<CExpr> {
     expr_for_compare_operand_with_width(symbols, inputs, var, view, 0)
 }
 
@@ -2618,9 +2694,9 @@ fn expr_for_compare_operand_with_width(
     var: SSAVar,
     view: &PreparedSemanticView,
     compare_width: u32,
-) -> CExpr {
+) -> Option<CExpr> {
     if let Some(expr) = compare_style_operand_expr(inputs.prepared, &var, compare_width) {
-        return expr;
+        return Some(expr);
     }
 
     let root = inputs
@@ -2631,13 +2707,13 @@ fn expr_for_compare_operand_with_width(
         .cloned()
         .unwrap_or_else(|| var.clone());
     if let Some(expr) = compare_style_operand_expr(inputs.prepared, &root, compare_width) {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(expr) = prepared_parameter_program_expr(symbols, view, inputs.prepared, &root)
         .or_else(|| prepared_parameter_program_expr(symbols, view, inputs.prepared, &var))
     {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(expr) = non_generic_prepared_owner_expr(symbols, view, &var)
@@ -2645,7 +2721,7 @@ fn expr_for_compare_operand_with_width(
         .or_else(|| non_generic_prepared_owner_expr(symbols, view, &root))
         .or_else(|| non_generic_prepared_predicate_expr(symbols, view, &root))
     {
-        return expr;
+        return Some(expr);
     }
 
     #[cfg(test)]
@@ -2653,43 +2729,42 @@ fn expr_for_compare_operand_with_width(
         && let Some(expr) =
             prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &var)
     {
-        return expr;
+        return Some(expr);
     }
     #[cfg(test)]
     if preferred_non_generic_stack_alias(view, &root).is_some()
         && let Some(expr) =
             prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &root)
     {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(expr) =
         generic_prepared_owner_expr(view, &var).or_else(|| generic_prepared_owner_expr(view, &root))
     {
-        return expr;
+        return Some(expr);
     }
 
     if view.stack_offset_for_var(&var).is_some()
         && let Some(expr) =
             prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &var)
     {
-        return expr;
+        return Some(expr);
     }
     if view.stack_offset_for_var(&root).is_some()
         && let Some(expr) =
             prepared_stack_program_expr_for_var(symbols, view, inputs.prepared, &root)
     {
-        return expr;
+        return Some(expr);
     }
 
     if let Some(expr) = prepared_fallback_visible_expr(symbols, view, &root)
         .or_else(|| prepared_fallback_visible_expr(symbols, view, &var))
     {
-        return expr;
+        return Some(expr);
     }
 
     prepared_value_program_expr(symbols, view, &var)
-        .expect("compare operand requiring a variable was admitted as a bound value")
 }
 
 fn exact_prepared_constant_bits(prepared: &SsaArtifact, var: &SSAVar) -> Option<u64> {

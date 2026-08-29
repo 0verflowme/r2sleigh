@@ -89,6 +89,25 @@ pub enum SemanticObligationKind {
     LiveValueProducer,
 }
 
+impl SemanticObligationKind {
+    /// Whether this obligation independently proves a program observation.
+    ///
+    /// Producer and loop-transition obligations are dependency annotations:
+    /// they inherit liveness from the root that reached them and cannot mint it
+    /// themselves. Unknown-effect obligations are refusal evidence. Treating
+    /// either class as a fresh positive root loses evidence polarity and can
+    /// promote preserved machine state into a source-level value.
+    pub const fn is_positive_observation_root(self) -> bool {
+        !matches!(
+            self,
+            Self::VolatileOrUnknownEffect
+                | Self::LoopCarriedState
+                | Self::LiveStateTransition
+                | Self::LiveValueProducer
+        )
+    }
+}
+
 impl std::fmt::Display for SemanticObligationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
@@ -1416,6 +1435,34 @@ mod tests {
     };
     use proptest::prelude::*;
     use r2il::{ArchSpec, MemoryOrdering, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    #[test]
+    fn only_independent_semantic_obligations_are_positive_observation_roots() {
+        for kind in [
+            SemanticObligationKind::ObservableMemoryRead,
+            SemanticObligationKind::ObservableMemoryWrite,
+            SemanticObligationKind::Call,
+            SemanticObligationKind::CallArgument,
+            SemanticObligationKind::CallResult,
+            SemanticObligationKind::Return,
+            SemanticObligationKind::ReturnValue,
+            SemanticObligationKind::ControlPredicate,
+            SemanticObligationKind::ControlTransfer,
+            SemanticObligationKind::Trap,
+            SemanticObligationKind::Atomicity,
+            SemanticObligationKind::MemoryOrdering,
+        ] {
+            assert!(kind.is_positive_observation_root(), "{kind:?}");
+        }
+        for kind in [
+            SemanticObligationKind::VolatileOrUnknownEffect,
+            SemanticObligationKind::LoopCarriedState,
+            SemanticObligationKind::LiveStateTransition,
+            SemanticObligationKind::LiveValueProducer,
+        ] {
+            assert!(!kind.is_positive_observation_root(), "{kind:?}");
+        }
+    }
 
     fn obligation_fixture() -> Vec<R2ILBlock> {
         let mut entry = R2ILBlock::new(0x1000, 4);

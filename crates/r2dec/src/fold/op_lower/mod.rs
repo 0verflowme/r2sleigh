@@ -13,8 +13,7 @@ use r2ssa::{DecompilePrepFacts, SSAOp, SSAVar, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::normalize_callee_name;
 use r2types::{
-    CalleeIdentity, ExternalStackSlotRole, FunctionRenderFacts, ReturnValueRenderFact,
-    SourceOwnedFunctionFacts,
+    CalleeIdentity, FunctionRenderFacts, ReturnValueRenderFact, SourceOwnedFunctionFacts,
 };
 
 use crate::analysis;
@@ -260,41 +259,6 @@ impl<'a> CertifiedRenderPlan<'a> {
             return None;
         }
         call_view.authoritative_args.get(index).cloned()
-    }
-
-    fn stack_param_expr_for_memory_fact(
-        &self,
-        fact: &r2types::MemoryAccessRenderFact,
-        names: &crate::binding_plan::BindingNameResolution,
-    ) -> Option<CExpr> {
-        if fact.is_write || fact.width == 0 {
-            return None;
-        }
-        let offset = self.proof.render_facts.stack_slot_offset(fact.object)?;
-        self.function_facts
-            .authorized_stack_param_owner_render(fact.object, offset)?;
-        let mut matching_slots =
-            self.function_facts
-                .type_facts()
-                .stack_slots
-                .iter()
-                .filter(|(key, slot)| {
-                    key.offset == offset
-                        && matches!(
-                            slot.role,
-                            ExternalStackSlotRole::StackArg | ExternalStackSlotRole::ParamHome
-                        )
-                });
-        let (_, slot) = matching_slots.next()?;
-        if matching_slots.next().is_some() {
-            return None;
-        }
-        let slot = u32::try_from(slot.param_index?).ok()?;
-        match names.require_parameter_slot(slot).ok()? {
-            crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. } => {
-                Some(CExpr::Var(symbol))
-            }
-        }
     }
 }
 

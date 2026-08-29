@@ -720,8 +720,6 @@ impl OwnedFunctionSnapshot {
                     .frame_pointer_storage()
                     .is_some_and(|storage| storage.size != machine.bits / 8)
                 || captured_fields.return_mechanism != interface.return_mechanism().is_some()
-                || captured_fields.stack_allocation_contract
-                    != interface.stack_allocation_contract().is_some()
             {
                 return Err(SnapshotValidationError::InvalidFunctionInterface);
             }
@@ -731,7 +729,11 @@ impl OwnedFunctionSnapshot {
             || captured_fields.stack_pointer_storage
             || captured_fields.frame_pointer_storage
             || captured_fields.return_mechanism
-            || captured_fields.stack_allocation_contract
+        {
+            return Err(SnapshotValidationError::InvalidFunctionInterface);
+        }
+        if captured_fields.stack_allocation_contract
+            != machine_roles.stack_allocation_contract().is_some()
         {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
@@ -916,13 +918,18 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
         .and_then(|interface| interface.with_frame_pointer_storage(register(32)))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::LowerAddresses,
-            ))
-        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact interface")
+    }
+
+    fn exact_machine_roles() -> SourceMachineRoles {
+        SourceMachineRoles::new(Some(register(16)), Some(register(24)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                    SourceStackGrowth::LowerAddresses,
+                ))
+            })
+            .expect("exact machine roles")
     }
 
     #[test]
@@ -1002,7 +1009,7 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface.clone()),
-            SourceMachineRoles::default(),
+            exact_machine_roles(),
             SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             captured_fields,
             valid.diagnostic_identity(),
@@ -1048,7 +1055,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_machine_width),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 narrow_fields,
                 valid.diagnostic_identity()
@@ -1067,7 +1074,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_frame_pointer,
                 valid.diagnostic_identity()
@@ -1086,7 +1093,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_stack_allocation_contract,
                 valid.diagnostic_identity()
@@ -1110,11 +1117,6 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::LowerAddresses,
-            ))
-        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("interface without explicit frame fact");
         assert_eq!(
@@ -1130,7 +1132,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface_without_frame_pointer.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
                 valid.diagnostic_identity()
@@ -1147,7 +1149,7 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface_without_frame_pointer),
-            SourceMachineRoles::default(),
+            exact_machine_roles(),
             SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             fields_without_frame_pointer,
             valid.diagnostic_identity(),
@@ -1171,7 +1173,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_return_mechanism,
                 valid.diagnostic_identity()
@@ -1239,7 +1241,7 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_revision),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
                 SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
                 valid.diagnostic_identity()

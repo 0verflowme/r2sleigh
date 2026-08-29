@@ -559,6 +559,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.safety_reason.as_deref()
     }
 
+    /// Seal a linearized native fallback as one lexical function-body region.
+    ///
+    /// Gotos remain explicit, so this asserts no structured control semantics.
+    /// It supplies only the lexical root needed for emit-time declaration
+    /// placement; CFG dominance and surviving observations still decide every
+    /// binding placement or refusal.
+    pub(crate) fn seal_linearized_body(
+        &self,
+        stmt: CStmt,
+    ) -> ControlFlowStructureResult<SealedStructuredBody> {
+        let source_authority = self
+            .fold_ctx
+            .inputs
+            .prepared_ssa
+            .map(r2ssa::SsaArtifact::authority)
+            .ok_or(StructuredRegionBuildError::MissingSourceAuthority)?;
+        seal_structured_body(
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(
+                    self.func.entry,
+                    StructuredRegionKind::FunctionBody,
+                ),
+                stmt,
+            ),
+            source_authority,
+        )
+        .map_err(ControlFlowStructureError::from)
+    }
+
     pub(crate) fn execution_stop(&self) -> Option<DecompileExecutionStop> {
         self.stop_reason.get()
     }
@@ -765,19 +794,47 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// it, and an accounting of what the function owes read every branch, loop and
     /// switch as unaccounted for. Recorded here rather than while folding, because
     /// only the structuring knows whether it rendered the control or refused it.
+    fn exact_control_obligations(
+        &self,
+        anchors: impl IntoIterator<Item = u64>,
+    ) -> BTreeSet<r2ssa::SemanticObligationId> {
+        let mut obligations = BTreeSet::new();
+        for anchor in anchors {
+            let Some(block) = self.func.blocks().find(|block| block.addr == anchor) else {
+                continue;
+            };
+            let Some(op_idx) = block.ops.len().checked_sub(1) else {
+                continue;
+            };
+            obligations.extend(self.fold_ctx.exact_effect_obligations_for_normalized_value(
+                crate::fold::context::EffectOccurrenceKind::Expression,
+                anchor,
+                op_idx,
+                None,
+            ));
+        }
+        obligations
+    }
+
     fn observe_control_ownership(&self, anchor: u64, stmt: CStmt) -> CStmt {
-        let Some(block) = self.func.blocks().find(|block| block.addr == anchor) else {
-            return stmt;
-        };
-        let Some(op_idx) = block.ops.len().checked_sub(1) else {
-            return stmt;
-        };
-        let obligations = self.fold_ctx.exact_effect_obligations_for_normalized_value(
-            crate::fold::context::EffectOccurrenceKind::Expression,
-            anchor,
-            op_idx,
-            None,
-        );
+        let obligations = self.exact_control_obligations(std::iter::once(anchor));
+        self.fold_ctx.observe_effect_stmt(&obligations, stmt)
+    }
+
+    /// A structured loop renders both its condition transfer and every
+    /// certified latch backedge. Latch transfers are implicit in C and so have
+    /// no standalone statement occurrence to own their source obligations.
+    fn observe_loop_control_ownership(&self, loop_id: LoopId, header: u64, stmt: CStmt) -> CStmt {
+        let anchors = std::iter::once(header)
+            .chain(
+                self.fold_ctx
+                    .control_facts()
+                    .and_then(|facts| facts.loops.get(&loop_id))
+                    .into_iter()
+                    .flat_map(|loop_fact| loop_fact.latches.iter().copied()),
+            )
+            .collect::<Vec<_>>();
+        let obligations = self.exact_control_obligations(anchors.iter().copied());
         self.fold_ctx.observe_effect_stmt(&obligations, stmt)
     }
 
@@ -1064,6 +1121,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     if !matches!(stmt, CStmt::Empty) {
                         stmts.push(stmt);
                     }
+                    if let Some(next) = regions.get(index + 1)
+                        && let Some(condition_block) =
+                            self.normal_loop_exit_condition_block(region, next.entry())
+                        && let Err(reason) =
+                            self.push_exact_edge_guard(condition_block, next.entry())
+                    {
+                        self.safety_reason = Some(format!(
+                            "loop condition at 0x{condition_block:x} cannot certify sequential exit 0x{:x}: {reason}",
+                            next.entry()
+                        ));
+                        return Ok(CStmt::Empty);
+                    }
                 }
                 if stmts.is_empty() {
                     CStmt::Empty
@@ -1183,9 +1252,20 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         return Ok(CStmt::Empty);
                     }
                 };
+                if let Err(reason) = self.push_exact_edge_guard(*header, body.entry()) {
+                    self.safety_reason = Some(format!(
+                        "loop header 0x{header:x} cannot certify its body edge: {reason}"
+                    ));
+                    self.active_domains = outer_domains;
+                    return Ok(CStmt::Empty);
+                }
                 let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body)?);
                 self.active_domains = outer_domains;
-                self.observe_control_ownership(*header, CStmt::while_loop(cond, body_stmt))
+                self.observe_loop_control_ownership(
+                    loop_id,
+                    *header,
+                    CStmt::while_loop(cond, body_stmt),
+                )
             }
             Region::DoWhileLoop { body, cond_block } => {
                 let (cond, predicate, condition_value) =
@@ -1226,7 +1306,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     body_stmt = Self::stmt_from_vec(stmts);
                 }
                 self.active_domains = outer_domains;
-                self.observe_control_ownership(
+                self.observe_loop_control_ownership(
+                    loop_id,
                     *cond_block,
                     CStmt::DoWhile {
                         body: Box::new(body_stmt),
@@ -1388,6 +1469,29 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let stmt = self.structure_region(region);
         self.active_domains = outer_domains;
         stmt
+    }
+
+    /// Identify the exact loop condition whose normal exit reaches the next
+    /// lexical region. A nested sequence has the continuation of its final
+    /// child; no other region shape implies a loop-exit edge.
+    fn normal_loop_exit_condition_block(&self, region: &Region, successor: u64) -> Option<u64> {
+        let condition = match region {
+            Region::WhileLoop { header, .. } => *header,
+            Region::DoWhileLoop { cond_block, .. } => *cond_block,
+            Region::Sequence(regions) => {
+                return regions
+                    .last()
+                    .and_then(|last| self.normal_loop_exit_condition_block(last, successor));
+            }
+            _ => return None,
+        };
+        // The caller still obtains the guard from the canonical edge facts;
+        // this check only avoids treating a non-adjacent lexical successor as
+        // an implied loop continuation.
+        self.func
+            .successors(condition)
+            .contains(&successor)
+            .then_some(condition)
     }
 
     fn exact_control_guard_for_edge(
@@ -4213,7 +4317,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         while_stmt: CStmt,
     ) -> Option<Vec<CStmt>> {
         let (prefix_stmts, init_stmt, induction_var) = Self::split_preheader_init(preheader_stmt)?;
-        let (while_semantic, _while_observations) = while_stmt.into_semantic_with_observations();
+        let (while_semantic, while_observations) = while_stmt.into_semantic_with_observations();
         let CStmt::While { cond, body } = while_semantic else {
             return None;
         };
@@ -4236,12 +4340,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         let mut rewritten = prefix_stmts;
-        rewritten.push(CStmt::For {
+        rewritten.push(while_observations.reapply(CStmt::For {
             init: Some(Box::new(init_stmt)),
             cond: Some(loop_cond),
             update: Some(update),
             body: Box::new(body_without_update),
-        });
+        }));
         Some(rewritten)
     }
 
@@ -5376,7 +5480,7 @@ mod tests {
                 facts,
                 facts.source().function(),
                 origins,
-                std::rc::Rc::clone(&plan),
+                std::rc::Rc::clone(&names),
                 std::rc::Rc::clone(&ctx.symbols),
             )
             .expect("exact structure observation journal"),
@@ -5759,6 +5863,69 @@ mod tests {
                 .any(|guard| matches!(guard, ControlGuard::Branch { truth: false, .. })),
             "the exact exit predicate must survive loop-domain projection"
         );
+    }
+
+    #[test]
+    fn while_body_and_continuation_retain_exact_header_edge_guards() {
+        let mut header = R2ILBlock::new(0x1000, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut body = R2ILBlock::new(0x1004, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1000, 8),
+        });
+        let mut exit = R2ILBlock::new(0x1008, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let blocks = [header, body, exit];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let region = Region::Sequence(vec![
+            Region::WhileLoop {
+                header: 0x1000,
+                body: Box::new(Region::Block(0x1004)),
+            },
+            Region::Block(0x1008),
+        ]);
+
+        let _stmt = structurer
+            .structure_region(&region)
+            .expect("exact source-owned while lowering");
+
+        assert!(
+            structurer.safety_reason().is_none(),
+            "the canonical header edge must certify the loop body: {:?}",
+            structurer.safety_reason()
+        );
+        let predicate = ctx
+            .control_facts()
+            .and_then(|facts| facts.branch_for_block(0x1000))
+            .expect("canonical header predicate")
+            .id;
+        let occurrence = &structurer
+            .rendered_block_domains
+            .get(&0x1004)
+            .expect("body block occurrence")[0];
+        assert!(occurrence.alternatives.iter().all(|domain| {
+            domain.guards.contains(&ControlGuard::Branch {
+                predicate,
+                truth: false,
+            })
+        }));
+        let continuation = &structurer
+            .rendered_block_domains
+            .get(&0x1008)
+            .expect("post-loop continuation occurrence")[0];
+        assert!(continuation.alternatives.iter().all(|domain| {
+            domain.guards.contains(&ControlGuard::Branch {
+                predicate,
+                truth: true,
+            })
+        }));
     }
 
     #[test]
@@ -6269,7 +6436,7 @@ mod tests {
     }
 
     #[test]
-    fn for_recognition_preserves_only_positional_observations() {
+    fn for_recognition_preserves_the_replaced_loop_observation() {
         let symbols = test_table();
         let prefix = assign(&symbols, "sum", CExpr::IntLit(0));
         let init = assign(&symbols, "i", CExpr::IntLit(0));
@@ -6314,10 +6481,14 @@ mod tests {
         for id in [prefix_id, init_id, cond_id, work_id, update_id] {
             assert!(reachable.contains(id), "exact child occurrence was lost");
         }
-        for id in [preheader_id, body_id, while_id] {
+        assert!(
+            reachable.contains(while_id),
+            "the for-loop must retain the observation owned by the equivalent while-loop"
+        );
+        for id in [preheader_id, body_id] {
             assert!(
                 !reachable.contains(id),
-                "eliminated control wrapper was relocated onto the for-loop"
+                "an eliminated aggregate wrapper was relocated onto a different occurrence"
             );
         }
         assert_eq!(stripped, CStmt::Block(plain));

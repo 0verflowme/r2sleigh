@@ -83,6 +83,45 @@ R2SLEIGH_DEFINE_WIDE_FIELD(512, 8, 32, uint32_t)
 R2SLEIGH_DEFINE_WIDE_FIELD(512, 8, 64, uint64_t)
 R2SLEIGH_DEFINE_WIDE_FIELD(512, 8, 128, __uint128_t)
 
+/*
+ * Exact arithmetic-flag helpers.  Keeping the intermediate arithmetic in the
+ * unsigned carrier type avoids C signed-overflow undefined behavior.  A
+ * rendered source operand appears once at the callsite; repeated bit tests are
+ * performed only on these helper-local values.
+ */
+#define R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(BITS, TYPE)                              \
+    static inline R2SLEIGH_UNUSED uint8_t                                         \
+        r2sleigh_int_carry_##BITS(TYPE left, TYPE right)                          \
+    {                                                                             \
+        const TYPE result = (TYPE)(left + right);                                 \
+        return (uint8_t)(result < left);                                          \
+    }                                                                             \
+    static inline R2SLEIGH_UNUSED uint8_t                                         \
+        r2sleigh_int_scarry_##BITS(TYPE left, TYPE right)                         \
+    {                                                                             \
+        const TYPE result = (TYPE)(left + right);                                 \
+        const TYPE same_sign = (TYPE)~(TYPE)(left ^ right);                       \
+        const TYPE changed_sign = (TYPE)(left ^ result);                          \
+        const TYPE overflow = (TYPE)(same_sign & changed_sign);                   \
+        return (uint8_t)((overflow >> ((BITS)-1)) & (TYPE)1);                     \
+    }                                                                             \
+    static inline R2SLEIGH_UNUSED uint8_t                                         \
+        r2sleigh_int_sborrow_##BITS(TYPE left, TYPE right)                        \
+    {                                                                             \
+        const TYPE result = (TYPE)(left - right);                                 \
+        const TYPE different_sign = (TYPE)(left ^ right);                         \
+        const TYPE changed_sign = (TYPE)(left ^ result);                          \
+        const TYPE overflow = (TYPE)(different_sign & changed_sign);              \
+        return (uint8_t)((overflow >> ((BITS)-1)) & (TYPE)1);                     \
+    }
+
+R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(8, uint8_t)
+R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(16, uint16_t)
+R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(32, uint32_t)
+R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(64, uint64_t)
+R2SLEIGH_DEFINE_ARITHMETIC_FLAGS(128, __uint128_t)
+
+#undef R2SLEIGH_DEFINE_ARITHMETIC_FLAGS
 #undef R2SLEIGH_DEFINE_WIDE_FIELD
 #undef R2SLEIGH_UNUSED
 

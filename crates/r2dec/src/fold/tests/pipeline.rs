@@ -829,7 +829,7 @@ mod tests {
                 &prepared.facts,
                 prepared.function(),
                 origins,
-                Rc::clone(&plan),
+                Rc::clone(names),
                 Rc::clone(&ctx.symbols),
             )
             .expect("observed lowering journal"),
@@ -854,7 +854,7 @@ mod tests {
             &prepared.facts,
             prepared.function(),
             &origins,
-            Rc::clone(&plan),
+            Rc::clone(names),
             Rc::clone(&symbols),
         )
         .expect("replacement journal for owned extraction");
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_narrow_register_write_applies_the_exact_insert_effect() {
+    fn observed_clearing_narrow_register_write_applies_exact_zero_extension() {
         let mut arch = make_test_arch_x86_64();
         let mut register_projections = arch
             .registers
@@ -944,6 +944,11 @@ mod tests {
                 b: Varnode::constant(1, 4),
             });
         }
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::register(0, 8),
+        });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)
             .with_name("observed_exact_narrow_register_write");
         let block = prepared.function().get_block(0x1000).expect("entry block");
@@ -963,10 +968,9 @@ mod tests {
         assert!(matches!(
             plan.write_disposition(copy_inst),
             Some(r2ssa::MachineWriteDisposition::Exact(
-                r2ssa::MachineWriteProjection::Insert {
-                    bit_offset: 0,
-                    width_bits: 32,
-                    carrier_width_bits: 64,
+                r2ssa::MachineWriteProjection::ZeroExtend {
+                    from_width_bits: 32,
+                    to_width_bits: 64,
                 }
             ))
         ));
@@ -990,7 +994,7 @@ mod tests {
             CExpr::Cast {
                 ty: CType::UInt(64),
                 expr,
-            } if matches!(expr.unobserved(), CExpr::Binary { op: BinaryOp::BitOr, .. })
+            } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::UInt(32), .. })
         ));
 
         assert_eq!(*ctx.observation_error.borrow(), None);
@@ -1084,13 +1088,105 @@ mod tests {
             !rendered.contains("opaque_machine_base"),
             "the contextual use must not fall back to its opaque machine binding: {rendered}"
         );
-        let address_symbol = names
-            .symbol_for_value(address.binding().value())
-            .expect("ordinary address binding remains available for non-contextual uses");
+        // This fixture intentionally withholds an upstream frame-pointer role,
+        // so the opaque address value remains an ordinary binding.  The exact
+        // per-use stack-object projection must still render the access without
+        // reinterpreting that binding's spelling downstream.
+        assert!(matches!(
+            names.require_value(address.binding().value()),
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(_))
+        ));
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn signed_borrow_uses_one_exact_projection_per_operand() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntSBorrow {
+            dst: Varnode::unique(0x100, 1),
+            a: Varnode::constant(i64::MAX as u64, 8),
+            b: Varnode::constant(u64::MAX, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::unique(0x108, 8),
+            src: Varnode::unique(0x100, 1),
+        });
+        for offset in [0x110, 0x118] {
+            entry.push(R2ILOp::IntAdd {
+                dst: Varnode::unique(offset, 8),
+                a: Varnode::unique(0x108, 8),
+                b: Varnode::constant(1, 8),
+            });
+        }
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x110, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("signed_borrow_projection");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (_plan, _names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+
+        enter_exact_test_site(&ctx, block.addr, 0);
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("signed borrow has exact scalar lowering")
+            .expect("signed borrow definition");
+        let rendered = format!("{stmt:?}");
         assert!(
-            !matches!(right.unobserved(), CExpr::Var(symbol) if *symbol == address_symbol),
-            "the load expression must not be replaced by the address value's binding"
+            rendered.contains("r2sleigh_int_sborrow_64"),
+            "signed borrow must use the external width-safe helper: {rendered}"
         );
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn population_count_consumes_the_upstream_machine_projection() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::PopCount {
+            dst: Varnode::unique(0x100, 1),
+            src: Varnode::constant(0xf0f0, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::unique(0x108, 8),
+            src: Varnode::unique(0x100, 1),
+        });
+        for offset in [0x110, 0x118] {
+            entry.push(R2ILOp::IntAdd {
+                dst: Varnode::unique(offset, 8),
+                a: Varnode::unique(0x108, 8),
+                b: Varnode::constant(1, 8),
+            });
+        }
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x110, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("population_count_projection");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, _names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, 0)
+            .expect("population-count instruction");
+        assert!(matches!(
+            plan.use_disposition(r2ssa::UseSite { inst, input_idx: 0 }),
+            Some(r2ssa::MachineUseDisposition::Exact(_))
+        ));
+
+        enter_exact_test_site(&ctx, block.addr, 0);
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
+            .expect("population count has exact scalar lowering")
+            .expect("population-count definition");
+        assert!(format!("{stmt:?}").contains("__builtin_popcountll"));
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
 
@@ -1209,6 +1305,12 @@ mod tests {
         let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
         let mut body = Vec::new();
         for prefix_idx in 0..store_idx {
+            if block.ops[prefix_idx]
+                .dst()
+                .is_some_and(|dst| ctx.is_dead(dst))
+            {
+                continue;
+            }
             enter_exact_test_site(&ctx, block.addr, prefix_idx);
             if let Some(prefix) = ctx
                 .op_to_stmt_with_args(&block.ops[prefix_idx], block.addr, prefix_idx)
@@ -1222,9 +1324,12 @@ mod tests {
             Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) => *address,
             other => panic!("expected contextual store address, got {other:?}"),
         };
-        let address_symbol = names
-            .symbol_for_value(address.binding().value())
-            .expect("ordinary address binding remains available for non-contextual uses");
+        assert!(matches!(
+            names.require_value(address.binding().value()),
+            Ok(crate::binding_plan::PlannedValueSymbol::Elided(
+                r2ssa::ledger::ElisionReason::DeadStackBase
+            ))
+        ));
         let memory = ctx
             .certified_memory_access_for_current_op(true)
             .filter(|memory| memory.access == address.memory_access().unwrap())
@@ -1259,10 +1364,6 @@ mod tests {
         assert!(
             !rendered.contains("opaque_store_base"),
             "the contextual store must not fall back to its opaque machine binding: {rendered}"
-        );
-        assert!(
-            !matches!(left.unobserved(), CExpr::Var(symbol) if *symbol == address_symbol),
-            "the store target must not be replaced by the address value's binding"
         );
         assert_eq!(*ctx.observation_error.borrow(), None);
         let value_site = r2ssa::UseSite {
@@ -1392,6 +1493,12 @@ mod tests {
         assert_eq!(*ctx.observation_error.borrow(), None);
         body.push(stmt);
         for suffix_idx in op_idx + 1..block.ops.len() {
+            if block.ops[suffix_idx]
+                .dst()
+                .is_some_and(|dst| ctx.is_dead(dst))
+            {
+                continue;
+            }
             enter_exact_test_site(&ctx, block.addr, suffix_idx);
             if let Some(suffix) = ctx
                 .op_to_stmt_with_args(&block.ops[suffix_idx], block.addr, suffix_idx)
@@ -1804,6 +1911,11 @@ mod tests {
             a: Varnode::unique(0x10, 8),
             b: Varnode::constant(1, 8),
         });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x20, 8),
+        });
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("sealed_inline_admission");
         let block = prepared.function().get_block(0x1000).expect("entry block");
@@ -1873,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_simplification_keeps_only_surviving_occurrence_observations() {
+    fn identity_simplification_keeps_audited_source_occurrences_intact() {
         let ctx = FoldingContext::new(64);
         let mut owner = crate::ast::RenderObservationOwner::new();
         let (value_id, value) = owner
@@ -1895,11 +2007,15 @@ mod tests {
 
         assert!(reachable.contains(value_id));
         assert!(reachable.contains(result_id));
-        assert!(
-            !reachable.contains(zero_id),
-            "the eliminated literal must remain unaccounted, not move onto x"
+        assert!(reachable.contains(zero_id));
+        assert_eq!(
+            function.body,
+            vec![CStmt::Return(Some(CExpr::binary(
+                BinaryOp::Add,
+                ctx.name_ref("x"),
+                CExpr::IntLit(0),
+            )))]
         );
-        assert_eq!(function.body, vec![CStmt::Return(Some(ctx.name_ref("x")))]);
     }
 
     #[test]
@@ -2696,6 +2812,50 @@ mod tests {
     }
 
     #[test]
+    fn rendered_integer_division_owns_its_exact_trap_obligation() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1910, 4);
+        entry.push(R2ILOp::IntDiv {
+            dst: Varnode::register(0, 8),
+            a: Varnode::constant(12, 8),
+            b: Varnode::constant(3, 8),
+        });
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("rendered_integer_division_trap");
+        let block = prepared.function().get_block(0x1910).expect("entry");
+        let op_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::IntDiv { .. }))
+            .expect("division operation");
+        let inst = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, op_idx)
+            .expect("division graph instruction");
+        let value = prepared
+            .graph()
+            .inst(inst)
+            .and_then(|inst| inst.output)
+            .expect("division output");
+        let ctx = make_x86_64_ctx_with_prepared(&prepared);
+
+        let obligations = ctx.exact_effect_obligations_for_normalized_value(
+            EffectOccurrenceKind::Expression,
+            block.addr,
+            op_idx,
+            Some(value),
+        );
+
+        assert!(obligations.iter().any(|id| {
+            id.kind == r2ssa::SemanticObligationKind::Trap
+                && prepared
+                    .obligations()
+                    .instruction_for_inst(inst)
+                    .is_some_and(|instruction| id.instruction == instruction.id)
+        }));
+    }
+
+    #[test]
     fn certified_materialized_memory_result_is_not_inlined() {
         let arch = make_test_arch_x86_64();
         let mut block = R2ILBlock::new(0x2000, 4);
@@ -2861,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_member_rendering_allows_exact_field_certificate() {
+    fn certified_member_fact_does_not_bypass_the_address_binding_plan() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntAdd {
@@ -2920,7 +3080,7 @@ mod tests {
             }) if matches!(inner.as_ref(), r2types::CTypeLike::Struct(name) if name == "DemoStruct")
         ));
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
-        let _observations = install_observed_lowering(&mut ctx, &prepared);
+        let (_plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
         enter_exact_test_site(&ctx, 0x1000, 1);
         let block = prepared.function().get_block(0x1000).expect("entry block");
         let SSAOp::Load { dst, addr, .. } = &block.ops[1] else {
@@ -2943,18 +3103,10 @@ mod tests {
         let (_, address_expr) = ctx
             .certified_memory_address_expr(memory)
             .expect("source-owned address expression");
-        let mut has_parameter = false;
-        address_expr.visit(&mut |expr| {
-            if let CExpr::Var(symbol) = expr
-                && ctx.symbols.borrow().get(*symbol).role == crate::symbol::SymbolRole::Parameter(0)
-            {
-                has_parameter = true;
-            }
-        });
-        assert!(
-            has_parameter,
-            "exact address must retain its typed parameter BindingId: {address_expr:?}"
-        );
+        let address_symbol = names
+            .symbol_for_value(memory.address)
+            .expect("the exact address value has one sealed binding");
+        assert_eq!(address_expr, CExpr::Var(address_symbol));
         let access = ctx
             .render_certified_load_access_expr(dst, addr, CType::UInt(64))
             .expect("exact memory and field facts must render");
@@ -2962,8 +3114,8 @@ mod tests {
         let expr = access.expr();
 
         assert!(
-            matches!(expr, CExpr::PtrMember { member, .. } | CExpr::Member { member, .. } if member == "hash"),
-            "canonical memory and field facts must allow certified member rendering: {expr:?}"
+            matches!(expr, CExpr::Deref(_)),
+            "a field label without a base-identity contract must retain the exact address binding: {expr:?}"
         );
     }
     #[test]

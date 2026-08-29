@@ -6882,18 +6882,28 @@ mod integration_tests {
         })
         .and_then(|interface| interface.with_frame_pointer_storage(rbp))
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(
+        .expect("exact x86-64 test source interface");
+        let machine_roles = r2ssa::SourceMachineRoles::new(
+            Some(x86_register_storage(arch, "RIP")),
+            Some(x86_register_storage(arch, "RSP")),
+        )
+        .and_then(|roles| {
+            roles.with_stack_allocation_contract(
                 r2ssa::SourceStackAllocationContract::with_implicit_active_sp_bytes(
                     r2ssa::SourceStackGrowth::LowerAddresses,
                     128,
                 ),
             )
         })
-        .expect("exact x86-64 test source interface");
+        .expect("exact x86-64 test machine roles");
         std::sync::Arc::new(
-            r2engine::EngineSourceSnapshot::new(revision, Some(interface), call_sites)
-                .expect("immutable x86-64 test source snapshot"),
+            r2engine::EngineSourceSnapshot::new_with_machine_roles(
+                revision,
+                Some(interface),
+                machine_roles,
+                call_sites,
+            )
+            .expect("immutable x86-64 test source snapshot"),
         )
     }
 
@@ -8490,10 +8500,9 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
-        // The saved-frame-pointer store is a live machine stack effect, but
-        // this source snapshot does not certify that object as a C program
-        // variable.  Native lowering must refuse at that first surviving use;
-        // it may not invent a local merely because the object has an offset.
+        // The SIMD worker contains machine operations whose exact C projection
+        // is unavailable. That upstream refusal precedes placement; the saved
+        // frame-pointer object must not be reached through a fabricated local.
         assert_eq!(response.placement_audit, r2engine::PlacementAudit::NotRun);
         assert_eq!(
             response.binding_audit,
@@ -8501,16 +8510,16 @@ mod integration_tests {
         );
         assert_eq!(
             response.render_refusal,
-            Some(r2engine::DecompileRenderRefusal::MissingProgramVariableAuthorization)
+            Some(r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization)
         );
         assert!(
             response.output.starts_with("/* r2dec fallback:")
                 && response
                     .output
-                    .contains("native rendering refused: missing program-variable authorization")
+                    .contains("native rendering refused: missing machine projection authorization")
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
-            "certified facts must remain inspectable while the live unauthorized stack object leaves only a fallback comment; output={} render_facts={:?}",
+            "certified facts must remain inspectable while the unprojected machine operation leaves only a fallback comment; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );

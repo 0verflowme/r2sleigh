@@ -1820,8 +1820,9 @@ mod tests {
     use crate::{
         AnalysisAssumption, AssumptionProvenance, AssumptionScope, AssumptionSet,
         AssumptionSubject, AssumptionValue, CanonicalStorageId, CanonicalStorageSpace, SSAOp,
-        SourceFunctionInterface, SourceFunctionReturn, SourceStackAllocationContract,
-        SourceStackGrowth, SourceStackSlotSpec, SsaArtifact, StackAddressBase,
+        SourceFunctionInterface, SourceFunctionReturn, SourceMachineRoles,
+        SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotSpec, SsaArtifact,
+        StackAddressBase,
     };
 
     fn constant(value: u64) -> Varnode {
@@ -2354,17 +2355,25 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(24)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0)))
         .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(
-                SourceStackAllocationContract::with_implicit_active_sp_bytes(
-                    SourceStackGrowth::LowerAddresses,
-                    implicit_active_sp_bytes,
-                ),
-            )
-        })
         .expect("coherent exact frame interface");
-        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
-            .expect("framed relation artifact")
+        let roles = SourceMachineRoles::new(Some(register_storage(24)), Some(register_storage(0)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(
+                    SourceStackAllocationContract::with_implicit_active_sp_bytes(
+                        SourceStackGrowth::LowerAddresses,
+                        implicit_active_sp_bytes,
+                    ),
+                )
+            })
+            .expect("coherent exact machine roles");
+        SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &blocks,
+            Some(&arch),
+            Some(interface),
+            roles,
+            Vec::new(),
+        )
+        .expect("framed relation artifact")
     }
 
     #[test]

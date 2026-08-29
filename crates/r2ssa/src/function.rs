@@ -304,8 +304,6 @@ impl SsaArtifact {
             .collect::<Vec<_>>();
         let live_out =
             crate::liveout::FunctionLiveOut::compute(&function, &graph, &return_storages);
-        let unobserved_merges = crate::deadphi::DeadPhis::find(&function, &graph, &live_out);
-        control.poll()?;
         let facts = PreparedFunctionFacts::collect_with_context(
             &function,
             &graph,
@@ -313,6 +311,7 @@ impl SsaArtifact {
             &AssumptionSet::default(),
             &machine_context,
         );
+        let unobserved_merges = crate::deadphi::DeadPhis::find(&graph, &live_out, &facts);
         let aggregate_accesses = collect_aggregate_access_projections(
             &graph,
             &facts.addresses,
@@ -453,11 +452,29 @@ impl SsaArtifact {
         function_interface: Option<SourceFunctionInterface>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Option<Self> {
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+        Self::for_decompile_with_interfaces_and_machine_roles(
             blocks,
             arch,
             function_interface,
             SourceMachineRoles::default(),
+            call_site_interfaces,
+        )
+    }
+
+    /// Build decompiler-prepared SSA with independently source-owned machine
+    /// roles. Machine geometry is not contingent on an exact prototype.
+    pub fn for_decompile_with_interfaces_and_machine_roles(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Option<Self> {
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            function_interface,
+            machine_roles,
             None,
             call_site_interfaces,
         );
@@ -480,11 +497,31 @@ impl SsaArtifact {
         call_site_interfaces: Vec<SourceCallSiteInterface>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+        Self::for_decompile_with_interfaces_machine_roles_and_control(
             blocks,
             arch,
             function_interface,
             SourceMachineRoles::default(),
+            call_site_interfaces,
+            control,
+        )
+    }
+
+    /// Controlled counterpart of
+    /// [`Self::for_decompile_with_interfaces_and_machine_roles`].
+    pub fn for_decompile_with_interfaces_machine_roles_and_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            function_interface,
+            machine_roles,
             None,
             call_site_interfaces,
         );
@@ -759,6 +796,12 @@ impl SsaArtifact {
     /// be the only statement of what a register holds at a loop head.
     pub const fn unobserved_merges(&self) -> &crate::deadphi::DeadPhis {
         &self.unobserved_merges
+    }
+
+    /// Complete upstream-certified domain of pure values no program
+    /// observation depends on.
+    pub const fn unobserved_values(&self) -> &std::collections::BTreeSet<crate::graph::ValueId> {
+        self.unobserved_merges.unobserved_values()
     }
 
     /// The values this function hands back, which have no reader inside it.
@@ -2579,6 +2622,7 @@ impl SSAFunction {
             .compute_decompile_family_states_with_control(&family_info, control)?
             .incoming;
         let mut synthesized_storages = Vec::new();
+        let canonical_storage_by_var = &self.canonical_storage_by_var;
 
         for &addr in &self.block_order {
             control.poll()?;
@@ -2589,21 +2633,33 @@ impl SSAFunction {
 
             for phi in &block.phis {
                 control.poll()?;
-                apply_phi_family_effect(phi, &mut state, &family_info);
+                apply_phi_family_effect(phi, &mut state, &family_info, canonical_storage_by_var);
             }
 
             let original_ops = std::mem::take(&mut block.ops);
             let mut normalized_ops = Vec::with_capacity(original_ops.len());
             for (op_index, op) in original_ops.into_iter().enumerate() {
                 control.poll()?;
-                let (materialized, rewritten) =
-                    materialize_register_alias_sources(&op, &state, &family_info, addr, op_index);
+                let (materialized, rewritten) = materialize_register_alias_sources(
+                    &op,
+                    &state,
+                    &family_info,
+                    canonical_storage_by_var,
+                    addr,
+                    op_index,
+                );
                 normalized_ops.extend(materialized);
-                apply_op_family_effect(&rewritten, &mut state, &family_info);
+                apply_op_family_effect(
+                    &rewritten,
+                    &mut state,
+                    &family_info,
+                    canonical_storage_by_var,
+                );
                 let cleared = materialize_cleared_register_write(
                     &rewritten,
                     &mut state,
                     &family_info,
+                    canonical_storage_by_var,
                     addr,
                     op_index,
                 );
@@ -2661,7 +2717,11 @@ impl SSAFunction {
             for (phi_index, phi) in block.phis.iter().enumerate() {
                 control.poll()?;
                 for (source_index, (pred_addr, source)) in phi.sources.iter().enumerate() {
-                    let Some(member) = family_info.member_for(source) else {
+                    let Some(member) = register_family_member_for(
+                        source,
+                        family_info,
+                        &self.canonical_storage_by_var,
+                    ) else {
                         continue;
                     };
                     let requested = RegisterFamilySlot {
@@ -2852,7 +2912,8 @@ impl SSAFunction {
         // matter: nothing says what they leave behind, so they still stop this.
         let call_carriers_are_restored = function_interface.is_some_and(|interface| {
             interface.stack_pointer_preserved_across_calls()
-                && interface.frame_pointer_preserved_across_calls()
+                && (interface.frame_pointer_storage().is_none()
+                    || interface.frame_pointer_preserved_across_calls())
         });
         let entry_stack_roots_are_stable = self.blocks().all(|block| {
             block.ops.iter().all(|op| match op {
@@ -2975,7 +3036,12 @@ impl SSAFunction {
                         );
                     }
 
-                    apply_phi_family_effect(phi, &mut family_state, family_info);
+                    apply_phi_family_effect(
+                        phi,
+                        &mut family_state,
+                        family_info,
+                        &self.canonical_storage_by_var,
+                    );
                 }
 
                 for op in &block.ops {
@@ -3125,7 +3191,12 @@ impl SSAFunction {
                     }
 
                     if let Some(dst) = op.dst() {
-                        apply_op_family_effect(op, &mut family_state, family_info);
+                        apply_op_family_effect(
+                            op,
+                            &mut family_state,
+                            family_info,
+                            &self.canonical_storage_by_var,
+                        );
                         changed |= ensure_value_root_identity(
                             &mut facts.canonical_value_roots,
                             dst.clone(),
@@ -3157,6 +3228,7 @@ impl SSAFunction {
         control.poll()?;
         let mut in_states: HashMap<u64, FamilyRootState> = HashMap::new();
         let mut out_states: HashMap<u64, FamilyRootState> = HashMap::new();
+        let entry_state = self.entry_register_family_state(family_info);
 
         loop {
             control.poll()?;
@@ -3165,7 +3237,17 @@ impl SSAFunction {
             for &addr in &self.block_order {
                 control.poll()?;
                 let preds = self.predecessors(addr);
-                let next_in = meet_family_states(&preds, &out_states);
+                let next_in = if addr == self.entry {
+                    let mut state = entry_state.clone();
+                    for predecessor in &preds {
+                        if let Some(predecessor) = out_states.get(predecessor) {
+                            state.retain(|slot, root| predecessor.get(slot) == Some(root));
+                        }
+                    }
+                    state
+                } else {
+                    meet_family_states(&preds, &out_states)
+                };
                 let next_out = self.transfer_family_state_for_block(addr, &next_in, family_info);
 
                 if in_states.get(&addr) != Some(&next_in) {
@@ -3190,6 +3272,52 @@ impl SSAFunction {
         })
     }
 
+    /// Canonical register values present on the implicit function-entry edge.
+    ///
+    /// Renaming gives overlapping entry views independent version-zero names.
+    /// Seeding the widest available view first makes those names one physical
+    /// state: a later partial write can preserve the untouched slices and a
+    /// wide read is composed from the old carrier plus the new lane. Without
+    /// this seed, an `AH` write followed by an `RAX` read incorrectly returned
+    /// the untouched entry `RAX` value.
+    fn entry_register_family_state(&self, family_info: &RegisterFamilyInfo) -> FamilyRootState {
+        let mut candidates = self
+            .canonical_storage_by_var
+            .iter()
+            .filter(|(var, storage)| {
+                var.version == 0 && storage.space == CanonicalStorageSpace::Register
+            })
+            .filter_map(|(var, storage)| {
+                let member = family_info.member_at_offset(storage.offset, storage.size)?;
+                Some((
+                    RegisterFamilySlot {
+                        family_id: member.family_id,
+                        offset: member.offset,
+                        width: storage.size,
+                    },
+                    var,
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|(left_slot, left), (right_slot, right)| {
+            left_slot
+                .family_id
+                .cmp(&right_slot.family_id)
+                .then_with(|| right_slot.width.cmp(&left_slot.width))
+                .then_with(|| left_slot.offset.cmp(&right_slot.offset))
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut state = FamilyRootState::new();
+        for (slot, var) in candidates {
+            if family_root_slice_for_range(&state, slot).is_some() {
+                continue;
+            }
+            seed_family_roots(&mut state, family_info, slot, var, var);
+        }
+        state
+    }
+
     fn transfer_family_state_for_block(
         &self,
         addr: u64,
@@ -3202,14 +3330,24 @@ impl SSAFunction {
         };
 
         for phi in &block.phis {
-            apply_phi_family_effect(phi, &mut state, family_info);
+            apply_phi_family_effect(phi, &mut state, family_info, &self.canonical_storage_by_var);
         }
 
         for op in &block.ops {
             let rewritten = crate::optimize::map_sources_in_op(op, &|src| {
-                rewrite_decompile_family_source(src, &state, family_info)
+                rewrite_decompile_family_source(
+                    src,
+                    &state,
+                    family_info,
+                    &self.canonical_storage_by_var,
+                )
             });
-            apply_op_family_effect(&rewritten, &mut state, family_info);
+            apply_op_family_effect(
+                &rewritten,
+                &mut state,
+                family_info,
+                &self.canonical_storage_by_var,
+            );
         }
 
         state
@@ -3812,6 +3950,22 @@ impl RegisterFamilyInfo {
     }
 }
 
+/// Resolve one SSA register value through its canonical storage before using a
+/// source display name as a fallback for synthetic values.
+fn register_family_member_for(
+    var: &SSAVar,
+    family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
+) -> Option<RegisterFamilyMember> {
+    match canonical_storage_by_var.get(var) {
+        Some(storage) if storage.space == CanonicalStorageSpace::Register => {
+            family_info.member_at_offset(storage.offset, storage.size)
+        }
+        Some(_) => None,
+        None => family_info.member_for(var),
+    }
+}
+
 fn seed_x86_low_register_aliases(
     name_to_member: &mut HashMap<String, RegisterFamilyMember>,
     family_width_sets: &mut HashMap<(usize, u64), HashSet<u32>>,
@@ -3877,8 +4031,10 @@ fn apply_phi_family_effect(
     phi: &PhiNode,
     state: &mut FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
 ) {
-    let Some(member) = family_info.member_for(&phi.dst) else {
+    let Some(member) = register_family_member_for(&phi.dst, family_info, canonical_storage_by_var)
+    else {
         return;
     };
     let written = RegisterFamilySlot {
@@ -3894,11 +4050,13 @@ fn apply_op_family_effect(
     op: &SSAOp,
     state: &mut FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
 ) {
     let Some(dst) = op.dst() else {
         return;
     };
-    let Some(member) = family_info.member_for(dst) else {
+    let Some(member) = register_family_member_for(dst, family_info, canonical_storage_by_var)
+    else {
         return;
     };
     let written = RegisterFamilySlot {
@@ -3907,8 +4065,13 @@ fn apply_op_family_effect(
         width: dst.size,
     };
 
-    let preserved_narrow_roots =
-        preserved_narrow_family_roots_for_widening(op, state, family_info, member);
+    let preserved_narrow_roots = preserved_narrow_family_roots_for_widening(
+        op,
+        state,
+        family_info,
+        canonical_storage_by_var,
+        member,
+    );
     // A callee may write the whole register whatever width the clobber is
     // modelled at, so nothing of the old value survives a call.
     if matches!(op, SSAOp::CallDefine { .. })
@@ -3971,13 +4134,15 @@ fn preserved_narrow_family_roots_for_widening(
     op: &SSAOp,
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
     dst_member: RegisterFamilyMember,
 ) -> Vec<(RegisterFamilySlot, RegisterFamilyRoot)> {
     let src = match op {
         SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => src,
         _ => return Vec::new(),
     };
-    let Some(src_member) = family_info.member_for(src) else {
+    let Some(src_member) = register_family_member_for(src, family_info, canonical_storage_by_var)
+    else {
         return Vec::new();
     };
     if src_member.family_id != dst_member.family_id
@@ -4017,6 +4182,7 @@ fn materialize_cleared_register_write(
     op: &SSAOp,
     state: &mut FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
     block_addr: u64,
     op_index: usize,
 ) -> Option<(SSAOp, CanonicalStorageId)> {
@@ -4026,7 +4192,7 @@ fn materialize_cleared_register_write(
         return None;
     }
     let dst = op.dst()?;
-    let member = family_info.member_for(dst)?;
+    let member = register_family_member_for(dst, family_info, canonical_storage_by_var)?;
     let cleared = family_info.register_cleared_by_narrow_write(member, dst.size)?;
     let widened = SSAVar::new(
         format!("tmp:regclear:{block_addr:x}:{op_index:x}"),
@@ -4063,24 +4229,28 @@ fn materialize_register_alias_sources(
     op: &SSAOp,
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
     block_addr: u64,
     op_index: usize,
 ) -> (Vec<SSAOp>, SSAOp) {
     let mut materialized = Vec::new();
     let mut replacements = HashMap::<SSAVar, SSAVar>::new();
-    let op =
-        rewrite_decompile_family_subpiece(op, state, family_info).unwrap_or_else(|| op.clone());
+    let op = rewrite_decompile_family_subpiece(op, state, family_info, canonical_storage_by_var)
+        .unwrap_or_else(|| op.clone());
 
     for (source_index, source) in op.sources().into_iter().enumerate() {
         if replacements.contains_key(source) {
             continue;
         }
-        let rewritten = rewrite_decompile_family_source(source, state, family_info);
+        let rewritten =
+            rewrite_decompile_family_source(source, state, family_info, canonical_storage_by_var);
         if rewritten != *source {
             replacements.insert(source.clone(), rewritten);
             continue;
         }
-        let Some(member) = family_info.member_for(source) else {
+        let Some(member) =
+            register_family_member_for(source, family_info, canonical_storage_by_var)
+        else {
             continue;
         };
         let requested = RegisterFamilySlot {
@@ -4209,11 +4379,12 @@ fn rewrite_decompile_family_subpiece(
     op: &SSAOp,
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
 ) -> Option<SSAOp> {
     let SSAOp::Subpiece { dst, src, offset } = op else {
         return None;
     };
-    let member = family_info.member_for(src)?;
+    let member = register_family_member_for(src, family_info, canonical_storage_by_var)?;
     let requested_end = offset.checked_add(dst.size)?;
     if requested_end > src.size {
         return None;
@@ -4302,8 +4473,10 @@ fn rewrite_decompile_family_source(
     src: &SSAVar,
     state: &FamilyRootState,
     family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
 ) -> SSAVar {
-    let Some(member) = family_info.member_for(src) else {
+    let Some(member) = register_family_member_for(src, family_info, canonical_storage_by_var)
+    else {
         return src.clone();
     };
     let slot = RegisterFamilySlot {
@@ -9195,6 +9368,50 @@ mod tests {
     }
 
     #[test]
+    fn entry_carrier_is_composed_with_a_partial_high_byte_write() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::sub("AH", 1, 1, "RAX"));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: make_reg(1, 1),
+            src: make_const(3, 1),
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: make_const(0x2000, 8),
+            val: make_reg(0, 8),
+        });
+
+        let function = SSAFunction::from_blocks_with_arch(&[block], Some(&arch))
+            .expect("partial-register fixture");
+        let ops = &function.get_block(0x1000).expect("entry block").ops;
+        let stored = ops.iter().find_map(|op| match op {
+            SSAOp::Store { val, .. } => Some(val),
+            _ => None,
+        });
+        assert!(
+            stored.is_some_and(|value| value.name.starts_with("tmp:regpiece:")),
+            "the wide read must consume an explicit composition, not stale entry RAX: {ops:?}"
+        );
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Piece { hi, lo, .. }
+                if hi.constant_bits() == Some(3) || lo.constant_bits() == Some(3)
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Subpiece { src, offset: 0, .. }
+                if *src == SSAVar::new("RAX", 0, 8)
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            SSAOp::Subpiece { src, offset: 2, .. }
+                if *src == SSAVar::new("RAX", 0, 8)
+        )));
+    }
+
+    #[test]
     fn vector_alias_narrow_write_preserves_disjoint_lane_roots() {
         let ops_all = normalize_manual_vector_alias_ops(vec![
             SSAOp::Copy {
@@ -10407,7 +10624,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_stack_roots_refuse_unknown_arch_calls_and_unknown_effects() {
+    fn entry_stack_roots_use_call_preservation_but_refuse_unknown_effects() {
         let mut arch = ArchSpec::new("custom-stack-call");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("custom_sp", 0x10, 8));
@@ -10438,7 +10655,8 @@ mod tests {
         .with_return_address_storage(ra_storage)
         .expect("custom return-address carrier")
         .with_stack_pointer_storage(sp_storage)
-        .expect("custom stack-pointer carrier");
+        .expect("custom stack-pointer carrier")
+        .with_preserved_call_carriers(true, false);
 
         for (name, boundary) in [
             (
@@ -10502,10 +10720,17 @@ mod tests {
                 !facts.stack_address_roots.is_empty(),
                 "{name} must preserve source-declared stack roots"
             );
-            assert!(
-                facts.entry_stack_address_roots.is_empty(),
-                "{name} must invalidate entry-SP-relative roots"
-            );
+            if name == "call" {
+                assert!(
+                    !facts.entry_stack_address_roots.is_empty(),
+                    "a convention-preserved SP retains entry-relative roots without an FP role"
+                );
+            } else {
+                assert!(
+                    facts.entry_stack_address_roots.is_empty(),
+                    "{name} must invalidate entry-SP-relative roots"
+                );
+            }
         }
     }
 

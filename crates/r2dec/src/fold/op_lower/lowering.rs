@@ -486,7 +486,15 @@ impl<'a> FoldingContext<'a> {
                 crate::observation_journal::LegacyObservationJournalError::InvalidUse(first_site),
             );
         }
-        Ok(certified.into_expr())
+        let access = certified.access();
+        let is_write = certified.is_write();
+        let expr = certified.into_expr();
+        let Some(journal) = self.inputs.observation_journal else {
+            return Ok(expr);
+        };
+        journal
+            .borrow_mut()
+            .observe_stack_access_expr(access, is_write, expr)
     }
 
     pub(crate) fn planned_input_expr_at(

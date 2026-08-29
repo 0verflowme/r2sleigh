@@ -733,6 +733,9 @@ pub enum MachineExprKind {
         mode: MachineArithmeticMode,
         input: MachineExprId,
     },
+    PopulationCount {
+        input: MachineExprId,
+    },
     Bitwise {
         op: MachineBitwiseOp,
         left: MachineExprId,
@@ -792,6 +795,7 @@ impl MachineExprKind {
             | Self::BitwiseNot { input }
             | Self::BooleanNot { input }
             | Self::Negate { input, .. }
+            | Self::PopulationCount { input }
             | Self::Cast { input, .. }
             | Self::Extract { input, .. } => vec![*input],
             Self::Arithmetic { left, right, .. }
@@ -1761,6 +1765,56 @@ fn exact_zero_extend_write(
     })
 }
 
+/// Project a narrow definition through the adjacent full-carrier extension
+/// that SSA alias normalization emitted for the same machine write.
+///
+/// This is a dataflow certificate, not an architecture/name heuristic: the
+/// extension must be the immediately following instruction in the same block,
+/// consume this exact output, and define this exact canonical carrier.
+fn exact_adjacent_cleared_carrier_write(
+    artifact: &SsaArtifact,
+    inst: &GraphInst,
+    root: &MachineExpr,
+    output: ExactRegisterGeometry,
+) -> Option<MachineWriteProjection> {
+    if output.bit_offset != 0
+        || output.width_bits >= output.carrier_bits
+        || root.ty.width_bits() != output.width_bits
+    {
+        return None;
+    }
+    let value = inst.output?;
+    let next_ordinal = inst.ordinal.checked_add(1)?;
+    let next = artifact
+        .graph()
+        .insts
+        .iter()
+        .find(|candidate| candidate.block == inst.block && candidate.ordinal == next_ordinal)?;
+    let InstPayload::Op(SSAOp::IntZExt { .. }) = &next.payload else {
+        return None;
+    };
+    if next.inputs.as_slice() != [value] {
+        return None;
+    }
+    let carrier = next
+        .output
+        .and_then(|next_output| artifact.graph().value(next_output))
+        .and_then(|next_output| next_output.canonical_storage)?;
+    if carrier
+        != (CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: output.carrier.offset,
+            size: output.carrier.size,
+        })
+    {
+        return None;
+    }
+    Some(MachineWriteProjection::ZeroExtend {
+        from_width_bits: output.width_bits,
+        to_width_bits: output.carrier_bits,
+    })
+}
+
 fn machine_write_disposition(
     artifact: &SsaArtifact,
     inst: &GraphInst,
@@ -1785,6 +1839,10 @@ fn machine_write_disposition(
             return MachineWriteDisposition::Refused(write_refusal_for_register_geometry(reason));
         }
     };
+    if let Some(zero_extend) = exact_adjacent_cleared_carrier_write(artifact, inst, root, geometry)
+    {
+        return MachineWriteDisposition::Exact(zero_extend);
+    }
     if let Some(zero_extend) = exact_zero_extend_write(artifact, inst, root, geometry) {
         return MachineWriteDisposition::Exact(zero_extend);
     }
@@ -2146,6 +2204,18 @@ impl MachineFunction {
                         }
                     )
                     && child(*input)?.ty == expr.ty
+            }
+            MachineExprKind::PopulationCount { input } => {
+                let input_bits = child(*input)?.ty.width_bits();
+                let required_output_bits = u32::BITS - input_bits.leading_zeros();
+                matches!(
+                    expr.ty,
+                    MachineType::Integer {
+                        signedness: MachineSignedness::Unsigned,
+                        ..
+                    }
+                ) && input_bits > 0
+                    && expr.ty.width_bits() >= required_output_bits
             }
             MachineExprKind::ArithmeticFlag { left, right, .. } => {
                 matches!(expr.ty, MachineType::Bool { .. })
@@ -2927,6 +2997,30 @@ impl MachineBuilder {
                     },
                 ))
             }
+            SSAOp::PopCount { .. } => {
+                if inst.inputs.len() != 1 {
+                    return Err(MachineBuildError::WrongOperandCount {
+                        inst: inst.id,
+                        expected: 1,
+                        actual: inst.inputs.len(),
+                    });
+                }
+                let input_value = graph
+                    .value(inst.inputs[0])
+                    .ok_or(MachineBuildError::MissingGraphValue(inst.inputs[0]))?;
+                let input_bits = binding_for_value(input_value)?.width_bits;
+                let required_output_bits = u32::BITS - input_bits.leading_zeros();
+                if input_bits == 0 || output.width_bits < required_output_bits {
+                    return Err(MachineBuildError::WidthMismatch {
+                        inst: inst.id,
+                        expected_bits: required_output_bits,
+                        actual_bits: output.width_bits,
+                    });
+                }
+                let input = self.intern_value(input_value)?;
+                self.record_whole_use(graph, inst, 0)?;
+                Ok((unsigned, MachineExprKind::PopulationCount { input }))
+            }
             SSAOp::IntCarry { .. } | SSAOp::IntSCarry { .. } | SSAOp::IntSBorrow { .. } => {
                 let inputs = self.operand_nodes(graph, inst, 2)?;
                 let op = match op {
@@ -3434,6 +3528,10 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
                 }
             )
             | (
+                SSAOp::PopCount { .. },
+                MachineExprKind::PopulationCount { .. }
+            )
+            | (
                 SSAOp::IntCarry { .. },
                 MachineExprKind::ArithmeticFlag {
                     op: MachineArithmeticFlagOp::UnsignedCarry,
@@ -3633,6 +3731,7 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         | SSAOp::IntDiv { .. }
         | SSAOp::IntRem { .. }
         | SSAOp::IntNegate { .. }
+        | SSAOp::PopCount { .. }
         | SSAOp::IntAnd { .. }
         | SSAOp::IntOr { .. }
         | SSAOp::IntXor { .. }
@@ -3953,25 +4052,6 @@ mod tests {
             };
         }
         renamed.registers.reverse();
-        let ops = || {
-            [
-                R2ILOp::Copy {
-                    dst: Varnode::unique(0x10, 1),
-                    src: Varnode::register(1, 1),
-                },
-                R2ILOp::Copy {
-                    dst: Varnode::unique(0x20, 4),
-                    src: Varnode::register(0, 4),
-                },
-            ]
-        };
-        let original_artifact = artifact_with_arch(ops(), &original);
-        let renamed_artifact = artifact_with_arch(ops(), &renamed);
-        let original_projection =
-            MachineProjection::from_artifact(&original_artifact).expect("original projection");
-        let renamed_projection =
-            MachineProjection::from_artifact(&renamed_artifact).expect("renamed projection");
-
         for storage in [
             CanonicalStorageId {
                 space: CanonicalStorageSpace::Register,
@@ -3984,6 +4064,22 @@ mod tests {
                 size: 4,
             },
         ] {
+            // One exact view per fixture keeps this a geometry test. When two
+            // overlapping entry views occur in one function, alias
+            // normalization intentionally chooses the widest as the canonical
+            // SSA root and materializes narrower reads as Subpiece operations.
+            let ops = || {
+                [R2ILOp::Copy {
+                    dst: Varnode::unique(0x10, storage.size),
+                    src: Varnode::register(storage.offset, storage.size),
+                }]
+            };
+            let original_artifact = artifact_with_arch(ops(), &original);
+            let renamed_artifact = artifact_with_arch(ops(), &renamed);
+            let original_projection =
+                MachineProjection::from_artifact(&original_artifact).expect("original projection");
+            let renamed_projection =
+                MachineProjection::from_artifact(&renamed_artifact).expect("renamed projection");
             assert_eq!(
                 value_geometry_for_storage(&original_projection, &original_artifact, storage,),
                 value_geometry_for_storage(&renamed_projection, &renamed_artifact, storage)
@@ -4489,6 +4585,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn population_count_is_an_exact_typed_machine_operation() {
+        let artifact = artifact_with_ops([R2ILOp::PopCount {
+            dst: Varnode::unique(0x10, 1),
+            src: Varnode::constant(0xf0f0, 8),
+        }]);
+
+        let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
+        projection
+            .validate_against(&artifact)
+            .expect("population-count projection validation");
+        assert!(projection.failures().is_empty());
+        let entity = projection
+            .entities()
+            .first()
+            .expect("population-count entity");
+        let root = projection
+            .expr(entity.root())
+            .expect("population-count root");
+        assert_eq!(
+            root.ty(),
+            &MachineType::Integer {
+                width_bits: 8,
+                signedness: MachineSignedness::Unsigned,
+            }
+        );
+        assert!(matches!(
+            root.kind(),
+            MachineExprKind::PopulationCount { .. }
+        ));
+        assert_eq!(
+            exact_use(&projection, &artifact, 0, 0),
+            MachineUseSlice {
+                bit_offset: 0,
+                width_bits: 64,
+                carrier_width_bits: 64,
+                conversion: None,
+            }
+        );
     }
 
     #[test]
@@ -5362,6 +5499,26 @@ mod tests {
                 width_bits: 32,
                 carrier_width_bits: 64,
             }
+        );
+
+        let mut clearing_arch = register_geometry_arch();
+        clearing_arch.name = "x86-64".to_string();
+        let clearing_low = artifact_with_arch(
+            [R2ILOp::Copy {
+                dst: Varnode::register(0, 4),
+                src: Varnode::constant(7, 4),
+            }],
+            &clearing_arch,
+        );
+        let clearing_projection =
+            MachineProjection::from_artifact(&clearing_low).expect("clearing projection");
+        assert_eq!(
+            exact_write(&clearing_projection, &clearing_low, 0),
+            MachineWriteProjection::ZeroExtend {
+                from_width_bits: 32,
+                to_width_bits: 64,
+            },
+            "the adjacent source-owned full-carrier extension certifies the narrow write"
         );
 
         let high = artifact_with_arch(

@@ -806,6 +806,12 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 
 	r2sleigh_wire_bool (writer, view->stack_pointer_preserved_across_calls);
 	r2sleigh_wire_bool (writer, view->frame_pointer_preserved_across_calls);
+	if (r_sys_getenv_asbool ("R2SLEIGH_DEBUG_MERGES")) {
+		eprintf ("R2WIREPRESERVE sp=%d fp=%d params=%zu convention=%zu\n",
+			view->stack_pointer_preserved_across_calls,
+			view->frame_pointer_preserved_across_calls,
+			view->num_parameters, view->calling_convention_length);
+	}
 
 	const bool has_return_address = (top->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) != 0;
@@ -844,28 +850,6 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 		r2sleigh_wire_bool (writer, false);
 	}
 
-	if (top->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
-		RAnalSnapshotStackAllocationContractView contract = {0};
-		if (!r_anal_function_snapshot_interface_stack_allocation_contract (snapshot,
-				&contract)) {
-			return false;
-		}
-		r2sleigh_wire_bool (writer, true);
-		switch (contract.growth) {
-		case R_ANAL_SNAPSHOT_STACK_GROWTH_LOWER:
-			r2sleigh_wire_u8 (writer, WALK_GROWTH_LOWER);
-			break;
-		case R_ANAL_SNAPSHOT_STACK_GROWTH_HIGHER:
-			r2sleigh_wire_u8 (writer, WALK_GROWTH_HIGHER);
-			break;
-		default:
-			/* NONE means no contract, not a third direction. */
-			return false;
-		}
-		r2sleigh_wire_u32 (writer, contract.implicit_active_sp_bytes);
-	} else {
-		r2sleigh_wire_bool (writer, false);
-	}
 	return true;
 }
 
@@ -931,6 +915,27 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		&carriers.return_address_storage);
 	walk_optional_storage (writer, carriers_read && has_stack_pointer,
 		&carriers.stack_pointer_storage);
+	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
+		RAnalSnapshotStackAllocationContractView contract = {0};
+		if (!r_anal_function_snapshot_interface_stack_allocation_contract (source,
+				&contract)) {
+			return false;
+		}
+		r2sleigh_wire_bool (writer, true);
+		switch (contract.growth) {
+		case R_ANAL_SNAPSHOT_STACK_GROWTH_LOWER:
+			r2sleigh_wire_u8 (writer, WALK_GROWTH_LOWER);
+			break;
+		case R_ANAL_SNAPSHOT_STACK_GROWTH_HIGHER:
+			r2sleigh_wire_u8 (writer, WALK_GROWTH_HIGHER);
+			break;
+		default:
+			return false;
+		}
+		r2sleigh_wire_u32 (writer, contract.implicit_active_sp_bytes);
+	} else {
+		r2sleigh_wire_bool (writer, false);
+	}
 
 	/* The convention's candidate slots describe where a caller would leave
 	 * arguments and the result. They are emitted whether or not a prototype was
@@ -990,9 +995,9 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
 			captured |= WALK_CAPTURED_RETURN_MECHANISM;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
-			captured |= WALK_CAPTURED_STACK_ALLOCATION;
-		}
+	}
+	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
+		captured |= WALK_CAPTURED_STACK_ALLOCATION;
 	}
 	r2sleigh_wire_u16 (writer, captured);
 

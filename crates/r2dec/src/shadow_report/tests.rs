@@ -343,6 +343,16 @@ fn independently_forged_candidate_is_classified_shadow_wrong() {
             dst: Varnode::unique(0x20, 8),
             src: Varnode::constant(2, 8),
         },
+        R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 8),
+        },
+        R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x20, 8),
+        },
     ]);
     let original = BindingPlan::build_shadow(&source).expect("sealed plan");
     let snapshot = matching_snapshot(&source, &original, 0);

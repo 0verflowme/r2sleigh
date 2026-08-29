@@ -32,7 +32,7 @@
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
       "r2il_fnv1a64": "d9fac0a75ea4fd0e",
-      "ssa_fnv1a64": "8f51e1c64f6ea7f8",
+      "ssa_fnv1a64": "b4774f2f27d479f2",
       "required_native_opcodes": [
         "movdqu",
         "paddd",
@@ -131,29 +131,29 @@
           "address": 4294968864,
           "size": 8,
           "phi_count": 0,
-          "op_count": 16,
-          "fnv1a64": "1cad4308a818e085"
+          "op_count": 17,
+          "fnv1a64": "2f7338facb1f0d7a"
         },
         {
           "address": 4294968872,
           "size": 7,
           "phi_count": 0,
-          "op_count": 15,
-          "fnv1a64": "fbbcfd95c469de25"
+          "op_count": 17,
+          "fnv1a64": "153e3af2da1c26cb"
         },
         {
           "address": 4294968879,
           "size": 6,
           "phi_count": 0,
-          "op_count": 23,
-          "fnv1a64": "838a633e1a76e309"
+          "op_count": 32,
+          "fnv1a64": "01c94b688865aea4"
         },
         {
           "address": 4294968889,
           "size": 39,
           "phi_count": 0,
-          "op_count": 125,
-          "fnv1a64": "b8059d96b3cfbcea"
+          "op_count": 126,
+          "fnv1a64": "475e69ad2e362fcf"
         },
         {
           "address": 4294968928,
@@ -181,7 +181,7 @@
           "size": 11,
           "phi_count": 105,
           "op_count": 43,
-          "fnv1a64": "35898241f72cafe0"
+          "fnv1a64": "8bfd2ef9736c4bab"
         },
         {
           "address": 4294969003,
@@ -250,7 +250,7 @@
       "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
       "bytes_fnv1a64": "bcde133ae05d0b35",
       "r2il_fnv1a64": "6afb3cfc527bdc1b",
-      "ssa_fnv1a64": "49835acdd0398aea",
+      "ssa_fnv1a64": "fb5c62f938043fd6",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
@@ -281,8 +281,8 @@
           "address": 4294969232,
           "size": 24,
           "phi_count": 0,
-          "op_count": 72,
-          "fnv1a64": "3e6c180c60549980"
+          "op_count": 78,
+          "fnv1a64": "e1f099c47ad3de54"
         }
       ]
     },

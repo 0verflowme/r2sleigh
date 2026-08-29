@@ -16,6 +16,7 @@ use r2source::{
 };
 
 use crate::function::SSAFunction;
+use crate::graph::SsaGraph;
 use crate::var::SSAVar;
 
 /// What the machine code proves about a function's interface.
@@ -50,28 +51,32 @@ fn is_entry_read(func: &SSAFunction, var: &SSAVar) -> Option<CanonicalStorageId>
     (storage.space == CanonicalStorageSpace::Register).then_some(storage)
 }
 
-/// Storages this function reads before writing anywhere in its body.
-fn entry_read_storages(func: &SSAFunction) -> Vec<CanonicalStorageId> {
+/// Storages this function reads before writing and whose values reach a program
+/// observation.
+///
+/// SSA normalization deliberately preserves machine-state joins that symbolic
+/// execution still needs. Those joins may mention every incoming convention
+/// register even when the native program never observes it, so occurrence in a
+/// phi or alias-composition op is not parameter evidence. The upstream positive
+/// observation certificate is the authority for admitting an entry read; an
+/// unsupported/unknown obligation can cause refusal but cannot prove a parameter.
+fn observed_entry_read_storages(
+    func: &SSAFunction,
+    graph: &SsaGraph,
+    observations: &crate::deadphi::ProvenProgramObservations,
+) -> Vec<CanonicalStorageId> {
     let mut reads = Vec::new();
     let mut note = |storage: CanonicalStorageId| {
         if !reads.contains(&storage) {
             reads.push(storage);
         }
     };
-    for block in func.blocks() {
-        for phi in &block.phis {
-            for (_, source) in &phi.sources {
-                if let Some(storage) = is_entry_read(func, source) {
-                    note(storage);
-                }
-            }
-        }
-        for op in &block.ops {
-            op.for_each_source(&mut |source| {
-                if let Some(storage) = is_entry_read(func, source) {
-                    note(storage);
-                }
-            });
+    for value in &graph.values {
+        if observations.contains(value.id)
+            && graph.def_inst(value.id).is_none()
+            && let Some(storage) = is_entry_read(func, &value.var)
+        {
+            note(storage);
         }
     }
     reads
@@ -107,7 +112,30 @@ pub fn recover_interface(
     if slots.argument_slots().is_empty() {
         return None;
     }
-    let reads = entry_read_storages(func);
+    // Recovery is intentionally a bounded two-phase path used only when the
+    // source supplied no exact interface. This provisional O(V + E) fact pass
+    // establishes the observation domain; the ordinary preparation pass then
+    // seals the recovered interface into the final artifact. A cheaper raw-use
+    // scan cannot distinguish program inputs from preserved machine state.
+    let graph = SsaGraph::from_function(func);
+    let facts = crate::semantic::PreparedFunctionFacts::collect(func, &graph);
+    if !facts.obligations.is_complete() {
+        return None;
+    }
+
+    let mut result = None;
+    let mut live_out = crate::liveout::FunctionLiveOut::default();
+    if let Some(candidate) = slots.result_slot() {
+        let candidate_live_out =
+            crate::liveout::FunctionLiveOut::compute(func, &graph, &[candidate]);
+        if !candidate_live_out.is_empty() && candidate_live_out.unresolved_blocks().next().is_none()
+        {
+            result = Some(candidate);
+            live_out = candidate_live_out;
+        }
+    }
+    let observations = crate::deadphi::ProvenProgramObservations::find(&graph, &live_out, &facts)?;
+    let reads = observed_entry_read_storages(func, &graph, &observations);
     let mut parameters = Vec::new();
     for slot in slots.argument_slots() {
         if !reads.iter().any(|read| read_covers_slot(*read, *slot)) {
@@ -115,42 +143,10 @@ pub fn recover_interface(
         }
         parameters.push(*slot);
     }
-    let result = slots
-        .result_slot()
-        .filter(|slot| function_defines(func, *slot));
     Some(RecoveredInterface {
         parameters: parameters.into_boxed_slice(),
         result,
     })
-}
-
-/// True when the function writes this storage somewhere in its body.
-///
-/// A result carrier the function never defines cannot be carrying a result it
-/// produced, so the return is reported absent rather than assumed.
-fn function_defines(func: &SSAFunction, storage: CanonicalStorageId) -> bool {
-    for block in func.blocks() {
-        for phi in &block.phis {
-            if phi.dst.version != 0
-                && func
-                    .canonical_storage_for_var(&phi.dst)
-                    .is_some_and(|defined| read_covers_slot(defined, storage))
-            {
-                return true;
-            }
-        }
-        for op in &block.ops {
-            if let Some(dst) = op.dst()
-                && dst.version != 0
-                && func
-                    .canonical_storage_for_var(dst)
-                    .is_some_and(|defined| read_covers_slot(defined, storage))
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Build a source interface from what the machine code proves.
@@ -305,7 +301,10 @@ mod tests {
         .expect("candidate slots")
     }
 
-    fn recovered(block: R2ILBlock) -> RecoveredInterface {
+    fn recovered(mut block: R2ILBlock) -> RecoveredInterface {
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
         let arch = arch();
         let func = SSAFunction::from_blocks_with_arch(&[block], Some(&arch)).expect("ssa");
         recover_interface(&func, &candidates()).expect("recovery")
@@ -364,7 +363,7 @@ mod tests {
         let mut block = R2ILBlock::new(0x1000, 4);
         // reads w0, the low half of x0: same argument, narrower view
         block.push(R2ILOp::IntZExt {
-            dst: Varnode::register(8, 8),
+            dst: Varnode::register(0, 8),
             src: Varnode::register(0, 4),
         });
         let interface = recovered(block);
@@ -381,6 +380,26 @@ mod tests {
         });
         let interface = recovered(block);
         assert_eq!(interface.result(), None);
+    }
+
+    #[test]
+    fn a_dead_entry_read_is_not_promoted_to_a_parameter() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::register(8, 8),
+        });
+        // x2 is a convention candidate and is genuinely read at the machine
+        // level, but this pure result reaches no effect or return. Its presence
+        // cannot prove a third source parameter.
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(16, 8),
+            a: Varnode::register(16, 8),
+            b: Varnode::constant(1, 8),
+        });
+        let interface = recovered(block);
+        assert_eq!(interface.parameters(), &[register(0, 8), register(8, 8)]);
     }
 
     #[test]

@@ -167,6 +167,9 @@ pub struct RadareAbi138FunctionInterfaceView {
     pub logical_types_complete: u8,
     pub stack_pointer_preserved_across_calls: u8,
     pub frame_pointer_preserved_across_calls: u8,
+    pub num_convention_argument_slots: usize,
+    pub convention_result_slot: RadareAbi138RegisterStorageView,
+    pub convention_slots_known: u8,
 }
 
 #[repr(C)]
@@ -174,6 +177,7 @@ pub struct RadareAbi138FunctionInterfaceView {
 pub struct RadareAbi138CallSiteView {
     pub instruction_addr: u64,
     pub target_addr: u64,
+    pub target_name_length: usize,
     pub calling_convention_length: usize,
     pub num_arguments: usize,
     pub result_kind: i32,
@@ -654,8 +658,7 @@ fn validate_top(view: &RadareAbi138SnapshotView) -> Result<(), RadareAbi138Captu
     }
     if (exact_slots && view.capabilities & RADARE_CAP_STACK_SLOTS == 0)
         || (exact_types && view.capabilities & RADARE_CAP_TYPES == 0)
-        || (exact_stack_allocation
-            && (!exact_interface || view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0))
+        || (exact_stack_allocation && view.capabilities & RADARE_CAP_STACK_POINTER_STORAGE == 0)
         || (exact_return_mechanism
             && (!exact_interface
                 || !exact_slots
@@ -1073,10 +1076,10 @@ unsafe fn capture_stack_allocation_contract(
     snapshot: *const c_void,
     accessors: &RadareAbi138Accessors,
     active: bool,
-    interface: SourceFunctionInterface,
-) -> Result<SourceFunctionInterface, RadareAbi138CaptureError> {
+    roles: SourceMachineRoles,
+) -> Result<SourceMachineRoles, RadareAbi138CaptureError> {
     if !active {
-        return Ok(interface);
+        return Ok(roles);
     }
     let view_fn = required(
         accessors.stack_allocation_contract_view,
@@ -1102,7 +1105,7 @@ unsafe fn capture_stack_allocation_contract(
         2 => SourceStackGrowth::HigherAddresses,
         _ => return Err(RadareAbi138CaptureError::InvalidEnum),
     };
-    interface
+    roles
         .with_stack_allocation_contract(
             SourceStackAllocationContract::with_implicit_active_sp_bytes(
                 growth,
@@ -1132,7 +1135,8 @@ unsafe fn capture_machine_roles(
 ) -> Result<SourceMachineRoles, RadareAbi138CaptureError> {
     let has_return_address = top.capabilities & RADARE_CAP_RETURN_ADDRESS_STORAGE != 0;
     let has_stack_pointer = top.capabilities & RADARE_CAP_STACK_POINTER_STORAGE != 0;
-    if !has_return_address && !has_stack_pointer {
+    let has_stack_allocation = top.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0;
+    if !has_return_address && !has_stack_pointer && !has_stack_allocation {
         return Ok(SourceMachineRoles::default());
     }
     let view_fn = required(accessors.interface_view, "interface_view")?;
@@ -1153,8 +1157,11 @@ unsafe fn capture_machine_roles(
     } else {
         return Err(RadareAbi138CaptureError::InactivePayload);
     };
-    SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
-        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)
+    let roles = SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)?;
+    // SAFETY: the optional scalar callback is copied from the validated table
+    // and read twice while the snapshot borrow remains live.
+    unsafe { capture_stack_allocation_contract(snapshot, accessors, has_stack_allocation, roles) }
 }
 
 unsafe fn capture_interface(
@@ -1422,16 +1429,6 @@ unsafe fn capture_interface(
     } else if !absent_storage(view.stack_pointer_storage) {
         return Err(RadareAbi138CaptureError::InactivePayload);
     }
-    // SAFETY: the optional scalar callback is copied from the validated table
-    // and read twice while the snapshot borrow remains live.
-    let interface = unsafe {
-        capture_stack_allocation_contract(
-            snapshot,
-            accessors,
-            top.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0,
-            interface,
-        )
-    }?;
     let address_size_bytes = u32::try_from(top.bits)
         .ok()
         .and_then(|bits| bits.checked_div(8))
@@ -1894,8 +1891,8 @@ pub unsafe fn capture_radare_abi138(
             && first.capabilities & RADARE_CAP_EXACT_RETURN_MECHANISM != 0,
         frame_pointer_storage: function_interface.is_some()
             && first.capabilities & RADARE_CAP_EXACT_FRAME_POINTER_STORAGE != 0,
-        stack_allocation_contract: function_interface.is_some()
-            && first.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT != 0,
+        stack_allocation_contract: first.capabilities & RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT
+            != 0,
     };
     OwnedFunctionSnapshot::from_captured_parts(
         machine,
@@ -2058,6 +2055,10 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
         .expect("exact return interface")
+    }
+
+    fn exact_machine_roles() -> SourceMachineRoles {
+        SourceMachineRoles::new(None, Some(register(24))).expect("exact machine roles")
     }
 
     fn mechanism_accessors(callback: Option<RadareReturnMechanismViewFn>) -> RadareAbi138Accessors {
@@ -2353,22 +2354,17 @@ mod tests {
     }
 
     #[test]
-    fn stack_allocation_contract_capability_requires_exact_interface_and_sp() {
+    fn stack_allocation_contract_capability_requires_sp_not_an_exact_interface() {
         let dependencies = RADARE_CAP_REVISION
             | RADARE_CAP_OWNED_BOUNDED_FUNCTION_IMAGE
-            | RADARE_CAP_EXACT_FUNCTION_INTERFACE
             | RADARE_CAP_STACK_POINTER_STORAGE
             | RADARE_CAP_EXACT_STACK_ALLOCATION_CONTRACT;
         assert_eq!(validate_top(&valid_top(dependencies)), Ok(()));
-        for dependency in [
-            RADARE_CAP_EXACT_FUNCTION_INTERFACE,
-            RADARE_CAP_STACK_POINTER_STORAGE,
-        ] {
-            assert_eq!(
-                validate_top(&valid_top(dependencies & !dependency)),
-                Err(RadareAbi138CaptureError::InvalidCapabilities)
-            );
-        }
+        assert_eq!(dependencies & RADARE_CAP_EXACT_FUNCTION_INTERFACE, 0);
+        assert_eq!(
+            validate_top(&valid_top(dependencies & !RADARE_CAP_STACK_POINTER_STORAGE)),
+            Err(RadareAbi138CaptureError::InvalidCapabilities)
+        );
     }
 
     #[test]
@@ -2386,18 +2382,18 @@ mod tests {
             };
             let accessors = stack_allocation_accessors(Some(stack_allocation_contract_view));
             // SAFETY: callback receives a live fixture for both synchronous reads.
-            let interface = unsafe {
+            let roles = unsafe {
                 capture_stack_allocation_contract(
                     (&fixture as *const StackAllocationFixture).cast(),
                     &accessors,
                     true,
-                    exact_return_interface(),
+                    exact_machine_roles(),
                 )
             }
             .expect("exact stack allocation contract");
             assert_eq!(fixture.calls.get(), 2);
             assert_eq!(
-                interface.stack_allocation_contract(),
+                roles.stack_allocation_contract(),
                 Some(
                     SourceStackAllocationContract::with_implicit_active_sp_bytes(
                         SourceStackGrowth::LowerAddresses,
@@ -2418,17 +2414,17 @@ mod tests {
         };
         let accessors = stack_allocation_accessors(Some(stack_allocation_contract_view));
         // SAFETY: inactive contracts must not invoke a foreign callback.
-        let interface = unsafe {
+        let roles = unsafe {
             capture_stack_allocation_contract(
                 (&fixture as *const StackAllocationFixture).cast(),
                 &accessors,
                 false,
-                exact_return_interface(),
+                exact_machine_roles(),
             )
         }
         .expect("inactive stack allocation contract");
         assert_eq!(fixture.calls.get(), 0);
-        assert_eq!(interface.stack_allocation_contract(), None);
+        assert_eq!(roles.stack_allocation_contract(), None);
     }
 
     #[test]
@@ -2440,7 +2436,7 @@ mod tests {
                     std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
                     &RadareAbi138Accessors::default(),
                     true,
-                    exact_return_interface(),
+                    exact_machine_roles(),
                 )
             },
             Err(RadareAbi138CaptureError::MissingAccessor(
@@ -2512,7 +2508,7 @@ mod tests {
                         (&fixture as *const StackAllocationFixture).cast(),
                         &accessors,
                         true,
-                        exact_return_interface(),
+                        exact_machine_roles(),
                     )
                 },
                 Err(expected)

@@ -278,6 +278,9 @@ impl<'a> FoldingContext<'a> {
         &self,
         error: crate::observation_journal::LegacyObservationJournalError,
     ) {
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!("OBSERVATION_ERROR {error:?}");
+        }
         let mut first = self.observation_error.borrow_mut();
         if first.is_none() {
             *first = Some(error);
@@ -647,6 +650,18 @@ impl<'a> FoldingContext<'a> {
                                 || (obligation.id.kind == ObligationKind::CallResult
                                     && unique_call_result
                                     && obligation.inputs.as_slice() == value.as_slice()))
+                    }
+                    r2ssa::InstPayload::Op(
+                        r2ssa::SSAOp::IntDiv { .. }
+                        | r2ssa::SSAOp::IntSDiv { .. }
+                        | r2ssa::SSAOp::IntRem { .. }
+                        | r2ssa::SSAOp::IntSRem { .. },
+                    ) => {
+                        inst.output == value
+                            && matches!(
+                                obligation.id.kind,
+                                ObligationKind::LiveValueProducer | ObligationKind::Trap
+                            )
                     }
                     _ => {
                         obligation.id.kind == ObligationKind::LiveValueProducer

@@ -411,6 +411,114 @@ impl<'a> FoldingContext<'a> {
         Some(self.member_access_expr(base, member.field_name.clone()))
     }
 
+    /// Spell an exact linear machine address without claiming an array or
+    /// member projection. Casting the certified base to a byte pointer before
+    /// applying the proved stride keeps C from scaling the addition by an
+    /// inferred pointee type. The result remains a raw dereference; source-like
+    /// subscript/member syntax is reserved for the upstream facts above.
+    fn render_certified_linear_byte_address(&self, address: &CExpr) -> Option<CExpr> {
+        let CertifiedLinearAddress {
+            base,
+            index,
+            offset,
+        } = self.certified_linear_address_components(address)?;
+        let mut result = CExpr::cast(CType::ptr(CType::UInt(8)), base);
+        if let Some(CertifiedLinearIndex { expr, stride }) = index
+            && stride != 0
+        {
+            let magnitude = stride.checked_abs()?;
+            let delta = if magnitude == 1 {
+                expr
+            } else {
+                CExpr::binary(BinaryOp::Mul, expr, CExpr::IntLit(magnitude))
+            };
+            result = CExpr::binary(
+                if stride > 0 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                },
+                result,
+                delta,
+            );
+        }
+        if offset != 0 {
+            let magnitude = offset.checked_abs()?;
+            result = CExpr::binary(
+                if offset > 0 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                },
+                result,
+                CExpr::IntLit(magnitude),
+            );
+        }
+        Some(result)
+    }
+
+    fn integerize_certified_address_expr(expr: &CExpr, pointer_bits: u32) -> Option<CExpr> {
+        let integer = CType::UInt(pointer_bits);
+        Some(match expr {
+            CExpr::Observed { id, expr } => CExpr::Observed {
+                id: *id,
+                expr: Box::new(Self::integerize_certified_address_expr(expr, pointer_bits)?),
+            },
+            CExpr::IntLit(value) => CExpr::IntLit(*value),
+            CExpr::UIntLit(value) => CExpr::UIntLit(*value),
+            CExpr::Var(symbol) => CExpr::cast(integer, CExpr::Var(*symbol)),
+            CExpr::Unary { op, operand } if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) => {
+                CExpr::Unary {
+                    op: *op,
+                    operand: Box::new(Self::integerize_certified_address_expr(
+                        operand,
+                        pointer_bits,
+                    )?),
+                }
+            }
+            CExpr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                ) =>
+            {
+                CExpr::binary(
+                    *op,
+                    Self::integerize_certified_address_expr(left, pointer_bits)?,
+                    Self::integerize_certified_address_expr(right, pointer_bits)?,
+                )
+            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(Self::integerize_certified_address_expr(
+                inner,
+                pointer_bits,
+            )?)),
+            CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Unary { .. }
+            | CExpr::Binary { .. }
+            | CExpr::External { .. }
+            | CExpr::Ternary { .. }
+            | CExpr::Cast { .. }
+            | CExpr::Call { .. }
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. }
+            | CExpr::Sizeof(_)
+            | CExpr::SizeofType(_)
+            | CExpr::AddrOf(_)
+            | CExpr::Deref(_)
+            | CExpr::Comma(_) => return None,
+        })
+    }
+
     fn render_certified_semantic_array_expr(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
@@ -629,154 +737,20 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<(SSAVar, CExpr)> {
         let prepared = self.prepared_ssa()?;
         let addr = prepared.value_var(fact.address)?.clone();
-        let expr = self
-            .render_certified_address_expr_for_var(&addr, 0, &mut HashSet::new())
-            .or_else(|| self.render_certified_value_expr_for_var(&addr))?;
+        if self.prepared_value_id_for_var(&addr) != Some(fact.address) {
+            return None;
+        }
+        let expr = match self.planned_value_expr(fact.address) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                );
+                return None;
+            }
+        };
         Some((addr, expr))
-    }
-
-    fn render_certified_address_expr_for_var(
-        &self,
-        var: &SSAVar,
-        depth: u32,
-        visited: &mut HashSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        if self.certified_const_bits(var).is_some() {
-            return self.render_certified_value_expr_for_var(var);
-        }
-        let prepared = self.prepared_ssa()?;
-        let value = self.prepared_value_id_for_var(var)?;
-        if let Some(expr) = self.certified_loop_carrier_expr_for_value(value) {
-            return Some(expr);
-        }
-        if var.version == 0 && var.is_register() {
-            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-                return Some(expr);
-            }
-            if self.stable_semantic_ids_are_required() {
-                return None;
-            }
-            return match self.planned_value_expr(value) {
-                Ok(expr) => Some(expr),
-                Err(error) => {
-                    self.retain_first_observation_error(error);
-                    self.retain_first_lowering_refusal(
-                        OpLoweringRefusal::MissingProgramVariableAuthorization,
-                    );
-                    None
-                }
-            };
-        }
-
-        if !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let r2ssa::InstPayload::Op(op) = &inst.payload else {
-                return None;
-            };
-            match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::New { src, .. }
-                | SSAOp::Cast { src, .. }
-                | SSAOp::Subpiece { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. } => {
-                    self.render_certified_address_expr_for_var(src, depth + 1, visited)
-                }
-                SSAOp::Load { .. } => {
-                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                    let proof = self.certified_render_context()?;
-                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
-                    if fact.value != Some(value) {
-                        return None;
-                    }
-                    self.certified_stack_owner_expr_for_memory_fact(fact)
-                }
-                SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Add,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntSub { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Sub,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntMult { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Mul,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntLeft { a, b, .. } => {
-                    let shift = self.certified_const_value_for_address_var(b, 0)?;
-                    if shift > 63 {
-                        return None;
-                    }
-                    Some(CExpr::binary(
-                        BinaryOp::Shl,
-                        self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                        CExpr::IntLit(shift as i64),
-                    ))
-                }
-                SSAOp::PtrAdd {
-                    base,
-                    index,
-                    element_size,
-                    ..
-                } => {
-                    let index =
-                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
-                    let scaled = if *element_size == 1 {
-                        index
-                    } else {
-                        CExpr::binary(
-                            BinaryOp::Mul,
-                            index,
-                            CExpr::IntLit(i64::from(*element_size)),
-                        )
-                    };
-                    Some(CExpr::binary(
-                        BinaryOp::Add,
-                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
-                        scaled,
-                    ))
-                }
-                SSAOp::PtrSub {
-                    base,
-                    index,
-                    element_size,
-                    ..
-                } => {
-                    let index =
-                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
-                    let scaled = if *element_size == 1 {
-                        index
-                    } else {
-                        CExpr::binary(
-                            BinaryOp::Mul,
-                            index,
-                            CExpr::IntLit(i64::from(*element_size)),
-                        )
-                    };
-                    Some(CExpr::binary(
-                        BinaryOp::Sub,
-                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
-                        scaled,
-                    ))
-                }
-                _ => None,
-            }
-        })();
-
-        visited.remove(&value);
-        result
     }
 
     pub(super) fn render_certified_memory_expr_for_fact(
@@ -800,7 +774,14 @@ impl<'a> FoldingContext<'a> {
             return Some(rendered);
         }
         if matches!(addr_expr, CExpr::Binary { .. }) {
-            return None;
+            let pointer_bits = self.inputs.arch.ptr_size.checked_mul(8)?;
+            let byte_address = self
+                .render_certified_linear_byte_address(&addr_expr)
+                .or_else(|| Self::integerize_certified_address_expr(&addr_expr, pointer_bits))?;
+            return Some(CExpr::Deref(Box::new(CExpr::cast(
+                CType::ptr(elem_ty),
+                byte_address,
+            ))));
         }
         let ptr_ty = CType::ptr(elem_ty);
         let casted = self.cast_addr_expr_to_ptr_if_needed(&addr, addr_expr, &ptr_ty);
@@ -814,48 +795,7 @@ impl<'a> FoldingContext<'a> {
         if fact.width == 0 {
             return None;
         }
-        if let Some(plan) = self
-            .certified_render_context()
-            .and_then(|proof| self.certified_render_plan(proof))
-            && let Some(expr) = self
-                .inputs
-                .binding_names
-                .and_then(|names| plan.stack_param_expr_for_memory_fact(fact, names))
-        {
-            return Some(expr);
-        }
         self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
         self.certified_stack_var_expr_for_object(fact.object)
-    }
-
-    fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
-        if depth > 4 {
-            return None;
-        }
-        if let Some(value) = self.certified_const_bits(var) {
-            return Some(value);
-        }
-        let prepared = self.prepared_ssa()?;
-        let value = self.prepared_value_id_for_var(var)?;
-        let inst_id = prepared.graph().def_inst(value)?;
-        let inst = prepared.graph().inst(inst_id)?;
-        let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return None;
-        };
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::Subpiece { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. } => {
-                self.certified_const_value_for_address_var(src, depth + 1)
-            }
-            SSAOp::IntAnd { a, b, .. } => Some(
-                self.certified_const_value_for_address_var(a, depth + 1)?
-                    & self.certified_const_value_for_address_var(b, depth + 1)?,
-            ),
-            _ => None,
-        }
     }
 }

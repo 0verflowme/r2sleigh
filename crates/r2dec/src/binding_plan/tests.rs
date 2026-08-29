@@ -5,7 +5,7 @@ use r2il::{
 };
 use r2ssa::{
     CanonicalStorageId, CanonicalStorageSpace, MachineUseDisposition, MachineWriteDisposition,
-    SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn,
+    SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SourceMachineRoles,
     SourceStackAllocationContract, SourceStackGrowth, SsaArtifact,
 };
 use std::cell::RefCell;
@@ -35,6 +35,7 @@ fn source_owned_blocks_with_stack_slots(
     arch.add_space(AddressSpace::ram(8));
     arch.add_register(RegisterDef::new("RAX", 0, 8));
     arch.add_register(RegisterDef::new("AH", 1, 1));
+    arch.add_register(RegisterDef::new("RBP", 0x20, 8));
     arch.add_register(RegisterDef::new("RSP", 0x28, 8));
     arch.add_register(RegisterDef::new("RIP", 0x30, 8));
     arch.add_register(RegisterDef::new("RDI", 0x38, 8));
@@ -57,6 +58,22 @@ fn source_owned_blocks_with_stack_slots(
                 slice: RegisterBitSlice {
                     lsb_bit_offset: 8,
                     size_bits: 8,
+                },
+            },
+        },
+        RegisterProjection {
+            written: RegisterStorage {
+                offset: 0x20,
+                size: 8,
+            },
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 64,
                 },
             },
         },
@@ -130,7 +147,7 @@ fn source_owned_blocks_with_stack_slots(
         offset,
         size: 8,
     };
-    let mut interface = SourceFunctionInterface::new_exact(
+    let interface = SourceFunctionInterface::new_exact(
         b"binding-plan-test-interface".to_vec(),
         "sysv64",
         [SourceAbiParameterSpec::new(0, storage(0x38))],
@@ -141,15 +158,24 @@ fn source_owned_blocks_with_stack_slots(
     )
     .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
     .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+    .and_then(|interface| interface.with_frame_pointer_storage(storage(0x20)))
     .expect("exact test source interface");
+    let mut machine_roles = SourceMachineRoles::new(Some(storage(0x30)), Some(storage(0x28)))
+        .expect("exact test machine roles");
     if let Some(contract) = stack_allocation {
-        interface = interface
+        machine_roles = machine_roles
             .with_stack_allocation_contract(contract)
             .expect("exact test allocation contract");
     }
     let source = Arc::new(
-        SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
-            .expect("test SSA artifact"),
+        SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            blocks,
+            Some(&arch),
+            Some(interface),
+            machine_roles,
+            Vec::new(),
+        )
+        .expect("test SSA artifact"),
     );
     let request = r2types::TypeWritebackAnalysisRequest::new(
         Arc::clone(&source),
@@ -178,6 +204,11 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
             dst: first,
             a: Varnode::unique(0x10, 8),
             b: Varnode::constant(1, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 8),
         },
     ]);
     let source = source_owned.source();
@@ -462,6 +493,13 @@ fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
         })
         .expect("returned RAX merge");
     assert!(!source.unobserved_merges().contains(live));
+    let dead_support = graph
+        .def_inst(dead)
+        .and_then(|inst| graph.inst(inst))
+        .and_then(|inst| inst.inputs.first())
+        .copied()
+        .expect("dead merge has an entry support value");
+    assert!(source.unobserved_values().contains(&dead_support));
 
     let plan = BindingPlan::build_shadow(&source_owned).expect("dead-merge-aware plan");
     assert!(matches!(
@@ -474,6 +512,13 @@ fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
     assert!(matches!(
         plan.disposition(live),
         Some(ValueDisposition::Bound { .. })
+    ));
+    assert!(matches!(
+        plan.disposition(dead_support),
+        Some(ValueDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::UnobservedValue,
+            proof,
+        }) if proof.authority == *source.authority() && proof.value == dead_support
     ));
     assert!(
         binding_components(&source_owned)
@@ -592,6 +637,11 @@ fn declaration_width_uses_exact_machine_carriers_not_register_view_widths() {
             dst: Varnode::register(1, 1),
             src: Varnode::constant(3, 1),
         },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 1),
+        },
     ]);
     let source = source_owned.source();
     let plan = BindingPlan::build_shadow(&source_owned).expect("sealed carrier-width plan");
@@ -611,10 +661,10 @@ fn declaration_width_uses_exact_machine_carriers_not_register_view_widths() {
     assert!(!register_values.is_empty());
     let mut carrier_binding = None;
     for value in register_values {
-        let binding = match plan.disposition(value) {
-            Some(ValueDisposition::Bound { binding }) => *binding,
-            disposition => panic!("AH value is not bound: {disposition:?}"),
+        let Some(ValueDisposition::Bound { binding }) = plan.disposition(value) else {
+            continue;
         };
+        let binding = *binding;
         carrier_binding.get_or_insert(binding);
         assert_eq!(
             plan.binding(binding).map(Binding::declaration_type),
@@ -623,7 +673,7 @@ fn declaration_width_uses_exact_machine_carriers_not_register_view_widths() {
     }
     assert!(plan.validate_seal(&source_owned).is_ok());
 
-    let carrier_binding = carrier_binding.expect("AH carrier binding");
+    let carrier_binding = carrier_binding.expect("at least one observed AH value has a binding");
     for forged_width in [32, 128] {
         let mut forged = plan.clone();
         forged.bindings[carrier_binding.index()].declaration_type = CType::UInt(forged_width);
@@ -709,10 +759,17 @@ fn refused_machine_use_leaves_its_constant_explicitly_refused() {
 
 #[test]
 fn unsupported_c_scalar_width_is_a_typed_value_refusal() {
-    let source_owned = source_owned([R2ILOp::Copy {
-        dst: Varnode::unique(0x10, 3),
-        src: Varnode::constant(0x12_3456, 3),
-    }]);
+    let source_owned = source_owned([
+        R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 3),
+            src: Varnode::constant(0x12_3456, 3),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 3),
+        },
+    ]);
     let output = source_owned
         .source()
         .graph()
@@ -745,6 +802,16 @@ fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
             R2ILOp::Copy {
                 dst: Varnode::unique(0x20, 4),
                 src: Varnode::constant(2, 4),
+            },
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x2000, 8),
+                val: Varnode::unique(0x10, 8),
+            },
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x2008, 8),
+                val: Varnode::unique(0x20, 4),
             },
         ]
     };
@@ -803,6 +870,16 @@ fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
             dst: second,
             a: Varnode::unique(0x20, 8),
             b: Varnode::constant(1, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x20, 8),
         },
     ]);
     let plan = BindingPlan::build_shadow(&source_owned).expect("sealed two-span plan");
@@ -877,6 +954,11 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
         R2ILOp::Copy {
             dst: Varnode::register(0, 8),
             src: Varnode::register(0x38, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::register(0x38, 8),
         },
     ]);
     let parameter = BindingCertificateSource::CertifiedEntity(SemanticId::Parameter(0));
@@ -1135,5 +1217,115 @@ fn exact_callee_allocation_binds_anonymous_stack_object_without_source_identity(
             SemanticId::StackSlot(certified)
         )]) if *certified == object
     ));
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
+fn exact_frame_round_trip_is_elided_without_a_program_binding() {
+    let saved = Varnode::unique(0x90, 8);
+    let loaded = Varnode::unique(0x98, 8);
+    let sp = Varnode::register(0x28, 8);
+    let fp = Varnode::register(0x20, 8);
+    let source_owned = source_owned_blocks_with_stack_slots(
+        &[R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: saved.clone(),
+                    src: fp.clone(),
+                },
+                R2ILOp::IntSub {
+                    dst: sp.clone(),
+                    a: sp.clone(),
+                    b: Varnode::constant(8, 8),
+                },
+                R2ILOp::Store {
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                    val: saved,
+                },
+                R2ILOp::Copy {
+                    dst: fp.clone(),
+                    src: sp.clone(),
+                },
+                R2ILOp::Load {
+                    dst: loaded.clone(),
+                    space: SpaceId::Ram,
+                    addr: sp.clone(),
+                },
+                R2ILOp::IntAdd {
+                    dst: sp.clone(),
+                    a: sp,
+                    b: Varnode::constant(8, 8),
+                },
+                R2ILOp::Copy {
+                    dst: fp,
+                    src: loaded,
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x30, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }],
+        Vec::new(),
+        Some(SourceStackAllocationContract::new(
+            SourceStackGrowth::LowerAddresses,
+        )),
+    );
+    let certificate = source_owned
+        .source()
+        .certificates()
+        .stack_frame_round_trips
+        .values()
+        .next()
+        .expect("upstream frame round-trip certificate");
+    let object = certificate.object;
+    let plan = Rc::new(BindingPlan::build_shadow(&source_owned).expect("frame-aware plan"));
+    assert_eq!(
+        plan.stack_object_disposition(object),
+        Some(StackObjectDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::StackFrame,
+        })
+    );
+    assert!(certificate.values.iter().all(|value| {
+        matches!(
+            plan.disposition(*value),
+            Some(ValueDisposition::Elided {
+                reason: r2ssa::ledger::ElisionReason::StackFrame,
+                ..
+            })
+        )
+    }));
+    assert!(
+        source_owned
+            .source()
+            .certificates()
+            .stack_geometry
+            .values
+            .iter()
+            .all(|value| matches!(
+                plan.disposition(*value),
+                Some(ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DeadStackBase,
+                    ..
+                })
+            ))
+    );
+    let resolution = BindingNameResolution::build(
+        &source_owned,
+        Rc::clone(&plan),
+        Rc::new(RefCell::new(SymbolTable::new())),
+    )
+    .expect("frame-aware name resolution");
+    assert_eq!(
+        resolution.require_stack(object),
+        Err(RenderedIdentityRefusal::StackObjectElided {
+            object,
+            reason: r2ssa::ledger::ElisionReason::StackFrame,
+        })
+    );
     assert!(plan.validate_seal(&source_owned).is_ok());
 }

@@ -23,12 +23,12 @@ pub use r2source::{
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
     SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract,
-    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
-    SourceTypeGraphError, SourceTypeKind, StackAddressBase,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceMachineRolesError,
+    SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
+    SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 19;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 20;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -749,17 +749,6 @@ fn write_function_interface(
     writer.option_storage(interface.stack_pointer_storage());
     writer.option_storage(interface.frame_pointer_storage());
     write_return_mechanism(writer, interface.return_mechanism());
-    match interface.stack_allocation_contract() {
-        Some(contract) => {
-            writer.u8(1);
-            writer.u8(match contract.growth() {
-                SourceStackGrowth::LowerAddresses => 1,
-                SourceStackGrowth::HigherAddresses => 2,
-            });
-            writer.u32(contract.implicit_active_sp_bytes());
-        }
-        None => writer.u8(0),
-    }
     writer.usize(interface.stack_slots().len());
     for slot in interface.stack_slots() {
         writer.stack_base(slot.base());
@@ -1366,6 +1355,19 @@ impl SourceMachineContext {
         writer.option_storage(abi.frame_pointer_storage());
 
         write_function_interface(&mut writer, self.function_interface.as_ref());
+        writer.option_storage(self.machine_roles.return_address_storage());
+        writer.option_storage(self.machine_roles.stack_pointer_storage());
+        match self.machine_roles.stack_allocation_contract() {
+            Some(contract) => {
+                writer.u8(1);
+                writer.u8(match contract.growth() {
+                    SourceStackGrowth::LowerAddresses => 1,
+                    SourceStackGrowth::HigherAddresses => 2,
+                });
+                writer.u32(contract.implicit_active_sp_bytes());
+            }
+            None => writer.u8(0),
+        }
 
         match self.convention_slots.as_ref() {
             Some(slots) => {
@@ -1858,8 +1860,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 19);
-        assert_eq!(x86_context.schema_version(), 19);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 20);
+        assert_eq!(x86_context.schema_version(), 20);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64

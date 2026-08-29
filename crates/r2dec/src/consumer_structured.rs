@@ -32,13 +32,15 @@ impl RoutedBody {
     }
 }
 
-pub(crate) fn primary_body_for_semantic_route<'a, 'o, F>(
+pub(crate) fn primary_body_for_semantic_route<'a, 'o, F, R>(
     route: &r2types::DecompileRouteFacts,
     structurer: &mut crate::ControlFlowStructurer<'a, 'o>,
     mut linearize: F,
+    mut rollback_tentative_structure: R,
 ) -> ControlFlowStructureResult<RoutedBody>
 where
     F: FnMut() -> ControlFlowStructureResult<Vec<CStmt>>,
+    R: FnMut(),
 {
     match route.kind {
         r2types::DecompileRouteKind::StructuredWorker => Ok(RoutedBody {
@@ -72,14 +74,17 @@ where
             // structure, rather than withhold all of it.
             match structurer.safety_reason() {
                 Some(reason) => {
+                    let reason = reason.to_string();
+                    rollback_tentative_structure();
                     let mut stmts = vec![CStmt::comment(format!(
                         "r2dec residual: {}; body rendered without structure",
-                        crate::sanitize_comment_text(reason)
+                        crate::sanitize_comment_text(&reason)
                     ))];
                     stmts.extend(linearize()?);
+                    let structured_body = structurer.seal_linearized_body(CStmt::Block(stmts))?;
                     Ok(RoutedBody {
-                        body_stmt: Some(CStmt::Block(stmts)),
-                        structured_body: None,
+                        body_stmt: None,
+                        structured_body: Some(structured_body),
                     })
                 }
                 None => match structured {
@@ -87,12 +92,9 @@ where
                         body_stmt: None,
                         structured_body: Some(structured_body),
                     }),
-                    Err(ControlFlowStructureError::StructuredRegion(error)) => Ok(RoutedBody {
-                        body_stmt: Some(CStmt::comment(format!(
-                            "r2dec residual: structured-region sealing failed: {error:?}"
-                        ))),
-                        structured_body: None,
-                    }),
+                    Err(ControlFlowStructureError::StructuredRegion(error)) => {
+                        Err(ControlFlowStructureError::StructuredRegion(error))
+                    }
                     Err(ControlFlowStructureError::Lowering(_)) => {
                         unreachable!("lowering refusal returned before route fallback")
                     }

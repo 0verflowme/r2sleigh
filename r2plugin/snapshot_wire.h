@@ -5,11 +5,8 @@
  * of implementing a callback per field, so the C boundary carries one buffer
  * rather than 67 entry points and 31 struct sizes kept in lockstep.
  *
- * The encoding is owned by r2source::snapshot_wire. This producer intentionally
- * remains on readable format v1: ABI spelling is classified exactly once by
- * r2source while decoding, rather than duplicated in C. The Rust reader keeps
- * v1 migration coverage, and this writer pins the v1 framing and payload order
- * in its own conformance test. */
+ * The encoding is owned by r2source::snapshot_wire. ABI spelling is classified
+ * exactly once by r2source while decoding rather than duplicated in C. */
 
 #ifndef R2SLEIGH_SNAPSHOT_WIRE_H
 #define R2SLEIGH_SNAPSHOT_WIRE_H
@@ -19,7 +16,7 @@
 #include <stdint.h>
 
 #define R2SLEIGH_SNAPSHOT_WIRE_MAGIC 0x52325357u
-#define R2SLEIGH_SNAPSHOT_WIRE_FORMAT_VERSION 1u
+#define R2SLEIGH_SNAPSHOT_WIRE_FORMAT_VERSION 3u
 #define R2SLEIGH_SNAPSHOT_WIRE_HEADER_BYTES 24u
 
 /* Reference written for an absent optional string. */
