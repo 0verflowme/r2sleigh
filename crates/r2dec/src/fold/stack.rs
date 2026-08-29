@@ -12,9 +12,9 @@ impl<'a> FoldingContext<'a> {
                 if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                     eprintln!("stack object {object:?} has no program variable: {error:?}");
                 }
-                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(
-                    super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
-                ));
+                self.retain_first_lowering_refusal(
+                    super::op_lower::OpLoweringRefusal::missing_program_variable(),
+                );
                 None
             }
         }

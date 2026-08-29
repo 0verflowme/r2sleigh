@@ -144,18 +144,10 @@ impl<'a> FoldingContext<'a> {
     )> {
         let cert = self
             .certified_callsite_for_op(block_addr, op_idx)
-            .ok_or_else(|| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                )
-            })?;
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         let render_fact = self
             .certified_call_render_fact_for_op(block_addr, op_idx)
-            .ok_or_else(|| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                )
-            })?;
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         let expected_site = r2types::CallsiteKey {
             block_addr,
             op_index: op_idx,
@@ -169,9 +161,7 @@ impl<'a> FoldingContext<'a> {
                     | r2types::CallsiteRenderDisposition::Residualized
             )
         {
-            return Err(crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingMachineProjectionAuthorization,
-            ));
+            return Err(OpLoweringRefusal::missing_machine_projection());
         }
         Ok((cert, render_fact))
     }
@@ -182,16 +172,11 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
     ) -> OpLoweringResult<CertifiedCallArgs> {
         let (cert, render_fact) = self.admitted_callsite(block_addr, op_idx)?;
-        let indexed = exact_indexed_call_arguments(cert, render_fact).ok_or_else(|| {
-            crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingMachineProjectionAuthorization,
-            )
-        })?;
-        let proof = self.certified_render_context().ok_or_else(|| {
-            crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingMachineProjectionAuthorization,
-            )
-        })?;
+        let indexed = exact_indexed_call_arguments(cert, render_fact)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let proof = self
+            .certified_render_context()
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
 
         let render_plan = self.certified_render_plan(proof);
         let args = indexed
@@ -206,11 +191,7 @@ impl<'a> FoldingContext<'a> {
                 )
             })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                )
-            })?;
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         Ok(CertifiedCallArgs {
             args,
             values: indexed.into_iter().map(|(_, value)| value).collect(),
@@ -241,18 +222,16 @@ impl<'a> FoldingContext<'a> {
             return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(addr)));
         }
         if target.name_kind().is_constant() {
-            return Err(crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingProgramVariableAuthorization,
-            ));
+            return Err(OpLoweringRefusal::missing_program_variable());
         }
-        let value = self.prepared_value_id_for_var(target).ok_or_else(|| {
-            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
-        })?;
+        let value = self
+            .prepared_value_id_for_var(target)
+            .ok_or_else(|| OpLoweringRefusal::missing_program_variable())?;
         match self.planned_value_expr(value) {
             Ok(expr) => Ok(expr),
             Err(error) => {
                 self.retain_first_observation_error(error);
-                Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
+                Err(OpLoweringRefusal::missing_program_variable())
             }
         }
     }

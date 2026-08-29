@@ -624,9 +624,7 @@ fn populate_prepared_render_definitions(
 ) -> Result<(), crate::analysis::lower::OpLoweringRefusal> {
     for block in blocks {
         let Some(block_id) = prepared.graph().block_id_for_addr(block.addr) else {
-            return Err(crate::analysis::lower::refusal(
-                crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization,
-            ));
+            return Err(crate::analysis::lower::OpLoweringRefusal::missing_machine_projection());
         };
         for (op_idx, op) in block.ops.iter().enumerate() {
             if matches!(
@@ -665,7 +663,9 @@ fn populate_prepared_render_definitions(
             }
             if let Some(resolver) = env.binding_names {
                 let Some(value) = use_info.exact_value_id_for_var(dst) else {
-                    return Err(crate::analysis::lower::refusal(crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization));
+                    return Err(
+                        crate::analysis::lower::OpLoweringRefusal::missing_program_variable(),
+                    );
                 };
                 match resolver.plan().disposition(value) {
                     Some(crate::binding_plan::ValueDisposition::Bound { .. }) => {}
@@ -681,7 +681,9 @@ fn populate_prepared_render_definitions(
                         continue;
                     }
                     None => {
-                        return Err(crate::analysis::lower::refusal(crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization));
+                        return Err(
+                            crate::analysis::lower::OpLoweringRefusal::missing_program_variable(),
+                        );
                     }
                 }
             }
@@ -701,11 +703,11 @@ fn populate_prepared_render_definitions(
                 match lower.op_to_expr(op) {
                     Ok(expr) => expr,
                     Err(
-                        refusal @ crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
+                        refusal @ crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..),
                     ) => return Err(refusal),
                     Err(
-                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization
-                        | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation,
+                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(..)
+                        | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation(..),
                     ) => {
                         // This table is an advisory expression cache, not an
                         // effect disposition. Omitting the definition cannot

@@ -1722,7 +1722,7 @@ mod tests {
                 source_call.0,
                 source_call.1,
             ),
-            Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+            Err(OpLoweringRefusal::missing_machine_projection()),
             "typed callee identity alone must not authorize an executable source call",
         );
     }
@@ -1741,7 +1741,7 @@ mod tests {
                 source_call.0,
                 source_call.1,
             ),
-            Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+            Err(OpLoweringRefusal::missing_machine_projection()),
             "typed callee identity alone must not authorize an executable indirect source call",
         );
     }
@@ -2969,7 +2969,7 @@ mod tests {
         assert_eq!(
             ctx.analyze_blocks_with_control(&[], control),
             Err(crate::analysis::PreparedRuntimeFactsError::Lowering(
-                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                OpLoweringRefusal::missing_machine_projection(),
             )),
             "missing exact SSA authority must be a typed refusal, never an empty analysis"
         );

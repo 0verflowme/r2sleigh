@@ -18,26 +18,20 @@ use super::{
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::binding_plan::PlannedValueSymbol;
 
-/// Note where a refusal was decided.
+/// Proof that a refusal was decided through a constructor.
 ///
-/// A refusal is a value, so `?` carries it away from wherever it was made and
-/// the report says only what kind it was. Twice now a class of refused
-/// functions took several passes to locate because every construction site had
-/// to be instrumented by hand to find the one that fired -- and one of them was
-/// not propagated at all but stored, so no amount of instrumenting the
-/// propagation paths would have found it.
-///
-/// `#[track_caller]` makes the origin a property of the refusal rather than
-/// something to be rediscovered. Set `R2DEC_TRACE_REFUSAL` to print it.
-#[track_caller]
-pub(crate) fn refusal(kind: OpLoweringRefusal) -> OpLoweringRefusal {
-    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
-        eprintln!(
-            "refusal {kind:?} decided at {}",
-            std::panic::Location::caller()
-        );
+/// The field is private to this module, so no other module can name it and no
+/// other module can build a refusal without going through the constructors
+/// below. That is the whole point: instrumenting construction sites by hand
+/// left holes, twice, and a refusal that escaped the instrumentation cost a
+/// full pass to find each time. Now the compiler enumerates them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusalOrigin(());
+
+impl std::fmt::Debug for RefusalOrigin {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
-    kind
 }
 
 /// Defensive renderer result for operations whose canonical disposition is
@@ -47,11 +41,58 @@ pub(crate) fn refusal(kind: OpLoweringRefusal) -> OpLoweringRefusal {
 /// received `MachineBuildError::UnsupportedOperation` from the projection.
 /// The renderer result exists only so legacy helpers cannot turn an opaque
 /// operation into executable C when called directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every variant carries a witness that only this module can make, so a
+/// refusal cannot be built without the constructor that records where it was
+/// decided. `R2DEC_TRACE_REFUSAL` prints that.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpLoweringRefusal {
-    MissingMachineProjectionAuthorization,
-    MissingProgramVariableAuthorization,
-    UnrepresentableOperation,
+    MissingMachineProjectionAuthorization(RefusalOrigin),
+    MissingProgramVariableAuthorization(RefusalOrigin),
+    UnrepresentableOperation(RefusalOrigin),
+}
+
+impl std::fmt::Debug for OpLoweringRefusal {
+    /// Named as it always was. The witness the variants carry is a
+    /// construction guard, not information, and it reaches rendered residual
+    /// comments through this.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingMachineProjectionAuthorization(_) => {
+                "MissingMachineProjectionAuthorization"
+            }
+            Self::MissingProgramVariableAuthorization(_) => "MissingProgramVariableAuthorization",
+            Self::UnrepresentableOperation(_) => "UnrepresentableOperation",
+        })
+    }
+}
+
+impl OpLoweringRefusal {
+    #[track_caller]
+    fn note(name: &str) -> RefusalOrigin {
+        if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+            eprintln!(
+                "refusal {name} decided at {}",
+                std::panic::Location::caller()
+            );
+        }
+        RefusalOrigin(())
+    }
+
+    #[track_caller]
+    pub(crate) fn missing_machine_projection() -> Self {
+        Self::MissingMachineProjectionAuthorization(Self::note("machine-projection"))
+    }
+
+    #[track_caller]
+    pub(crate) fn missing_program_variable() -> Self {
+        Self::MissingProgramVariableAuthorization(Self::note("program-variable"))
+    }
+
+    #[track_caller]
+    pub(crate) fn unrepresentable_operation() -> Self {
+        Self::UnrepresentableOperation(Self::note("unrepresentable-operation"))
+    }
 }
 
 pub(crate) fn no_string_literals() -> &'static std::collections::BTreeMap<u64, String> {
@@ -144,31 +185,26 @@ impl<'a> LowerCtx<'a> {
     fn exact_value_id(&self, var: &SSAVar) -> Result<ValueId, OpLoweringRefusal> {
         self.use_info
             .and_then(|info| info.exact_value_id_for_var(var))
-            .ok_or_else(|| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                )
-            })
+            .ok_or_else(|| OpLoweringRefusal::missing_program_variable())
     }
 
     fn bound_program_symbol(
         &self,
         var: &SSAVar,
     ) -> Result<crate::symbol::SymbolId, OpLoweringRefusal> {
-        let resolver = self.binding_names.ok_or_else(|| {
-            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
-        })?;
+        let resolver = self
+            .binding_names
+            .ok_or_else(|| OpLoweringRefusal::missing_program_variable())?;
         let value = self.exact_value_id(var)?;
-        match resolver.require_value(value).map_err(|_| {
-            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
-        })? {
+        match resolver
+            .require_value(value)
+            .map_err(|_| OpLoweringRefusal::missing_program_variable())?
+        {
             PlannedValueSymbol::Bound(symbol) => Ok(symbol),
             PlannedValueSymbol::Inline(_)
             | PlannedValueSymbol::Elided(_)
             | PlannedValueSymbol::Refused(_)
-            | PlannedValueSymbol::Absent => {
-                Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
-            }
+            | PlannedValueSymbol::Absent => Err(OpLoweringRefusal::missing_program_variable()),
         }
     }
 
@@ -182,7 +218,7 @@ impl<'a> LowerCtx<'a> {
             Ok(crate::naming::spell_var(var, self))
         }
         #[cfg(not(test))]
-        Err(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        Err(OpLoweringRefusal::missing_program_variable())
     }
 
     pub(crate) fn get_expr(&self, var: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
@@ -208,9 +244,7 @@ impl<'a> LowerCtx<'a> {
             #[cfg(test)]
             return Ok(self.expr_for_ssa_name(var.display_name().as_str()));
             #[cfg(not(test))]
-            return Err(crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingProgramVariableAuthorization,
-            ));
+            return Err(OpLoweringRefusal::missing_program_variable());
         }
 
         let value_id = self.exact_value_id(var)?;
@@ -338,14 +372,10 @@ impl<'a> LowerCtx<'a> {
         self.require_op_value_identities(op)?;
         Ok(match op {
             SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
-                return Err(crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                ));
+                return Err(OpLoweringRefusal::missing_machine_projection());
             }
             SSAOp::Load { space, .. } if *space != r2il::SpaceId::Ram => {
-                return Err(crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                ));
+                return Err(OpLoweringRefusal::missing_machine_projection());
             }
             SSAOp::Copy { src, .. } => self.get_expr(src)?,
             SSAOp::Load { dst, addr, .. } => {
@@ -517,7 +547,7 @@ impl<'a> LowerCtx<'a> {
                 Some(expr) => expr,
                 None => self.ptr_arith_expr(base, index, *element_size, true)?,
             },
-            _ => return Err(OpLoweringRefusal::UnrepresentableOperation),
+            _ => return Err(OpLoweringRefusal::unrepresentable_operation()),
         })
     }
 
@@ -526,33 +556,25 @@ impl<'a> LowerCtx<'a> {
             #[cfg(test)]
             return Ok(());
             #[cfg(not(test))]
-            return Err(crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingProgramVariableAuthorization,
-            ));
+            return Err(OpLoweringRefusal::missing_program_variable());
         };
-        let info = self.use_info.ok_or_else(|| {
-            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
-        })?;
+        let info = self
+            .use_info
+            .ok_or_else(|| OpLoweringRefusal::missing_program_variable())?;
         for var in op.sources() {
             if var.constant_bits().is_some() {
                 continue;
             }
-            let value = info.exact_value_id_for_var(var).ok_or_else(|| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                )
-            })?;
+            let value = info
+                .exact_value_id_for_var(var)
+                .ok_or_else(|| OpLoweringRefusal::missing_program_variable())?;
             if !matches!(
                 resolver
                     .require_value(value)
-                    .map_err(|_| crate::analysis::lower::refusal(
-                        OpLoweringRefusal::MissingProgramVariableAuthorization
-                    ))?,
+                    .map_err(|_| OpLoweringRefusal::missing_program_variable())?,
                 PlannedValueSymbol::Bound(_)
             ) {
-                return Err(crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                ));
+                return Err(OpLoweringRefusal::missing_program_variable());
             }
         }
         Ok(())
@@ -739,19 +761,15 @@ impl<'a> LowerCtx<'a> {
             .value_id
             .is_some_and(|certificate| certificate != value_id)
         {
-            return Err(crate::analysis::lower::refusal(
-                OpLoweringRefusal::MissingProgramVariableAuthorization,
-            ));
+            return Err(OpLoweringRefusal::missing_program_variable());
         }
         if !visited.insert(value_id) {
             return Ok(None);
         }
         if let Some(resolver) = self.binding_names {
-            resolver.require_value(value_id).map_err(|_| {
-                crate::analysis::lower::refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                )
-            })?;
+            resolver
+                .require_value(value_id)
+                .map_err(|_| OpLoweringRefusal::missing_program_variable())?;
         }
         let expr = self.get_expr_with_depth(&value.var, depth, visited);
         visited.remove(&value_id);
@@ -790,9 +808,8 @@ impl<'a> LowerCtx<'a> {
 
     #[cfg(test)]
     fn fixture_constant_to_expr(&self, var: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
-        let value = parse_const_value(&var.name).ok_or_else(|| {
-            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
-        })?;
+        let value = parse_const_value(&var.name)
+            .ok_or_else(|| OpLoweringRefusal::missing_program_variable())?;
         Ok(self.constant_to_expr(value))
     }
 
@@ -1576,7 +1593,7 @@ mod tests {
         for op in opaque {
             assert_eq!(
                 ctx.op_to_expr(&op),
-                Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+                Err(OpLoweringRefusal::missing_machine_projection()),
                 "opaque operations must retain the canonical machine refusal"
             );
         }
@@ -1654,7 +1671,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:5000", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a raw SSA spelling cannot authorize an executable memory expression"
         );
     }
@@ -1695,7 +1712,7 @@ mod tests {
 
         assert_eq!(
             refusal,
-            Err(OpLoweringRefusal::MissingMachineProjectionAuthorization),
+            Err(OpLoweringRefusal::missing_machine_projection()),
             "custom-space memory requires an upstream machine projection"
         );
     }
@@ -1747,7 +1764,7 @@ mod tests {
 
         assert_eq!(
             ram,
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a raw value root cannot authorize an executable RAM access"
         );
         assert_eq!(custom, Ok(None));
@@ -1788,7 +1805,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("arg1", 0, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a pointer-like spelling is not a machine projection certificate"
         );
     }
@@ -1845,7 +1862,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a name-keyed address definition cannot authorize a subscript"
         );
     }
@@ -1888,7 +1905,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:stackaddr", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a name-keyed stack offset is not an ObjectId-backed projection"
         );
     }
@@ -1935,7 +1952,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a name-keyed expression cannot authorize pointer arithmetic"
         );
     }
@@ -1989,7 +2006,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a name-keyed alias chain cannot authorize an array subscript"
         );
     }
@@ -2042,7 +2059,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr: SSAVar::new("tmp:addr", 1, 8),
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "a name-keyed base alias cannot authorize member syntax"
         );
     }
@@ -2118,7 +2135,7 @@ mod tests {
                 space: r2il::SpaceId::Ram,
                 addr,
             }),
-            Err(OpLoweringRefusal::MissingProgramVariableAuthorization),
+            Err(OpLoweringRefusal::missing_program_variable()),
             "name-keyed pointer arithmetic cannot authorize an exact projection"
         );
     }

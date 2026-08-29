@@ -3116,13 +3116,13 @@ impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
 impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
     fn from(refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
         match refusal {
-            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization => {
+            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(..) => {
                 Self::MissingMachineProjectionAuthorization
             }
-            crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization => {
+            crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..) => {
                 Self::MissingProgramVariableAuthorization
             }
-            crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation => {
+            crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation(..) => {
                 Self::UnrepresentableOperation
             }
         }
