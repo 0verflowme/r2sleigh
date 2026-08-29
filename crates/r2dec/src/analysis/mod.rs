@@ -116,15 +116,9 @@ pub(crate) struct UseInfo {
     pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
     pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
-    pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
-    pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
     pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
-    #[cfg(test)]
-    pub(crate) formatted_defs: HashMap<String, CExpr>,
     pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
-    pub(crate) memory_stores: HashMap<String, String>,
     pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
-    pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
     pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
@@ -134,7 +128,6 @@ pub(crate) struct UseInfo {
     pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
-    pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
     pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
     /// Writes that reached the string-keyed half and not the value-keyed one.
@@ -421,13 +414,9 @@ impl UseInfo {
                 .source_value_id
                 .is_none_or(|value_id| !values.contains(&value_id))
         });
-        self.frame_object_field_roots
-            .retain(|_, value| !semantic_value_references_any(value, &values));
         self.switch_selector_roots
             .retain(|_, value| !semantic_value_references_any(value, &values));
         self.stable_stack_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_memory_values
             .retain(|_, value| !semantic_value_references_any(value, &values));
         for var in vars {
             self.value_ids_by_var.remove(&var);
