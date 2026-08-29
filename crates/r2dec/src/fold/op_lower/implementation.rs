@@ -2045,6 +2045,21 @@ impl<'a> FoldingContext<'a> {
         false
     }
 
+
+    /// A call renders as a statement of its own only when nothing names its
+    /// result.
+    ///
+    /// Where a `CallDefine` names it, that operation renders the call as the
+    /// right-hand side of the assignment that defines the register, and
+    /// emitting it here as well would call the function twice.
+    fn call_statement_unless_result_is_named(&self, call: CExpr) -> Option<CStmt> {
+        let site = (self.current_block_addr.get()?, self.current_op_idx.get()?);
+        if self.call_result_exprs_map().contains_key(&site) {
+            return None;
+        }
+        Some(CStmt::Expr(call))
+    }
+
     fn op_to_stmt_impl(&self, op: &SSAOp, frame: &LowerFrame) -> OpLoweringResult<Option<CStmt>> {
         let input = |input_idx: usize, var: &SSAVar| -> OpLoweringResult<CExpr> {
             Ok(self.observed_input(frame, input_idx, self.get_expr(var)?))
@@ -2529,7 +2544,7 @@ impl<'a> FoldingContext<'a> {
                 }?;
                 let func_expr = self.observed_input(frame, 0, func_expr);
                 let call = CExpr::call(func_expr, vec![]);
-                Some(CStmt::Expr(call))
+                self.call_statement_unless_result_is_named(call)
             }
             SSAOp::CallInd { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
@@ -2546,7 +2561,7 @@ impl<'a> FoldingContext<'a> {
                 };
                 let func_expr = self.observed_input(frame, 0, func_expr);
                 let call = CExpr::call(func_expr, vec![]);
-                Some(CStmt::Expr(call))
+                self.call_statement_unless_result_is_named(call)
             }
             SSAOp::PtrAdd {
                 dst,
@@ -2602,12 +2617,32 @@ impl<'a> FoldingContext<'a> {
                 // Phi nodes handled separately
                 None
             }
-            // The call statement defines the register; this only records that
-            // it does. The obligation model already classes it structural
-            // alongside `Nop`, and having no statement lowering for it refused
-            // every function that used a call's result -- `murmur3_32` at -O0
-            // calls `memcpy` and was refused for it.
-            SSAOp::CallDefine { .. } => None,
+            // The operation that gives a call's result a name.
+            //
+            // The call itself renders as a bare expression statement and
+            // assigns nothing, so this is what defines the register the callee
+            // returned in. Having no lowering for it refused every function
+            // that used a call's result at all -- `murmur3_32` at -O0 calls
+            // `memcpy` and was refused for that.
+            //
+            // The call expression is rendered here rather than by the call, so
+            // the call's own arm renders nothing when a result is recorded for
+            // its site. Otherwise the call would appear twice and be made
+            // twice.
+            SSAOp::CallDefine { dst } => {
+                let lhs = self.assignment_lhs_expr(dst)?;
+                let source_call = self
+                    .call_result_source_for_var(dst)
+                    .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+                let call = self
+                    .call_result_exprs_map()
+                    .get(&source_call)
+                    .cloned()
+                    .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
+                    .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+                let rhs = self.assignment_rhs_with_type_policy(dst, None, call);
+                self.assign_stmt(lhs, rhs)
+            }
             SSAOp::Nop => None,
             SSAOp::Unimplemented => Some(CStmt::comment("Unimplemented operation")),
             // No statement lowering for this operation. Saying which one is
