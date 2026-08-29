@@ -8,8 +8,6 @@ use r2types::TypeOracle;
 #[cfg(test)]
 use super::StackSlotProvenance;
 #[cfg(test)]
-use super::utils::format_traced_name;
-#[cfg(test)]
 use super::utils::parse_const_value;
 use super::{
     BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, UseInfo, ValueProvenance,
@@ -107,10 +105,6 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) binding_names: Option<&'a crate::binding_plan::BindingNameResolution>,
     pub(crate) use_info: Option<&'a UseInfo>,
     pub(crate) pinned: &'a HashSet<String>,
-    #[cfg(test)]
-    pub(crate) var_aliases: &'a HashMap<String, String>,
-    #[cfg(test)]
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     /// The table that owns plan-minted presentation handles. Production only
     /// reads an already-sealed handle; fixture adapters may mint test symbols.
@@ -126,20 +120,8 @@ impl<'a> LowerCtx<'a> {
         crate::symbol::spelling(self.symbols, id)
     }
 
-    #[cfg(test)]
-    fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.use_info
-            .and_then(|info| info.render_definition_for_name(name))
-    }
-
     fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
         self.use_info.and_then(|info| info.definition_for_var(var))
-    }
-
-    #[cfg(test)]
-    fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        self.use_info
-            .and_then(|info| info.render_semantic_value_for_name(name))
     }
 
     fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
@@ -150,12 +132,6 @@ impl<'a> LowerCtx<'a> {
     fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
         self.use_info
             .and_then(|info| info.forwarded_value_for_var(var))
-    }
-
-    #[cfg(test)]
-    fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        self.use_info
-            .and_then(|info| info.render_forwarded_value_for_name(name))
     }
 
     fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
@@ -175,11 +151,6 @@ impl<'a> LowerCtx<'a> {
     fn is_condition_value(&self, value: ValueId) -> bool {
         self.use_info
             .is_some_and(|info| info.is_condition_value(value))
-    }
-
-    #[cfg(test)]
-    fn var_alias_for_name(&self, name: &str) -> Option<&String> {
-        self.var_aliases.get(name)
     }
 
     fn exact_value_id(&self, var: &SSAVar) -> Result<ValueId, OpLoweringRefusal> {
@@ -208,17 +179,14 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// The identifier for a value, from the binding plan and nowhere else.
+    ///
+    /// This used to fall back, under test only, to a ladder of alias tables
+    /// spelling a name from the SSA variable. Release builds already refused
+    /// instead, and every one of those tables was empty, so the ladder decided
+    /// nothing while still being a second thing that could answer.
     pub(crate) fn var_name(&self, var: &SSAVar) -> Result<String, OpLoweringRefusal> {
-        if self.binding_names.is_some() {
-            return Ok(self.spelling(self.bound_program_symbol(var)?).to_string());
-        }
-
-        #[cfg(test)]
-        {
-            Ok(crate::naming::spell_var(var, self))
-        }
-        #[cfg(not(test))]
-        Err(OpLoweringRefusal::missing_program_variable())
+        Ok(self.spelling(self.bound_program_symbol(var)?).to_string())
     }
 
     pub(crate) fn get_expr(&self, var: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
@@ -240,10 +208,11 @@ impl<'a> LowerCtx<'a> {
             return self.fixture_constant_to_expr(var);
         }
 
+        // Without a binding plan there is no name to give, in any build. The
+        // string-keyed spelling that used to answer here could not recover a
+        // value identity from a rendered name, which is why it was already
+        // refused outside tests.
         if self.binding_names.is_none() {
-            #[cfg(test)]
-            return Ok(self.expr_for_ssa_name(var.display_name().as_str()));
-            #[cfg(not(test))]
             return Err(OpLoweringRefusal::missing_program_variable());
         }
 
@@ -304,68 +273,11 @@ impl<'a> LowerCtx<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn expr_for_ssa_name(&self, name: &str) -> CExpr {
-        assert!(
-            self.binding_names.is_none(),
-            "native lowering cannot recover value identity from a rendered spelling"
-        );
-        self.expr_for_ssa_name_with_depth(name, 0, &mut HashSet::new())
-    }
-
-    #[cfg(test)]
     pub(crate) fn expr_for_semantic_value(
         &self,
         value: &SemanticValue,
     ) -> Result<Option<CExpr>, OpLoweringRefusal> {
         self.render_semantic_value(value, 0, &mut HashSet::new())
-    }
-
-    #[cfg(test)]
-    fn expr_for_ssa_name_with_depth(
-        &self,
-        name: &str,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> CExpr {
-        if depth > 8 {
-            return crate::symbol::var_ref(
-                self.symbols,
-                format_traced_name(name, self.var_aliases),
-            );
-        }
-
-        if let Some(val) = parse_const_value(name) {
-            if let Some(expr) = self.resolve_addr_literal(val) {
-                return expr;
-            }
-            return if val > 0x7fffffff {
-                CExpr::UIntLit(val)
-            } else {
-                CExpr::IntLit(val as i64)
-            };
-        }
-
-        if let Some(prov) = self.forwarded_value_for_name(name)
-            && visited.insert(format!("prov:{name}"))
-        {
-            return self.expr_for_ssa_name_with_depth(&prov.source, depth + 1, visited);
-        }
-
-        if let Some(expr) = self.render_semantic_value_by_name(name, depth, visited) {
-            return expr;
-        }
-
-        if let Some(expr) = self.definition_for_name(name)
-            && visited.insert(name.to_string())
-        {
-            return expr.clone();
-        }
-
-        if let Some(alias) = self.var_alias_for_name(name) {
-            return crate::symbol::var_ref(self.symbols, alias.clone());
-        }
-
-        crate::symbol::var_ref(self.symbols, format_traced_name(name, self.var_aliases))
     }
 
     pub(crate) fn op_to_expr(&self, op: &SSAOp) -> Result<CExpr, OpLoweringRefusal> {
@@ -588,25 +500,6 @@ impl<'a> LowerCtx<'a> {
             },
             vec![self.get_expr(source)?],
         ))
-    }
-
-    #[cfg(test)]
-    fn render_semantic_value_by_name(
-        &self,
-        name: &str,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if depth > 8 || !visited.insert(format!("sem:{name}")) {
-            return None;
-        }
-
-        let rendered = self.semantic_value_for_name(name).and_then(|value| {
-            self.render_semantic_value(value, depth + 1, &mut HashSet::new())
-                .expect("fixture semantic value must have render authorization")
-        });
-        visited.remove(&format!("sem:{name}"));
-        rendered
     }
 
     fn render_semantic_value_for_var(
@@ -1342,23 +1235,6 @@ fn uint_type_from_size(size: u32) -> CType {
 }
 
 #[cfg(test)]
-impl crate::naming::NameSource for LowerCtx<'_> {
-    fn carrier_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn var_alias(&self, display: &str) -> Option<String> {
-        self.var_alias_for_name(display).cloned()
-    }
-
-    fn param_alias(&self, register: &str) -> Option<String> {
-        self.param_register_aliases
-            .get(&register.to_ascii_lowercase())
-            .cloned()
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1374,7 +1250,6 @@ mod tests {
         _use_counts: &'a HashMap<String, usize>,
         _condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
-        var_aliases: &'a HashMap<String, String>,
         _ptr_arith: &'a HashMap<String, PtrArith>,
         _stack_slots: &'a HashMap<String, StackSlotProvenance>,
         _forwarded_values: &'a HashMap<String, ValueProvenance>,
@@ -1382,7 +1257,6 @@ mod tests {
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbol_names: &'a HashMap<u64, String>,
     ) -> LowerCtx<'a> {
-        let param_register_aliases = Box::leak(Box::new(HashMap::new()));
         LowerCtx {
             binding_names: None,
             symbols,
@@ -1423,8 +1297,6 @@ mod tests {
                 info
             }))),
             pinned,
-            var_aliases,
-            param_register_aliases,
             type_oracle: None,
         }
     }
@@ -1435,7 +1307,6 @@ mod tests {
         let empty_exprs = HashMap::new();
         let empty_counts = HashMap::new();
         let empty_names = HashSet::new();
-        let empty_aliases = HashMap::new();
         let empty_ptrs = HashMap::new();
         let empty_slots = HashMap::new();
         let empty_forwarded = HashMap::new();
@@ -1446,7 +1317,6 @@ mod tests {
             &empty_counts,
             &empty_names,
             &empty_names,
-            &empty_aliases,
             &empty_ptrs,
             &empty_slots,
             &empty_forwarded,
@@ -1490,7 +1360,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1500,7 +1369,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1528,7 +1396,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1538,7 +1405,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1561,7 +1427,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1571,7 +1436,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1600,43 +1464,6 @@ mod tests {
     }
 
     #[test]
-    fn get_expr_keeps_ram_addresses_numeric_without_typed_string_fact() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let mut str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        str_map.insert(0x403048, "Usage: %s <test_num> [args...]\\n".to_string());
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
-        let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &var_aliases,
-            &ptr_arith,
-            &stack_slots,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        let var = SSAVar::new("ram:403048", 0, 8);
-        assert_eq!(
-            ctx.get_expr(&var).expect("test spelling is available"),
-            crate::symbol::var_ref(&symbols, "ram:403048")
-        );
-    }
-
-    #[test]
     fn ram_load_without_exact_value_bindings_is_refused() {
         let symbols = test_table();
         let fn_map = HashMap::new();
@@ -1646,7 +1473,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1656,7 +1482,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1686,7 +1511,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1696,7 +1520,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1724,7 +1547,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1737,7 +1559,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1780,7 +1601,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1790,7 +1610,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1819,7 +1638,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1847,7 +1665,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1877,7 +1694,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::from([(
             "tmp:stackaddr_1".to_string(),
@@ -1890,7 +1706,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1919,7 +1734,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1937,7 +1751,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -1966,7 +1779,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -1991,7 +1803,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -2020,7 +1831,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let ptr_arith = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
@@ -2044,7 +1854,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,
@@ -2073,7 +1882,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let var_aliases = HashMap::new();
         let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let addr = SSAVar::new("tmp:addr", 1, 8);
@@ -2120,7 +1928,6 @@ mod tests {
             &use_counts,
             &condition_vars,
             &pinned,
-            &var_aliases,
             &ptr_arith,
             &stack_slots,
             &forwarded_values,

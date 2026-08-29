@@ -53,8 +53,6 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) binding_names: Option<Rc<crate::binding_plan::BindingNameResolution>>,
     #[cfg(test)]
     pub(crate) stack_aliases_by_offset: BTreeMap<i64, StackAliasView>,
-    #[cfg(test)]
-    pub(crate) param_alias_by_reg: HashMap<String, String>,
     pub(crate) value_id_by_var: HashMap<SSAVar, ValueId>,
     pub(crate) var_by_value_id: HashMap<ValueId, SSAVar>,
     pub(crate) owner_expr_by_value: HashMap<ValueId, CExpr>,
@@ -85,8 +83,6 @@ pub(crate) struct PreparedSemanticViewInputs<'a> {
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
-    #[cfg(test)]
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
     pub(crate) function_facts: &'a FunctionFacts,
     #[cfg(test)]
     pub(crate) certified_rendering_required: bool,
@@ -173,8 +169,6 @@ impl PreparedSemanticView {
         let certified_rendering_required = inputs.certified_rendering_required;
         let mut view = Self {
             binding_names,
-            #[cfg(test)]
-            param_alias_by_reg: inputs.param_register_aliases.clone(),
             #[cfg(test)]
             certified_rendering_required,
             member_projected_accesses: inputs
@@ -444,22 +438,10 @@ fn prepared_value_program_expr(
     view: &PreparedSemanticView,
     var: &SSAVar,
 ) -> Option<CExpr> {
-    if view.binding_names.is_some() {
-        return view.admitted_value_symbol(var).map(CExpr::Var);
-    }
-
-    #[cfg(test)]
-    {
-        Some(crate::symbol::var_ref(
-            symbols,
-            crate::naming::spell_var(var, view),
-        ))
-    }
-    #[cfg(not(test))]
-    {
-        let _ = symbols;
-        None
-    }
+    // The binding plan answers, or nothing does. The alias ladder that used to
+    // spell a name here under test consulted tables with no writers.
+    let _ = symbols;
+    view.admitted_value_symbol(var).map(CExpr::Var)
 }
 
 fn prepared_parameter_program_expr(
@@ -474,18 +456,11 @@ fn prepared_parameter_program_expr(
             .map(CExpr::Var);
     }
 
-    #[cfg(test)]
-    {
-        view.param_alias_by_reg
-            .get(&var.name.to_ascii_lowercase())
-            .cloned()
-            .map(|name| crate::symbol::var_ref(symbols, name))
-    }
-    #[cfg(not(test))]
-    {
-        let _ = symbols;
-        None
-    }
+    // The parameter's certified slot answers, or nothing does. A register
+    // spelling looked up in an alias map is not an ABI slot, and the map had
+    // no writer.
+    let _ = symbols;
+    None
 }
 
 fn prepared_var(prepared: &SsaArtifact, value_id: ValueId) -> Option<&SSAVar> {
@@ -694,10 +669,6 @@ fn populate_prepared_render_definitions(
                     string_literals: crate::analysis::lower::no_string_literals(),
                     use_info: Some(use_info),
                     pinned: &use_info.pinned,
-                    #[cfg(test)]
-                    var_aliases: &use_info.var_aliases,
-                    #[cfg(test)]
-                    param_register_aliases: env.param_register_aliases,
                     type_oracle: env.type_oracle,
                 };
                 match lower.op_to_expr(op) {
@@ -4030,23 +4001,6 @@ fn normalize_prepared_inline_expr(expr: CExpr, depth: u32) -> CExpr {
 }
 
 #[cfg(test)]
-impl crate::naming::NameSource for PreparedSemanticView {
-    fn carrier_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn var_alias(&self, _display: &str) -> Option<String> {
-        None
-    }
-
-    fn param_alias(&self, register: &str) -> Option<String> {
-        self.param_alias_by_reg
-            .get(&register.to_ascii_lowercase())
-            .cloned()
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
@@ -4510,7 +4464,6 @@ mod tests {
         );
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
@@ -4520,7 +4473,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4569,7 +4521,6 @@ mod tests {
         let callee_facts = BTreeMap::new();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let callsite_facts = test_callsite_facts(&prepared);
         let function_facts = FunctionFacts::default()
             .with_callee_resolution(callee_resolution.clone())
@@ -4581,7 +4532,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4629,7 +4579,6 @@ mod tests {
             .insert(key, CalleeIdentity::from_name("sym.imp.printf"));
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let function_facts =
             FunctionFacts::default().with_callee_resolution(callee_resolution.clone());
 
@@ -4639,7 +4588,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4664,7 +4612,6 @@ mod tests {
         let prepared = test_prepared_call_artifact();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(
             &symbols,
@@ -4672,7 +4619,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: leak_function_facts(FunctionFacts::default()),
                 certified_rendering_required: false,
             },
@@ -4702,7 +4648,6 @@ mod tests {
         );
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(
             &symbols,
@@ -4710,7 +4655,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: leak_function_facts(FunctionFacts::default()),
                 certified_rendering_required: false,
             },
@@ -4767,7 +4711,6 @@ mod tests {
         summaries.summaries.insert(summary_id, summary);
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let callsite_facts = test_callsite_facts(&prepared);
         let function_facts = FunctionFacts::default()
             .with_callee_resolution(callee_resolution.clone())
@@ -4779,7 +4722,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4810,7 +4752,6 @@ mod tests {
         summaries.summaries.insert(summary_id, summary);
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(
             &symbols,
@@ -4818,7 +4759,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: leak_function_facts(FunctionFacts::default()),
                 certified_rendering_required: false,
             },
@@ -4850,7 +4790,6 @@ mod tests {
         call_facts.stack_argument_locations.clear();
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(
@@ -4859,7 +4798,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4882,7 +4820,6 @@ mod tests {
         let callsite_facts = test_callsite_facts(&prepared);
         let stack_slots = BTreeMap::new();
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
         let function_facts = FunctionFacts::default().with_callsites(callsite_facts.clone());
 
         let view = PreparedSemanticView::build(
@@ -4891,7 +4828,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &function_facts,
                 certified_rendering_required: false,
             },
@@ -4922,7 +4858,6 @@ mod tests {
             },
         )]);
         let visible_bindings = Vec::new();
-        let param_register_aliases = HashMap::new();
 
         let view = PreparedSemanticView::build(
             &symbols,
@@ -4930,7 +4865,6 @@ mod tests {
                 prepared: &prepared,
                 stack_slots: &stack_slots,
                 visible_bindings: &visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: leak_function_facts(FunctionFacts::default()),
                 certified_rendering_required: false,
             },
@@ -4956,11 +4890,9 @@ mod tests {
         let strings = HashMap::new();
         let binary_symbols = HashMap::new();
         let arg_regs = vec!["RDI".to_string()];
-        let param_register_aliases = HashMap::new();
         let caller_saved_regs = HashSet::from(["RCX".to_string()]);
         let env = PassEnv {
             binding_names: None,
-            carrier_aliases: crate::analysis::no_carrier_aliases(),
             string_literals: crate::analysis::lower::no_string_literals(),
             ptr_size: 8,
             sp_name: "RSP",
@@ -4975,7 +4907,6 @@ mod tests {
             callee_resolution: None,
             summary_view: None,
             arg_regs: &arg_regs,
-            param_register_aliases: &param_register_aliases,
             caller_saved_regs: &caller_saved_regs,
             type_oracle: None,
         };
@@ -4994,39 +4925,31 @@ mod tests {
         );
     }
 
+    /// Without a binding plan, nothing is spelled at all.
+    ///
+    /// This used to assert an ordering: that a storage spelling must not
+    /// preempt the value projection. The ordering existed because an alias
+    /// ladder could answer the same question, and every table it consulted had
+    /// no writer, so it decided nothing while still being a second answerer.
+    /// With the ladder gone the ordering question does not arise, and what is
+    /// worth pinning is that the projection is the only source of a name.
     #[test]
-    fn storage_spelling_does_not_preempt_the_value_projection() {
+    fn no_binding_plan_spells_nothing() {
         let symbols = test_table();
         let view = PreparedSemanticView::default();
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &SSAVar::constant(1, 8)),
-            None
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("tmp:1", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "t1"))
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("ram:401000", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "ram:401000"))
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("unique:1", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "t1"))
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("const:40", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "64")),
-            "constant-looking presentation spelling cannot preempt binding projection"
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("space1:20", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "space1:20"))
-        );
-        assert_eq!(
-            prepared_fallback_visible_expr(&symbols, &view, &test_var("rax", 0, 8)),
-            Some(crate::symbol::var_ref(&symbols, "rax"))
-        );
+        for var in [
+            SSAVar::constant(1, 8),
+            test_var("tmp:1", 0, 8),
+            test_var("ram:401000", 0, 8),
+            test_var("unique:1", 0, 8),
+            test_var("const:40", 0, 8),
+        ] {
+            assert_eq!(
+                prepared_fallback_visible_expr(&symbols, &view, &var),
+                None,
+                "an empty binding plan cannot name {var:?}"
+            );
+        }
     }
 
     #[test]

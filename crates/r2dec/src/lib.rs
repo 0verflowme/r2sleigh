@@ -40,7 +40,6 @@ pub mod control;
 mod effect_ledger;
 pub(crate) mod fold;
 pub mod highlight;
-pub(crate) mod naming;
 pub(crate) mod normalize;
 mod observation_journal;
 mod placement;
@@ -4546,8 +4545,6 @@ impl Decompiler {
                 stack_slots: &self.context.type_facts().stack_slots,
                 #[cfg(test)]
                 visible_bindings: &self.context.type_facts().visible_bindings,
-                #[cfg(test)]
-                param_register_aliases: &HashMap::new(),
                 function_facts: &self.context.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,

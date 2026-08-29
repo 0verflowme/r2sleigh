@@ -55,12 +55,6 @@ pub(crate) fn no_flag_registers() -> &'static std::collections::HashSet<String> 
     EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
-#[cfg(test)]
-pub(crate) fn no_carrier_aliases() -> &'static HashMap<String, String> {
-    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(HashMap::new)
-}
-
 #[allow(dead_code)]
 #[derive(Clone)]
 
@@ -89,10 +83,6 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
-    #[cfg(test)]
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
-    #[cfg(test)]
-    pub(crate) carrier_aliases: &'a HashMap<String, String>,
     /// Where a rendered name is written down, so building a reference can mint one.
     pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
@@ -124,8 +114,6 @@ pub(crate) struct UseInfo {
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
     pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
     pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
-    #[cfg(test)]
-    pub(crate) var_aliases: HashMap<String, String>,
     pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
     pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
     pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
@@ -248,7 +236,6 @@ pub(crate) struct FrameObjectFieldKey {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct StackInfo {
     pub(crate) stack_vars: HashMap<i64, String>,
-    pub(crate) stack_arg_aliases: HashMap<i64, String>,
     pub(crate) definition_overrides: HashMap<String, CExpr>,
 }
 
@@ -579,40 +566,12 @@ impl UseInfo {
         self.use_counts_by_value.get(&value).copied().unwrap_or(0)
     }
 
-    #[cfg(test)]
-    pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.definitions_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        self.definition_for_name(name)
-    }
-
     pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
         if self.ambiguous_value_vars.contains(var) {
             return None;
         }
         self.value_id_for_var(var)
             .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        self.semantic_value_for_name(name)
     }
 
     pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
@@ -625,20 +584,6 @@ impl UseInfo {
         // still about this value.
         self.value_id_for_var(var)
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn render_forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        self.forwarded_value_for_name(name)
     }
 
     /// File a definition against the value a spelling names, if it has none.

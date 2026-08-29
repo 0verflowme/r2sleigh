@@ -733,7 +733,6 @@ impl<'a> FoldingContext<'a> {
                         prepared,
                         stack_slots: self.inputs.stack_slots,
                         visible_bindings: self.inputs.visible_bindings,
-                        param_register_aliases: analysis::no_carrier_aliases(),
                         function_facts: self.inputs.function_facts,
                         #[cfg(test)]
                         certified_rendering_required: false,
@@ -832,10 +831,6 @@ impl<'a> FoldingContext<'a> {
             callee_resolution: self.inputs.callee_resolution(),
             summary_view: self.inputs.summary_view(),
             arg_regs: &self.inputs.arch.arg_regs,
-            #[cfg(test)]
-            param_register_aliases: analysis::no_carrier_aliases(),
-            #[cfg(test)]
-            carrier_aliases: analysis::no_carrier_aliases(),
             caller_saved_regs: &self.inputs.arch.caller_saved_regs,
             type_oracle: self.inputs.type_oracle,
         }
