@@ -1115,16 +1115,44 @@ location rather than that radare2 was silent.
 
 ### Stages, each with a gate
 
-Derive the size from the accesses when no declared slot answers, leaving
-everything else alone. The gate is that no differential cell is lost.
+The order below is not the obvious one, and the reason is worth stating because
+the obvious order was tried first and is wrong.
 
 Convert declared frame-pointer slots into entry-relative coordinates at ingest,
-so internal roots are stack-pointer-relative only. The gate is generation at or
-above twenty-nine.
+so that every internal root is stack-pointer-relative and a base is no longer
+part of an object's identity. The gate is generation at or above twenty-nine.
 
-Collapse the two root maps and delete `rebase_declared_frame_pointer`. The gate
-is that the rendering of the passing cells is byte-identical, which the
+Then derive the size from the accesses when no declared slot answers. The gate
+is that no differential cell is lost.
+
+Then collapse the two root maps and delete `rebase_declared_frame_pointer`. The
+gate is that the rendering of the passing cells is byte-identical, which the
 determinism property test is already able to check.
+
+### Why the width cannot be derived first
+
+Deriving the width first was implemented and reverted. It works -- the objects
+of `murmur3_32` acquire widths of eight and four, the refusal moves from
+`missing program-variable authorization` to a later machine-projection one, and
+the object at entry offset zero correctly keeps no width because it is the
+return address and no access agrees on a width for it.
+
+It also breaks `memory_ssa_separates_saved_sp_slot_from_frame_relative_local`,
+which exists to keep two objects apart: a saved stack-pointer slot at
+`(StackPointer, -8)` and a frame-relative local at `(FramePointer, -8)`. Same
+offset, different base, genuinely different places. Its assertion says that an
+uncaptured stack resource must not borrow another coordinate's width, and
+deriving from accesses does exactly that while two bases are still in play.
+
+Requiring the object's coordinate to be captured is not enough to satisfy it,
+because both of those objects have captured coordinates. The bases are what
+distinguish them, so the width may only be derived once a base is no longer how
+two objects are told apart -- which is the first stage, not this one.
+
+The test is the design speaking. In a unified coordinate system those two
+objects are distinguished by their true entry-relative offsets, the saved slot
+at entry minus eight and the local at entry minus eight minus the frame size,
+and no base is needed to separate them.
 
 Everything stack-related depends on this, so the corpus will move before it
 settles. That is expected, and it is why each stage has a gate rather than one
