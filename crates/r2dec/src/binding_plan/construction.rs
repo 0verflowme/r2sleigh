@@ -425,30 +425,6 @@ pub(super) fn binding_components(
         })
         .collect::<Vec<_>>();
     components.sort_by_key(|component| component.members.first().copied());
-    if std::env::var_os("R2DEC_TRACE_LOCS").is_some() {
-        for component in &components {
-            let locations = component
-                .members
-                .iter()
-                .filter_map(|value| {
-                    source
-                        .graph()
-                        .value(*value)
-                        .and_then(|v| v.canonical_storage)
-                        .map(|s| (s.space, s.offset))
-                })
-                .collect::<BTreeSet<_>>();
-            if locations.len() > 1 {
-                eprintln!(
-                    "component spans {} locations {:?} sources={:?} members={:?}",
-                    locations.len(),
-                    locations,
-                    component.sources,
-                    component.members
-                );
-            }
-        }
-    }
     Ok(components)
 }
 
