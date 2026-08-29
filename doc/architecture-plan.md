@@ -1378,3 +1378,46 @@ class is not a safe operation to measure by cell count. Every cell a refusal
 fix newly admits has to be checked against the differential oracle before the
 fix lands, and a fix that admits a wrong render is not finished, however correct
 its own reasoning is.
+
+### Track D: where the seventeen remaining refusals actually come from
+
+With the phi and span defects fixed the corpus is at thirty-seven of
+fifty-four and the refusals sort into five classes. Traced:
+
+**Seven cells: no call-site interface at all.** These refuse at the
+`CallDefine` arm for want of a call-result source, and the chain runs back
+through `process_call_result_flow_block`, which needs a complete call boundary,
+to `collect_source_boundary_facts`, which only completes a boundary inside
+`if let Some(interface) = machine_context.call_site_interface(call_site.id)`.
+For the failing calls that returns `None`, so the boundary is never completed
+and every use of a call's result in the function is refused.
+
+The failing calls in `murmur3_32` are three `call sym._rotl32`, and `_rotl32`
+is a local function in the same binary. radare2's own signature for it is
+`void sym._rotl32 ()` -- no arguments, void return -- for a function that takes
+two and returns one. So the answer is not to trust radare2 harder. It is that a
+callee we have the code for should have its interface derived from our own
+analysis, which is the "sibling-function linking" D2 already names.
+
+**Two facts about this class are worth separating.** The first is that a call
+emits one `CallDefine` per register it may have destroyed, and the renderer
+treated every one as the call's result: at -O0 `murmur3_32` has nine clobbers
+to one result at a single call. The second is that the result register and the
+lane the callee's prototype is declared at are different values -- an `int`
+returned in `rax` gives a `CallDefine` for `RAX` and one for `EAX` -- and the
+boundary certifies the carrier while the program reads the lane. Both are
+fixed and measured, and both are currently inert on rendering because the
+interface is missing underneath them, so neither is in the tree. They belong in
+the same change as whatever supplies the interface.
+
+**Three cells: `preserved_carrier_read_before_assignment`, and these are the
+real ones.** Two of the five were phis and are fixed. What is left is genuine
+`Insert`: `xor cl, byte [rdi + rax]` in `pearson` at both O1 and O2, and
+`movdqa xmm0, xmmword [...]` in `crc32_bitwise` at O2. A byte write into `rcx`
+really does preserve the other seven bytes, so `Insert` is the honest
+projection and the refusal is asking a fair question: the renderer emits the
+preserved bits by reading the object it is assigning, and nothing has assigned
+it yet.
+
+**The rest:** two `observation journal`, three `effect obligations refused`,
+two `read_before_assignment`. Not yet traced.
