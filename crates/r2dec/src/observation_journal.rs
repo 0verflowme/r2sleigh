@@ -2195,6 +2195,11 @@ impl LegacyObservationJournal {
     }
 
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
+        // Each of the three loops below names the exact cell it found empty
+        // under `R2DEC_TRACE_REFUSAL`, the same switch the lowering refusals
+        // use. A seal failure otherwise reports only that some value, use or
+        // write went unaccounted, and finding which one back from that cost
+        // four separate investigations.
         for (index, observation) in self.values.iter().enumerate() {
             if observation.is_none() {
                 let value = ValueId(index as u32);

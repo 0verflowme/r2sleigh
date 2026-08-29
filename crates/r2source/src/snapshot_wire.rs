@@ -3175,7 +3175,7 @@ mod tests {
         };
         let snapshot = OwnedFunctionSnapshot::from_captured_parts(
             base.machine().clone(),
-            base.function().clone(),
+            *base.function(),
             base.presentation().clone(),
             base.image().clone(),
             base.advisory_calls().to_vec().into_boxed_slice(),

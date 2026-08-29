@@ -5817,6 +5817,62 @@ pub(crate) fn test_native_semantic_report(
     }
 }
 
+/// Every label a `goto` in this statement names.
+fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet<String>) {
+    match statement {
+        CStmt::Goto(label) => {
+            into.insert(label.clone());
+        }
+        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+            collect_goto_targets(stmt, into);
+        }
+        CStmt::Block(statements) => {
+            for statement in statements {
+                collect_goto_targets(statement, into);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_goto_targets(then_body, into);
+            if let Some(else_body) = else_body {
+                collect_goto_targets(else_body, into);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            collect_goto_targets(body, into);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_goto_targets(init, into);
+            }
+            collect_goto_targets(body, into);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for statement in &case.body {
+                    collect_goto_targets(statement, into);
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    collect_goto_targets(statement, into);
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10161,61 +10217,5 @@ mod tests {
             Err(DecompileRenderRefusal::UnrepresentableControlFlow),
             "release builds must not admit a partially represented region domain"
         );
-    }
-}
-
-/// Every label a `goto` in this statement names.
-fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet<String>) {
-    match statement {
-        CStmt::Goto(label) => {
-            into.insert(label.clone());
-        }
-        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
-            collect_goto_targets(stmt, into);
-        }
-        CStmt::Block(statements) => {
-            for statement in statements {
-                collect_goto_targets(statement, into);
-            }
-        }
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_goto_targets(then_body, into);
-            if let Some(else_body) = else_body {
-                collect_goto_targets(else_body, into);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            collect_goto_targets(body, into);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                collect_goto_targets(init, into);
-            }
-            collect_goto_targets(body, into);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                for statement in &case.body {
-                    collect_goto_targets(statement, into);
-                }
-            }
-            if let Some(default) = default {
-                for statement in default {
-                    collect_goto_targets(statement, into);
-                }
-            }
-        }
-        CStmt::Empty
-        | CStmt::Expr(_)
-        | CStmt::Decl { .. }
-        | CStmt::Return(_)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
     }
 }

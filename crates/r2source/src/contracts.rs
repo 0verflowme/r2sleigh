@@ -2371,7 +2371,7 @@ mod tests {
         let higher = SourceStackAllocationContract::new(SourceStackGrowth::HigherAddresses);
         let base = SourceMachineRoles::default();
         assert_eq!(
-            base.clone().with_stack_allocation_contract(lower),
+            base.with_stack_allocation_contract(lower),
             Err(SourceMachineRolesError::InvalidStackAllocationContract)
         );
 
