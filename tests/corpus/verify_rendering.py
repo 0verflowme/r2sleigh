@@ -1490,11 +1490,16 @@ def certified_image_literals(
 def map_image_data(
     source: str, binary: Path
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
-    sections = _json_stdout(
-        ["r2", "-e", "scr.color=0", "-q", "-c", "iSj", str(binary)]
-    )
+    # Segments as well as sections. A base the compiler materializes at higher
+    # optimization levels is frequently the image base itself, which is inside
+    # the `__TEXT` segment but before the first section in it, so a
+    # section-only view called it unmapped and left the literal alone. The
+    # emitted C then dereferenced a raw absolute address and died, which the
+    # differential score reported as the decompiler producing a wrong answer.
+    mapped = _json_stdout(["r2", "-e", "scr.color=0", "-q", "-c", "iSj", str(binary)])
+    mapped += _json_stdout(["r2", "-e", "scr.color=0", "-q", "-c", "iSSj", str(binary)])
     mapped_ranges: list[tuple[int, int]] = []
-    for section in sections:
+    for section in mapped:
         start = int(section.get("vaddr", 0))
         size = int(section.get("vsize") or section.get("size") or 0)
         if start and size:
@@ -1509,12 +1514,21 @@ def map_image_data(
     records: list[dict[str, Any]] = []
     replacements: dict[int, str] = {}
     for index, address in enumerate(sorted(by_address)):
-        containing_range = next(
-            ((start, end) for start, end in mapped_ranges if start <= address < end),
-            None,
+        # Follow contiguous mapping past the end of the one section that
+        # happens to contain the address. A base loaded with `adrp` is a page
+        # address, and what it indexes is frequently in the next section along:
+        # pearson's table sits at base + 0xe6c while the containing section ends
+        # 3680 bytes in, so a blob cut at that boundary made the emitted C read
+        # off the end of its own capture. That is the verifier miscompiling the
+        # program it is checking, not the decompiler.
+        end = next(
+            (end for start, end in mapped_ranges if start <= address < end),
+            address,
         )
-        _, end = containing_range or (address, address)
-        length = min(4096, end - address)
+        for start, candidate_end in sorted(mapped_ranges):
+            if start <= end < candidate_end:
+                end = candidate_end
+        length = min(65536, end - address)
         data = _json_stdout(
             [
                 "r2",
