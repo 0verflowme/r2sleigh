@@ -1703,6 +1703,17 @@ impl LegacyObservationJournal {
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
+        for inst in crate::binding_plan::certified_return_control_insts(source.source()) {
+            let Some(definition) = graph.inst(inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst));
+            };
+            if definition.output.is_some() {
+                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::ReturnControl) {
+                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+                }
+            }
+        }
         for site in crate::binding_plan::certified_direct_control_target_sites(source.source()) {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectControlTarget) {
                 Some(r2ssa::ledger::ElisionReason::DirectControlTarget) | None => {}
@@ -2186,14 +2197,56 @@ impl LegacyObservationJournal {
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
         for (index, observation) in self.values.iter().enumerate() {
             if observation.is_none() {
-                return Some(LegacyObservationJournalError::RenderedValueRequired(
-                    ValueId(index as u32),
-                ));
+                let value = ValueId(index as u32);
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    let graph = self.source.graph();
+                    eprintln!(
+                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?}",
+                        self.plan.disposition(value),
+                        graph
+                            .def_inst(value)
+                            .and_then(|inst| graph.inst(inst))
+                            .map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(130)
+                                .collect::<String>()),
+                        uses = graph.use_sites(value).len(),
+                        storage = graph
+                            .value(value)
+                            .and_then(|v| v.canonical_storage)
+                            .map(|s| (s.space, s.offset, s.size))
+                    );
+                    for site in graph.use_sites(value) {
+                        eprintln!(
+                            "   use {site:?} -> {:?}",
+                            graph
+                                .inst(site.inst)
+                                .map(|inst| format!("{:?}", inst.payload)
+                                    .chars()
+                                    .take(110)
+                                    .collect::<String>())
+                        );
+                    }
+                }
+                return Some(LegacyObservationJournalError::RenderedValueRequired(value));
             }
         }
         for (inst, row) in self.uses.iter().enumerate() {
             for (input_idx, observation) in row.iter().enumerate() {
                 if observation.is_none() {
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        let graph = self.source.graph();
+                        eprintln!(
+                            "unaccounted use inst={inst} input={input_idx} payload={:?}",
+                            graph.inst(InstId(inst as u32)).map(|inst| format!(
+                                "{:?}",
+                                inst.payload
+                            )
+                            .chars()
+                            .take(120)
+                            .collect::<String>())
+                        );
+                    }
                     return Some(
                         LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(
                             UseSite {
@@ -2212,6 +2265,18 @@ impl LegacyObservationJournal {
             .enumerate()
         {
             if *has_output && observation.is_none() {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    let graph = self.source.graph();
+                    eprintln!(
+                        "unaccounted write inst={index} payload={:?}",
+                        graph
+                            .inst(InstId(index as u32))
+                            .map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(120)
+                                .collect::<String>())
+                    );
+                }
                 return Some(
                     LegacyObservationJournalError::ExactWriteRequiresRenderedOccurrence(InstId(
                         index as u32,

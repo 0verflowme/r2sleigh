@@ -73,6 +73,15 @@ fn upstream_zero_occurrence_outcome(
     }) {
         return Outcome::Elided(ElisionReason::ReturnControl);
     }
+    // The copies a return address reaches its return through. AArch64's `ret`
+    // is a copy of the link register into the program counter followed by a
+    // return on that, and the copy carries an obligation of its own that no
+    // statement answers, because the structured form says `return`.
+    if source_inst.is_some_and(|inst| {
+        crate::binding_plan::certified_return_control_insts(prepared).contains(&inst)
+    }) {
+        return Outcome::Elided(ElisionReason::ReturnControl);
+    }
     if source_inst.is_some_and(|inst| prepared.certificates().stack_geometry.insts.contains(&inst))
     {
         return Outcome::Elided(ElisionReason::DeadStackBase);

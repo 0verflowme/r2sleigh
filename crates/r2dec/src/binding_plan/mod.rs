@@ -154,7 +154,8 @@ pub(crate) enum ValueDisposition {
 /// This is a per-use answer. A return-address value may also have an ordinary
 /// program use, which must remain renderable even though the `Return` operand
 /// itself is machine control and has no C occurrence.
-pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
+/// The exact `Return` uses of a certified return address.
+fn certified_return_transfer_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
     let graph = source.graph();
     source
         .facts()
@@ -185,9 +186,38 @@ pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTr
 /// Only these values may be globally elided from the binding domain. The
 /// per-use accounting above remains independent so a mixed-use value stays
 /// bound while its exact `Return` use is still justified as non-rendered.
+/// Every use that only ever carries a return address to its return.
+///
+/// The transfer itself, and the copies a return address reaches it through.
+/// AArch64's `ret` lifts to a copy of the link register into the program
+/// counter and a return on that, so the copy's read of the link register is
+/// as much return control as the return's own read, and neither is rendered:
+/// the structured form says `return`.
+pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
+    let graph = source.graph();
+    let mut sites = certified_return_transfer_sites(source);
+    for value in certified_return_control_values(source) {
+        sites.extend(graph.use_sites(value).iter().copied());
+    }
+    sites
+}
+
+/// Definitions whose whole result is a return address on its way to the return.
+///
+/// The copy that moves a link register into the program counter defines a
+/// value the structured form never emits, so its write is accounted here
+/// rather than being left for a rendering that will not happen.
+pub(super) fn certified_return_control_insts(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
+    let graph = source.graph();
+    certified_return_control_values(source)
+        .into_iter()
+        .filter_map(|value| graph.def_inst(value))
+        .collect()
+}
+
 pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
     let graph = source.graph();
-    let sites = certified_return_control_sites(source);
+    let sites = certified_return_transfer_sites(source);
     let mut values = sites
         .iter()
         .filter_map(|site| graph.inst(site.inst)?.inputs.get(site.input_idx).copied())
@@ -205,6 +235,44 @@ pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BT
             .values()
             .flat_map(|certificate| certificate.values.iter().copied()),
     );
+
+    // Follow the copies a return address arrives through.
+    //
+    // AArch64's `ret` lifts to a copy of the link register into the program
+    // counter and then a return on that. The return's own input is certified,
+    // but the link register one copy upstream is not, so it was bound to an
+    // object no rendering ever emitted and the seal refused the function for a
+    // value nothing rendered.
+    //
+    // A value every one of whose uses is a copy producing something already
+    // control-only is itself control-only: it reaches nothing but the return.
+    loop {
+        let mut added = false;
+        for value in &graph.values {
+            if values.contains(&value.id) {
+                continue;
+            }
+            let uses = graph.use_sites(value.id);
+            if uses.is_empty() {
+                continue;
+            }
+            let reaches_only_control = uses.iter().all(|site| {
+                graph.inst(site.inst).is_some_and(|inst| {
+                    matches!(
+                        inst.payload,
+                        r2ssa::InstPayload::Op(r2ssa::SSAOp::Copy { .. })
+                    ) && inst.output.is_some_and(|output| values.contains(&output))
+                })
+            });
+            if reaches_only_control {
+                values.insert(value.id);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     values
 }
 
