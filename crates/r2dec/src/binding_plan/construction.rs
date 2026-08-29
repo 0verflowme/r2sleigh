@@ -194,33 +194,7 @@ pub(super) fn binding_components(
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let unobserved_merges = source.unobserved_merges();
-    let unobserved_values = source.unobserved_values();
-    let return_controls = certified_return_control_values(source);
-    let direct_control_targets = certified_direct_control_target_values(source);
-    let stack_frame_values = certified_stack_frame_values(source);
-    let stack_geometry_values = certified_stack_geometry_values(source);
-    let structural_unused =
-        source
-            .obligations()
-            .structural_unused_values(graph)
-            .ok_or(BindingPlanBuildError::Seal(
-                BindingPlanSourceMismatch::Authority,
-            ))?;
-    let eligible = graph
-        .values
-        .iter()
-        .map(|value| {
-            value.var.constant_bits().is_none()
-                && !unobserved_merges.contains(value.id)
-                && !unobserved_values.contains(&value.id)
-                && !return_controls.contains(&value.id)
-                && !direct_control_targets.contains(&value.id)
-                && !stack_frame_values.contains(&value.id)
-                && !stack_geometry_values.contains(&value.id)
-                && !structural_unused.contains(&value.id)
-        })
-        .collect::<Vec<_>>();
+    let eligible = super::rules::component_eligible_values(source_owned)?;
     let mut parent = (0..value_count).collect::<Vec<_>>();
     let mut rank = vec![0_u8; value_count];
 
@@ -284,45 +258,7 @@ pub(super) fn binding_components(
         }
     }
 
-    // Values one instruction reads together are live together.
-    //
-    // This is the whole interference test that matters here, and it is exact
-    // rather than approximate: if a single instruction takes both values as
-    // inputs, both must hold their content at that instruction, so they cannot
-    // be one C object. `fnv1a64` is the case -- `xor rax, r8` reads the byte
-    // just loaded and the hash carried from the previous iteration, and a loop
-    // carrier coalesced `rax`'s whole run into `r8` anyway. The rendering then
-    // said `R8_1 ^= R8_1`, which is zero, and the function returned zero for
-    // every non-empty input while compiling perfectly cleanly.
-    // Only across storage locations. A carrier coalescing two runs of the same
-    // register is the ordinary case and stays allowed; what has to be declined
-    // is folding one machine location into another while both are needed, which
-    // is what a copy into a carried register looks like.
-    let location_of = |value: ValueId| {
-        source
-            .graph()
-            .value(value)
-            .and_then(|value| value.canonical_storage)
-            .map(r2ssa::CanonicalStorageId::location)
-    };
-    let mut read_together = BTreeSet::<(ValueId, ValueId)>::new();
-    for inst in &source.graph().insts {
-        for (position, left) in inst.inputs.iter().enumerate() {
-            for right in inst.inputs.iter().skip(position + 1) {
-                if left == right {
-                    continue;
-                }
-                let (Some(left_location), Some(right_location)) =
-                    (location_of(*left), location_of(*right))
-                else {
-                    continue;
-                };
-                if left_location != right_location {
-                    read_together.insert((*left.min(right), *left.max(right)));
-                }
-            }
-        }
-    }
+    let read_together = super::rules::values_read_together(source.graph());
     // Whether merging every one of these values into one object would put two
     // values that some instruction reads together into that object.
     let merge_would_interfere = |parent: &mut Vec<usize>, values: &BTreeSet<ValueId>| {
@@ -336,9 +272,7 @@ pub(super) fn binding_components(
                 members.insert(ValueId(index as u32));
             }
         }
-        read_together
-            .iter()
-            .any(|(left, right)| members.contains(left) && members.contains(right))
+        super::rules::set_interferes(&read_together, &members)
     };
 
     if let Some(render) = source_owned.report().render() {

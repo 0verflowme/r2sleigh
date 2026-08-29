@@ -148,33 +148,7 @@ pub(super) fn seal_binding_components(
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let unobserved_merges = source.unobserved_merges();
-    let unobserved_values = source.unobserved_values();
-    let return_controls = certified_return_control_values(source);
-    let direct_control_targets = certified_direct_control_target_values(source);
-    let stack_frame_values = certified_stack_frame_values(source);
-    let stack_geometry_values = certified_stack_geometry_values(source);
-    let structural_unused =
-        source
-            .obligations()
-            .structural_unused_values(graph)
-            .ok_or(BindingPlanBuildError::Seal(
-                BindingPlanSourceMismatch::Authority,
-            ))?;
-    let eligible = graph
-        .values
-        .iter()
-        .map(|value| {
-            value.var.constant_bits().is_none()
-                && !unobserved_merges.contains(value.id)
-                && !unobserved_values.contains(&value.id)
-                && !return_controls.contains(&value.id)
-                && !direct_control_targets.contains(&value.id)
-                && !stack_frame_values.contains(&value.id)
-                && !stack_geometry_values.contains(&value.id)
-                && !structural_unused.contains(&value.id)
-        })
-        .collect::<Vec<_>>();
+    let eligible = super::rules::component_eligible_values(source_owned)?;
     let mut members_by_source = BTreeMap::<BindingCertificateSource, BTreeSet<ValueId>>::new();
 
     let mut values_by_span = BTreeMap::<SpanId, BTreeSet<ValueId>>::new();
@@ -202,35 +176,7 @@ pub(super) fn seal_binding_components(
         }
     }
 
-    // Values one instruction reads together are live together, and across
-    // storage locations that forbids coalescing them into one object. The
-    // construction pass applies the same rule; this derivation is deliberately
-    // independent of it, so the rule has to be stated here too or the two
-    // disagree and the seal rejects a plan that is correct.
-    let location_of = |value: ValueId| {
-        graph
-            .value(value)
-            .and_then(|value| value.canonical_storage)
-            .map(r2ssa::CanonicalStorageId::location)
-    };
-    let mut read_together = BTreeSet::<(ValueId, ValueId)>::new();
-    for inst in &graph.insts {
-        for (position, left) in inst.inputs.iter().enumerate() {
-            for right in inst.inputs.iter().skip(position + 1) {
-                if left == right {
-                    continue;
-                }
-                let (Some(left_location), Some(right_location)) =
-                    (location_of(*left), location_of(*right))
-                else {
-                    continue;
-                };
-                if left_location != right_location {
-                    read_together.insert((*left.min(right), *left.max(right)));
-                }
-            }
-        }
-    }
+    let read_together = super::rules::values_read_together(graph);
 
     if let Some(render) = source_owned.report().render() {
         for entity in render.certified_entities.values() {
@@ -260,9 +206,7 @@ pub(super) fn seal_binding_components(
                     merged.extend(span_members.iter().copied());
                 }
             }
-            let interferes = read_together
-                .iter()
-                .any(|(left, right)| merged.contains(left) && merged.contains(right));
+            let interferes = super::rules::set_interferes(&read_together, &merged);
             if !members.is_empty() && !interferes {
                 members_by_source
                     .entry(BindingCertificateSource::CertifiedEntity(entity.id()))

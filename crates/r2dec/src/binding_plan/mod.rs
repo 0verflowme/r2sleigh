@@ -631,6 +631,7 @@ pub(crate) struct BindingPlan {
 
 mod construction;
 mod name_resolution;
+mod rules;
 mod seal;
 
 pub(crate) use name_resolution::{
