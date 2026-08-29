@@ -2615,10 +2615,13 @@ impl SSAFunction {
                 continue;
             };
 
-            for phi in &block.phis {
-                control.poll()?;
-                apply_phi_family_effect(phi, &mut state, &family_info, canonical_storage_by_var);
-            }
+            control.poll()?;
+            apply_block_phi_family_effects(
+                &block.phis,
+                &mut state,
+                &family_info,
+                canonical_storage_by_var,
+            );
 
             let original_ops = std::mem::take(&mut block.ops);
             let mut normalized_ops = Vec::with_capacity(original_ops.len());
@@ -3002,14 +3005,13 @@ impl SSAFunction {
                             root,
                         );
                     }
-
-                    apply_phi_family_effect(
-                        phi,
-                        &mut family_state,
-                        family_info,
-                        &self.canonical_storage_by_var,
-                    );
                 }
+                apply_block_phi_family_effects(
+                    &block.phis,
+                    &mut family_state,
+                    family_info,
+                    &self.canonical_storage_by_var,
+                );
 
                 for op in &block.ops {
                     control.poll()?;
@@ -3296,9 +3298,12 @@ impl SSAFunction {
             return state;
         };
 
-        for phi in &block.phis {
-            apply_phi_family_effect(phi, &mut state, family_info, &self.canonical_storage_by_var);
-        }
+        apply_block_phi_family_effects(
+            &block.phis,
+            &mut state,
+            family_info,
+            &self.canonical_storage_by_var,
+        );
 
         for op in &block.ops {
             let rewritten = crate::optimize::map_sources_in_op(op, &|src| {
@@ -3965,6 +3970,34 @@ fn meet_family_states(
         merged.retain(|slot, root| state.get(slot) == Some(root));
     }
     merged
+}
+
+/// Fold a block's phi results into the register-family state.
+///
+/// A block's phis all take effect at one point, so the state they produce must
+/// not depend on the order they happen to be listed in. It did. Each phi kills
+/// the slots it overlaps before seeding its own, so the last phi to mention a
+/// register owns every width of it, and `block.phis` is ordered by the
+/// variable's display name. That name order puts `EDX` before `RDX` but `R8`
+/// before `R8D`, because the wide name is a prefix of the narrow one only for
+/// the extended registers. So a 32-bit loop carrier in `r8` erased its own
+/// 64-bit carrier root while the identical code in `rdx` did not, and only
+/// across a back edge, where no later program order re-establishes the carrier.
+///
+/// Widest last. The register's full merge owns it and the narrower merges stay
+/// slices of that, which is what program order already produces for a straight
+/// line of writes inside a block.
+fn apply_block_phi_family_effects(
+    phis: &[PhiNode],
+    state: &mut FamilyRootState,
+    family_info: &RegisterFamilyInfo,
+    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
+) {
+    let mut widest_last: Vec<&PhiNode> = phis.iter().collect();
+    widest_last.sort_by_key(|phi| phi.dst.size);
+    for phi in widest_last {
+        apply_phi_family_effect(phi, state, family_info, canonical_storage_by_var);
+    }
 }
 
 fn apply_phi_family_effect(

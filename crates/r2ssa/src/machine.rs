@@ -1870,6 +1870,16 @@ fn machine_write_disposition(
     let Some(output) = inst.output else {
         return MachineWriteDisposition::Refused(MachineWriteRefusal::IncoherentOperation);
     };
+    // A phi is not a machine event. It merges the values reaching a point; no
+    // instruction there writes a slice of a register and preserves the rest.
+    // Reading a carrier-relative projection off its geometry says otherwise,
+    // and for a merge of a sub-register that reads as `Insert`: an assertion
+    // that the merge preserves the carrier's other bits, which it neither does
+    // nor could. Where the carrier is live across the merge it has a phi of
+    // its own, and that phi is what answers for it.
+    if matches!(inst.payload, InstPayload::Phi { .. }) {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+    }
     let Some(storage) = artifact
         .graph()
         .value(output)
