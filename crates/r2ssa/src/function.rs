@@ -821,21 +821,6 @@ impl SsaArtifact {
         &self.facts
     }
 
-    /// Whether a narrow write to a general register clears the rest of it.
-    ///
-    /// x86-64 does this when it writes `eax`, AArch64 when it writes `w0`. It is
-    /// what makes two widths of one register one location: after a narrow write
-    /// the wide value is the narrow one zero-extended, so a value held at one
-    /// width answers for a read at the other. Where it does not hold, the upper
-    /// bytes keep whatever they had and the two widths are two values.
-    pub const fn narrow_write_clears_register(&self) -> bool {
-        matches!(
-            self.machine_context.architecture_family(),
-            crate::machine_context::MachineArchitectureFamily::X86_64
-                | crate::machine_context::MachineArchitectureFamily::AArch64
-        )
-    }
-
     pub const fn machine_context(&self) -> &SourceMachineContext {
         &self.machine_context
     }
@@ -2621,7 +2606,6 @@ impl SSAFunction {
         let block_in_states = self
             .compute_decompile_family_states_with_control(&family_info, control)?
             .incoming;
-        let mut synthesized_storages = Vec::new();
         let canonical_storage_by_var = &self.canonical_storage_by_var;
 
         for &addr in &self.block_order {
@@ -2655,27 +2639,10 @@ impl SSAFunction {
                     &family_info,
                     canonical_storage_by_var,
                 );
-                let cleared = materialize_cleared_register_write(
-                    &rewritten,
-                    &mut state,
-                    &family_info,
-                    canonical_storage_by_var,
-                    addr,
-                    op_index,
-                );
                 normalized_ops.push(rewritten);
-                if let Some((cleared, storage)) = cleared {
-                    let dst = cleared
-                        .dst()
-                        .expect("cleared-register materialization always writes its carrier")
-                        .clone();
-                    synthesized_storages.push((dst, storage));
-                    normalized_ops.push(cleared);
-                }
             }
             block.ops = normalized_ops;
         }
-        self.canonical_storage_by_var.extend(synthesized_storages);
 
         // Renaming treats overlapping register names as independent variables,
         // so a phi for a contained lane can still carry its version-zero name
@@ -3672,7 +3639,6 @@ struct RegisterFamilyMember {
 struct RegisterFamilyInfo {
     name_to_member: HashMap<String, RegisterFamilyMember>,
     /// Whether a 32-bit write to a general register clears the rest of it.
-    narrow_write_clears_register: bool,
     /// Which family covers a register-space range, for storage the arch does not name.
     family_ranges: Vec<(u64, u64, usize)>,
     family_widths_by_offset: HashMap<(usize, u64), Vec<u32>>,
@@ -3819,7 +3785,6 @@ impl RegisterFamilyInfo {
                 .insert(reg.size);
         }
 
-        let narrow_write_clears_register = arch_narrow_write_clears_register(arch);
         if arch.name.eq_ignore_ascii_case("x86-64") || arch.name.eq_ignore_ascii_case("x86") {
             seed_x86_low_register_aliases(&mut name_to_member, &mut family_width_sets);
         }
@@ -3864,36 +3829,11 @@ impl RegisterFamilyInfo {
         }
 
         Self {
-            narrow_write_clears_register,
             name_to_member,
             family_ranges: merged,
             family_widths_by_offset,
             family_slots,
         }
-    }
-
-    /// The register a narrow write defines in full, when the architecture says so.
-    ///
-    /// Writing `eax` on x86-64 does not leave the top half of `rax` alone: it
-    /// zeroes it. The p-code writes four bytes and says nothing about the other
-    /// four, so without this the model has the old value surviving there.
-    fn register_cleared_by_narrow_write(
-        &self,
-        member: RegisterFamilyMember,
-        written_width: u32,
-    ) -> Option<RegisterFamilySlot> {
-        if !self.narrow_write_clears_register || written_width != 4 {
-            return None;
-        }
-        // A general register, told from a vector one by how wide the whole family
-        // can be: eight bytes for rax, sixteen or more for a vector register. The
-        // widths at one offset cannot tell them apart, since a vector register has
-        // an eight-byte view too.
-        let widest = self.widest_slot_containing(member)?;
-        if widest.width != 8 || widest.offset != member.offset {
-            return None;
-        }
-        Some(widest)
     }
 
     /// The whole register a storage range is part of.
@@ -4171,58 +4111,6 @@ fn preserved_narrow_family_roots_for_widening(
             state.get(&slot).cloned().map(|root| (slot, root))
         })
         .collect()
-}
-
-/// Say in the graph what a narrow write does to the rest of its register.
-///
-/// The p-code for `mov eax, x` writes four bytes. The machine also clears the
-/// other four, so the model has to say so, or a later read of `rax` resolves to
-/// whatever it held before the write.
-fn materialize_cleared_register_write(
-    op: &SSAOp,
-    state: &mut FamilyRootState,
-    family_info: &RegisterFamilyInfo,
-    canonical_storage_by_var: &BTreeMap<SSAVar, CanonicalStorageId>,
-    block_addr: u64,
-    op_index: usize,
-) -> Option<(SSAOp, CanonicalStorageId)> {
-    // A call's result is whatever the callee left in the register, so the width
-    // its clobber is modelled at says nothing about the other bytes.
-    if matches!(op, SSAOp::CallDefine { .. }) {
-        return None;
-    }
-    let dst = op.dst()?;
-    let member = register_family_member_for(dst, family_info, canonical_storage_by_var)?;
-    let cleared = family_info.register_cleared_by_narrow_write(member, dst.size)?;
-    let widened = SSAVar::new(
-        format!("tmp:regclear:{block_addr:x}:{op_index:x}"),
-        1,
-        cleared.width,
-    );
-    // The write itself already said what its own bytes hold, and that is more
-    // precise than reading them back out of the widened value, so only the part
-    // the machine cleared is recorded here.
-    let narrow: Vec<_> = state
-        .iter()
-        .filter(|(slot, _)| family_slot_contains(cleared, **slot) && **slot != cleared)
-        .map(|(slot, root)| (*slot, root.clone()))
-        .collect();
-    kill_overlapping_family_roots(state, cleared);
-    state.insert(cleared, RegisterFamilyRoot::exact(widened.clone()));
-    for (slot, root) in narrow {
-        state.insert(slot, root);
-    }
-    Some((
-        SSAOp::IntZExt {
-            dst: widened,
-            src: dst.clone(),
-        },
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: cleared.offset,
-            size: cleared.width,
-        },
-    ))
 }
 
 fn materialize_register_alias_sources(
@@ -4598,7 +4486,7 @@ fn family_slot_is_maximal(family_info: &RegisterFamilyInfo, slot: RegisterFamily
 /// invalidates is its own range; the parts around it still hold what they held.
 ///
 /// This is only sound because a narrow write that clears the rest of its
-/// register now says so: `materialize_cleared_register_write` widens it first,
+/// register says so in the lift: Sleigh emits the widening `IntZExt` itself,
 /// so nothing here preserves bytes the machine zeroed.
 fn kill_overlapping_family_roots(state: &mut FamilyRootState, written: RegisterFamilySlot) {
     let Some(written_end) = written.offset.checked_add(u64::from(written.width)) else {
@@ -4900,15 +4788,6 @@ fn signed_stack_delta_through_roots(
     }
     let root = resolve_value_root(var, roots, family_state, family_info);
     (root != *var).then(|| signed_stack_delta(&root)).flatten()
-}
-
-/// Whether a narrow write to a general register clears the rest of it.
-///
-/// Both x86-64 and AArch64 do: writing `eax` or `w0` zeroes the upper half.
-fn arch_narrow_write_clears_register(arch: &ArchSpec) -> bool {
-    arch.name.eq_ignore_ascii_case("x86-64")
-        || arch.name.eq_ignore_ascii_case("aarch64")
-        || arch.name.eq_ignore_ascii_case("arm64")
 }
 
 fn signed_stack_delta(var: &SSAVar) -> Option<i64> {
@@ -9304,7 +9183,7 @@ mod tests {
                 src: SSAVar::new("XMM0_L2", 7, 4),
             },
         ]);
-        let ops = ops_without_register_clears(&ops_all);
+        let ops: Vec<&SSAOp> = ops_all.iter().collect();
 
         assert_eq!(ops.len(), 5);
         match &ops[1] {
@@ -9440,7 +9319,7 @@ mod tests {
                 src: SSAVar::new("XMM0_L3", 0, 4),
             },
         ]);
-        let ops = ops_without_register_clears(&ops_all);
+        let ops: Vec<&SSAOp> = ops_all.iter().collect();
 
         let lane_slices = ops
             .iter()
@@ -9474,7 +9353,7 @@ mod tests {
                 offset: 8,
             },
         ]);
-        let ops = ops_without_register_clears(&ops_all);
+        let ops: Vec<&SSAOp> = ops_all.iter().collect();
 
         assert_eq!(ops.len(), 3);
         match &ops[2] {
@@ -9515,7 +9394,7 @@ mod tests {
                 src: SSAVar::new("XMM0", 0, 16),
             },
         ]);
-        let ops = ops_without_register_clears(&ops_all);
+        let ops: Vec<&SSAOp> = ops_all.iter().collect();
 
         assert!(ops.iter().any(|op| matches!(
             op,
@@ -9599,7 +9478,7 @@ mod tests {
                 src: SSAVar::new("XMM0_L0", 0, 4),
             },
         ]);
-        let ops = ops_without_register_clears(&ops_all);
+        let ops: Vec<&SSAOp> = ops_all.iter().collect();
 
         let final_low = ops
             .windows(2)
@@ -9642,7 +9521,7 @@ mod tests {
 
         func.normalize_register_alias_sources(&make_arm64_alias_arch());
 
-        match ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops)[1] {
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
             SSAOp::IntSExt { src, .. } => {
                 assert_eq!(src, &SSAVar::new("tmp:24c00", 3, 4));
             }
@@ -9678,7 +9557,12 @@ mod tests {
 
         func.normalize_register_alias_sources(&make_arm64_alias_arch());
 
-        let ops = ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops);
+        let ops: Vec<&SSAOp> = func
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .collect();
         let extracted = match &ops[1] {
             SSAOp::Subpiece { dst, src, offset } => {
                 assert_eq!(src, &SSAVar::new("x8", 1, 8));
@@ -9691,16 +9575,6 @@ mod tests {
             SSAOp::IntRight { a, .. } => assert_eq!(a, &extracted),
             other => panic!("expected IntRight, got {other:?}"),
         }
-    }
-
-    /// The ops a test cares about, without the clearing writes the model adds
-    /// to say that a narrow x86 write zeroes the rest of its register.
-    fn ops_without_register_clears(ops: &[SSAOp]) -> Vec<&SSAOp> {
-        ops.iter()
-            .filter(|op| {
-                !matches!(op, SSAOp::IntZExt { dst, .. } if dst.name.starts_with("tmp:regclear:"))
-            })
-            .collect()
     }
 
     #[test]
@@ -9734,29 +9608,7 @@ mod tests {
 
         func.normalize_register_alias_sources(&arch);
 
-        let cleared = func
-            .get_block(0x1000)
-            .expect("entry block")
-            .ops
-            .iter()
-            .find_map(|op| match op {
-                SSAOp::IntZExt { dst, .. } if dst.name.starts_with("tmp:regclear:") => {
-                    Some(dst.clone())
-                }
-                _ => None,
-            })
-            .expect("narrow x86 write materializes its cleared full carrier");
-        assert_eq!(
-            func.canonical_storage_for_var(&cleared),
-            Some(CanonicalStorageId {
-                space: CanonicalStorageSpace::Register,
-                offset: 0,
-                size: 8,
-            }),
-            "synthetic full-carrier values retain source-owned storage provenance"
-        );
-
-        match ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops)[1] {
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
             SSAOp::IntSub { a, .. } => {
                 assert_eq!(a, &SSAVar::new("tmp:loaded_byte", 1, 1));
             }
@@ -9799,7 +9651,7 @@ mod tests {
 
         func.normalize_register_alias_sources(&arch);
 
-        match ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops)[2] {
+        match &func.get_block(0x1000).expect("entry block").ops[2] {
             SSAOp::IntLess { a, .. } => {
                 assert_eq!(a, &SSAVar::new("tmp:loaded_byte", 1, 1));
             }
@@ -9846,7 +9698,12 @@ mod tests {
 
         func.normalize_register_alias_sources(&arch);
 
-        let ops = ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops);
+        let ops: Vec<&SSAOp> = func
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .collect();
         assert_eq!(ops.len(), 4, "an exact narrow root needs no extraction");
         match &ops[2] {
             SSAOp::Copy { src, .. } => assert_eq!(src, &SSAVar::new("EAX", 2, 4)),
@@ -9890,7 +9747,12 @@ mod tests {
 
         func.normalize_register_alias_sources(&arch);
 
-        let ops = ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops);
+        let ops: Vec<&SSAOp> = func
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .collect();
         let extracted = match &ops[1] {
             SSAOp::Subpiece { dst, src, offset } => {
                 assert_eq!(src, &SSAVar::new("R8D", 1, 4));
@@ -9935,7 +9797,12 @@ mod tests {
 
         func.normalize_register_alias_sources(&arch);
 
-        let ops = ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops);
+        let ops: Vec<&SSAOp> = func
+            .get_block(0x1000)
+            .expect("entry block")
+            .ops
+            .iter()
+            .collect();
         let extracted = match &ops[1] {
             SSAOp::Subpiece { dst, src, offset } => {
                 assert_eq!(src, &SSAVar::new("tmp:loaded_len", 1, 8));
@@ -9982,7 +9849,7 @@ mod tests {
             SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("symbolic SSA should build");
         let block = artifact.function().get_block(0x1000).expect("entry block");
 
-        match ops_without_register_clears(&block.ops)[1] {
+        match &block.ops[1] {
             SSAOp::IntEqual { a, .. } => {
                 assert_eq!(a, &SSAVar::constant(0x41, 1));
             }
@@ -10147,7 +10014,7 @@ mod tests {
 
         func.normalize_register_alias_sources(&make_arm64_alias_arch());
 
-        match ops_without_register_clears(&func.get_block(0x1000).expect("entry block").ops)[1] {
+        match &func.get_block(0x1000).expect("entry block").ops[1] {
             SSAOp::Copy { src, .. } => {
                 assert_eq!(src, &SSAVar::constant(0xdead, 4));
             }

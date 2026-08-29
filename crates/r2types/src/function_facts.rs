@@ -4837,9 +4837,18 @@ mod tests {
             ),
         ];
         let mut block = R2ILBlock::new(0x401000, 2);
-        block.push(R2ILOp::Copy {
+        // An arithmetic write followed by the carrier clear the lift states
+        // for it. Arithmetic rather than a copy so the narrow result survives
+        // as its own definition instead of being folded into its uses, and the
+        // extension has an `eax` to name.
+        block.push(R2ILOp::IntAdd {
             dst: Varnode::register(0, 4),
-            src: Varnode::constant(7, 4),
+            a: Varnode::register(0, 4),
+            b: Varnode::constant(7, 4),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0, 8),
+            src: Varnode::register(0, 4),
         });
         if has_return {
             block.push(R2ILOp::Return {

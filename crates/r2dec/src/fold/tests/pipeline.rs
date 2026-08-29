@@ -933,9 +933,18 @@ mod tests {
         arch.register_projections = register_projections;
 
         let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
+        // A narrow register write as the lift states it: the arithmetic write,
+        // then Sleigh's own extension of the whole carrier. An arithmetic write
+        // rather than a copy so the narrow value survives as its own
+        // definition instead of being folded into its uses.
+        entry.push(R2ILOp::IntAdd {
             dst: Varnode::register(0, 4),
-            src: Varnode::constant(0xaa, 4),
+            a: Varnode::register(0, 4),
+            b: Varnode::constant(0xaa, 4),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0, 8),
+            src: Varnode::register(0, 4),
         });
         for offset in [0x20, 0x28] {
             entry.push(R2ILOp::IntAdd {
@@ -955,7 +964,7 @@ mod tests {
         let copy_idx = block
             .ops
             .iter()
-            .position(|op| matches!(op, SSAOp::Copy { dst, .. } if dst.size == 4))
+            .position(|op| matches!(op, SSAOp::IntAdd { dst, .. } if dst.size == 4))
             .expect("low-register write");
         let copy_inst = prepared
             .graph()

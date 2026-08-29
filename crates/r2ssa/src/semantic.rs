@@ -10159,10 +10159,32 @@ mod tests {
             ),
         ];
         let mut block = R2ILBlock::new(0x2f20, 4);
-        block.push(R2ILOp::Copy {
-            dst: Varnode::register(0, if write_logical_carrier { 4 } else { 8 }),
-            src: Varnode::constant(7, if write_logical_carrier { 4 } else { 8 }),
-        });
+        if write_logical_carrier {
+            // An arithmetic write rather than a copy, so that the narrow value
+            // survives as its own definition: a copy of a constant is folded
+            // into its uses, and then there is no `eax` for the extension to
+            // name.
+            block.push(R2ILOp::IntAdd {
+                dst: Varnode::register(0, 4),
+                a: Varnode::register(0, 4),
+                b: Varnode::constant(7, 4),
+            });
+        } else {
+            block.push(R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(7, 8),
+            });
+        }
+        if write_logical_carrier {
+            // What the lift emits for a narrow x86-64 register write: Sleigh
+            // states the carrier clear itself, on the op after the write, so
+            // the full return register is defined here without anything in
+            // this crate synthesizing a definition for it.
+            block.push(R2ILOp::IntZExt {
+                dst: Varnode::register(0, 8),
+                src: Varnode::register(0, 4),
+            });
+        }
         block.push(R2ILOp::Return {
             target: Varnode::register(16, 8),
         });

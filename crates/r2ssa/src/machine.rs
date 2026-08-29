@@ -1765,12 +1765,22 @@ fn exact_zero_extend_write(
     })
 }
 
-/// Project a narrow definition through the adjacent full-carrier extension
-/// that SSA alias normalization emitted for the same machine write.
+/// Project a narrow definition through the full-carrier extension the lift
+/// states for it.
 ///
-/// This is a dataflow certificate, not an architecture/name heuristic: the
-/// extension must be the immediately following instruction in the same block,
-/// consume this exact output, and define this exact canonical carrier.
+/// This is a dataflow certificate, not an architecture or name heuristic. On
+/// x86-64 Sleigh emits the carrier clear itself -- `RAX = zext(EAX)` in the
+/// same instruction's p-code as the write of `EAX` -- and that op is the fact
+/// this reads.
+///
+/// It is deliberately not an adjacency test. The clear is emitted next to the
+/// write, but by the time this runs the graph has been through renaming, alias
+/// normalization and copy propagation, and any of them can put an op in
+/// between or rewrite the extension to name the value the write copied rather
+/// than the write's own output. Both are the same statement about the machine.
+/// So the question asked here is the one actually meant: before anything reads
+/// the carrier, does the block define it as a zero-extension of what this write
+/// left in its slice?
 fn exact_adjacent_cleared_carrier_write(
     artifact: &SsaArtifact,
     inst: &GraphInst,
@@ -1784,35 +1794,72 @@ fn exact_adjacent_cleared_carrier_write(
         return None;
     }
     let value = inst.output?;
-    let next_ordinal = inst.ordinal.checked_add(1)?;
-    let next = artifact
-        .graph()
+    let graph = artifact.graph();
+    let storage_of = |candidate: ValueId| graph.value(candidate)?.canonical_storage;
+    let slice = storage_of(value)?;
+    let carrier = CanonicalStorageId {
+        space: CanonicalStorageSpace::Register,
+        offset: output.carrier.offset,
+        size: output.carrier.size,
+    };
+
+    // What this write leaves in its slice. A copy leaves exactly its source, so
+    // an extension naming that source states the same fact as one naming this
+    // write's output, and copy propagation is free to have rewritten it either
+    // way.
+    let mut written = vec![value];
+    if let InstPayload::Op(SSAOp::Copy { .. }) = &inst.payload
+        && let [source] = inst.inputs.as_slice()
+    {
+        written.push(*source);
+    }
+
+    let mut following: Vec<&GraphInst> = graph
         .insts
         .iter()
-        .find(|candidate| candidate.block == inst.block && candidate.ordinal == next_ordinal)?;
-    let InstPayload::Op(SSAOp::IntZExt { .. }) = &next.payload else {
-        return None;
-    };
-    if next.inputs.as_slice() != [value] {
-        return None;
+        .filter(|candidate| candidate.block == inst.block && candidate.ordinal > inst.ordinal)
+        .collect();
+    following.sort_by_key(|candidate| candidate.ordinal);
+
+    for next in following {
+        // A read of the carrier before it is cleared means the carrier still
+        // held something this write did not put there, so the write did not
+        // define it.
+        if next
+            .inputs
+            .iter()
+            .any(|input| storage_of(*input) == Some(carrier))
+        {
+            return None;
+        }
+        let Some(defined) = next.output.and_then(storage_of) else {
+            continue;
+        };
+        // The slice written again before the carrier was cleared: whatever
+        // clears the carrier later is about that later value, not this one.
+        if defined == slice {
+            return None;
+        }
+        if defined != carrier {
+            continue;
+        }
+        // The op that answers for the carrier. It certifies this write only if
+        // it is a zero-extension of what this write left in the slice.
+        let InstPayload::Op(SSAOp::IntZExt { .. }) = &next.payload else {
+            return None;
+        };
+        let [extended] = next.inputs.as_slice() else {
+            return None;
+        };
+        if !written.contains(extended) {
+            return None;
+        }
+        return Some(MachineWriteProjection::ZeroExtend {
+            from_width_bits: output.width_bits,
+            to_width_bits: output.carrier_bits,
+        });
     }
-    let carrier = next
-        .output
-        .and_then(|next_output| artifact.graph().value(next_output))
-        .and_then(|next_output| next_output.canonical_storage)?;
-    if carrier
-        != (CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: output.carrier.offset,
-            size: output.carrier.size,
-        })
-    {
-        return None;
-    }
-    Some(MachineWriteProjection::ZeroExtend {
-        from_width_bits: output.width_bits,
-        to_width_bits: output.carrier_bits,
-    })
+    None
 }
 
 fn machine_write_disposition(
@@ -5514,14 +5561,22 @@ mod tests {
             }
         );
 
-        let mut clearing_arch = register_geometry_arch();
-        clearing_arch.name = "x86-64".to_string();
+        // The clear is the lift's own statement, not an architecture name:
+        // Sleigh emits `RAX = zext(EAX)` on the op after the narrow write, and
+        // that is the op the certificate reads.
         let clearing_low = artifact_with_arch(
-            [R2ILOp::Copy {
-                dst: Varnode::register(0, 4),
-                src: Varnode::constant(7, 4),
-            }],
-            &clearing_arch,
+            [
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0, 4),
+                    a: Varnode::register(0, 4),
+                    b: Varnode::constant(7, 4),
+                },
+                R2ILOp::IntZExt {
+                    dst: Varnode::register(0, 8),
+                    src: Varnode::register(0, 4),
+                },
+            ],
+            &arch,
         );
         let clearing_projection =
             MachineProjection::from_artifact(&clearing_low).expect("clearing projection");

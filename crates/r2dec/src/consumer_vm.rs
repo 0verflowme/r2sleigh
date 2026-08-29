@@ -419,9 +419,18 @@ mod tests {
             dst: Varnode::unique(0x110, 4),
             src: Varnode::register(0x18, 4),
         });
-        block.push(R2ILOp::Copy {
+        // An arithmetic write, so the narrow result survives as its own
+        // definition rather than being folded into its uses.
+        block.push(R2ILOp::IntAdd {
             dst: Varnode::register(0x00, 4),
-            src: Varnode::constant(0, 4),
+            a: Varnode::register(0x18, 4),
+            b: Varnode::constant(0, 4),
+        });
+        // The carrier clear the lift states for a narrow x86-64 register
+        // write, which is what makes the full return register defined here.
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::register(0x00, 4),
         });
         block.push(R2ILOp::Return {
             target: Varnode::register(0x30, 8),
