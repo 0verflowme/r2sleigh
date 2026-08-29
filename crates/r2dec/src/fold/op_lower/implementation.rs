@@ -1795,6 +1795,20 @@ impl<'a> FoldingContext<'a> {
         )
     }
 
+    /// Cast to exactly this type unless the expression already says so.
+    ///
+    /// Unlike `cast_expr_if_needed` this does not consult a source hint: it is
+    /// for a type the operation requires rather than one the renderer is free
+    /// to leave implicit.
+    fn cast_expr_to(expr: CExpr, target: CType) -> CExpr {
+        if let CExpr::Cast { ty, .. } = expr.unobserved()
+            && *ty == target
+        {
+            return expr;
+        }
+        CExpr::cast(target, expr)
+    }
+
     fn cast_expr_if_needed(&self, expr: CExpr, target: CType, source: Option<&CType>) -> CExpr {
         if let CExpr::Cast { ty, .. } = expr.unobserved()
             && *ty == target
@@ -2691,10 +2705,19 @@ impl<'a> FoldingContext<'a> {
         let mut rhs_expr =
             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
         if let Some(ty) = operand_ty {
-            let a_hint = self.type_hint_for_var(a);
-            let b_hint = self.type_hint_for_var(b);
-            lhs_expr = self.cast_expr_if_needed(lhs_expr, ty.clone(), a_hint.as_ref());
-            rhs_expr = self.cast_expr_if_needed(rhs_expr, ty, b_hint.as_ref());
+            // Stated, not hinted. This type is the operation: `IntSLess` and
+            // `IntLess` differ only in the signedness of the operands they
+            // compare, so leaving it off changes what the comparison means.
+            //
+            // `cast_expr_if_needed` decides from the source type hint, and an
+            // absent hint made it conclude no cast was needed -- which is a
+            // conclusion drawn from not knowing. The x86 sign flag is
+            // `IntSLess(result, 0)`, and its operands carried no hint, so it
+            // rendered as `(uint32_t)result < (uint32_t)0`: false for every
+            // input. `cmp k, 8; jge` then exited on entry and the CRC inner
+            // loop never ran once.
+            lhs_expr = Self::cast_expr_to(lhs_expr, ty.clone());
+            rhs_expr = Self::cast_expr_to(rhs_expr, ty);
         }
         let rhs_raw = self.identity_simplify_binary(
             op,
