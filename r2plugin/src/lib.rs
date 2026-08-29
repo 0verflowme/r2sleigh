@@ -8481,18 +8481,24 @@ mod integration_tests {
                 parsed_context,
             ),
         );
+        // Entry-relative, not frame-relative. This home is twelve below the
+        // frame pointer, and the frame pointer is eight below the entry stack
+        // pointer, so the one coordinate objects are identified in puts it at
+        // minus twenty. It was minus twelve while a slot's position was
+        // recorded against whichever register happened to name it.
+        const LEN_HOME_OFFSET: i64 = -20;
         let len_home_objects = response
             .function_facts
             .render_facts()
             .stack_slots()
-            .filter_map(|(object, _, offset, _)| (offset == -12).then_some(object))
+            .filter_map(|(object, _, offset, _)| (offset == LEN_HOME_OFFSET).then_some(object))
             .collect::<Vec<_>>();
         let [len_home_object] = len_home_objects.as_slice() else {
-            panic!("expected one -12 parameter home, got {len_home_objects:?}");
+            panic!("expected one parameter home at {LEN_HOME_OFFSET}, got {len_home_objects:?}");
         };
         let len_home = response
             .function_facts
-            .authorized_stack_param_owner_render(*len_home_object, -12)
+            .authorized_stack_param_owner_render(*len_home_object, LEN_HOME_OFFSET)
             .unwrap_or_else(|| {
                 panic!(
                     "second parameter home should authorize its signature owner; type_facts={:?}",

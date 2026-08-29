@@ -4503,6 +4503,37 @@ fn collect_stack_geometry_certificate(
     }
 }
 
+/// The one entry-relative position a storage holds, if it holds exactly one.
+///
+/// A frame pointer established once has a single position for the whole body.
+/// A register reused for anything else has several, and then no displacement
+/// describes it and the caller must not pretend one does.
+fn unique_stack_root_for_storage(
+    function: &SSAFunction,
+    storage: crate::CanonicalStorageId,
+) -> Option<StackAddressRoot> {
+    let facts = function.decompile_prep_facts()?;
+    let mut found: Option<StackAddressRoot> = None;
+    for (var, root) in &facts.stack_address_roots {
+        // Only entry-relative positions. The register also carries a seeded
+        // root naming itself as its own base, which says nothing about where
+        // it sits relative to entry and would make every frame pointer look
+        // like it had two positions.
+        if root.base != StackAddressBase::StackPointer {
+            continue;
+        }
+        if function.canonical_storage_for_var(var) != Some(storage) {
+            continue;
+        }
+        match found {
+            None => found = Some(*root),
+            Some(existing) if existing == *root => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "this single canonical certificate pass explicitly joins each upstream fact owner without a parallel wrapper"
@@ -4525,6 +4556,30 @@ fn collect_prepared_function_certificates(
             let key = (slot.base(), slot.offset());
             if exact_stack_slots.insert(key, *slot).is_some() {
                 ambiguous_stack_slots.insert(key);
+            }
+            // A slot declared against the frame pointer, restated in the one
+            // coordinate objects are identified in.
+            //
+            // Objects are keyed by their entry-relative position now, so a
+            // declared slot that names the frame pointer as its base cannot be
+            // found by that name any more. The frame pointer has an
+            // entry-relative position of its own -- after `push rbp;
+            // mov rbp, rsp` it is the entry stack pointer less eight -- and
+            // adding the slot's displacement to it gives the same coordinate
+            // the object carries.
+            //
+            // Only when the base register has exactly one such position. More
+            // than one means the register is reused for something else and no
+            // single displacement describes it.
+            if slot.base() == StackAddressBase::FramePointer
+                && let Some(base_root) =
+                    unique_stack_root_for_storage(function, slot.base_storage())
+                && let Some(entry_offset) = base_root.offset.checked_add(slot.offset())
+            {
+                let translated = (StackAddressBase::StackPointer, entry_offset);
+                if exact_stack_slots.insert(translated, *slot).is_some() {
+                    ambiguous_stack_slots.insert(translated);
+                }
             }
         }
     }
@@ -9138,14 +9193,21 @@ mod tests {
                 ..
             })
         ));
+        // The two are still separate objects, and now they are separated by
+        // where they actually are rather than by which register named them.
+        // The frame pointer is established from the stack pointer here, so it
+        // has a provable entry-relative position of minus eight, and a local
+        // eight below it is at minus sixteen. Naming both minus eight and
+        // distinguishing them by base was the coordinate split that made one
+        // slot reachable under two incomparable names.
         assert!(matches!(
             artifact
                 .objects()
                 .object(local_store.location.object)
                 .map(|object| &object.kind),
             Some(ObjectKind::StackSlot {
-                base: StackAddressBase::FramePointer,
-                offset: -8,
+                base: StackAddressBase::StackPointer,
+                offset: -16,
                 ..
             })
         ));

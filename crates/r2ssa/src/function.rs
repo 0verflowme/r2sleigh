@@ -4864,16 +4864,21 @@ fn rebase_declared_frame_pointer(
     dst: &SSAVar,
     inherited: StackAddressRoot,
 ) -> StackAddressRoot {
-    match function
-        .canonical_storage_for_var(dst)
-        .and_then(|storage| declared_stack_bases.get(&storage))
-    {
-        Some(StackAddressBase::FramePointer) => StackAddressRoot {
-            base: StackAddressBase::FramePointer,
-            offset: 0,
-        },
-        Some(StackAddressBase::StackPointer) | None => inherited,
-    }
+    // The frame pointer keeps the position it inherited, when it has one.
+    //
+    // Where the function establishes its own frame -- `push rbp; mov rbp, rsp`
+    // -- the frame pointer is the entry stack pointer less eight, and that is
+    // provable. Resetting it to its own base at offset zero threw the proof
+    // away, and the same slot reached through the two registers then carried
+    // two incomparable coordinates; the object model read the disagreement as
+    // ambiguity and refused the slot outright.
+    //
+    // A frame pointer the function receives rather than establishes has no
+    // provable relation to the entry stack pointer, and for that case its own
+    // base is still the honest answer. The seeded root supplies it, and this
+    // no longer overwrites what the body proved.
+    let _ = (function, declared_stack_bases, dst);
+    inherited
 }
 
 /// The displacement an address computation adds, resolved through copies.
@@ -10424,13 +10429,19 @@ mod tests {
                     .map(|root| (typed_function.canonical_storage_for_var(dst), root))
             })
             .collect::<Vec<_>>();
-        assert!(op_roots.contains(&(
-            Some(fp_storage),
-            StackAddressRoot {
-                base: StackAddressBase::FramePointer,
-                offset: 0,
-            },
-        )));
+        // The frame pointer has a position now, not a base of its own. Here it
+        // is the entry stack pointer itself, which is what a frame pointer
+        // established before any allocation is.
+        assert!(
+            op_roots.contains(&(
+                Some(fp_storage),
+                StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: 0,
+                },
+            )),
+            "op roots were {op_roots:?}"
+        );
         assert!(op_roots.contains(&(
             Some(sp_storage),
             StackAddressRoot {
@@ -10484,10 +10495,14 @@ mod tests {
                     offset: -0x10,
                 }
         }));
+        // The same position, and now the same name for it. This used to assert
+        // that the general map called the location frame-relative while the
+        // entry map called it stack-relative -- one place under two
+        // coordinates, which is what the two maps existed to keep apart.
         assert!(op_roots.iter().any(|(_, root)| {
             *root
                 == StackAddressRoot {
-                    base: StackAddressBase::FramePointer,
+                    base: StackAddressBase::StackPointer,
                     offset: -0x10,
                 }
         }));
@@ -10592,10 +10607,13 @@ mod tests {
                 offset: 0,
             })
         );
+        // Same place, named in the one coordinate objects use. The frame
+        // pointer here is the entry stack pointer, so a local twenty-four
+        // below it is twenty-four below entry.
         assert_eq!(
             artifact.stack_address_root_for_value(local_address),
             Some(StackAddressRoot {
-                base: StackAddressBase::FramePointer,
+                base: StackAddressBase::StackPointer,
                 offset: -0x18,
             })
         );

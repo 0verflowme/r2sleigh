@@ -2383,10 +2383,18 @@ mod tests {
         assert_eq!(first.graph().blocks, second.graph().blocks);
         assert_eq!(first.graph().insts, second.graph().insts);
         assert_eq!(first.graph().values, second.graph().values);
-        assert_ne!(
+        // The two describe the same geometry, and now say so. Both compute
+        // their frame register from the stack pointer, and both store at the
+        // same entry-relative addresses; the only difference is which register
+        // the interface calls the frame pointer. That declaration used to move
+        // every object, because a slot's position was recorded against
+        // whichever register named it. In one coordinate it moves nothing.
+        assert_eq!(
             first.objects().entry_stack_roots,
             second.objects().entry_stack_roots
         );
+        // The declaration is still part of what the function is, so the
+        // semantic fingerprint continues to separate them.
         assert_ne!(
             stable_ssa_semantic_fingerprint(&first),
             stable_ssa_semantic_fingerprint(&second)
