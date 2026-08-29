@@ -968,3 +968,57 @@ flag stays off, because trading a differential cell for two raw cells is the
 wrong direction.
 
 The two remaining raw errors.
+
+## The complete inventory of what is not rendering
+
+Thirty-nine of fifty-four cells do not render. Every one has been traced to a
+cause, and all of them now land in files the concurrent session holds. The two
+below were traced after the previous section was written.
+
+### An indirect branch rendered as a switch still owes its target operand
+
+`murmur3_32` on x64 at O1 and O2 refuses with
+`exact_use_requires_rendered_occurrence` for input 0 of a
+`BranchInd { target: R8_11 }` -- the jump table for the tail `switch (len & 3)`.
+
+The structurer renders that transfer as a `CStmt::Switch` whose cases name the
+destinations directly, so the computed target address is never read in the
+emitted C. That is a correct elision, and nothing states it: the use cell stays
+empty and the seal refuses.
+
+It cannot be decided at the seal. Nothing the journal holds records that the
+structure took ownership of a transfer -- that state lives in the structurer,
+and the switch is built at `structure.rs:1613`. The elision has to be observed
+where the switch is rendered, in the same way an unconditional branch's
+obligation is elided as `DirectControlTarget`.
+
+Two cells.
+
+### A volatile-or-unknown effect with no instruction behind it
+
+`fnv1a32`, `djb2` and `sdbm` on x64 at O2 each refuse one obligation, and
+`xxhash32` refuses three. All are `VolatileOrUnknownEffect`, refused at the SSA
+layer as `UnsupportedEffect`.
+
+Tracing them shows the obligation carries no source instruction at all --
+`inst=None`, so there is no payload to inspect and nothing downstream can
+classify it. Whether these are honest lifting gaps or obligations minted
+without a backing instruction cannot be told from the consumer side. They are
+produced in `r2ssa/src/obligation.rs`, which is where that question has to be
+answered.
+
+Four cells.
+
+### Where the thirty-nine sit
+
+Nineteen are the do-while scope defect and six are structural refusals raised
+before the audit runs, both in `structure.rs`. Five are
+`preserved_carrier_read_before_assignment` in `machine.rs`. Four are the
+volatile effects above in `obligation.rs`. Three are `rendered_value_required`
+for values 77, 114 and 121, traced earlier to `semantic.rs`. Two are the
+indirect branch above.
+
+The split by optimization level is the more useful summary: O0 renders fourteen
+of eighteen, O1 and O2 render one of thirty-six between them. The optimized
+builds are the frontier, and the do-while shape is most of what stands in
+front of them.
