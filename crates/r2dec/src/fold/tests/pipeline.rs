@@ -2811,6 +2811,62 @@ mod tests {
         }));
     }
 
+    /// Property 3: the rendering does not depend on the order the input
+    /// arrives in.
+    ///
+    /// Blocks are keyed by address, so permuting the slice they are handed in
+    /// describes the same function. Anything that reaches the output from an
+    /// unordered container, or from the order blocks happened to be visited in,
+    /// shows up here as a byte difference between two renderings of one
+    /// function. The plan states this property and until now nothing proved it.
+    #[test]
+    fn rendering_does_not_depend_on_input_block_order() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 0x10);
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1020, 8),
+            cond: Varnode::register(0x38, 8),
+        });
+        let mut middle = R2ILBlock::new(0x1010, 0x10);
+        middle.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::register(0x38, 8),
+        });
+        let mut exit = R2ILBlock::new(0x1020, 0x10);
+        exit.push(R2ILOp::IntXor {
+            dst: Varnode::register(0x10, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(7, 8),
+        });
+        let blocks = [entry, middle, exit];
+
+        let render = |order: &[usize]| -> String {
+            let permuted = order
+                .iter()
+                .map(|index| blocks[*index].clone())
+                .collect::<Vec<_>>();
+            let fixture = prepared_from_r2il_blocks(&permuted, &arch).with_name("determinism");
+            let decompiler = crate::Decompiler::new(crate::DecompilerConfig::default());
+            decompiler.decompile_input(&crate::DecompilerInput::new(fixture.facts))
+        };
+
+        // The entry is whichever block comes first, so it stays first: moving it
+        // would describe a different function rather than the same one in a
+        // different order.
+        let canonical = render(&[0, 1, 2]);
+        assert_eq!(
+            canonical,
+            render(&[0, 2, 1]),
+            "input block order changed the rendering"
+        );
+    }
+
     #[test]
     fn rendered_integer_division_owns_its_exact_trap_obligation() {
         let arch = make_test_arch_x86_64();
