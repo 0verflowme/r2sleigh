@@ -95,10 +95,6 @@ pub(crate) struct UseInfo {
     pub(crate) value_ids_by_var: HashMap<SSAVar, ValueId>,
     pub(crate) ambiguous_value_vars: HashSet<SSAVar>,
     pub(crate) ambiguous_value_ids: BTreeSet<ValueId>,
-    #[cfg(test)]
-    pub(crate) value_ids_by_name: HashMap<String, ValueId>,
-    #[cfg(test)]
-    pub(crate) ambiguous_value_names: HashSet<String>,
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
     pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
     /// Condition codes as this target's register file defines them.
@@ -112,15 +108,6 @@ pub(crate) struct UseInfo {
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
-    /// Writes that reached the string-keyed half and not the value-keyed one.
-    ///
-    /// Every paired store is written through one helper, so the two halves
-    /// cannot drift by a missed call site. They still drift when the value has
-    /// no canonical identity to key on: the helper writes the name and skips the
-    /// `ValueId`. Those entries are exactly what the location model has to
-    /// account for before the string-keyed half can be derived rather than
-    /// stored, so counting them measures what is left of that step instead of
-    /// asserting it.
     /// The first fact dropped because its variable had no exact value identity.
     ///
     /// Each writer below keys its fact by `ValueId`, and where the variable has
@@ -288,15 +275,6 @@ impl UseInfo {
             return None;
         }
         self.value_ids_by_var.insert(var.clone(), value_id);
-
-        #[cfg(test)]
-        {
-            let display = var.display_name();
-            self.bind_value_name(display, value_id);
-            if var.version == 0 {
-                self.bind_value_name(var.name.clone(), value_id);
-            }
-        }
         self.vars_by_value_id
             .entry(value_id)
             .or_insert_with(|| var.clone());
@@ -346,35 +324,7 @@ impl UseInfo {
         for var in vars {
             self.value_ids_by_var.remove(&var);
             self.ambiguous_value_vars.insert(var.clone());
-            #[cfg(test)]
-            {
-                self.invalidate_value_name(var.display_name());
-                if var.version == 0 {
-                    self.invalidate_value_name(var.name);
-                }
-            }
         }
-    }
-
-    #[cfg(test)]
-    fn invalidate_value_name(&mut self, name: String) {
-        self.value_ids_by_name.remove(&name);
-        self.ambiguous_value_names.insert(name);
-    }
-
-    #[cfg(test)]
-    fn bind_value_name(&mut self, name: String, value_id: ValueId) {
-        if self.ambiguous_value_names.contains(&name) {
-            return;
-        }
-        if let Some(existing) = self.value_ids_by_name.get(&name).copied()
-            && existing != value_id
-        {
-            self.value_ids_by_name.remove(&name);
-            self.ambiguous_value_names.insert(name);
-            return;
-        }
-        self.value_ids_by_name.insert(name, value_id);
     }
 
     pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
@@ -411,25 +361,6 @@ impl UseInfo {
         }
     }
 
-    /// Resolve a spelling only when it is already bound to one exact value.
-    ///
-    /// Production never manufactures a `ValueId` for text: a spelling can
-    /// denote a binding containing several SSA values and is not upstream
-    /// evidence for any one of them. Legacy fixtures that have no SSA artifact
-    /// may allocate a private synthetic identity under `cfg(test)` only.
-    #[cfg(test)]
-    pub(crate) fn value_id_for_name_or_bind(&mut self, name: &str) -> Option<ValueId> {
-        if let Some(value_id) = self.value_id_for_name(name) {
-            return Some(value_id);
-        }
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        let value_id = ValueId(9500 + self.value_ids_by_name.len() as u32);
-        self.bind_value_name(name.to_string(), value_id);
-        self.value_id_for_name(name)
-    }
-
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
         self.exact_value_id_for_var(var)
     }
@@ -446,14 +377,6 @@ impl UseInfo {
             .get(&value_id)
             .filter(|stored| *stored == var)
             .map(|_| value_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_ids_by_name.get(name).copied()
     }
 
     pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
@@ -496,19 +419,6 @@ impl UseInfo {
         // still about this value.
         self.value_id_for_var(var)
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-    }
-
-    /// File a definition against the value a spelling names, if it has none.
-    #[cfg(test)]
-    pub(crate) fn insert_definition_for_name_if_absent(&mut self, name: &str, expr: CExpr) {
-        match self.value_id_for_name_or_bind(name) {
-            Some(value_id) => {
-                self.definitions_by_value.entry(value_id).or_insert(expr);
-            }
-            None => {
-                self.dropped_unkeyed_fact.get_or_insert("definitions");
-            }
-        }
     }
 
     pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {

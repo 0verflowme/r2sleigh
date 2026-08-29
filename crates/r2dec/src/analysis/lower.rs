@@ -1244,12 +1244,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn make_ctx<'a>(
         symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
-        _definitions: &'a HashMap<String, CExpr>,
-        _use_counts: &'a HashMap<String, usize>,
-        _condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
-        _ptr_arith: &'a HashMap<String, PtrArith>,
-        _forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
         #[cfg(test)] _symbol_names: &'a HashMap<u64, String>,
@@ -1262,34 +1257,7 @@ mod tests {
             // test hands in are seeded into a `UseInfo` rather than being
             // consulted as a second source. Leaked because the context borrows
             // it and the tests build both inline.
-            use_info: Some(Box::leak(Box::new({
-                let mut info = crate::analysis::UseInfo::default();
-                for (name, expr) in _definitions {
-                    info.insert_definition_for_name_if_absent(name, expr.clone());
-                }
-                for (name, count) in _use_counts {
-                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
-                        info.use_counts_by_value.insert(value_id, *count);
-                    }
-                }
-                for name in _condition_vars {
-                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
-                        info.condition_values.insert(value_id);
-                    }
-                }
-                for (name, ptr) in _ptr_arith {
-                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
-                        info.ptr_arith_by_value.insert(value_id, ptr.clone());
-                    }
-                }
-                for (name, provenance) in _forwarded_values {
-                    if let Some(value_id) = info.value_id_for_name_or_bind(name) {
-                        info.forwarded_values_by_value
-                            .insert(value_id, provenance.clone());
-                    }
-                }
-                info
-            }))),
+            use_info: Some(Box::leak(Box::new(crate::analysis::UseInfo::default()))),
             pinned,
             type_oracle: None,
         }
@@ -1298,20 +1266,11 @@ mod tests {
     #[test]
     fn floating_intrinsic_is_external_not_a_program_variable() {
         let symbols = test_table();
-        let empty_exprs = HashMap::new();
-        let empty_counts = HashMap::new();
         let empty_names = HashSet::new();
-        let empty_ptrs = HashMap::new();
-        let empty_forwarded = HashMap::new();
         let empty_addresses = HashMap::new();
         let ctx = make_ctx(
             &symbols,
-            &empty_exprs,
-            &empty_counts,
             &empty_names,
-            &empty_names,
-            &empty_ptrs,
-            &empty_forwarded,
             &empty_addresses,
             &empty_addresses,
             &empty_addresses,
@@ -1348,24 +1307,8 @@ mod tests {
         fn_map.insert(0x405000, "sym.wins".to_string());
         str_map.insert(0x405000, "string_loses".to_string());
         sym_map.insert(0x405000, "symbol_loses".to_string());
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
+        let ctx = make_ctx(&symbols, &pinned, &fn_map, &str_map, &sym_map);
 
         for addr in [0x401000, 0x402000, 0x403000, 0x404000, 0x405000] {
             assert_eq!(
@@ -1382,24 +1325,8 @@ mod tests {
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
+        let ctx = make_ctx(&symbols, &pinned, &fn_map, &str_map, &sym_map);
 
         assert_eq!(ctx.resolve_addr_literal(0xff), None);
         assert_eq!(ctx.resolve_addr_literal(0x5000), None);
@@ -1411,24 +1338,8 @@ mod tests {
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
+        let ctx = make_ctx(&symbols, &pinned, &fn_map, &str_map, &sym_map);
 
         let opaque = [
             SSAOp::CallOther {
@@ -1455,24 +1366,8 @@ mod tests {
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
+        let ctx = make_ctx(&symbols, &pinned, &fn_map, &str_map, &sym_map);
 
         assert_eq!(
             ctx.op_to_expr(&SSAOp::Load {
@@ -1491,20 +1386,10 @@ mod tests {
         let function_names = HashMap::new();
         let strings = HashMap::new();
         let binary_symbols = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
             &pinned,
-            &ptr_arith,
-            &forwarded_values,
             &function_names,
             &strings,
             &binary_symbols,
@@ -1525,23 +1410,13 @@ mod tests {
     #[test]
     fn semantic_load_rendering_requires_exact_value_identity_for_ram() {
         let symbols = test_table();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
         let function_names = HashMap::new();
         let strings = HashMap::new();
         let binary_symbols = HashMap::new();
         let ctx = make_ctx(
             &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
             &pinned,
-            &ptr_arith,
-            &forwarded_values,
             &function_names,
             &strings,
             &binary_symbols,
@@ -1577,24 +1452,8 @@ mod tests {
         let fn_map = HashMap::new();
         let str_map = HashMap::new();
         let sym_map = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
+        let ctx = make_ctx(&symbols, &pinned, &fn_map, &str_map, &sym_map);
 
         assert_eq!(
             ctx.op_to_expr(&SSAOp::Load {
@@ -1604,309 +1463,6 @@ mod tests {
             }),
             Err(OpLoweringRefusal::missing_program_variable()),
             "a pointer-like spelling is not a machine projection certificate"
-        );
-    }
-
-    #[test]
-    fn name_keyed_negative_index_definition_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let definitions = HashMap::from([(
-            "tmp:addr_1".to_string(),
-            CExpr::binary(
-                BinaryOp::Add,
-                crate::symbol::var_ref(&symbols, "arg1"),
-                CExpr::binary(
-                    BinaryOp::Mul,
-                    CExpr::Cast {
-                        ty: CType::Int(64),
-                        expr: Box::new(CExpr::unary(
-                            UnaryOp::Neg,
-                            crate::symbol::var_ref(&symbols, "arg2"),
-                        )),
-                    },
-                    CExpr::IntLit(4),
-                ),
-            ),
-        )]);
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5002", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("tmp:addr", 1, 8),
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "a name-keyed address definition cannot authorize a subscript"
-        );
-    }
-
-    #[test]
-    fn name_keyed_stack_slot_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let definitions = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5003", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("tmp:stackaddr", 1, 8),
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "a name-keyed stack offset is not an ObjectId-backed projection"
-        );
-    }
-
-    #[test]
-    fn name_keyed_base_plus_const_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let definitions = HashMap::from([(
-            "tmp:addr_1".to_string(),
-            CExpr::binary(
-                BinaryOp::Add,
-                crate::symbol::var_ref(&symbols, "arg1"),
-                CExpr::IntLit(8),
-            ),
-        )]);
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5004", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("tmp:addr", 1, 8),
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "a name-keyed expression cannot authorize pointer arithmetic"
-        );
-    }
-
-    #[test]
-    fn name_keyed_const_index_alias_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let definitions = HashMap::from([
-            ("tmp:index_1".to_string(), CExpr::IntLit(0)),
-            (
-                "tmp:addr_1".to_string(),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    crate::symbol::var_ref(&symbols, "arg1"),
-                    CExpr::binary(
-                        BinaryOp::Mul,
-                        crate::symbol::var_ref(&symbols, "tmp:index_1"),
-                        CExpr::IntLit(4),
-                    ),
-                ),
-            ),
-        ]);
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5005", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("tmp:addr", 1, 8),
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "a name-keyed alias chain cannot authorize an array subscript"
-        );
-    }
-
-    #[test]
-    fn name_keyed_base_alias_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let ptr_arith = HashMap::new();
-        let forwarded_values = HashMap::new();
-        let definitions = HashMap::from([
-            (
-                "tmp:base_1".to_string(),
-                crate::symbol::var_ref(&symbols, "rdx_1"),
-            ),
-            (
-                "tmp:addr_1".to_string(),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    crate::symbol::var_ref(&symbols, "tmp:base_1"),
-                    CExpr::IntLit(8),
-                ),
-            ),
-        ]);
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5006", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr: SSAVar::new("tmp:addr", 1, 8),
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "a name-keyed base alias cannot authorize member syntax"
-        );
-    }
-
-    #[test]
-    fn name_keyed_pointer_arithmetic_does_not_authorize_a_load() {
-        let symbols = test_table();
-        let fn_map = HashMap::new();
-        let str_map = HashMap::new();
-        let sym_map = HashMap::new();
-        let use_counts = HashMap::new();
-        let condition_vars = HashSet::new();
-        let pinned = HashSet::new();
-        let forwarded_values = HashMap::new();
-        let addr = SSAVar::new("tmp:addr", 1, 8);
-        let arr = SSAVar::new("arg1", 0, 8);
-        let ptr_local = SSAVar::new("tmp:arr_local", 1, 8);
-        let ptr_arith = HashMap::from([(
-            addr.display_name(),
-            PtrArith {
-                base: arr.clone(),
-                index: ptr_local,
-                element_size: 4,
-                is_sub: false,
-            },
-        )]);
-        let definitions = HashMap::from([
-            (
-                "tmp:arr_local_1".to_string(),
-                crate::symbol::var_ref(&symbols, "local_8"),
-            ),
-            (
-                "local_8".to_string(),
-                crate::symbol::var_ref(&symbols, "arg1"),
-            ),
-            (
-                "local_c".to_string(),
-                crate::symbol::var_ref(&symbols, "arg2"),
-            ),
-            (
-                addr.display_name(),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    crate::symbol::var_ref(&symbols, "local_8"),
-                    CExpr::binary(
-                        BinaryOp::Mul,
-                        crate::symbol::var_ref(&symbols, "local_c"),
-                        CExpr::IntLit(4),
-                    ),
-                ),
-            ),
-        ]);
-        let ctx = make_ctx(
-            &symbols,
-            &definitions,
-            &use_counts,
-            &condition_vars,
-            &pinned,
-            &ptr_arith,
-            &forwarded_values,
-            &fn_map,
-            &str_map,
-            &sym_map,
-        );
-
-        assert_eq!(
-            ctx.op_to_expr(&SSAOp::Load {
-                dst: SSAVar::new("tmp:5007", 1, 4),
-                space: r2il::SpaceId::Ram,
-                addr,
-            }),
-            Err(OpLoweringRefusal::missing_program_variable()),
-            "name-keyed pointer arithmetic cannot authorize an exact projection"
         );
     }
 }
