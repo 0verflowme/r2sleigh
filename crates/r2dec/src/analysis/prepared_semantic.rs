@@ -3,8 +3,7 @@ use std::rc::Rc;
 
 use r2ssa::function::DefLocation;
 use r2ssa::{
-    CompareKind, MemoryLocation, ObjectKind, ReturnCarrier, SSAOp, SSAVar, SsaArtifact, ValueId,
-    ValueOwner,
+    CompareKind, MemoryLocation, ObjectKind, SSAOp, SSAVar, SsaArtifact, ValueId, ValueOwner,
 };
 use r2types::{
     CalleeIdentity, CalleeResolutionFacts, CalleeTargetIdentityRequest, CallsiteKey,
@@ -16,10 +15,7 @@ use r2types::{
     VisibleBindingKind,
 };
 
-use super::{
-    BaseRef, DecompilerFacts, NormalizedAddr, SSABlock, ScalarValue, SemanticValue, StackInfo,
-    UseInfo, ValueProvenance,
-};
+use super::{DecompilerFacts, SSABlock, StackInfo, UseInfo, ValueProvenance};
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::binding_plan::{
     PlannedParameterSymbol, PlannedStackSymbol, PlannedValueSymbol, RenderedIdentityRefusal,
@@ -536,7 +532,7 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     let mut stack_info = StackInfo::default();
 
     seed_prepared_stack_facts(symbols, &mut use_info, &mut stack_info, prepared, view);
-    collect_prepared_runtime_facts(symbols, &mut use_info, blocks, prepared, view);
+    collect_prepared_runtime_facts(&mut use_info, blocks, prepared, view);
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, prepared, view, origins);
@@ -2331,26 +2327,6 @@ fn stack_offset_for_object_kind(kind: &ObjectKind) -> Option<i64> {
     }
 }
 
-fn prepared_stack_reload_param_alias_expr(
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-    value_id: ValueId,
-) -> Option<CExpr> {
-    let cert = prepared.stack_reload_certificate_for_value(value_id)?;
-    if prepared
-        .objects()
-        .object(cert.object)
-        .is_none_or(|fact| fact.kind.space() != r2il::SpaceId::Ram)
-    {
-        return None;
-    }
-    [cert.canonical_source, cert.source]
-        .into_iter()
-        .filter_map(|source| prepared.value_var(source))
-        .find_map(|var| view.admitted_parameter_symbol(prepared, var))
-        .map(CExpr::Var)
-}
-
 fn expr_for_compare_operand(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     inputs: &PreparedSemanticViewInputs<'_>,
@@ -3156,7 +3132,6 @@ fn seed_prepared_stack_facts(
 }
 
 fn collect_prepared_runtime_facts(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     blocks: &[SSABlock],
     prepared: &SsaArtifact,
@@ -3165,35 +3140,18 @@ fn collect_prepared_runtime_facts(
     for block in blocks {
         for phi in &block.phis {
             let _ = bind_prepared_value_id(use_info, view, &phi.dst);
-            #[cfg(test)]
-            {
-                let dst_key = phi.dst.display_name();
-                use_info.phi_sources.insert(
-                    dst_key.clone(),
-                    phi.sources.iter().map(|(_, src)| src.clone()).collect(),
-                );
-                use_info.producers.insert(
-                    dst_key,
-                    SSAOp::Phi {
-                        dst: phi.dst.clone(),
-                        sources: phi.sources.iter().map(|(_, src)| src.clone()).collect(),
-                    },
-                );
-            }
             for (_, src) in &phi.sources {
                 // Bind first, then let the one helper write both halves.
                 // Writing them here as well meant a second copy of the pairing
                 // rule living beside the first.
                 let _ = bind_prepared_value_id(use_info, view, src);
-                use_info.note_use_for_var(src);
             }
-            seed_prepared_value_fact(use_info, &phi.dst, view);
+            let _ = bind_prepared_value_id(use_info, view, &phi.dst);
         }
 
         for op in &block.ops {
             for src in op.sources() {
                 let _ = bind_prepared_value_id(use_info, view, src);
-                use_info.note_use_for_var(src);
             }
             // A value defined by adding or subtracting a constant is that
             // operand at an offset. This was the only fact the local-struct
@@ -3204,17 +3162,10 @@ fn collect_prepared_runtime_facts(
             // them. So the rule moves here and the overlay goes.
             if let SSAOp::CBranch { cond, .. } = op {
                 let _ = bind_prepared_value_id(use_info, view, cond);
-                use_info.note_condition_var(cond);
             }
 
             if let Some(dst) = op.dst() {
                 let _ = bind_prepared_value_id(use_info, view, dst);
-                #[cfg(test)]
-                {
-                    let dst_key = dst.display_name();
-                    use_info.producers.insert(dst_key, op.clone());
-                }
-                seed_prepared_value_fact(use_info, dst, view);
             }
 
             match op {
@@ -3252,36 +3203,6 @@ fn collect_prepared_runtime_facts(
                                 .dropped_unkeyed_fact
                                 .get_or_insert("forwarded_values");
                         }
-                    }
-                }
-                SSAOp::Load {
-                    dst,
-                    space: r2il::SpaceId::Ram,
-                    addr,
-                } => {
-                    let Some(offset) = prepared_direct_stack_load_offset(prepared, view, addr)
-                    else {
-                        continue;
-                    };
-                    let reload_value = bind_prepared_value_id(use_info, view, dst);
-                    let reload_param_expr = reload_value.and_then(|value_id| {
-                        prepared_stack_reload_param_alias_expr(prepared, view, value_id)
-                    });
-                    let stack_alias_expr =
-                        prepared_stack_alias_expr_for_offset(symbols, view, offset);
-                    if let Some(expr) = reload_param_expr.or(stack_alias_expr) {
-                        if let Some(value_id) = reload_value {
-                            use_info
-                                .definitions_by_value
-                                .entry(value_id)
-                                .or_insert_with(|| expr.clone());
-                        } else {
-                            use_info.dropped_unkeyed_fact.get_or_insert("definitions");
-                        }
-                        use_info.insert_semantic_value_for_value_if_absent(
-                            reload_value,
-                            SemanticValue::Scalar(ScalarValue::Expr(expr.clone())),
-                        );
                     }
                 }
                 _ => {}
@@ -3327,52 +3248,9 @@ fn populate_prepared_call_runtime_facts(
 
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
-                record_prepared_call_result_facts(use_info, site, prepared, view, &call_expr);
             }
         }
     }
-}
-
-fn seed_prepared_value_fact(use_info: &mut UseInfo, var: &SSAVar, view: &PreparedSemanticView) {
-    let bound_value_id = bind_prepared_value_id(use_info, view, var);
-    if let Some(expr) = view
-        .predicate_expr_for_cond(var)
-        .cloned()
-        .or_else(|| view.owner_expr_for_var(var).cloned())
-    {
-        if let Some(value_id) = bound_value_id {
-            use_info
-                .definitions_by_value
-                .entry(value_id)
-                .or_insert_with(|| expr.clone());
-        } else {
-            use_info.dropped_unkeyed_fact.get_or_insert("definitions");
-        }
-        if let Some(value_id) = bound_value_id {
-            use_info
-                .semantic_values_by_value
-                .entry(value_id)
-                .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
-        }
-    }
-}
-
-fn semantic_value_for_prepared_expr(
-    view: &PreparedSemanticView,
-    var: &SSAVar,
-    expr: CExpr,
-) -> SemanticValue {
-    if let Some(offset) = view.stack_offset_for_var(var)
-        && matches!(expr, CExpr::AddrOf(_))
-    {
-        return SemanticValue::Address(NormalizedAddr {
-            base: BaseRef::StackSlot(offset),
-            index: None,
-            scale_bytes: 0,
-            offset_bytes: 0,
-        });
-    }
-    SemanticValue::Scalar(ScalarValue::Expr(expr))
 }
 
 fn prepared_call_expr(
@@ -3452,27 +3330,6 @@ fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
             .take(call_view.authoritative_arg_values.len())
             .copied()
             .eq(call_view.authoritative_arg_values.iter().copied())
-}
-
-fn record_prepared_call_result_facts(
-    use_info: &mut UseInfo,
-    source_site: (u64, usize),
-    _prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-    call_expr: &CExpr,
-) {
-    for cert in view.call_result_facts_by_value.values().filter(|cert| {
-        cert.callsite.block_addr == source_site.0 && cert.callsite.op_index == source_site.1
-    }) {
-        let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
-            && matches!(&cert.carrier, ReturnCarrier::Register { .. });
-        if direct {
-            use_info
-                .definitions_by_value
-                .entry(cert.value)
-                .or_insert_with(|| call_expr.clone());
-        }
-    }
 }
 
 fn normalize_prepared_inline_expr(expr: CExpr, depth: u32) -> CExpr {

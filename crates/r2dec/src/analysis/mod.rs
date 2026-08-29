@@ -16,14 +16,6 @@ pub(crate) use prepared_semantic::{
     build_prepared_runtime_facts_with_control,
 };
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PtrArith {
-    pub(crate) base: SSAVar,
-    pub(crate) index: SSAVar,
-    pub(crate) element_size: u32,
-    pub(crate) is_sub: bool,
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {
@@ -48,8 +40,6 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
     pub(crate) ret_reg_name: &'a str,
-    /// Registers that are condition codes, as this target's register file defines them.
-    pub(crate) flag_regs: &'a std::collections::HashSet<String>,
     #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
@@ -78,15 +68,6 @@ pub(crate) struct UseInfo {
     pub(crate) ambiguous_value_vars: HashSet<SSAVar>,
     pub(crate) ambiguous_value_ids: BTreeSet<ValueId>,
     pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
-    pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
-    /// Condition codes as this target's register file defines them.
-    pub(crate) flag_regs: std::collections::HashSet<String>,
-    pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
-    pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
-    pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
-    pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
-    pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
-    pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
@@ -204,30 +185,6 @@ pub(crate) struct ValueProvenance {
     pub(crate) stack_slot: Option<i64>,
 }
 
-fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
-    value
-        .value_id
-        .is_some_and(|value_id| ids.contains(&value_id))
-}
-
-fn normalized_addr_references_any(addr: &NormalizedAddr, ids: &BTreeSet<ValueId>) -> bool {
-    matches!(&addr.base, BaseRef::Value(value) if value_ref_references_any(value, ids))
-        || addr
-            .index
-            .as_ref()
-            .is_some_and(|value| value_ref_references_any(value, ids))
-}
-
-fn semantic_value_references_any(value: &SemanticValue, ids: &BTreeSet<ValueId>) -> bool {
-    match value {
-        SemanticValue::Scalar(ScalarValue::Root(value)) => value_ref_references_any(value, ids),
-        SemanticValue::Scalar(ScalarValue::Expr(_)) | SemanticValue::Unknown => false,
-        SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
-            normalized_addr_references_any(addr, ids)
-        }
-    }
-}
-
 impl UseInfo {
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
         let conflicting_value = self
@@ -289,15 +246,8 @@ impl UseInfo {
         for value in &values {
             self.vars_by_value_id.remove(value);
             self.ambiguous_value_ids.insert(*value);
-            self.use_counts_by_value.remove(value);
-            self.definitions_by_value.remove(value);
-            self.semantic_values_by_value.remove(value);
-            self.ptr_arith_by_value.remove(value);
-            self.condition_values.remove(value);
             self.forwarded_values_by_value.remove(value);
         }
-        self.semantic_values_by_value
-            .retain(|_, value| !semantic_value_references_any(value, &values));
         self.forwarded_values_by_value.retain(|_, provenance| {
             provenance
                 .source_value_id
@@ -306,40 +256,6 @@ impl UseInfo {
         for var in vars {
             self.value_ids_by_var.remove(&var);
             self.ambiguous_value_vars.insert(var.clone());
-        }
-    }
-
-    pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
-        } else {
-            self.dropped_unkeyed_fact.get_or_insert("use_counts");
-        }
-    }
-
-    pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.condition_values.insert(value_id);
-        } else {
-            self.dropped_unkeyed_fact.get_or_insert("condition_vars");
-        }
-    }
-
-    /// Record a semantic value against the exact upstream value identity.
-    pub(crate) fn insert_semantic_value_for_value_if_absent(
-        &mut self,
-        value_id: Option<ValueId>,
-        value: SemanticValue,
-    ) {
-        match value_id {
-            Some(value_id) => {
-                self.semantic_values_by_value
-                    .entry(value_id)
-                    .or_insert(value);
-            }
-            None => {
-                self.dropped_unkeyed_fact.get_or_insert("semantic_values");
-            }
         }
     }
 
