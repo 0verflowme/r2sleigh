@@ -969,56 +969,85 @@ wrong direction.
 
 The two remaining raw errors.
 
-## The complete inventory of what is not rendering
+## Architecture work: what was done and what it cost
 
-Thirty-nine of fifty-four cells do not render. Every one has been traced to a
-cause, and all of them now land in files the concurrent session holds. The two
-below were traced after the previous section was written.
+All four architecture items are settled. Three needed a change, one turned
+out not to exist, and two of the four were diagnosed wrongly first -- both
+times by reasoning from the symptom instead of tracing the value.
 
-### An indirect branch rendered as a switch still owes its target operand
+### A1. A declaration the read cannot see
 
-`murmur3_32` on x64 at O1 and O2 refuses with
-`exact_use_requires_rendered_occurrence` for input 0 of a
-`BranchInd { target: R8_11 }` -- the jump table for the tail `switch (len & 3)`.
+Diagnosed first as a structurer defect: `Region::DoWhileLoop` flattens its
+condition block's statements into the body while the condition expression
+stays outside, so a temporary the body declares is read out of scope. The
+proposed fix was to reshape the loop into `while (1) { body; if (!cond) break; }`.
 
-The structurer renders that transfer as a `CStmt::Switch` whose cases name the
-destinations directly, so the computed target address is never read in the
-emitted C. That is a correct elision, and nothing states it: the use cell stays
-empty and the seal refuses.
+That was wrong. Tracing the binding rather than the symptom showed the
+condition temporary is a plan binding carrying an `Inline` decision, and
+inlining is what moves its declaration into the body. The loop shape never
+had to change.
 
-It cannot be decided at the seal. Nothing the journal holds records that the
-structure took ownership of a transfer -- that state lives in the structurer,
-and the switch is built at `structure.rs:1613`. The elision has to be observed
-where the switch is rendered, in the same way an unconditional branch's
-obligation is elided as `DirectControlTarget`.
+Whether an inline is expressible is a fact about the emitted tree, not about
+the occurrence set the decisions were derived from, so the tree is asked:
+apply, check that every name is declared in a scope that dominates its reads,
+and demote any inline the check reports to the lexical declaration it now
+carries as a fallback. A demotion only ever turns an inline into a
+declaration, so it terminates.
 
-Two cells.
+Generation 15 to 26, raw 14 to 22, diagnostic and differential 12 to 20.
 
-### A volatile-or-unknown effect with no instruction behind it
+### A2. A constant is a boolean
 
-`fnv1a32`, `djb2` and `sdbm` on x64 at O2 each refuse one obligation, and
-`xxhash32` refuses three. All are `VolatileOrUnknownEffect`, refused at the SSA
-layer as `UnsupportedEffect`.
+Diagnosed first as certificates keyed on pre-prep value ids, invalidated by
+any pass that renumbers. Also wrong: certificates are already collected after
+prep, and every memory-access fact matched its site exactly when traced.
 
-Tracing them shows the obligation carries no source instruction at all --
-`inst=None`, so there is no payload to inspect and nothing downstream can
-classify it. Whether these are honest lifting gaps or obligations minted
-without a backing instruction cannot be told from the consumer side. They are
-produced in `r2ssa/src/obligation.rs`, which is where that question has to be
-answered.
+The real blocker was `value_has_boolean_producer`, which decides whether a
+value may be interned as a boolean by walking back to a producing comparison.
+Folding `0xfff1 == 0` replaces that comparison with a `Copy` of a constant,
+and a constant has no defining instruction, so the walk concluded the value
+had never been boolean and refused every use of the select reading it -- the
+divide-by-zero guard Sleigh emits around a division. A constant zero or one
+is a boolean; constant folding a comparison is exactly how a boolean becomes
+one.
 
-Four cells.
+With that fixed, `enable_inst_combine` could be turned on for the decompile
+path, which is what removes `EAX_0 = EAX_0 ^ EAX_0` -- an uninitialised read
+of an entry value that no internal check refuses, and the deliberate hole in
+property 1's second half.
 
-### Where the thirty-nine sit
+Raw 22 to 27, raw errors 4 to 0. Every function that renders now compiles
+under a strict dialect with warnings fatal.
 
-Nineteen are the do-while scope defect and six are structural refusals raised
-before the audit runs, both in `structure.rs`. Five are
-`preserved_carrier_read_before_assignment` in `machine.rs`. Four are the
-volatile effects above in `obligation.rs`. Three are `rendered_value_required`
-for values 77, 114 and 121, traced earlier to `semantic.rs`. Two are the
-indirect branch above.
+### A3. Not needed
 
-The split by optimization level is the more useful summary: O0 renders fourteen
-of eighteen, O1 and O2 render one of thirty-six between them. The optimized
-builds are the frontier, and the do-while shape is most of what stands in
-front of them.
+Structural control ownership was to be made visible at the seal so that a
+`BranchInd` rendered as a switch could state the elision of its target
+operand. Enabling `inst_combine` removed the two cells that motivated it.
+
+The architectural gap is real -- nothing the journal holds records that the
+structure took ownership of a transfer -- but there is no failing case, and
+writing the mechanism ahead of a trace is the exact move this project's
+history warns against. It is recorded here and left unbuilt.
+
+### A4. Determinism, proved rather than asserted
+
+Property 3 had one `shuffle` reference in the tree. It now has a property
+test that renders one function from two orderings of its input blocks and
+requires byte-identical output, with the entry block held first because the
+first block is what defines the entry.
+
+Nothing was found to fix. The corpus repeat comparison is the stronger
+probe and it agrees: all fifty-four cells are byte-identical across two
+separate runs. That is decisive rather than merely encouraging, because
+Rust seeds each process's hash maps differently, so any hash iteration
+order reaching the output would have diverged between the two processes.
+
+### Where the properties stand
+
+Property 1 is enforced, both halves: the dominating-scope check drives
+placement's own inline decision, and the uninitialised entry read it could
+not refuse is now never generated. Property 2 is tripwired by the raw gate,
+which is at zero errors. Property 3 has a test and passes it. Property 4 was
+already enforced, and is the check that caught every regression made against
+this branch.
