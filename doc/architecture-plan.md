@@ -1263,3 +1263,118 @@ Expect the corpus to fall during A and B. It is a canary, and the ledger is the
 instrument: `rendered + justified_elision + refused = total`, `unaccounted = 0`,
 `defects = 0` on accepted output. A fall with the ledger balanced is the rewrite
 working; a rise with it unbalanced is the rewrite being cheated.
+
+## Revision 4 -- what the tracks found when they were run
+
+Tracks A through D were written from a reading of the code. Running them
+changed what several of them are about, and the corrections are worth more than
+the original statements, so they are recorded here rather than edited in above.
+
+### Track A: most of it was unread, and one part of it was refusing
+
+A1's classification found six `UseInfo` fields with no reader at all, and the
+whole name-keyed identity -- `value_ids_by_name`, `ambiguous_value_names`, and
+a `value_id_for_name_or_bind` that minted `ValueId(9500 + len)` for any
+spelling that had none -- reachable only from the lowering tests. That last
+part was not merely unused but inert: a minted identity is written to the
+name-keyed map while every lookup that matters goes through `value_ids_by_var`,
+which the fixtures never seeded. Deleting the seeding entirely left every test
+passing, which says the fixtures had been running against an empty `UseInfo`.
+
+Two findings from A were not anticipated by it.
+
+The first is that a deleted table can keep refusing. `merge_prepared_stack_slot`
+lost its destination field and still reported a dropped fact whenever a slot had
+no value identity, and that report is read at the lowering catch-all to refuse
+the function. A refusal on behalf of a table that no longer exists is not
+conservative, it is false, and nothing about the deletion made it visible. Any
+further field deletion has to check for this shape: the writer that survives its
+table and reports the loss.
+
+The second is that `definitions_by_value` was not a field to be collapsed but
+the output of a second renderer. `analysis/lower.rs` held a complete duplicate
+lowering of every SSA operation into a C expression, with its own operand
+resolution, its own cast rules and its own type-from-width helpers, and its
+results went into that map. Nothing read them. Making the accessor return
+`None` unconditionally left all fifty-four cells byte-identical, so the only
+consumer of a definition the ladder produced was the ladder itself, resolving
+its own operands. It is gone, 2042 lines, and with it `PassEnv`, five
+`FoldArchConfig` fields, `FoldInputs::display_names` and `FoldInputs::strings`.
+
+### Track B is smaller than five clusters, and points somewhere else
+
+One of B's five clusters of inferred casts, the `TypeOracle` channel, was
+reachable only from that ladder. `SourceEvidenceTypeOracle` was constructed on
+every native render and handed to the fold, and the fold's only reader was the
+duplicate lowering. Deleting the ladder retired the cluster.
+
+B1's actual proposal -- make `cast_needed` refuse when it has no source type --
+was traced and is not yet the right first move. Its blast radius is every
+arithmetic and comparison operation whose destination has a certified type, and
+a refusal there aborts the whole function, so it would convert a large number of
+renders into refusals before any of them could be given a source to carry.
+
+The trace turned up something more direct. Every binding is declared with
+`Binding::declaration_type`, which is always `CType::machine_bits(width)` --
+unsigned. The cast policy compares against `type_hint_for_var`, which reports
+what upstream proved the value *means*: signed, a pointer, a typedef. These are
+two answerers for one value's type, and only one of them is about the program
+the compiler reads. A value declared `uint32_t` and believed `int32_t` gets no
+cast at all, because target and source compare equal, and the emitted expression
+is then unsigned. That is the shape of the sign-flag defect that made
+`crc32_bitwise` return a CRC of nothing, and it is still representable.
+
+Switching the cast source to the declared type is correct and measured
+byte-identical on this corpus, which means the disagreement does not currently
+bite here. Per the rule that a partial fix changing no rendered behaviour does
+not stay in the tree, it is not committed on its own; it belongs in the same
+change as the refusal that completes it.
+
+### Track C1 was three defects, and none of them was the one named
+
+C1 said definitions classified `Insert` that are narrow writes clearing their
+carrier should be `ZeroExtend`. Tracing the five cells found instead:
+
+**The lift already states the clear.** `mov eax, edx` lifts to `Copy` followed
+by `IntZExt { dst: RAX, src: EAX }`; Ghidra's x86 specification carries a family
+of sub-constructors for exactly this. `materialize_cleared_register_write`
+synthesized a second `IntZExt` for the same carrier one op earlier -- twenty-
+seven of them in one block of `crc32_bitwise`, none ever read -- and the machine
+layer's certificate, which looked at ordinal+1, was reading that invention
+rather than the lift. Removing the synthesizer required rewriting the
+certificate from an adjacency test into the dataflow question it means: before
+anything reads the carrier, does the block define it as a zero-extension of what
+this write left in its slice.
+
+**A phi is not a machine write.** `machine_write_disposition` runs on every
+graph instruction with an output, phis included, and derives a carrier-relative
+projection from geometry alone. For a merge of a sub-register that comes out as
+`Insert`, which asserts the merge preserves the carrier's other bits. It neither
+does nor could; where the carrier is live across the merge it has a phi of its
+own, and that phi is what answers for it. Two of the five cells are phis.
+
+**The phi fold order is a display-name sort.** Each phi kills the slots it
+overlaps before seeding its own, so the last phi to mention a register owns
+every width of it, and `block.phis` is ordered by display name. That order puts
+`EDX` before `RDX` but `R8` before `R8D`, because the wide name is a prefix of
+the narrow one only for the extended registers. A 32-bit loop carrier in `r8`
+therefore erased its own 64-bit carrier root while identical code in `rdx` did
+not, and only across a back edge, where no later program order re-establishes
+the carrier. An answer that depends on a name sort cannot be right whichever way
+it comes out.
+
+### What the refusals were hiding
+
+Fixing the phi defects takes the corpus from thirty-five to thirty-seven, and
+makes `adler32` at O1 render *wrongly*: the machine saves a sum into `r8d`
+before clobbering `r9`, and the rendering places both in one C object, so the
+saved value is destroyed and the subtraction reads the quotient.
+
+This is the sharpest thing the tracks have produced. The five
+`preserved_carrier_read_before_assignment` refusals were not only false, they
+were also load-bearing -- they were suppressing a binding-collapse defect
+underneath, and removing them exposes it. It follows that clearing a refusal
+class is not a safe operation to measure by cell count. Every cell a refusal
+fix newly admits has to be checked against the differential oracle before the
+fix lands, and a fix that admits a wrong render is not finished, however correct
+its own reasoning is.
