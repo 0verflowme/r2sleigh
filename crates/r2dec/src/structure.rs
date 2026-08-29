@@ -27,7 +27,14 @@ pub(crate) enum ControlFlowStructureError {
 }
 
 impl From<OpLoweringRefusal> for ControlFlowStructureError {
+    #[track_caller]
     fn from(error: OpLoweringRefusal) -> Self {
+        if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+            eprintln!(
+                "refusal {error:?} left lowering at {}",
+                std::panic::Location::caller()
+            );
+        }
         Self::Lowering(error)
     }
 }

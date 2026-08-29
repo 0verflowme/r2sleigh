@@ -931,9 +931,60 @@ impl BindingPlan {
                 continue;
             }
             let expected_disposition = match (source_slot, callee_allocation) {
-                (None, None) => StackObjectDisposition::Refused {
+                // Neither strong form answers, so the object is named by the
+                // width its own accesses agree on. Without even that there is
+                // no geometry to state and it stays refused.
+                (None, None) if size.is_none() => StackObjectDisposition::Refused {
                     reason: StackObjectRefusal::MissingSourceIdentity { object },
                 },
+                (None, None) => {
+                    let size_bytes = size.expect("the arm above covers a missing width");
+                    let Some(width_bits) = size_bytes.checked_mul(8).filter(|width| *width > 0)
+                    else {
+                        let expected = StackObjectDisposition::Refused {
+                            reason: StackObjectRefusal::InvalidWidth { object, size_bytes },
+                        };
+                        if self.stack_object_disposition(object) != Some(expected) {
+                            return Err(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
+                                    object,
+                                },
+                            ));
+                        }
+                        continue;
+                    };
+                    let Some(binding) = BindingId::from_dense_index(binding_index) else {
+                        return Err(BindingPlanBuildError::TooManyBindings {
+                            count: binding_index.saturating_add(1),
+                        });
+                    };
+                    let planned =
+                        self.bindings
+                            .get(binding_index)
+                            .ok_or(BindingPlanBuildError::Seal(
+                                BindingPlanSourceMismatch::UnexpectedStackObjectDisposition {
+                                    object,
+                                },
+                            ))?;
+                    if planned.certificate.sources.as_ref()
+                        != [BindingCertificateSource::CertifiedEntity(entity)]
+                        || !actual_by_binding[binding_index].is_empty()
+                    {
+                        return Err(BindingPlanBuildError::Seal(
+                            BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
+                        ));
+                    }
+                    if planned.declaration_type != CType::machine_bits(width_bits) {
+                        return Err(BindingPlanBuildError::Seal(
+                            BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                object,
+                                binding,
+                            },
+                        ));
+                    }
+                    binding_index += 1;
+                    StackObjectDisposition::Bound { binding }
+                }
                 (None, Some(certificate)) => {
                     if certificate.object != object
                         || size != Some(certificate.size_bytes)

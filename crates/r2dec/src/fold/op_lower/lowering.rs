@@ -722,9 +722,9 @@ impl<'a> FoldingContext<'a> {
                     match op {
                         SSAOp::Call { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return Err(
+                                return Err(crate::analysis::lower::refusal(
                                     OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                                );
+                                ));
                             };
                             let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
                             let func_expr =
@@ -747,9 +747,9 @@ impl<'a> FoldingContext<'a> {
                         }
                         SSAOp::CallInd { target } => {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
-                                return Err(
+                                return Err(crate::analysis::lower::refusal(
                                     OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                                );
+                                ));
                             };
                             let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
                             let func_expr =
@@ -784,7 +784,12 @@ impl<'a> FoldingContext<'a> {
 
     fn finish_lowering_transaction(&self, lowered: LoweredOp) -> OpLoweringResult<LoweredOp> {
         match self.pending_lowering_refusal.take() {
-            Some(refusal) => Err(refusal),
+            Some(refusal) => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal {refusal:?} raised by finish_lowering_transaction");
+                }
+                Err(refusal)
+            }
             None => Ok(lowered),
         }
     }

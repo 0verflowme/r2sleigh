@@ -1974,9 +1974,7 @@ impl<'a> FoldingContext<'a> {
                             Ok(expr) => expr,
                             Err(error) => {
                                 self.retain_first_observation_error(error);
-                                return Err(
-                                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
-                                );
+                                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
                             }
                         };
                         let expr = self.observe_certified_value_read_expr(

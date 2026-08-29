@@ -287,11 +287,24 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Store the first refusal this fold decided, and say where.
+    ///
+    /// A stored refusal is raised later by whoever finishes the transaction, so
+    /// it does not pass through any of the propagation paths and instrumenting
+    /// those never finds it. This is the only place it can be caught, which is
+    /// why the location is captured here rather than left to be rediscovered.
+    #[track_caller]
     pub(super) fn retain_first_lowering_refusal(
         &self,
         refusal: crate::fold::op_lower::OpLoweringRefusal,
     ) {
         if self.pending_lowering_refusal.get().is_none() {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!(
+                    "refusal {refusal:?} retained at {}",
+                    std::panic::Location::caller()
+                );
+            }
             self.pending_lowering_refusal.set(Some(refusal));
         }
     }

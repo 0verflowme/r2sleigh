@@ -624,9 +624,9 @@ fn populate_prepared_render_definitions(
 ) -> Result<(), crate::analysis::lower::OpLoweringRefusal> {
     for block in blocks {
         let Some(block_id) = prepared.graph().block_id_for_addr(block.addr) else {
-            return Err(
+            return Err(crate::analysis::lower::refusal(
                 crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization,
-            );
+            ));
         };
         for (op_idx, op) in block.ops.iter().enumerate() {
             if matches!(
@@ -665,9 +665,7 @@ fn populate_prepared_render_definitions(
             }
             if let Some(resolver) = env.binding_names {
                 let Some(value) = use_info.exact_value_id_for_var(dst) else {
-                    return Err(
-                        crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
-                    );
+                    return Err(crate::analysis::lower::refusal(crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization));
                 };
                 match resolver.plan().disposition(value) {
                     Some(crate::binding_plan::ValueDisposition::Bound { .. }) => {}
@@ -683,9 +681,7 @@ fn populate_prepared_render_definitions(
                         continue;
                     }
                     None => {
-                        return Err(
-                            crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
-                        );
+                        return Err(crate::analysis::lower::refusal(crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization));
                     }
                 }
             }

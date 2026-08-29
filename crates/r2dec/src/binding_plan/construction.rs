@@ -815,7 +815,14 @@ impl BindingPlan {
                     );
                     continue;
                 }
-                if source_slot.is_none() && callee_allocation.is_none()
+                // Identity needs a geometry, not an endorsement. A declared
+                // slot and a callee allocation are the two strong forms and
+                // still cannot both answer at once; where neither does, the
+                // width the object's own accesses agree on is enough to name
+                // it. Radare2 reports no stack variables at all for some
+                // functions, and every local in them was refused for that
+                // silence.
+                if source_slot.is_none() && callee_allocation.is_none() && size.is_none()
                     || source_slot.is_some() && callee_allocation.is_some()
                 {
                     stack_objects.insert(
@@ -885,12 +892,27 @@ impl BindingPlan {
                     continue;
                 }
                 let Some(source_slot) = *source_slot else {
-                    stack_objects.insert(
-                        *object,
-                        StackObjectDisposition::Refused {
-                            reason: StackObjectRefusal::MissingSourceIdentity { object: *object },
+                    // Named by the width its own accesses agree on, at the
+                    // position the object model proved. A local like any other;
+                    // only the origin of its geometry differs.
+                    let Some(binding) = BindingId::from_dense_index(bindings.len()) else {
+                        return Err(BindingPlanBuildError::TooManyBindings {
+                            count: bindings.len().saturating_add(1),
+                        });
+                    };
+                    bindings.push(Binding {
+                        declaration_type: CType::machine_bits(width_bits),
+                        certificate: BindingCertificate {
+                            sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
                         },
-                    );
+                        presentation_name_hint: Some(if *offset < 0 {
+                            format!("stack_m{}", offset.unsigned_abs())
+                        } else {
+                            format!("stack_p{}", offset.unsigned_abs())
+                        }),
+                        caller_supplied: false,
+                    });
+                    stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
                     continue;
                 };
                 if source_slot.base() != *base

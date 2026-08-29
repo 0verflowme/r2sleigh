@@ -4503,6 +4503,30 @@ fn collect_stack_geometry_certificate(
     }
 }
 
+/// The one width every complete access to this object uses.
+///
+/// `None` unless there is at least one access, all of them are the same width,
+/// and every one carries complete provenance. A disagreement in width means the
+/// object is read as more than one thing, which is not a geometry this can
+/// state.
+fn accessed_object_width(structured: &StructuredDataflowFacts, object: ObjectId) -> Option<u32> {
+    let mut width = None;
+    for access in structured.memory_accesses.values() {
+        if access.object != object {
+            continue;
+        }
+        if !access.provenance_complete || access.width == 0 {
+            return None;
+        }
+        match width {
+            None => width = Some(access.width),
+            Some(existing) if existing == access.width => {}
+            Some(_) => return None,
+        }
+    }
+    width
+}
+
 /// The one entry-relative position a storage holds, if it holds exactly one.
 ///
 /// A frame pointer established once has a single position for the whole body.
@@ -4737,6 +4761,13 @@ fn collect_prepared_function_certificates(
                     space: SpaceId::Ram,
                     base,
                     offset,
+                    // Failing both, the object's own accesses say how wide it
+                    // is. Every access reaching it at one width, with complete
+                    // provenance, is a fact about the program rather than an
+                    // opinion about it -- and radare2 has no opinion to offer
+                    // for most of these: it reports no stack variables at all
+                    // for `murmur3_32`, which has fourteen of them.
+                    //
                     size: exact_stack_slots
                         .get(&(base, offset))
                         .map(SourceStackSlotSpec::size_bytes)
@@ -4744,7 +4775,8 @@ fn collect_prepared_function_certificates(
                             callee_stack_allocations
                                 .get(object)
                                 .map(|certificate| certificate.size_bytes)
-                        }),
+                        })
+                        .or_else(|| accessed_object_width(structured, *object)),
                     source_slot: exact_stack_slots.get(&(base, offset)).copied(),
                     callee_allocation: callee_stack_allocations.get(object).cloned(),
                 },
@@ -9226,14 +9258,20 @@ mod tests {
             interface.stack_slots().first().copied(),
             "the prepared certificate must retain the complete exact source stack-slot identity"
         );
+        // Each has the width its own accesses give it, and they differ. The
+        // concern this replaces was that a resource could borrow a width from
+        // another coordinate naming the same offset; the two are at minus eight
+        // and minus sixteen now, so there is no shared name to borrow through.
+        // The saved slot is written once by an eight-byte store and says eight;
+        // the local is four and stays four.
         assert_eq!(
             artifact
                 .certificates()
                 .stack_slots
                 .get(&save.location.object)
                 .and_then(|slot| slot.size),
-            None,
-            "an uncaptured stack resource must not borrow another coordinate's width"
+            Some(8),
+            "a resource takes the width its own accesses agree on"
         );
         assert_eq!(
             artifact
