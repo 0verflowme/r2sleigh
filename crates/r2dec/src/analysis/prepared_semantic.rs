@@ -21,7 +21,7 @@ use r2types::{
 use super::lower::LowerCtx;
 use super::{
     BaseRef, DecompilerFacts, NormalizedAddr, PassEnv, SSABlock, ScalarValue, SemanticValue,
-    StackInfo, StackSlotProvenance, StackSlotValueKind, UseInfo, ValueProvenance, ValueRef,
+    StackInfo, UseInfo, ValueProvenance,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::binding_plan::{
@@ -547,7 +547,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, prepared, view, origins);
-    overlay_prepared_switch_roots(&mut use_info, prepared, view);
     populate_prepared_render_definitions(
         symbols,
         &mut use_info,
@@ -3403,7 +3402,7 @@ fn seed_prepared_stack_facts(
     #[cfg(not(test))]
     let _ = symbols;
     #[cfg(test)]
-    for (offset, alias) in &view.stack_aliases_by_offset {
+    for offset in view.stack_aliases_by_offset.keys() {
         if let Some(stack_expr) = prepared_stack_alias_expr_for_offset(symbols, view, *offset) {
             let CExpr::Var(stack_symbol) = stack_expr else {
                 continue;
@@ -3413,25 +3412,6 @@ fn seed_prepared_stack_facts(
                 .stack_vars
                 .entry(*offset)
                 .or_insert(name.clone());
-            let provenance = StackSlotProvenance {
-                offset: *offset,
-                predicate_carrier: false,
-                return_carrier: false,
-                value_kind: if matches!(alias.binding_kind, Some(VisibleBindingKind::StackObject)) {
-                    StackSlotValueKind::AddressLike
-                } else {
-                    StackSlotValueKind::Scalar
-                },
-            };
-            merge_prepared_stack_slot(use_info, None, provenance);
-            if *offset < 0 {
-                use_info
-                    .stable_stack_values
-                    .entry(*offset)
-                    .or_insert_with(|| {
-                        SemanticValue::Scalar(ScalarValue::Expr(CExpr::Var(stack_symbol)))
-                    });
-            }
         }
     }
 
@@ -3442,7 +3422,7 @@ fn seed_prepared_stack_facts(
         let Some(object) = prepared.objects().object(*object_id) else {
             continue;
         };
-        let Some(offset) = stack_offset_for_object_kind(&object.kind) else {
+        let Some(_offset) = stack_offset_for_object_kind(&object.kind) else {
             continue;
         };
         let Some(value) = prepared_var(prepared, key.value) else {
@@ -3452,19 +3432,12 @@ fn seed_prepared_stack_facts(
         if use_info.bind_value_id(value, value_id).is_none() {
             continue;
         }
-        let provenance = StackSlotProvenance {
-            offset,
-            predicate_carrier: false,
-            return_carrier: false,
-            value_kind: StackSlotValueKind::AddressLike,
-        };
-        merge_prepared_stack_slot(use_info, Some(value_id), provenance);
         #[cfg(test)]
-        let test_alias = preferred_stack_alias_name(view, offset)
+        let test_alias = preferred_stack_alias_name(view, _offset)
             .map(|name| crate::symbol::var_ref(symbols, name));
         #[cfg(not(test))]
         let test_alias = None;
-        if let Some(stack_expr) = view
+        if let Some(_stack_expr) = view
             .admitted_stack_symbol(*object_id)
             .map(CExpr::Var)
             .or(test_alias)
@@ -3473,13 +3446,7 @@ fn seed_prepared_stack_facts(
             _stack_info
                 .definition_overrides
                 .entry(value.display_name())
-                .or_insert_with(|| CExpr::AddrOf(Box::new(stack_expr.clone())));
-            if offset < 0 {
-                use_info
-                    .stable_stack_values
-                    .entry(offset)
-                    .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(stack_expr)));
-            }
+                .or_insert_with(|| CExpr::AddrOf(Box::new(_stack_expr.clone())));
         }
     }
 }
@@ -3516,7 +3483,7 @@ fn collect_prepared_runtime_facts(
                 let _ = bind_prepared_value_id(use_info, view, src);
                 use_info.note_use_for_var(src);
             }
-            seed_prepared_value_fact(symbols, use_info, &phi.dst, prepared, view);
+            seed_prepared_value_fact(use_info, &phi.dst, view);
         }
 
         for op in &block.ops {
@@ -3543,7 +3510,7 @@ fn collect_prepared_runtime_facts(
                     let dst_key = dst.display_name();
                     use_info.producers.insert(dst_key, op.clone());
                 }
-                seed_prepared_value_fact(symbols, use_info, dst, prepared, view);
+                seed_prepared_value_fact(use_info, dst, view);
             }
 
             match op {
@@ -3556,9 +3523,6 @@ fn collect_prepared_runtime_facts(
                     let bound_copy = bind_prepared_copy_ids(use_info, view, dst, src);
                     let bound_dst_id = bound_copy.map(|(dst_id, _)| dst_id);
                     let bound_src_id = bound_copy.map(|(_, src_id)| src_id);
-                    if let Some((dst_id, src_id)) = bound_copy {
-                        use_info.copy_sources_by_value.insert(dst_id, src_id);
-                    }
                     let source_stack_slot = use_info
                         .forwarded_value_for_var(src)
                         .and_then(|provenance| provenance.stack_slot)
@@ -3596,13 +3560,6 @@ fn collect_prepared_runtime_facts(
                         continue;
                     };
                     let reload_value = bind_prepared_value_id(use_info, view, dst);
-                    let provenance = StackSlotProvenance {
-                        offset,
-                        predicate_carrier: false,
-                        return_carrier: false,
-                        value_kind: StackSlotValueKind::Scalar,
-                    };
-                    merge_prepared_stack_slot(use_info, reload_value, provenance);
                     let reload_param_expr = reload_value.and_then(|value_id| {
                         prepared_stack_reload_param_alias_expr(prepared, view, value_id)
                     });
@@ -3621,14 +3578,6 @@ fn collect_prepared_runtime_facts(
                             reload_value,
                             SemanticValue::Scalar(ScalarValue::Expr(expr.clone())),
                         );
-                        if offset < 0 {
-                            use_info
-                                .stable_stack_values
-                                .entry(offset)
-                                .or_insert_with(|| {
-                                    SemanticValue::Scalar(ScalarValue::Expr(expr.clone()))
-                                });
-                        }
                     }
                 }
                 _ => {}
@@ -3674,56 +3623,13 @@ fn populate_prepared_call_runtime_facts(
 
             if let Some(call_expr) = prepared_call_expr(site, symbols, call_view) {
                 use_info.call_result_exprs.insert(site, call_expr.clone());
-                record_prepared_call_result_facts(
-                    symbols, use_info, site, prepared, view, &call_expr,
-                );
+                record_prepared_call_result_facts(use_info, site, prepared, view, &call_expr);
             }
         }
     }
 }
 
-fn overlay_prepared_switch_roots(
-    use_info: &mut UseInfo,
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-) {
-    for (block_addr, selector_value) in &view.switch_selector_value_by_block {
-        let Some(selector) = prepared_var(prepared, *selector_value) else {
-            continue;
-        };
-        use_info.switch_selector_roots.insert(
-            *block_addr,
-            SemanticValue::Scalar(ScalarValue::Root(ValueRef::with_value_id(
-                *selector_value,
-                selector.clone(),
-            ))),
-        );
-    }
-}
-
-fn merge_prepared_stack_slot(
-    use_info: &mut UseInfo,
-    value_id: Option<ValueId>,
-    provenance: StackSlotProvenance,
-) {
-    if let Some(value_id) = value_id {
-        use_info
-            .stack_slots_by_value
-            .entry(value_id)
-            .and_modify(|existing| *existing = existing.merge(provenance))
-            .or_insert(provenance);
-    } else {
-        use_info.dropped_unkeyed_fact.get_or_insert("stack_slots");
-    }
-}
-
-fn seed_prepared_value_fact(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    use_info: &mut UseInfo,
-    var: &SSAVar,
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-) {
+fn seed_prepared_value_fact(use_info: &mut UseInfo, var: &SSAVar, view: &PreparedSemanticView) {
     let bound_value_id = bind_prepared_value_id(use_info, view, var);
     if let Some(expr) = view
         .predicate_expr_for_cond(var)
@@ -3744,49 +3650,6 @@ fn seed_prepared_value_fact(
                 .entry(value_id)
                 .or_insert_with(|| semantic_value_for_prepared_expr(view, var, expr.clone()));
         }
-        if let Some(offset) = view
-            .stack_offset_for_var(var)
-            .or_else(|| stack_offset_for_value(prepared, var))
-        {
-            merge_prepared_stack_slot(
-                use_info,
-                bound_value_id,
-                StackSlotProvenance {
-                    offset,
-                    predicate_carrier: false,
-                    return_carrier: false,
-                    value_kind: stack_value_kind_for_prepared_expr(&expr),
-                },
-            );
-            if offset < 0 {
-                use_info
-                    .stable_stack_values
-                    .entry(offset)
-                    .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(expr)));
-            }
-        }
-    } else if let Some(offset) = view
-        .stack_offset_for_var(var)
-        .or_else(|| stack_offset_for_value(prepared, var))
-    {
-        merge_prepared_stack_slot(
-            use_info,
-            bound_value_id,
-            StackSlotProvenance {
-                offset,
-                predicate_carrier: false,
-                return_carrier: false,
-                value_kind: StackSlotValueKind::AddressLike,
-            },
-        );
-        if let Some(expr) = prepared_stack_program_expr_for_var(symbols, view, prepared, var)
-            && offset < 0
-        {
-            use_info
-                .stable_stack_values
-                .entry(offset)
-                .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(expr)));
-        }
     }
 }
 
@@ -3806,13 +3669,6 @@ fn semantic_value_for_prepared_expr(
         });
     }
     SemanticValue::Scalar(ScalarValue::Expr(expr))
-}
-
-fn stack_value_kind_for_prepared_expr(expr: &CExpr) -> StackSlotValueKind {
-    match expr {
-        CExpr::AddrOf(_) => StackSlotValueKind::AddressLike,
-        _ => StackSlotValueKind::Scalar,
-    }
 }
 
 fn prepared_call_expr(
@@ -3895,39 +3751,22 @@ fn prepared_call_render_authorized(call_view: &PreparedCallView) -> bool {
 }
 
 fn record_prepared_call_result_facts(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     use_info: &mut UseInfo,
     source_site: (u64, usize),
     _prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     call_expr: &CExpr,
 ) {
-    let site = source_site;
     for cert in view.call_result_facts_by_value.values().filter(|cert| {
         cert.callsite.block_addr == source_site.0 && cert.callsite.op_index == source_site.1
     }) {
         let direct = matches!(cert.owner.as_ref(), Some(ValueOwner::Value(_)))
             && matches!(&cert.carrier, ReturnCarrier::Register { .. });
-        use_info.insert_call_result_source_for_value(cert.value, site);
         if direct {
             use_info
                 .definitions_by_value
                 .entry(cert.value)
                 .or_insert_with(|| call_expr.clone());
-        }
-        if let Some(ValueOwner::StackSlot { object, offset }) = cert.owner.as_ref() {
-            let Some(expr @ CExpr::Var(_symbol)) =
-                prepared_stack_program_expr_for_object_offset(symbols, view, *object, *offset)
-            else {
-                use_info.dropped_unkeyed_fact.get_or_insert("stack_slots");
-                continue;
-            };
-            if *offset < 0 {
-                use_info
-                    .stable_stack_values
-                    .entry(*offset)
-                    .or_insert_with(|| SemanticValue::Scalar(ScalarValue::Expr(expr)));
-            }
         }
     }
 }
@@ -4023,7 +3862,6 @@ mod tests {
         let mut info = UseInfo::default();
         let binding = bind_prepared_copy_ids(&mut info, &view, &dst, &src);
         if let Some((dst_id, src_id)) = binding {
-            info.copy_sources_by_value.insert(dst_id, src_id);
             info.forwarded_values_by_value.insert(
                 dst_id,
                 ValueProvenance {
@@ -4036,7 +3874,6 @@ mod tests {
         }
 
         assert_eq!(binding, None);
-        assert!(info.copy_sources_by_value.is_empty());
         assert!(info.forwarded_values_by_value.is_empty());
         assert_eq!(info.value_id_for_var(&dst), None);
         assert_eq!(info.value_id_for_var(&src), None);

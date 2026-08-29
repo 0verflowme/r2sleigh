@@ -6,8 +6,6 @@ use r2ssa::{SSAOp, SSAVar, ValueId};
 use r2types::TypeOracle;
 
 #[cfg(test)]
-use super::StackSlotProvenance;
-#[cfg(test)]
 use super::utils::parse_const_value;
 use super::{
     BaseRef, NormalizedAddr, PtrArith, ScalarValue, SemanticValue, UseInfo, ValueProvenance,
@@ -1251,7 +1249,6 @@ mod tests {
         _condition_vars: &'a HashSet<String>,
         pinned: &'a HashSet<String>,
         _ptr_arith: &'a HashMap<String, PtrArith>,
-        _stack_slots: &'a HashMap<String, StackSlotProvenance>,
         _forwarded_values: &'a HashMap<String, ValueProvenance>,
         #[cfg(test)] _function_names: &'a HashMap<u64, String>,
         #[cfg(test)] _strings: &'a HashMap<u64, String>,
@@ -1285,9 +1282,6 @@ mod tests {
                         info.ptr_arith_by_value.insert(value_id, ptr.clone());
                     }
                 }
-                for (name, slot) in _stack_slots {
-                    info.insert_stack_slot_for_name(name, *slot);
-                }
                 for (name, provenance) in _forwarded_values {
                     if let Some(value_id) = info.value_id_for_name_or_bind(name) {
                         info.forwarded_values_by_value
@@ -1308,7 +1302,6 @@ mod tests {
         let empty_counts = HashMap::new();
         let empty_names = HashSet::new();
         let empty_ptrs = HashMap::new();
-        let empty_slots = HashMap::new();
         let empty_forwarded = HashMap::new();
         let empty_addresses = HashMap::new();
         let ctx = make_ctx(
@@ -1318,7 +1311,6 @@ mod tests {
             &empty_names,
             &empty_names,
             &empty_ptrs,
-            &empty_slots,
             &empty_forwarded,
             &empty_addresses,
             &empty_addresses,
@@ -1361,7 +1353,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1370,7 +1361,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1397,7 +1387,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1406,7 +1395,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1428,7 +1416,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1437,7 +1424,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1474,7 +1460,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1483,7 +1468,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1512,7 +1496,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1521,7 +1504,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &function_names,
             &strings,
@@ -1548,7 +1530,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let function_names = HashMap::new();
         let strings = HashMap::new();
@@ -1560,7 +1541,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &function_names,
             &strings,
@@ -1602,7 +1582,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1611,7 +1590,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1639,7 +1617,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([(
             "tmp:addr_1".to_string(),
@@ -1666,7 +1643,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1695,10 +1671,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::from([(
-            "tmp:stackaddr_1".to_string(),
-            StackSlotProvenance::new(-0x18),
-        )]);
         let forwarded_values = HashMap::new();
         let ctx = make_ctx(
             &symbols,
@@ -1707,7 +1679,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1735,7 +1706,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([(
             "tmp:addr_1".to_string(),
@@ -1752,7 +1722,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1780,7 +1749,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([
             ("tmp:index_1".to_string(), CExpr::IntLit(0)),
@@ -1804,7 +1772,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1832,7 +1799,6 @@ mod tests {
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
         let ptr_arith = HashMap::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let definitions = HashMap::from([
             (
@@ -1855,7 +1821,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,
@@ -1882,7 +1847,6 @@ mod tests {
         let use_counts = HashMap::new();
         let condition_vars = HashSet::new();
         let pinned = HashSet::new();
-        let stack_slots = HashMap::new();
         let forwarded_values = HashMap::new();
         let addr = SSAVar::new("tmp:addr", 1, 8);
         let arr = SSAVar::new("arg1", 0, 8);
@@ -1929,7 +1893,6 @@ mod tests {
             &condition_vars,
             &pinned,
             &ptr_arith,
-            &stack_slots,
             &forwarded_values,
             &fn_map,
             &str_map,

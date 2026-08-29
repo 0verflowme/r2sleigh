@@ -107,16 +107,10 @@ pub(crate) struct UseInfo {
     pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
     pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
-    pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
     pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
     pub(crate) condition_values: BTreeSet<ValueId>,
     pub(crate) pinned: HashSet<String>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
-    pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
-    pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
-    pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
-    pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
-    pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
     /// Writes that reached the string-keyed half and not the value-keyed one.
     ///
@@ -150,13 +144,6 @@ impl ValueRef {
     pub(crate) fn new(var: SSAVar) -> Self {
         Self {
             value_id: None,
-            var,
-        }
-    }
-
-    pub(crate) fn with_value_id(value_id: ValueId, var: SSAVar) -> Self {
-        Self {
-            value_id: Some(value_id),
             var,
         }
     }
@@ -240,58 +227,12 @@ pub(crate) struct StackInfo {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub(crate) enum StackSlotValueKind {
-    Scalar,
-    AddressLike,
-    #[default]
-    Unknown,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StackSlotProvenance {
-    pub(crate) offset: i64,
-    pub(crate) predicate_carrier: bool,
-    pub(crate) return_carrier: bool,
-    pub(crate) value_kind: StackSlotValueKind,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValueProvenance {
     pub(crate) source: String,
     pub(crate) source_value_id: Option<ValueId>,
     pub(crate) source_var: Option<SSAVar>,
     pub(crate) stack_slot: Option<i64>,
-}
-
-impl StackSlotProvenance {
-    #[cfg(test)]
-    pub(crate) fn new(offset: i64) -> Self {
-        Self {
-            offset,
-            predicate_carrier: false,
-            return_carrier: false,
-            value_kind: StackSlotValueKind::Unknown,
-        }
-    }
-
-    pub(crate) fn merge(self, other: Self) -> Self {
-        if self.offset != other.offset {
-            return self;
-        }
-        Self {
-            offset: self.offset,
-            predicate_carrier: self.predicate_carrier || other.predicate_carrier,
-            return_carrier: self.return_carrier || other.return_carrier,
-            value_kind: match (self.value_kind, other.value_kind) {
-                (StackSlotValueKind::Unknown, kind) | (kind, StackSlotValueKind::Unknown) => kind,
-                (lhs, rhs) if lhs == rhs => lhs,
-                _ => StackSlotValueKind::Unknown,
-            },
-        }
-    }
 }
 
 fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
@@ -391,29 +332,17 @@ impl UseInfo {
             self.use_counts_by_value.remove(value);
             self.definitions_by_value.remove(value);
             self.semantic_values_by_value.remove(value);
-            self.copy_sources_by_value.remove(value);
             self.ptr_arith_by_value.remove(value);
             self.condition_values.remove(value);
-            self.call_result_source_by_value.remove(value);
-            self.stack_slots_by_value.remove(value);
-            self.stable_memory_values_by_value.remove(value);
             self.forwarded_values_by_value.remove(value);
         }
-        self.copy_sources_by_value
-            .retain(|dst, src| !values.contains(dst) && !values.contains(src));
         self.semantic_values_by_value
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_memory_values_by_value
             .retain(|_, value| !semantic_value_references_any(value, &values));
         self.forwarded_values_by_value.retain(|_, provenance| {
             provenance
                 .source_value_id
                 .is_none_or(|value_id| !values.contains(&value_id))
         });
-        self.switch_selector_roots
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_stack_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
         for var in vars {
             self.value_ids_by_var.remove(&var);
             self.ambiguous_value_vars.insert(var.clone());
@@ -464,13 +393,6 @@ impl UseInfo {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.value_id_for_name_or_bind(name) {
-            self.stack_slots_by_value.insert(value_id, slot);
-        }
-    }
-
     /// Record a semantic value against the exact upstream value identity.
     pub(crate) fn insert_semantic_value_for_value_if_absent(
         &mut self,
@@ -506,16 +428,6 @@ impl UseInfo {
         let value_id = ValueId(9500 + self.value_ids_by_name.len() as u32);
         self.bind_value_name(name.to_string(), value_id);
         self.value_id_for_name(name)
-    }
-
-    pub(crate) fn insert_call_result_source_for_value(
-        &mut self,
-        value: ValueId,
-        source_call: (u64, usize),
-    ) {
-        if !self.ambiguous_value_ids.contains(&value) {
-            self.call_result_source_by_value.insert(value, source_call);
-        }
     }
 
     pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
