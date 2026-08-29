@@ -811,31 +811,6 @@ impl<'a> FoldingContext<'a> {
         self.symbols.borrow().spelling(id)
     }
 
-    pub(crate) fn to_pass_env(&self) -> analysis::PassEnv<'_> {
-        analysis::PassEnv {
-            binding_names: self.inputs.binding_names.map(std::rc::Rc::as_ref),
-            symbols: &self.symbols,
-            string_literals: self.inputs.display_names.strings(),
-            ptr_size: self.inputs.arch.ptr_size,
-            sp_name: &self.inputs.arch.sp_name,
-            fp_name: &self.inputs.arch.fp_name,
-            ret_reg_name: &self.inputs.arch.ret_reg_name,
-            flag_regs: &self.inputs.arch.flag_regs,
-            #[cfg(test)]
-            function_names: self.inputs.function_names,
-            #[cfg(test)]
-            strings: self.inputs.strings,
-            #[cfg(test)]
-            binary_symbols: self.inputs.binary_symbols,
-            callee_facts: self.inputs.callee_facts(),
-            callee_resolution: self.inputs.callee_resolution(),
-            summary_view: self.inputs.summary_view(),
-            arg_regs: &self.inputs.arch.arg_regs,
-            caller_saved_regs: &self.inputs.arch.caller_saved_regs,
-            type_oracle: self.inputs.type_oracle,
-        }
-    }
-
     #[cfg(test)]
     pub fn set_function_names(&mut self, names: HashMap<u64, String>) {
         self.inputs.function_names = Box::leak(Box::new(names));
@@ -899,7 +874,6 @@ impl<'a> FoldingContext<'a> {
         let symbols = &self.symbols;
 
         if let Some(prepared) = self.inputs.prepared_ssa {
-            let env = self.to_pass_env();
             let prepared_view = self
                 .prepared_semantic_view()
                 .cloned()
@@ -911,7 +885,6 @@ impl<'a> FoldingContext<'a> {
             self.state.analysis_ctx = analysis::build_prepared_runtime_facts_with_control(
                 symbols,
                 blocks,
-                &env,
                 prepared,
                 &prepared_view,
                 normalization_origins,
@@ -2658,7 +2631,7 @@ impl<'a> FoldingContext<'a> {
                         format!("{unhandled:?}").chars().take(160).collect::<String>()
                     );
                 }
-                return Err(OpLoweringRefusal::missing_machine_projection());
+                return Err(OpLoweringRefusal::unrepresentable_operation());
             }
         })
     }
@@ -2844,7 +2817,9 @@ fn unsupported_live_definition_is_a_typed_refusal() {
 
     assert_eq!(
         ctx.op_to_stmt_impl(&unsupported, &frame),
-        Err(OpLoweringRefusal::missing_machine_projection())
+        Err(OpLoweringRefusal::unrepresentable_operation()),
+        "an operation the renderer has no lowering for is unrepresentable, \
+         not a machine projection this renderer was denied"
     );
 }
 

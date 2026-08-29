@@ -2,7 +2,7 @@
 mod tests {
     use super::*;
     use std::{
-        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap},
         ops::Deref,
         rc::Rc,
         sync::Arc,
@@ -612,14 +612,7 @@ mod tests {
 
     fn make_x86_64_ctx<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
-            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
             ptr_size: 8,
-            sp_name: "rsp".to_string(),
-            fp_name: "rbp".to_string(),
-            ret_reg_name: "rax".to_string(),
             arg_regs: vec![
                 "rdi".to_string(),
                 "rsi".to_string(),
@@ -628,7 +621,6 @@ mod tests {
                 "r8".to_string(),
                 "r9".to_string(),
             ],
-            caller_saved_regs: HashSet::new(),
         }));
         let empty_u64 = Box::leak(Box::new(HashMap::new()));
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
@@ -637,15 +629,12 @@ mod tests {
             normalization_origins: None,
             observation_journal: None,
             binding_names: None,
-            display_names: crate::empty_display_names(),
             arch,
             function_names: empty_u64,
-            strings: empty_u64,
             binary_symbols: empty_u64,
             function_facts: empty_function_facts(),
             stack_slots: empty_stack_slots,
             visible_bindings: empty_visible,
-            type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,

@@ -1,4 +1,3 @@
-pub(crate) mod arch;
 pub(crate) mod context;
 pub(crate) mod flags;
 pub(crate) mod op_lower;

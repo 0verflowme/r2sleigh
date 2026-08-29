@@ -70,7 +70,6 @@ use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
 use r2types::{
     CTypeLike, DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts,
-    SourceEvidenceTypeOracle, TypeOracle,
 };
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
@@ -1273,22 +1272,6 @@ fn count_residual_markers(stmts: &[CStmt]) -> usize {
     found
 }
 
-/// State the proof status of a rendered function in its own body.
-///
-/// Rendering used to stop at the function boundary whenever the certification
-/// kernel had not claimed the route, which meant one unproven construct cost
-/// every proven one beside it and left the caller with nothing to read. The
-/// function is rendered either way now, so it has to say what it is: the
-/// structurer marks the individual constructs it could not prove, and this
-/// records whether the kernel certified the function at all.
-///
-/// A shared empty name table for fixtures that carry no recovered names.
-#[cfg(test)]
-pub(crate) fn empty_display_names() -> &'static r2types::DisplayNames {
-    static EMPTY: std::sync::OnceLock<r2types::DisplayNames> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(r2types::DisplayNames::default)
-}
-
 /// State what the rendering did and did not show.
 ///
 /// "Nothing was marked" and "everything was shown to be right" are different
@@ -1940,8 +1923,6 @@ struct DecompilerContext {
     #[cfg(test)]
     pub function_names: std::collections::HashMap<u64, String>,
     #[cfg(test)]
-    pub strings: std::collections::HashMap<u64, String>,
-    #[cfg(test)]
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
     function_facts: FunctionFacts,
@@ -1962,8 +1943,6 @@ impl DecompilerContext {
         Self {
             #[cfg(test)]
             function_names: std::collections::HashMap::new(),
-            #[cfg(test)]
-            strings: std::collections::HashMap::new(),
             #[cfg(test)]
             symbols: std::collections::HashMap::new(),
             function_facts: function_facts.report().clone(),
@@ -4473,12 +4452,6 @@ impl Decompiler {
             }
         }
         let render_signature = self.context.type_facts().render_authorized_signature();
-        let evidence_type_oracle = SourceEvidenceTypeOracle::new(
-            prepared,
-            input.source_owned_facts().evidence_types(),
-            &self.context.type_facts().external_type_db,
-        );
-        let type_oracle = Some(&evidence_type_oracle as &dyn TypeOracle);
         let params = match binding_names
             .parameters()
             .map(|resolved| {
@@ -4521,21 +4494,7 @@ impl Decompiler {
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
-            sp_name: self.config.sp_name.clone(),
-            fp_name: self.config.fp_name.clone(),
-            ret_reg_name: self
-                .config
-                .ret_regs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "rax".to_string()),
             arg_regs: self.config.arg_regs.clone(),
-            caller_saved_regs: self.config.caller_saved_regs.clone(),
-            flag_regs: prepared
-                .machine_context()
-                .flag_register_names()
-                .into_iter()
-                .collect(),
         };
         let prepared_semantic_view = match analysis::PreparedSemanticView::build_with_bindings(
             symbols,
@@ -4581,11 +4540,8 @@ impl Decompiler {
             normalization_origins: Some(&normalization_origins),
             observation_journal: Some(&observation_journal),
             arch: &fold_arch,
-            display_names: self.context.function_facts.display_names(),
             #[cfg(test)]
             function_names: &self.context.function_names,
-            #[cfg(test)]
-            strings: &self.context.strings,
             #[cfg(test)]
             binary_symbols: &self.context.symbols,
             function_facts: &self.context.function_facts,
@@ -4593,7 +4549,6 @@ impl Decompiler {
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
             visible_bindings: &self.context.type_facts().visible_bindings,
-            type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
             binding_names: Some(&binding_names),
@@ -5918,14 +5873,7 @@ mod tests {
 
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
-            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
             ptr_size: 8,
-            sp_name: "rsp".to_string(),
-            fp_name: "rbp".to_string(),
-            ret_reg_name: "rax".to_string(),
             arg_regs: vec![
                 "rdi".to_string(),
                 "rsi".to_string(),
@@ -5934,20 +5882,16 @@ mod tests {
                 "r8".to_string(),
                 "r9".to_string(),
             ],
-            caller_saved_regs: HashSet::new(),
         }));
         FoldingContext::from_inputs(FoldInputs {
             normalization_origins: None,
             observation_journal: None,
-            display_names: crate::empty_display_names(),
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
-            strings: Box::leak(Box::new(HashMap::new())),
             binary_symbols: Box::leak(Box::new(HashMap::new())),
             function_facts: crate::fold::context::empty_function_facts(),
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
-            type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             binding_names: None,

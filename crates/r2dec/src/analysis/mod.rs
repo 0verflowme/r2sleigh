@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-#[cfg(test)]
-use std::sync::OnceLock;
 
 use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
@@ -17,14 +15,6 @@ pub(crate) use prepared_semantic::{
     PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView, PreparedSemanticViewInputs,
     build_prepared_runtime_facts_with_control,
 };
-
-#[cfg(test)]
-static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn empty_callee_facts() -> &'static BTreeMap<u64, CalleeFact> {
-    EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new)
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PtrArith {
@@ -45,14 +35,6 @@ impl DecompilerFacts {
     pub(crate) fn semantic(&self) -> &UseInfo {
         &self.use_info
     }
-}
-
-/// No condition codes, for a fixture whose target states none.
-#[cfg(test)]
-pub(crate) fn no_flag_registers() -> &'static std::collections::HashSet<String> {
-    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
 #[allow(dead_code)]
@@ -379,36 +361,6 @@ impl UseInfo {
             .map(|_| value_id)
     }
 
-    pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.vars_by_value_id.get(&value_id)
-    }
-
-    pub(crate) fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
-        if self.ambiguous_value_vars.contains(var) {
-            return None;
-        }
-        self.value_id_for_var(var)
-            .and_then(|value_id| self.definitions_by_value.get(&value_id))
-    }
-
-    pub(crate) fn use_count_for_value(&self, value: ValueId) -> usize {
-        if self.ambiguous_value_ids.contains(&value) {
-            return 0;
-        }
-        self.use_counts_by_value.get(&value).copied().unwrap_or(0)
-    }
-
-    pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
-        if self.ambiguous_value_vars.contains(var) {
-            return None;
-        }
-        self.value_id_for_var(var)
-            .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-    }
-
     pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
         if self.ambiguous_value_vars.contains(var) {
             return None;
@@ -419,21 +371,6 @@ impl UseInfo {
         // still about this value.
         self.value_id_for_var(var)
             .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-    }
-
-    pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
-        if self.ambiguous_value_vars.contains(var) {
-            return None;
-        }
-        self.value_id_for_var(var)
-            .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
-    }
-
-    pub(crate) fn is_condition_value(&self, value: ValueId) -> bool {
-        if self.ambiguous_value_ids.contains(&value) {
-            return false;
-        }
-        self.condition_values.contains(&value)
     }
 }
 

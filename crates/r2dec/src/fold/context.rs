@@ -3,14 +3,14 @@ use std::cell::Cell;
 use std::cell::OnceCell;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::{CExpr, CType};
 use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
-use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts, InterprocSummaryView, TypeOracle};
+use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts};
 #[cfg(test)]
 use r2types::{ExternalStackSlotSpec, StackSlotKey, VisibleBinding};
 
@@ -25,13 +25,7 @@ pub(crate) enum EffectOccurrenceKind {
 #[derive(Debug, Clone)]
 pub(crate) struct FoldArchConfig {
     pub(crate) ptr_size: u32,
-    pub(crate) sp_name: String,
-    pub(crate) fp_name: String,
-    pub(crate) ret_reg_name: String,
     pub(crate) arg_regs: Vec<String>,
-    pub(crate) caller_saved_regs: HashSet<String>,
-    /// Registers that are condition codes, as the target's register file defines them.
-    pub(crate) flag_regs: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,19 +34,14 @@ pub(crate) struct FoldInputs<'a> {
     #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
-    pub(crate) strings: &'a HashMap<u64, String>,
-    #[cfg(test)]
     /// What the binary calls the thing at an address, not a name this
     /// rendering declares.
     pub(crate) binary_symbols: &'a HashMap<u64, String>,
     pub(crate) function_facts: &'a FunctionFacts,
-    /// Spellings for addresses this function touches, for rendering only.
-    pub(crate) display_names: &'a r2types::DisplayNames,
     #[cfg(test)]
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
-    pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     /// Sole `BindingId -> SymbolId` projection for this native rendering.
@@ -93,10 +82,6 @@ impl<'a> FoldInputs<'a> {
 
     pub(crate) fn render_facts(&self) -> Option<&'a r2types::FunctionRenderFacts> {
         self.function_facts.render()
-    }
-
-    pub(crate) fn summary_view(&self) -> Option<&'a InterprocSummaryView> {
-        Some(self.function_facts.summary_view())
     }
 }
 
@@ -171,21 +156,6 @@ pub(crate) struct FoldingContext<'a> {
 impl FoldArchConfig {
     #[cfg(test)]
     pub(crate) fn for_ptr_size(ptr_size: u32) -> Self {
-        let sp_name = if ptr_size == 64 {
-            "rsp".to_string()
-        } else {
-            "esp".to_string()
-        };
-        let fp_name = if ptr_size == 64 {
-            "rbp".to_string()
-        } else {
-            "ebp".to_string()
-        };
-        let ret_reg_name = if ptr_size == 64 {
-            "rax".to_string()
-        } else {
-            "eax".to_string()
-        };
         let arg_regs = if ptr_size == 64 {
             vec![
                 "rdi".to_string(),
@@ -198,32 +168,7 @@ impl FoldArchConfig {
         } else {
             vec![]
         };
-        let caller_saved_regs = {
-            let mut regs = HashSet::new();
-            if ptr_size == 64 {
-                for r in ["rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11"] {
-                    regs.insert(r.to_string());
-                }
-            } else {
-                for r in ["eax", "ecx", "edx"] {
-                    regs.insert(r.to_string());
-                }
-            }
-            regs
-        };
-
-        Self {
-            ptr_size,
-            flag_regs: crate::fold::arch::X86_FLAG_REGISTERS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-            sp_name,
-            fp_name,
-            ret_reg_name,
-            arg_regs,
-            caller_saved_regs,
-        }
+        Self { ptr_size, arg_regs }
     }
 }
 
@@ -872,12 +817,9 @@ impl<'a> FoldingContext<'a> {
             normalization_origins: None,
             observation_journal: None,
             binding_names: None,
-            display_names: crate::empty_display_names(),
             arch,
             #[cfg(test)]
             function_names: EMPTY_U64_STRING.get_or_init(HashMap::new),
-            #[cfg(test)]
-            strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
             #[cfg(test)]
             binary_symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             function_facts: empty_function_facts(),
@@ -885,7 +827,6 @@ impl<'a> FoldingContext<'a> {
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
-            type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,

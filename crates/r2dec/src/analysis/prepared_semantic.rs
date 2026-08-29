@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-#[cfg(test)]
-use r2ssa::SSAVarNameKind;
 use r2ssa::function::DefLocation;
 use r2ssa::{
     CompareKind, MemoryLocation, ObjectKind, ReturnCarrier, SSAOp, SSAVar, SsaArtifact, ValueId,
@@ -18,10 +16,9 @@ use r2types::{
     VisibleBindingKind,
 };
 
-use super::lower::LowerCtx;
 use super::{
-    BaseRef, DecompilerFacts, NormalizedAddr, PassEnv, SSABlock, ScalarValue, SemanticValue,
-    StackInfo, UseInfo, ValueProvenance,
+    BaseRef, DecompilerFacts, NormalizedAddr, SSABlock, ScalarValue, SemanticValue, StackInfo,
+    UseInfo, ValueProvenance,
 };
 use crate::ast::{BinaryOp, CExpr, UnaryOp};
 use crate::binding_plan::{
@@ -514,7 +511,6 @@ fn prepared_call_site_tuple(
 pub(crate) fn build_prepared_runtime_facts(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     blocks: &[SSABlock],
-    env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
 ) -> DecompilerFacts {
@@ -523,16 +519,13 @@ pub(crate) fn build_prepared_runtime_facts(
         crate::DecompileWorkControl::new(&execution, crate::DecompileWorkPhase::Structuring);
     let origins =
         crate::normalize::NormalizationOrigins::for_unchanged(prepared.function(), prepared);
-    build_prepared_runtime_facts_with_control(
-        symbols, blocks, env, prepared, view, &origins, control,
-    )
-    .expect("default decompiler work control cannot stop")
+    build_prepared_runtime_facts_with_control(symbols, blocks, prepared, view, &origins, control)
+        .expect("default decompiler work control cannot stop")
 }
 
 pub(crate) fn build_prepared_runtime_facts_with_control(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     blocks: &[SSABlock],
-    env: &PassEnv<'_>,
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     origins: &crate::normalize::NormalizationOrigins,
@@ -547,15 +540,6 @@ pub(crate) fn build_prepared_runtime_facts_with_control(
     #[cfg(test)]
     pin_prepared_loop_carried_phi_values(&mut use_info, prepared, view);
     populate_prepared_call_runtime_facts(symbols, &mut use_info, blocks, prepared, view, origins);
-    populate_prepared_render_definitions(
-        symbols,
-        &mut use_info,
-        blocks,
-        env,
-        prepared,
-        view,
-        origins,
-    )?;
 
     control.poll()?;
     Ok(DecompilerFacts {
@@ -585,286 +569,6 @@ fn pin_prepared_phi_materialized_var(use_info: &mut UseInfo, var: &SSAVar) {
     let display = var.display_name();
     use_info.pinned.insert(display.clone());
     use_info.pinned.insert(display.to_ascii_lowercase());
-}
-
-fn populate_prepared_render_definitions(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    use_info: &mut UseInfo,
-    blocks: &[SSABlock],
-    env: &PassEnv<'_>,
-    prepared: &SsaArtifact,
-    view: &PreparedSemanticView,
-    origins: &crate::normalize::NormalizationOrigins,
-) -> Result<(), crate::analysis::lower::OpLoweringRefusal> {
-    for block in blocks {
-        let Some(block_id) = prepared.graph().block_id_for_addr(block.addr) else {
-            return Err(crate::analysis::lower::OpLoweringRefusal::missing_machine_projection());
-        };
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            if matches!(
-                origins.origin(crate::normalize::NormalizedOpSite {
-                    block: block_id,
-                    op_idx,
-                }),
-                Some(crate::normalize::NormalizedOpOrigin::Original(inst))
-                    if prepared
-                        .certificates()
-                        .stack_frame_round_trip_by_inst
-                        .contains_key(inst)
-                        || prepared
-                            .certificates()
-                            .machine_return_control_by_inst
-                            .contains_key(inst)
-                        || prepared
-                            .certificates()
-                            .stack_geometry
-                            .insts
-                            .contains(inst)
-                        || prepared
-                            .certificates()
-                            .stack_geometry
-                            .uses
-                            .iter()
-                            .any(|site| site.inst == *inst)
-            ) {
-                continue;
-            }
-            let Some(dst) = op.dst() else {
-                continue;
-            };
-            if !prepared_op_has_render_definition(op) {
-                continue;
-            }
-            if let Some(resolver) = env.binding_names {
-                let Some(value) = use_info.exact_value_id_for_var(dst) else {
-                    return Err(
-                        crate::analysis::lower::OpLoweringRefusal::missing_program_variable(),
-                    );
-                };
-                match resolver.plan().disposition(value) {
-                    Some(crate::binding_plan::ValueDisposition::Bound { .. }) => {}
-                    Some(
-                        crate::binding_plan::ValueDisposition::Inline { .. }
-                        | crate::binding_plan::ValueDisposition::Elided { .. }
-                        | crate::binding_plan::ValueDisposition::Refused { .. },
-                    ) => {
-                        // Render definitions are an advisory expression cache.
-                        // An output the sealed plan will not render owns no
-                        // cache cell and must not force its operands back into
-                        // the program-variable domain.
-                        continue;
-                    }
-                    None => {
-                        return Err(
-                            crate::analysis::lower::OpLoweringRefusal::missing_program_variable(),
-                        );
-                    }
-                }
-            }
-            let expr = {
-                let lower = LowerCtx {
-                    binding_names: env.binding_names,
-                    symbols,
-                    string_literals: crate::analysis::lower::no_string_literals(),
-                    use_info: Some(use_info),
-                    pinned: &use_info.pinned,
-                    type_oracle: env.type_oracle,
-                };
-                match lower.op_to_expr(op) {
-                    Ok(expr) => expr,
-                    Err(
-                        refusal @ crate::analysis::lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..),
-                    ) => return Err(refusal),
-                    Err(
-                        crate::analysis::lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(..)
-                        | crate::analysis::lower::OpLoweringRefusal::UnrepresentableOperation(..),
-                    ) => {
-                        // This table is an advisory expression cache, not an
-                        // effect disposition. Omitting the definition cannot
-                        // authorize executable fallback; BindingPlan retains
-                        // the canonical MachineProjection refusal.
-                        continue;
-                    }
-                }
-            };
-            if std::env::var("R2SLEIGH_TRACE_DEFFILTER").as_deref() == Ok(&*dst.display_name()) {
-                eprintln!(
-                    "DEFFILTER {} self={} safe={} carrier={}",
-                    dst.display_name(),
-                    is_self_render_definition_for_value(symbols, use_info, env, dst, &expr),
-                    prepared_render_definition_is_safe(symbols, &expr, env),
-                    use_info.value_id_for_var(dst).is_some_and(|value| {
-                        view.certified_loop_carrier_values.contains(&value)
-                    })
-                );
-            }
-            if is_self_render_definition_for_value(symbols, use_info, env, dst, &expr) {
-                continue;
-            }
-            if !prepared_render_definition_is_safe(symbols, &expr, env) {
-                continue;
-            }
-            // A carrier and the values that read it are mutable state; the only
-            // definition available for one is the value it held on some path.
-            if use_info
-                .value_id_for_var(dst)
-                .is_some_and(|value| view.certified_loop_carrier_values.contains(&value))
-            {
-                continue;
-            }
-            if let Some(value_id) = use_info.value_id_for_var(dst) {
-                use_info
-                    .definitions_by_value
-                    .entry(value_id)
-                    .or_insert_with(|| expr.clone());
-            } else {
-                use_info.dropped_unkeyed_fact.get_or_insert("definitions");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn prepared_op_has_render_definition(op: &SSAOp) -> bool {
-    matches!(
-        op,
-        SSAOp::Copy { .. }
-            | SSAOp::Load { .. }
-            | SSAOp::IntAdd { .. }
-            | SSAOp::IntSub { .. }
-            | SSAOp::IntMult { .. }
-            | SSAOp::IntDiv { .. }
-            | SSAOp::IntSDiv { .. }
-            | SSAOp::IntRem { .. }
-            | SSAOp::IntSRem { .. }
-            | SSAOp::IntAnd { .. }
-            | SSAOp::IntOr { .. }
-            | SSAOp::IntXor { .. }
-            | SSAOp::IntLeft { .. }
-            | SSAOp::IntRight { .. }
-            | SSAOp::IntSRight { .. }
-            | SSAOp::IntEqual { .. }
-            | SSAOp::IntNotEqual { .. }
-            | SSAOp::IntLess { .. }
-            | SSAOp::IntLessEqual { .. }
-            | SSAOp::IntSLess { .. }
-            | SSAOp::IntSLessEqual { .. }
-            | SSAOp::IntZExt { .. }
-            | SSAOp::IntSExt { .. }
-            | SSAOp::IntCarry { .. }
-            | SSAOp::IntSCarry { .. }
-            | SSAOp::IntSBorrow { .. }
-            | SSAOp::IntNegate { .. }
-            | SSAOp::IntNot { .. }
-            | SSAOp::BoolNot { .. }
-            | SSAOp::BoolAnd { .. }
-            | SSAOp::BoolOr { .. }
-            | SSAOp::BoolXor { .. }
-            | SSAOp::Piece { .. }
-            | SSAOp::FloatAdd { .. }
-            | SSAOp::FloatSub { .. }
-            | SSAOp::FloatMult { .. }
-            | SSAOp::FloatDiv { .. }
-            | SSAOp::FloatNeg { .. }
-            | SSAOp::FloatAbs { .. }
-            | SSAOp::FloatSqrt { .. }
-            | SSAOp::FloatEqual { .. }
-            | SSAOp::FloatNotEqual { .. }
-            | SSAOp::FloatLess { .. }
-            | SSAOp::FloatLessEqual { .. }
-            | SSAOp::Trunc { .. }
-            | SSAOp::Int2Float { .. }
-            | SSAOp::Float2Int { .. }
-            | SSAOp::FloatCeil { .. }
-            | SSAOp::FloatFloor { .. }
-            | SSAOp::FloatRound { .. }
-            | SSAOp::FloatNaN { .. }
-            | SSAOp::Subpiece { .. }
-            | SSAOp::FloatFloat { .. }
-            | SSAOp::Cast { .. }
-            | SSAOp::Select { .. }
-            | SSAOp::PtrAdd { .. }
-            | SSAOp::PtrSub { .. }
-    )
-}
-
-fn prepared_render_definition_is_safe(
-    _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    expr: &CExpr,
-    env: &PassEnv<'_>,
-) -> bool {
-    let mut safe = true;
-    expr.visit(&mut |node| {
-        if matches!(
-            node,
-            CExpr::Deref(_)
-                | CExpr::Subscript { .. }
-                | CExpr::Member { .. }
-                | CExpr::PtrMember { .. }
-        ) {
-            safe = false;
-            return;
-        }
-        let CExpr::Var(name) = node else {
-            return;
-        };
-        if !env
-            .binding_names
-            .is_some_and(|resolver| resolver.authorizes_program_variable(*name))
-        {
-            safe = false;
-        }
-    });
-    safe
-}
-
-#[cfg(test)]
-fn is_self_render_definition(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    dst: &SSAVar,
-    expr: &CExpr,
-) -> bool {
-    let dst_display = dst.display_name();
-    let dst_rendered = if let Some(tmp_name) = SSAVarNameKind::strip_temporary_prefix(&dst.name) {
-        let suffix = if dst.version > 0 {
-            format!("_{}", dst.version)
-        } else {
-            String::new()
-        };
-        format!("t{}{}", tmp_name, suffix)
-    } else if dst.version > 0 {
-        format!("{}_{}", dst.name.to_ascii_lowercase(), dst.version)
-    } else {
-        dst.name.to_ascii_lowercase()
-    };
-    matches!(expr, CExpr::Var(name) if *crate::symbol::spelling(symbols, *name) == dst_display || crate::symbol::spelling(symbols, *name).eq_ignore_ascii_case(&dst_rendered))
-}
-
-fn is_self_render_definition_for_value(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    use_info: &UseInfo,
-    env: &PassEnv<'_>,
-    dst: &SSAVar,
-    expr: &CExpr,
-) -> bool {
-    if let Some(resolver) = env.binding_names {
-        let Some(value) = use_info.exact_value_id_for_var(dst) else {
-            return false;
-        };
-        let Ok(PlannedValueSymbol::Bound(symbol)) = resolver.require_value(value) else {
-            return false;
-        };
-        return matches!(expr, CExpr::Var(candidate) if *candidate == symbol);
-    }
-    #[cfg(test)]
-    {
-        is_self_render_definition(symbols, dst, expr)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = symbols;
-        false
-    }
 }
 
 #[cfg(test)]
@@ -4720,48 +4424,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepared_definition_safety_requires_binding_plan_authorization() {
-        let symbols = test_table();
-        let function_names = HashMap::new();
-        let strings = HashMap::new();
-        let binary_symbols = HashMap::new();
-        let arg_regs = vec!["RDI".to_string()];
-        let caller_saved_regs = HashSet::from(["RCX".to_string()]);
-        let env = PassEnv {
-            binding_names: None,
-            string_literals: crate::analysis::lower::no_string_literals(),
-            ptr_size: 8,
-            sp_name: "RSP",
-            fp_name: "RBP",
-            ret_reg_name: "RAX",
-            flag_regs: crate::analysis::no_flag_registers(),
-            function_names: &function_names,
-            strings: &strings,
-            binary_symbols: &binary_symbols,
-            symbols: &test_table(),
-            callee_facts: crate::analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &arg_regs,
-            caller_saved_regs: &caller_saved_regs,
-            type_oracle: None,
-        };
-
-        assert!(
-            !prepared_render_definition_is_safe(
-                &symbols,
-                &crate::symbol::var_ref(&symbols, "value"),
-                &env
-            ),
-            "an arbitrary spelling cannot authorize a program variable"
-        );
-        assert!(
-            prepared_render_definition_is_safe(&symbols, &CExpr::IntLit(1), &env),
-            "literal-only definitions need no program-variable authorization"
-        );
-    }
-
     /// Without a binding plan, nothing is spelled at all.
     ///
     /// This used to assert an ordering: that a storage spelling must not
@@ -4787,72 +4449,5 @@ mod tests {
                 "an empty binding plan cannot name {var:?}"
             );
         }
-    }
-
-    #[test]
-    fn self_render_definition_uses_typed_temporary_render_name() {
-        let symbols = test_table();
-        let dst = test_var("tmp:11f80", 2, 8);
-        assert!(is_self_render_definition(
-            &symbols,
-            &dst,
-            &crate::symbol::var_ref(&symbols, "t11f80_2")
-        ));
-        assert!(is_self_render_definition(
-            &symbols,
-            &dst,
-            &CExpr::Var(crate::symbol::declare(&symbols, dst.display_name()))
-        ));
-        assert!(!is_self_render_definition(
-            &symbols,
-            &dst,
-            &crate::symbol::var_ref(&symbols, "t11f80_3")
-        ));
-
-        let version_zero_temp = test_var("tmp:11f80", 0, 8);
-        assert!(is_self_render_definition(
-            &symbols,
-            &version_zero_temp,
-            &crate::symbol::var_ref(&symbols, "t11f80")
-        ));
-        assert!(!is_self_render_definition(
-            &symbols,
-            &version_zero_temp,
-            &crate::symbol::var_ref(&symbols, "t11f80_0")
-        ));
-
-        let versioned_reg = test_var("rax", 2, 8);
-        assert!(is_self_render_definition(
-            &symbols,
-            &versioned_reg,
-            &crate::symbol::var_ref(&symbols, "rax_2")
-        ));
-        assert!(!is_self_render_definition(
-            &symbols,
-            &versioned_reg,
-            &crate::symbol::var_ref(&symbols, "rax")
-        ));
-
-        let version_zero_reg = test_var("rbx", 0, 8);
-        assert!(is_self_render_definition(
-            &symbols,
-            &version_zero_reg,
-            &crate::symbol::var_ref(&symbols, "rbx")
-        ));
-        assert!(!is_self_render_definition(
-            &symbols,
-            &version_zero_reg,
-            &crate::symbol::var_ref(&symbols, "rbx_0")
-        ));
-    }
-
-    #[test]
-    fn prepared_select_has_render_definition() {
-        assert!(prepared_op_has_render_definition(&SSAOp::Select {
-            dst: test_var("tmp:result", 1, 4),
-            cond: test_var("tmp:cond", 1, 1),
-            if_true: test_var("W0", 1, 4),
-            if_false: test_var("W1", 1, 4),
-        }));
     }
 }

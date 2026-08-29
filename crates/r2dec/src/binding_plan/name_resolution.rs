@@ -259,15 +259,6 @@ impl BindingNameResolution {
         self.by_binding.get(binding.index()).copied()
     }
 
-    /// Whether this exact symbol was minted from one sealed renderer binding.
-    ///
-    /// Consumers use the `SymbolId`, never its current presentation spelling,
-    /// when they need proof that an existing assignment target is a program
-    /// variable authorized by the binding plan.
-    pub(crate) fn authorizes_program_variable(&self, symbol: SymbolId) -> bool {
-        self.by_binding.contains(&symbol)
-    }
-
     /// Exact parameter answers in ascending source ABI slot order.
     ///
     /// Refused slots stay in the iterator as typed errors. Consumers building a
