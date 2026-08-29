@@ -71,17 +71,6 @@ impl StorageSpans {
             };
 
         for block in func.blocks() {
-            for phi in &block.phis {
-                let Some(output) = graph.value_id_for_var(&phi.dst) else {
-                    continue;
-                };
-                let sources = phi
-                    .sources
-                    .iter()
-                    .filter_map(|(_, source)| graph.value_id_for_var(source))
-                    .collect::<Vec<_>>();
-                join_with_same_storage(output, &sources, &mut builder);
-            }
             for (op_index, _) in block.ops.iter().enumerate() {
                 let Some(inst) = graph
                     .inst_id_for_op_site(block.addr, op_index)
@@ -93,6 +82,76 @@ impl StorageSpans {
                     continue;
                 };
                 join_with_same_storage(output, &inst.inputs, &mut builder);
+            }
+        }
+
+        // A merge continues a run only when every content arriving at it is
+        // already that run.
+        //
+        // A span is the stretch over which one storage holds one content, and a
+        // phi is where contents from different paths arrive at the same place.
+        // Where those contents are the same run the storage is still
+        // uninterrupted and the run continues. Where they are different runs it
+        // is not, and joining anyway declares two contents to be one.
+        //
+        // That is what put `murmur3_32` wrong. It builds `c2` in a lifter
+        // temporary and later `0xe6546b64` in the same temporary, and a phi
+        // over that temporary joined both runs into one span and so into one C
+        // object. The second constant overwrote the first while the first was
+        // still live, and the block loop multiplied by the wrong number while
+        // compiling perfectly cleanly.
+        //
+        // The phis are considered after the ops so that the runs straight-line
+        // code establishes are already known when a merge is judged.
+        for block in func.blocks() {
+            for phi in &block.phis {
+                let Some(output) = graph.value_id_for_var(&phi.dst) else {
+                    continue;
+                };
+                let Some(storage) = storage_of(output) else {
+                    continue;
+                };
+                let sources = phi
+                    .sources
+                    .iter()
+                    .filter_map(|(_, source)| graph.value_id_for_var(source))
+                    .filter(|source| {
+                        storage_of(*source)
+                            .is_some_and(|other| storage.location() == other.location())
+                    })
+                    .collect::<Vec<_>>();
+                // Coalescing an input into the merge makes them one C object,
+                // which is sound exactly when the two are never both needed.
+                // Two independent reasons establish that, and either is enough.
+                //
+                // Every arriving content is already the same run, so the merge
+                // introduces no second content and the storage is uninterrupted
+                // across it. This is the ordinary carried value.
+                let mut roots = sources
+                    .iter()
+                    .map(|source| builder.find_mut(source.0))
+                    .collect::<Vec<_>>();
+                roots.dedup();
+                if roots.len() <= 1 {
+                    join_with_same_storage(output, &sources, &mut builder);
+                    continue;
+                }
+
+                // Otherwise, only an input this merge is the sole reader of. An
+                // input read by anything else is still needed after the merge,
+                // so one object would have to hold two contents and one of them
+                // would be overwritten while it was still wanted.
+                let exclusive = sources
+                    .iter()
+                    .copied()
+                    .filter(|source| {
+                        graph
+                            .use_sites(*source)
+                            .iter()
+                            .all(|site| Some(site.inst) == graph.def_inst(output))
+                    })
+                    .collect::<Vec<_>>();
+                join_with_same_storage(output, &exclusive, &mut builder);
             }
         }
         builder.finalize()
