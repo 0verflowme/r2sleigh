@@ -18,6 +18,28 @@ use super::{
 use crate::ast::{BinaryOp, CExpr, CType, UnaryOp};
 use crate::binding_plan::PlannedValueSymbol;
 
+/// Note where a refusal was decided.
+///
+/// A refusal is a value, so `?` carries it away from wherever it was made and
+/// the report says only what kind it was. Twice now a class of refused
+/// functions took several passes to locate because every construction site had
+/// to be instrumented by hand to find the one that fired -- and one of them was
+/// not propagated at all but stored, so no amount of instrumenting the
+/// propagation paths would have found it.
+///
+/// `#[track_caller]` makes the origin a property of the refusal rather than
+/// something to be rediscovered. Set `R2DEC_TRACE_REFUSAL` to print it.
+#[track_caller]
+pub(crate) fn refusal(kind: OpLoweringRefusal) -> OpLoweringRefusal {
+    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+        eprintln!(
+            "refusal {kind:?} decided at {}",
+            std::panic::Location::caller()
+        );
+    }
+    kind
+}
+
 /// Defensive renderer result for operations whose canonical disposition is
 /// owned by `r2ssa::MachineProjection`.
 ///
@@ -122,21 +144,24 @@ impl<'a> LowerCtx<'a> {
     fn exact_value_id(&self, var: &SSAVar) -> Result<ValueId, OpLoweringRefusal> {
         self.use_info
             .and_then(|info| info.exact_value_id_for_var(var))
-            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)
+            .ok_or_else(|| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                )
+            })
     }
 
     fn bound_program_symbol(
         &self,
         var: &SSAVar,
     ) -> Result<crate::symbol::SymbolId, OpLoweringRefusal> {
-        let resolver = self
-            .binding_names
-            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        let resolver = self.binding_names.ok_or_else(|| {
+            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        })?;
         let value = self.exact_value_id(var)?;
-        match resolver
-            .require_value(value)
-            .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?
-        {
+        match resolver.require_value(value).map_err(|_| {
+            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        })? {
             PlannedValueSymbol::Bound(symbol) => Ok(symbol),
             PlannedValueSymbol::Inline(_)
             | PlannedValueSymbol::Elided(_)
@@ -183,7 +208,9 @@ impl<'a> LowerCtx<'a> {
             #[cfg(test)]
             return Ok(self.expr_for_ssa_name(var.display_name().as_str()));
             #[cfg(not(test))]
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            ));
         }
 
         let value_id = self.exact_value_id(var)?;
@@ -311,10 +338,14 @@ impl<'a> LowerCtx<'a> {
         self.require_op_value_identities(op)?;
         Ok(match op {
             SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                ));
             }
             SSAOp::Load { space, .. } if *space != r2il::SpaceId::Ram => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                ));
             }
             SSAOp::Copy { src, .. } => self.get_expr(src)?,
             SSAOp::Load { dst, addr, .. } => {
@@ -495,25 +526,33 @@ impl<'a> LowerCtx<'a> {
             #[cfg(test)]
             return Ok(());
             #[cfg(not(test))]
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            ));
         };
-        let info = self
-            .use_info
-            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        let info = self.use_info.ok_or_else(|| {
+            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        })?;
         for var in op.sources() {
             if var.constant_bits().is_some() {
                 continue;
             }
-            let value = info
-                .exact_value_id_for_var(var)
-                .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+            let value = info.exact_value_id_for_var(var).ok_or_else(|| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                )
+            })?;
             if !matches!(
                 resolver
                     .require_value(value)
-                    .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?,
+                    .map_err(|_| crate::analysis::lower::refusal(
+                        OpLoweringRefusal::MissingProgramVariableAuthorization
+                    ))?,
                 PlannedValueSymbol::Bound(_)
             ) {
-                return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+                return Err(crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                ));
             }
         }
         Ok(())
@@ -700,15 +739,19 @@ impl<'a> LowerCtx<'a> {
             .value_id
             .is_some_and(|certificate| certificate != value_id)
         {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            ));
         }
         if !visited.insert(value_id) {
             return Ok(None);
         }
         if let Some(resolver) = self.binding_names {
-            resolver
-                .require_value(value_id)
-                .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+            resolver.require_value(value_id).map_err(|_| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingProgramVariableAuthorization,
+                )
+            })?;
         }
         let expr = self.get_expr_with_depth(&value.var, depth, visited);
         visited.remove(&value_id);
@@ -747,8 +790,9 @@ impl<'a> LowerCtx<'a> {
 
     #[cfg(test)]
     fn fixture_constant_to_expr(&self, var: &SSAVar) -> Result<CExpr, OpLoweringRefusal> {
-        let value = parse_const_value(&var.name)
-            .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+        let value = parse_const_value(&var.name).ok_or_else(|| {
+            crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization)
+        })?;
         Ok(self.constant_to_expr(value))
     }
 

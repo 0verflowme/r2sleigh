@@ -10,9 +10,7 @@ impl<'a> FoldingContext<'a> {
                 Some(CExpr::Var(symbol))
             }
             Err(_) => {
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                 None
             }
         }
@@ -87,16 +85,12 @@ impl<'a> FoldingContext<'a> {
         match self.planned_value_expr(value) {
             Ok(expr @ CExpr::Var(_)) => Some(expr),
             Ok(_) => {
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                 None
             }
             Err(error) => {
                 self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                 None
             }
         }
@@ -113,9 +107,7 @@ impl<'a> FoldingContext<'a> {
             Ok(_) => None,
             Err(error) => {
                 self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                 None
             }
         }
@@ -235,9 +227,7 @@ impl<'a> FoldingContext<'a> {
                 if self.stable_semantic_ids_are_required() {
                     return None;
                 }
-                self.retain_first_lowering_refusal(
-                    OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                 return None;
             }
 
@@ -1037,19 +1027,19 @@ impl<'a> FoldingContext<'a> {
 
     fn get_expr_inner(&self, var: &SSAVar) -> OpLoweringResult<CExpr> {
         let Some(value) = self.prepared_value_id_for_var(var) else {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
         };
         let Some(names) = self.inputs.binding_names else {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
         };
         if names.disposition_for_value(value).is_none() {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
         }
         let expr = match self.planned_value_expr(value) {
             Ok(expr) => expr,
             Err(error) => {
                 self.retain_first_observation_error(error);
-                return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
             }
         };
         Ok(expr)
@@ -1082,15 +1072,15 @@ impl<'a> FoldingContext<'a> {
                 let block_addr = self
                     .current_block_addr
                     .get()
-                    .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+                    .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization))?;
                 let op_idx = self
                     .current_op_idx
                     .get()
-                    .ok_or(OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+                    .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization))?;
                 Some(self.planned_input_expr_at(block_addr, op_idx, 1)?)
             }
             SSAOp::Return { .. } => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
             }
             _ => None,
         })
@@ -1632,9 +1622,7 @@ impl<'a> FoldingContext<'a> {
                 Ok(expr) => Some(expr),
                 Err(error) => {
                     self.retain_first_observation_error(error);
-                    self.retain_first_lowering_refusal(
-                        OpLoweringRefusal::MissingProgramVariableAuthorization,
-                    );
+                    self.retain_first_lowering_refusal(crate::analysis::lower::refusal(OpLoweringRefusal::MissingProgramVariableAuthorization));
                     None
                 }
             },
@@ -1941,12 +1929,12 @@ impl<'a> FoldingContext<'a> {
             if let SSAOp::Return { .. } = op {
                 let (source_inst, boundary) = self
                     .source_return_boundary_for_normalized_op(block.addr, op_idx)
-                    .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                    .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization))?;
                 if boundary.at != source_inst
                     || !boundary.complete
                     || !boundary.register_compositions.is_empty()
                 {
-                    return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                    return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
                 }
 
                 let (return_value, stmt) = match boundary.values.as_slice() {
@@ -1955,23 +1943,23 @@ impl<'a> FoldingContext<'a> {
                             .certified_return_for_normalized_op(block.addr, op_idx)
                             .is_some()
                         {
-                            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
                         }
                         (None, CStmt::Return(None))
                     }
                     [_] => {
                         let prepared = self
                             .prepared_ssa()
-                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                            .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization))?;
                         let (source_block, source_op) = prepared
                             .inst_op_site(source_inst)
-                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                            .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization))?;
                         let certificate = prepared
                             .return_certificate_for_op(source_block, source_op)
-                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                            .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization))?;
                         let certified = self
                             .certified_return_for_normalized_op(block.addr, op_idx)
-                            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+                            .ok_or_else(|| crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization))?;
                         if certificate.at != source_inst
                             || certificate.block_addr != source_block
                             || certificate.op_index != source_op
@@ -1980,7 +1968,7 @@ impl<'a> FoldingContext<'a> {
                             || certified.value != certificate.value
                             || certified.width != certificate.width
                         {
-                            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
                         }
                         let expr = match self.planned_value_expr(certified.value) {
                             Ok(expr) => expr,
@@ -2065,10 +2053,10 @@ impl<'a> FoldingContext<'a> {
         };
         Ok(match op {
             SSAOp::CallOther { .. } | SSAOp::CpuId { .. } => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
             }
             SSAOp::Load { space, .. } if *space != r2il::SpaceId::Ram => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
             }
             SSAOp::Copy { dst, src } => {
                 if self.current_copy_has_coalesced_carrier_elision() {
@@ -2606,7 +2594,7 @@ impl<'a> FoldingContext<'a> {
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Return { .. } => {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
             }
             SSAOp::Branch { .. } | SSAOp::CBranch { .. } | SSAOp::BranchInd { .. } => {
                 // Handled by control flow structuring
@@ -2648,7 +2636,7 @@ impl<'a> FoldingContext<'a> {
         operation: &str,
     ) -> OpLoweringResult<Option<CStmt>> {
         if a.size != b.size || !matches!(a.size, 1 | 2 | 4 | 8 | 16) {
-            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            return Err(crate::analysis::lower::refusal(OpLoweringRefusal::MissingMachineProjectionAuthorization));
         }
         let lhs = self.assignment_lhs_expr(dst)?;
         let operand_ty = uint_type_from_size(a.size);

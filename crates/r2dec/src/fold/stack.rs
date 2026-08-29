@@ -9,9 +9,9 @@ impl<'a> FoldingContext<'a> {
         match names.require_stack(object) {
             Ok(crate::binding_plan::PlannedStackSymbol::Bound(symbol)) => Some(CExpr::Var(symbol)),
             Err(_) => {
-                self.retain_first_lowering_refusal(
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(
                     super::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                ));
                 None
             }
         }

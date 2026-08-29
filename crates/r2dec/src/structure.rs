@@ -1950,11 +1950,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let target_expr = self
                 .fold_ctx
                 .planned_value_expr(target_value)
-                .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+                .map_err(|_| {
+                    crate::analysis::lower::refusal(
+                        OpLoweringRefusal::MissingProgramVariableAuthorization,
+                    )
+                })?;
             let source_expr = self
                 .fold_ctx
                 .planned_value_expr(source_value)
-                .map_err(|_| OpLoweringRefusal::MissingProgramVariableAuthorization)?;
+                .map_err(|_| {
+                    crate::analysis::lower::refusal(
+                        OpLoweringRefusal::MissingProgramVariableAuthorization,
+                    )
+                })?;
             if target_expr.transparently_eq(&source_expr) {
                 continue;
             }

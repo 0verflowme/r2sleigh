@@ -20,7 +20,14 @@ impl<'a> FoldingContext<'a> {
             | Error::MissingPlannedValue(_) => {
                 OpLoweringRefusal::MissingProgramVariableAuthorization
             }
-            _ => OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            other => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal from journal error {other:?}");
+                }
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                )
+            }
         }
     }
 
@@ -149,11 +156,15 @@ impl<'a> FoldingContext<'a> {
             Ok(output) => output,
             Err(error) => {
                 self.retain_first_observation_error(error);
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                ));
             }
         };
         let Some(names) = self.inputs.binding_names else {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            ));
         };
         let symbol = match names.require_value(output.value) {
             Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => symbol,
@@ -179,7 +190,9 @@ impl<'a> FoldingContext<'a> {
         let rhs = *right;
         let planned_lhs = CExpr::Var(symbol);
         if !lhs.transparently_eq(&planned_lhs) {
-            return Err(OpLoweringRefusal::MissingProgramVariableAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingProgramVariableAuthorization,
+            ));
         }
         match self.project_planned_assignment(Some(site), lhs.clone(), rhs.clone()) {
             Ok((lhs, rhs)) => Ok(CStmt::Expr(CExpr::assign(lhs, rhs))),
@@ -664,7 +677,9 @@ impl<'a> FoldingContext<'a> {
         direct: bool,
     ) -> OpLoweringResult<CExpr> {
         if self.prepared_value_id_for_var(target) != Some(cert.target) {
-            return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+            return Err(crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            ));
         }
         let planned = self.planned_input_expr(frame, 0).map_err(|error| {
             let refusal = Self::observation_lowering_refusal(&error);
@@ -672,15 +687,19 @@ impl<'a> FoldingContext<'a> {
             refusal
         })?;
         let target = if direct {
-            let address = cert
-                .direct_target
-                .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+            let address = cert.direct_target.ok_or_else(|| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                )
+            })?;
             let canonical =
                 self.callee_identity_expr(&self.callee_identity_for_direct_target(address));
             crate::ast::carry_outer_expr_observations(&planned, canonical)
         } else {
             if cert.direct_target.is_some() {
-                return Err(OpLoweringRefusal::MissingMachineProjectionAuthorization);
+                return Err(crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                ));
             }
             Self::indirect_callable_expr(planned)
         };

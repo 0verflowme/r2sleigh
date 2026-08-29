@@ -61,9 +61,11 @@ impl<'a> FoldingContext<'a> {
         is_write: bool,
         elem_ty: CType,
     ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
-        let (block_addr, op_idx) = self
-            .current_source_op_site()
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let (block_addr, op_idx) = self.current_source_op_site().ok_or_else(|| {
+            crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )
+        })?;
         let fact = self
             .certified_memory_access_for_current_op(is_write)
             .filter(|fact| {
@@ -75,14 +77,26 @@ impl<'a> FoldingContext<'a> {
                     && fact.is_write == is_write
                     && fact.width == width
             })
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+            .ok_or_else(|| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                )
+            })?;
         let expr = self
             .render_certified_memory_expr_for_fact(fact, elem_ty.clone())
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+            .ok_or_else(|| {
+                crate::analysis::lower::refusal(
+                    OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                )
+            })?;
         let expr = if is_write {
             Self::expr_is_store_target_candidate(&expr)
                 .then_some(expr)
-                .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?
+                .ok_or_else(|| {
+                    crate::analysis::lower::refusal(
+                        OpLoweringRefusal::MissingMachineProjectionAuthorization,
+                    )
+                })?
         } else {
             self.typed_subscript_access(expr, &elem_ty)
         };
@@ -100,12 +114,16 @@ impl<'a> FoldingContext<'a> {
         addr: &SSAVar,
         elem_ty: CType,
     ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
-        let address = self
-            .prepared_value_id_for_var(addr)
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
-        let value = self
-            .prepared_value_id_for_var(dst)
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let address = self.prepared_value_id_for_var(addr).ok_or_else(|| {
+            crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )
+        })?;
+        let value = self.prepared_value_id_for_var(dst).ok_or_else(|| {
+            crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )
+        })?;
         self.certified_memory_access_expr(address, value, dst.size, false, elem_ty)
     }
 
@@ -115,12 +133,16 @@ impl<'a> FoldingContext<'a> {
         val: &SSAVar,
         elem_ty: CType,
     ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
-        let address = self
-            .prepared_value_id_for_var(addr)
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
-        let value = self
-            .prepared_value_id_for_var(val)
-            .ok_or(OpLoweringRefusal::MissingMachineProjectionAuthorization)?;
+        let address = self.prepared_value_id_for_var(addr).ok_or_else(|| {
+            crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )
+        })?;
+        let value = self.prepared_value_id_for_var(val).ok_or_else(|| {
+            crate::analysis::lower::refusal(
+                OpLoweringRefusal::MissingMachineProjectionAuthorization,
+            )
+        })?;
         self.certified_memory_access_expr(address, value, val.size, true, elem_ty)
     }
 
@@ -676,9 +698,9 @@ impl<'a> FoldingContext<'a> {
             Ok(expr) => Some(expr),
             Err(error) => {
                 self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(
                     OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                ));
                 None
             }
         }
@@ -744,9 +766,9 @@ impl<'a> FoldingContext<'a> {
             Ok(expr) => expr,
             Err(error) => {
                 self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(
+                self.retain_first_lowering_refusal(crate::analysis::lower::refusal(
                     OpLoweringRefusal::MissingProgramVariableAuthorization,
-                );
+                ));
                 return None;
             }
         };
