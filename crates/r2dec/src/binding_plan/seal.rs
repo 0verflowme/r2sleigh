@@ -202,6 +202,36 @@ pub(super) fn seal_binding_components(
         }
     }
 
+    // Values one instruction reads together are live together, and across
+    // storage locations that forbids coalescing them into one object. The
+    // construction pass applies the same rule; this derivation is deliberately
+    // independent of it, so the rule has to be stated here too or the two
+    // disagree and the seal rejects a plan that is correct.
+    let location_of = |value: ValueId| {
+        graph
+            .value(value)
+            .and_then(|value| value.canonical_storage)
+            .map(r2ssa::CanonicalStorageId::location)
+    };
+    let mut read_together = BTreeSet::<(ValueId, ValueId)>::new();
+    for inst in &graph.insts {
+        for (position, left) in inst.inputs.iter().enumerate() {
+            for right in inst.inputs.iter().skip(position + 1) {
+                if left == right {
+                    continue;
+                }
+                let (Some(left_location), Some(right_location)) =
+                    (location_of(*left), location_of(*right))
+                else {
+                    continue;
+                };
+                if left_location != right_location {
+                    read_together.insert((*left.min(right), *left.max(right)));
+                }
+            }
+        }
+    }
+
     if let Some(render) = source_owned.report().render() {
         for entity in render.certified_entities.values() {
             let Some(values) = entity.coalescing_values() else {
@@ -220,7 +250,20 @@ pub(super) fn seal_binding_components(
                     eligible[index].then_some(Ok(value))
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            if !members.is_empty() {
+            // What this certificate would put in one object: its own members
+            // and everything already sharing a run with any of them.
+            let mut merged = members.clone();
+            for value in &members {
+                if let Some(span) = source.storage_spans().span_of(*value)
+                    && let Some(span_members) = source.storage_spans().members(span)
+                {
+                    merged.extend(span_members.iter().copied());
+                }
+            }
+            let interferes = read_together
+                .iter()
+                .any(|(left, right)| merged.contains(left) && merged.contains(right));
+            if !members.is_empty() && !interferes {
                 members_by_source
                     .entry(BindingCertificateSource::CertifiedEntity(entity.id()))
                     .or_default()
