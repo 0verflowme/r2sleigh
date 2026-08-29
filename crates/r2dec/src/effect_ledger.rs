@@ -35,6 +35,12 @@ fn upstream_zero_occurrence_outcome(
     effects: &SurvivingEffectObservations,
     id: SemanticObligationId,
 ) -> Outcome {
+    // The instruction does nothing, so there is nothing to render for it and
+    // nothing left unaccounted when the rendering omits it.
+    if id.kind == SemanticObligationKind::NoNativeSemantics {
+        return Outcome::Elided(ElisionReason::NoNativeSemantics);
+    }
+
     if matches!(
         id.kind,
         SemanticObligationKind::VolatileOrUnknownEffect | SemanticObligationKind::Trap

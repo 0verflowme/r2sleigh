@@ -83,6 +83,13 @@ pub enum ElisionReason {
     DeadCallerSaved,
     /// A register write consumed entirely by a rendered call's argument list.
     DeadCallArgument,
+    /// A native instruction the lifter decoded to no semantics at all.
+    ///
+    /// There is nothing for the rendering to emit because the instruction does
+    /// nothing. A failed decode produces an `Unimplemented` operation instead,
+    /// so this is a positive fact about the instruction and not a way of
+    /// saying the effect is unknown.
+    NoNativeSemantics,
     /// A bound object placement removed because nothing read it.
     ///
     /// Distinct from `DeadUnusedTemporary`, which names a lifted temporary with
@@ -127,6 +134,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DeadUnusedTemporary => "dead-unused-temp",
             Self::DeadCallerSaved => "dead-caller-saved",
             Self::DeadCallArgument => "dead-call-arg",
+            Self::NoNativeSemantics => "no-native-semantics",
             Self::DeadUnreadBinding => "dead-unread-binding",
             Self::DeadStackBase => "dead-stack-base",
             Self::UnobservedMerge => "unobserved-merge",

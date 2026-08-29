@@ -284,6 +284,63 @@ pub(super) fn binding_components(
         }
     }
 
+    // Values one instruction reads together are live together.
+    //
+    // This is the whole interference test that matters here, and it is exact
+    // rather than approximate: if a single instruction takes both values as
+    // inputs, both must hold their content at that instruction, so they cannot
+    // be one C object. `fnv1a64` is the case -- `xor rax, r8` reads the byte
+    // just loaded and the hash carried from the previous iteration, and a loop
+    // carrier coalesced `rax`'s whole run into `r8` anyway. The rendering then
+    // said `R8_1 ^= R8_1`, which is zero, and the function returned zero for
+    // every non-empty input while compiling perfectly cleanly.
+    // Only across storage locations. A carrier coalescing two runs of the same
+    // register is the ordinary case and stays allowed; what has to be declined
+    // is folding one machine location into another while both are needed, which
+    // is what a copy into a carried register looks like.
+    let location_of = |value: ValueId| {
+        source
+            .graph()
+            .value(value)
+            .and_then(|value| value.canonical_storage)
+            .map(r2ssa::CanonicalStorageId::location)
+    };
+    let mut read_together = BTreeSet::<(ValueId, ValueId)>::new();
+    for inst in &source.graph().insts {
+        for (position, left) in inst.inputs.iter().enumerate() {
+            for right in inst.inputs.iter().skip(position + 1) {
+                if left == right {
+                    continue;
+                }
+                let (Some(left_location), Some(right_location)) =
+                    (location_of(*left), location_of(*right))
+                else {
+                    continue;
+                };
+                if left_location != right_location {
+                    read_together.insert((*left.min(right), *left.max(right)));
+                }
+            }
+        }
+    }
+    // Whether merging every one of these values into one object would put two
+    // values that some instruction reads together into that object.
+    let merge_would_interfere = |parent: &mut Vec<usize>, values: &BTreeSet<ValueId>| {
+        let roots = values
+            .iter()
+            .map(|value| find(parent, value.0 as usize))
+            .collect::<BTreeSet<_>>();
+        let mut members = BTreeSet::new();
+        for index in 0..parent.len() {
+            if roots.contains(&find(parent, index)) {
+                members.insert(ValueId(index as u32));
+            }
+        }
+        read_together
+            .iter()
+            .any(|(left, right)| members.contains(left) && members.contains(right))
+    };
+
     if let Some(render) = source_owned.report().render() {
         for entity in render.certified_entities.values() {
             let Some(values) = entity.coalescing_values() else {
@@ -306,7 +363,15 @@ pub(super) fn binding_components(
             if values.is_empty() {
                 continue;
             }
+            // A certificate says these values are one object. It cannot say so
+            // about two values that are read by one instruction, because that
+            // instruction needs both at once. Where it does, the coalescing is
+            // declined and the values keep their own objects, which costs an
+            // assignment in the output and nothing in correctness.
             if let Some(first) = values.first().copied() {
+                if merge_would_interfere(&mut parent, &values) {
+                    continue;
+                }
                 for value in values.iter().copied().skip(1) {
                     union(&mut parent, &mut rank, first, value);
                 }
@@ -360,6 +425,30 @@ pub(super) fn binding_components(
         })
         .collect::<Vec<_>>();
     components.sort_by_key(|component| component.members.first().copied());
+    if std::env::var_os("R2DEC_TRACE_LOCS").is_some() {
+        for component in &components {
+            let locations = component
+                .members
+                .iter()
+                .filter_map(|value| {
+                    source
+                        .graph()
+                        .value(*value)
+                        .and_then(|v| v.canonical_storage)
+                        .map(|s| (s.space, s.offset))
+                })
+                .collect::<BTreeSet<_>>();
+            if locations.len() > 1 {
+                eprintln!(
+                    "component spans {} locations {:?} sources={:?} members={:?}",
+                    locations.len(),
+                    locations,
+                    component.sources,
+                    component.members
+                );
+            }
+        }
+    }
     Ok(components)
 }
 

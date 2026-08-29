@@ -84,6 +84,15 @@ pub enum SemanticObligationKind {
     Atomicity,
     MemoryOrdering,
     VolatileOrUnknownEffect,
+    /// A native instruction the lifter decoded to no semantics at all.
+    ///
+    /// Distinct from `VolatileOrUnknownEffect`, which is refusal evidence: this
+    /// is a positive fact about the instruction rather than an absence of one.
+    /// A failed decode produces an `Unimplemented` operation, so zero canonical
+    /// operations means the decode succeeded and the instruction does nothing --
+    /// `nop dword [rax]` is the case that matters, and calling it unknown
+    /// refused eight otherwise-complete functions.
+    NoNativeSemantics,
     LoopCarriedState,
     LiveStateTransition,
     LiveValueProducer,
@@ -101,6 +110,7 @@ impl SemanticObligationKind {
         !matches!(
             self,
             Self::VolatileOrUnknownEffect
+                | Self::NoNativeSemantics
                 | Self::LoopCarriedState
                 | Self::LiveStateTransition
                 | Self::LiveValueProducer
@@ -124,6 +134,7 @@ impl std::fmt::Display for SemanticObligationKind {
             Self::Atomicity => "atomicity",
             Self::MemoryOrdering => "memory-ordering",
             Self::VolatileOrUnknownEffect => "volatile-or-unknown",
+            Self::NoNativeSemantics => "no-native-semantics",
             Self::LoopCarriedState => "loop-carried-state",
             Self::LiveStateTransition => "live-state-transition",
             Self::LiveValueProducer => "live-value-producer",
@@ -737,7 +748,7 @@ impl SemanticObligationInventory {
             }
             let obligation_id = SemanticObligationId {
                 instruction: id,
-                kind: SemanticObligationKind::VolatileOrUnknownEffect,
+                kind: SemanticObligationKind::NoNativeSemantics,
                 component: SemanticObligationComponent::Whole,
             };
             let mut obligations = BTreeSet::new();
