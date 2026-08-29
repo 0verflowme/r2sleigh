@@ -139,7 +139,16 @@ pub(crate) struct UseInfo {
     /// account for before the string-keyed half can be derived rather than
     /// stored, so counting them measures what is left of that step instead of
     /// asserting it.
-    pub(crate) unkeyed_writes: std::collections::BTreeMap<&'static str, usize>,
+    /// The first fact dropped because its variable had no exact value identity.
+    ///
+    /// Each writer below keys its fact by `ValueId`, and where the variable has
+    /// no exact one the fact used to be counted here and thrown away. Counting
+    /// a dropped fact is not accounting for it: the analysis then carries on
+    /// with a table that is missing something, and nothing downstream can tell.
+    ///
+    /// It is measured at zero on every corpus configuration, so recording the
+    /// first one and refusing costs nothing and stops the silent loss.
+    pub(crate) dropped_unkeyed_fact: Option<&'static str>,
 }
 
 #[allow(dead_code)]
@@ -456,7 +465,7 @@ impl UseInfo {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
         } else {
-            *self.unkeyed_writes.entry("use_counts").or_default() += 1;
+            self.dropped_unkeyed_fact.get_or_insert("use_counts");
         }
     }
 
@@ -464,7 +473,7 @@ impl UseInfo {
         if let Some(value_id) = self.exact_value_id_for_var(var) {
             self.condition_values.insert(value_id);
         } else {
-            *self.unkeyed_writes.entry("condition_vars").or_default() += 1;
+            self.dropped_unkeyed_fact.get_or_insert("condition_vars");
         }
     }
 
@@ -487,7 +496,9 @@ impl UseInfo {
                     .entry(value_id)
                     .or_insert(value);
             }
-            None => *self.unkeyed_writes.entry("semantic_values").or_default() += 1,
+            None => {
+                self.dropped_unkeyed_fact.get_or_insert("semantic_values");
+            }
         }
     }
 
@@ -637,7 +648,9 @@ impl UseInfo {
             Some(value_id) => {
                 self.definitions_by_value.entry(value_id).or_insert(expr);
             }
-            None => *self.unkeyed_writes.entry("definitions").or_default() += 1,
+            None => {
+                self.dropped_unkeyed_fact.get_or_insert("definitions");
+            }
         }
     }
 

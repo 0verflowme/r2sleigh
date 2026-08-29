@@ -748,7 +748,7 @@ fn populate_prepared_render_definitions(
                     .entry(value_id)
                     .or_insert_with(|| expr.clone());
             } else {
-                *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
+                use_info.dropped_unkeyed_fact.get_or_insert("definitions");
             }
         }
     }
@@ -3609,10 +3609,9 @@ fn collect_prepared_runtime_facts(
                                 exact_prepared_copy_provenance(src, src_id, source_stack_slot),
                             );
                         } else {
-                            *use_info
-                                .unkeyed_writes
-                                .entry("forwarded_values")
-                                .or_default() += 1;
+                            use_info
+                                .dropped_unkeyed_fact
+                                .get_or_insert("forwarded_values");
                         }
                     }
                 }
@@ -3645,7 +3644,7 @@ fn collect_prepared_runtime_facts(
                                 .entry(value_id)
                                 .or_insert_with(|| expr.clone());
                         } else {
-                            *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
+                            use_info.dropped_unkeyed_fact.get_or_insert("definitions");
                         }
                         use_info.insert_semantic_value_for_value_if_absent(
                             reload_value,
@@ -3743,7 +3742,7 @@ fn merge_prepared_stack_slot(
             .and_modify(|existing| *existing = existing.merge(provenance))
             .or_insert(provenance);
     } else {
-        *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
+        use_info.dropped_unkeyed_fact.get_or_insert("stack_slots");
     }
 }
 
@@ -3766,7 +3765,7 @@ fn seed_prepared_value_fact(
                 .entry(value_id)
                 .or_insert_with(|| expr.clone());
         } else {
-            *use_info.unkeyed_writes.entry("definitions").or_default() += 1;
+            use_info.dropped_unkeyed_fact.get_or_insert("definitions");
         }
         if let Some(value_id) = bound_value_id {
             use_info
@@ -3949,7 +3948,7 @@ fn record_prepared_call_result_facts(
             let Some(expr @ CExpr::Var(_symbol)) =
                 prepared_stack_program_expr_for_object_offset(symbols, view, *object, *offset)
             else {
-                *use_info.unkeyed_writes.entry("stack_slots").or_default() += 1;
+                use_info.dropped_unkeyed_fact.get_or_insert("stack_slots");
                 continue;
             };
             if *offset < 0 {

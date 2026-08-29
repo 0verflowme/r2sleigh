@@ -886,12 +886,20 @@ impl<'a> FoldingContext<'a> {
         control: crate::DecompileWorkControl<'_>,
     ) -> Result<(), analysis::PreparedRuntimeFactsError> {
         control.poll()?;
+        // A fact the analysis could not key is a fact it lost. It used to be
+        // counted and discarded, which reads as accounting while leaving a
+        // table quietly incomplete and nothing downstream able to tell. The
+        // count is zero on every corpus configuration, so refusing here costs
+        // nothing and turns a silent loss into a stated one.
         if self.inputs.prepared_ssa.is_some()
-            && std::env::var_os("R2SLEIGH_DEBUG_UNKEYED").is_some()
+            && let Some(kind) = self.use_info().dropped_unkeyed_fact
         {
-            let unkeyed = &self.use_info().unkeyed_writes;
-            let total: usize = unkeyed.values().sum();
-            eprintln!("UNKEYED total={total} by_store={unkeyed:?}");
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!("analysis dropped an unkeyed {kind} fact");
+            }
+            return Err(analysis::PreparedRuntimeFactsError::Lowering(
+                crate::analysis::lower::OpLoweringRefusal::missing_program_variable(),
+            ));
         }
         let symbols = &self.symbols;
 
