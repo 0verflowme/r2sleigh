@@ -57,7 +57,7 @@ impl Default for DecompilePrepConfig {
     fn default() -> Self {
         Self {
             max_iterations: 1,
-            enable_inst_combine: false,
+            enable_inst_combine: true,
             enable_cse: false,
         }
     }

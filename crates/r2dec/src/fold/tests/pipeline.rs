@@ -2815,9 +2815,12 @@ mod tests {
     fn rendered_integer_division_owns_its_exact_trap_obligation() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1910, 4);
+        // The dividend is the incoming register, not a literal. A division of
+        // two constants is folded to its result before rendering, and then
+        // there is no division left to own the obligation this test is about.
         entry.push(R2ILOp::IntDiv {
             dst: Varnode::register(0, 8),
-            a: Varnode::constant(12, 8),
+            a: Varnode::register(0, 8),
             b: Varnode::constant(3, 8),
         });
         let prepared = prepared_from_r2il_blocks(&[entry], &arch)

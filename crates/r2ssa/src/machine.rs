@@ -3757,6 +3757,19 @@ fn value_has_boolean_producer(graph: &crate::graph::SsaGraph, value: ValueId) ->
         if !visiting.insert(value) {
             return false;
         }
+        // A constant zero or one is a boolean. Constant folding a comparison is
+        // exactly how a boolean becomes one -- `0xfff1 == 0` collapses to a
+        // `Copy` of a constant, and a constant has no defining instruction, so
+        // walking producers alone concludes the value was never boolean and
+        // refuses every use of the select that reads it.
+        if let Some(constant) = graph
+            .value(value)
+            .and_then(|value| value.var.constant_bits())
+            && (constant == 0 || constant == 1)
+        {
+            visiting.remove(&value);
+            return true;
+        }
         let result = graph
             .def_inst(value)
             .and_then(|inst| graph.inst(inst))

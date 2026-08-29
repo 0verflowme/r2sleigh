@@ -391,10 +391,14 @@ fn direct_cfg_target_is_elided_only_when_every_use_is_control_topology() {
     );
 
     let mut mixed_entry = R2ILBlock::new(0x1000, 0x10);
+    // The literal is added to a register, not to another literal. Adding two
+    // constants folds to their sum before the plan is built, and the literal
+    // then has only its control use left, which is not the mixed use this
+    // fixture exists to describe.
     mixed_entry.push(R2ILOp::IntAdd {
         dst: Varnode::unique(0x80, 8),
         a: target.clone(),
-        b: Varnode::constant(1, 8),
+        b: Varnode::register(0x38, 8),
     });
     mixed_entry.push(R2ILOp::CBranch {
         target,

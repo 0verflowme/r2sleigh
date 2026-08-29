@@ -597,6 +597,35 @@ fn assert_function_capture(function_name: &str) {
         .collect::<Vec<_>>();
     assert_captured_abi_facts(function, &ssa, &owned_blocks);
 
+    // Re-capture path. These fixtures pin the prepared SSA by hash, so any
+    // deliberate change to the preparation pipeline drifts all of them at once
+    // and there was no way to record the new truth except by hand. Setting
+    // `R2SLEIGH_BLESS_LIFT_CAPTURE` prints what was actually produced, in the
+    // shape the capture file stores, so the update is transcribed rather than
+    // guessed at.
+    if std::env::var_os("R2SLEIGH_BLESS_LIFT_CAPTURE").is_some() {
+        let blocks = ssa_blocks
+            .iter()
+            .map(|actual| {
+                serde_json::json!({
+                    "address": actual["addr"],
+                    "size": actual["size"],
+                    "phi_count": actual["phis"].as_array().map_or(0, Vec::len),
+                    "op_count": actual["ops"].as_array().map_or(0, Vec::len),
+                    "fnv1a64": json_fnv1a64(actual.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "BLESS_LIFT_CAPTURE {}",
+            serde_json::json!({
+                "name": function.name,
+                "ssa_fnv1a64": actual_ssa_hash,
+                "ssa_blocks": blocks,
+            })
+        );
+    }
+
     assert!(
         capture_mismatches.is_empty(),
         "{} capture drift:\n{}",
