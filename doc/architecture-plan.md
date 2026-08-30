@@ -1611,3 +1611,61 @@ Not attempted: three cells are blocked on vector width rather than on the
 binding spine. `adler32` at x64 -O2 refuses with a 128-bit constant, and
 `crc32_bitwise` and `xxhash32` at arm64 -O2 refuse for a missing literal
 projection on NEON code. Those need vector types, not a spine fix.
+
+### What the call cells stop on now, and two traced dead ends
+
+Four cells generate and fail to compile rather than failing to render:
+`murmur3_32` and `xxhash32` at -O0 on both architectures. On arm64 the errors
+are frame slots the function writes and never reads, and the entry values of
+`x29`/`x30` read before assignment; on x64 they are sign conversions on
+stack-slot stores. Two more, `murmur3_32` at -O1 and -O2, now reach an
+unaccounted use of a `BranchInd` target: the tail switch is a jump table, the
+structurer never builds a `Region::Switch` for it, and nothing else accounts
+for the target operand. No corpus function has ever rendered a jump table, so
+that path is untested rather than broken in a known way.
+
+Three of the eight remaining cells are not the binding spine at all. Two are
+genuine NEON: `crc32_bitwise` and `xxhash32` at arm64 -O2 compute their result
+through vector lanes, and `SSAOp::CallOther` is an unconditional refusal in the
+renderer. The third, `adler32` at x64 -O2, is not a vector problem despite
+looking like one: the function contains no SSE at all, and its 128-bit constant
+is how Ghidra lifts `imul r10, rcx, 0x2001f` -- both operands sign-extended to
+sixteen bytes, multiplied, and sliced. `bit_vector` refuses any constant whose
+*varnode* is wider than eight bytes, although a p-code constant carries its
+value in a `u64` and so provably fits. The register form of the same
+instruction already renders, which is why `adler32` at -O1 passes and -O2 does
+not. `fletcher32` at x64 -O2 fails identically. That guard is two functions in
+one file and everything downstream already accepts 128 bits.
+
+Two attempts were traced to their end and reverted.
+
+The first was the preserved-carrier read, from the other side. Declining to
+coalesce a value with its own widening does clear `pearson` and
+`crc32_bitwise`, but it cannot tell that shape from the legitimate one:
+`xxhash32` at -O1 coalesces a 32-bit value with the 64-bit one it becomes, and
+declining there splits a loop carrier and duplicates its edge. Both are
+narrow-defined-then-widened at one location, so no rule over that shape alone
+separates them. Pairing the decline with a placement rule that only counts the
+carrier read when a member is wider than the write then rendered
+`CL_2 = (CL_2 & ~mask) | ...` on a `uint64_t` object, and clang caught the
+uninitialised read that placement had stopped catching. That is worth stating
+plainly: the placement refusal was standing in front of the defect, and
+silencing it moved the same error to the compiler. What sets the object's width
+is `binding_width`, which takes the maximum of member width, use-slice carrier
+and *write carrier* -- so a single-member one-byte binding is declared 64 bits
+by the register geometry alone. Any future attempt has to answer that first.
+
+The second was the dead frame slot. Placement decides `DeadStore` for those
+slots and its trial removal discards nothing, because `discard_observed_statement`
+matches only a marker on the statement and a stack write is marked on the
+expression the assignment writes to. Teaching it to recognise a statement whose
+assignment target carries the mark makes the removal work -- and the removal
+then loses the `ObservableMemoryWrite` obligation each store owns, so the effect
+ledger refuses the function. Guarding the removal on that obligation restores
+the four cells and costs `adler32` at x64 -O0, where the same pass legitimately
+removes a statement that owns one. So the guard is not the answer either. The
+missing piece is upstream of both: a certificate that a slot in this function's
+own frame, written and never read, is not observable from outside, which is what
+would let the obligation elide and the store go. `CalleeStackAllocationCertificate`
+already proves the allocation is this function's; `collect_stack_frame_round_trip_certificates`
+declines these objects only because `reads.is_empty()`.

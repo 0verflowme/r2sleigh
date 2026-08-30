@@ -118,6 +118,15 @@ pub enum ElisionReason {
     /// A source-classified structural instruction produced a value with no
     /// graph use and owns no semantic obligation.
     UnusedStructuralValue,
+    /// The content an object already held when the function started.
+    ///
+    /// A value with no defining instruction was put there by the caller, so no
+    /// statement in this function assigns it and none can be expected to. Where
+    /// something reads it the read is its occurrence and this does not apply;
+    /// this accounts for the entry content nothing in the function observes,
+    /// which is what a register the caller happened to leave behind looks like
+    /// once the merges that carried it are found to be unobserved.
+    CallerSuppliedEntryValue,
     /// A removed merge input already names the merge result, so its edge copy
     /// would be the identity assignment `x = x`.
     RedundantPhiEdge,
@@ -150,6 +159,7 @@ impl std::fmt::Display for ElisionReason {
             Self::UnobservedMerge => "unobserved-merge",
             Self::UnobservedValue => "unobserved-value",
             Self::UnusedStructuralValue => "unused-structural-value",
+            Self::CallerSuppliedEntryValue => "caller-supplied-entry-value",
             Self::RedundantPhiEdge => "redundant-phi-edge",
             Self::MaterializedPhiEdges => "materialized-phi-edges",
             Self::DeadUnclassified => "dead-unclassified",

@@ -2261,6 +2261,45 @@ impl LegacyObservationJournal {
                 | ObservationTarget::Effect(_) => {}
             }
         }
+
+        // The entry content of an object nothing in the function observes.
+        //
+        // A value with no defining instruction was put there by the caller, so
+        // there is no statement to render for it and no write cell to fall back
+        // on: its only possible occurrence is a read. Where every read of it
+        // has itself been accounted as elided -- the merges that carried it
+        // were unobserved, or the slices of it were -- no occurrence can exist,
+        // and the cell has no other answerer.
+        //
+        // This is not the blanket fill the loop above warns against. The
+        // condition is proved from the cells as they now stand: a use left
+        // empty, or one that rendered, disqualifies the value and leaves the
+        // seal to catch it. `murmur3_32` and `pearson` are the case, where the
+        // caller's `rdx` reaches nothing but a dead merge.
+        let reason = r2ssa::ledger::ElisionReason::CallerSuppliedEntryValue;
+        for index in 0..self.values.len() {
+            let value = ValueId(index as u32);
+            if self.values.get(index).is_none_or(|slot| slot.is_some())
+                || graph.def_inst(value).is_some()
+                || !matches!(
+                    self.plan.disposition(value),
+                    Some(ValueDisposition::Bound { .. })
+                )
+            {
+                continue;
+            }
+            let unobserved = graph.use_sites(value).iter().all(|site| {
+                matches!(
+                    self.uses
+                        .get(site.inst.0 as usize)
+                        .and_then(|row| row.get(site.input_idx)),
+                    Some(Some(LegacyUseObservation::Elided(_)))
+                )
+            });
+            if unobserved && let Some(slot) = self.values.get_mut(index) {
+                *slot = Some(LegacyValueObservation::Elided(reason));
+            }
+        }
     }
 
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
