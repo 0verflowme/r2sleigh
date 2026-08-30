@@ -1507,3 +1507,37 @@ assignment policy, and is fixed the same way.
 
 Recorded rather than committed, because the change as it stands admits a cell
 that compiles and computes the wrong thing.
+
+### The callee-saved spill slots, traced to where it stops being tractable
+
+`xxhash32` at x64 O1 and O2 render correct answers and fail the strict gate on
+`-Wunused-but-set-variable` for `stack_m24` and `stack_m16`. Those are the slots
+`push r14` and `push rbx` write. Traced, layer by layer:
+
+- Placement records a read occurrence for each slot, from the matching `pop`, so
+  the slot is not a dead store and keeps its declaration.
+- The `pop`'s value is `Bound`, so restricting the occurrence to readers the
+  plan renders changes nothing -- measured inert.
+- Placement's reconsideration loop, which exists to remove exactly this kind of
+  orphaned declaration, reaches both bindings and gives up with `discarded=0`:
+  the write occurrence's observation does not match the statement that carries
+  the write.
+- The mechanism that should have elided the pair upstream is
+  `StackFrameRoundTripCertificate`, which certifies a callee-saved register
+  stored on entry and restored on exit and elides both as frame setup. It
+  declines here on `escapes`: the entry value of `rbx` has uses outside the
+  round trip.
+- Those uses are `tmp:regalias:phi:*` subpieces and phis -- artifacts of
+  register alias repair, not of the program. The certificate is behaving
+  correctly given what the graph says; what the graph says about the entry
+  value's liveness is what is wrong.
+
+So the defect is real and its origin is alias repair attributing uses of a
+callee-saved entry value that the program does not make. That is a fifth layer
+down from the symptom, and each layer above it is behaving correctly given its
+input. Recorded rather than guessed at, because a change to alias repair made
+without tracing that attribution would be a change to the layer that reports
+the problem rather than the one that causes it.
+
+Both cells compute the right answer; this is a strict-gate defect, not a
+correctness one.
