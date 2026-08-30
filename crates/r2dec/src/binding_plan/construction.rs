@@ -273,7 +273,6 @@ pub(super) fn binding_components(
             }
         }
         super::rules::set_interferes(&read_together, &members)
-            || super::rules::set_outlives_a_redefinition(graph, &members)
     };
 
     if let Some(render) = source_owned.report().render() {
@@ -304,7 +303,9 @@ pub(super) fn binding_components(
             // declined and the values keep their own objects, which costs an
             // assignment in the output and nothing in correctness.
             if let Some(first) = values.first().copied() {
-                if merge_would_interfere(&mut parent, &values) {
+                if merge_would_interfere(&mut parent, &values)
+                    || super::rules::set_outlives_a_redefinition(graph, &values)
+                {
                     continue;
                 }
                 for value in values.iter().copied().skip(1) {
