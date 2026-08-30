@@ -1421,3 +1421,36 @@ it yet.
 
 **The rest:** two `observation journal`, three `effect obligations refused`,
 two `read_before_assignment`. Not yet traced.
+
+### Track C2 rests on a premise that does not hold
+
+C2 said to collapse `stack_address_roots` and `entry_stack_address_roots` into
+one map, on the reading that a value with two stack coordinates is the plan's
+one defect in the stack model. Tried, and it is not.
+
+The two maps do not answer the same question. `entry_stack_address_roots` says
+where a value is relative to the stack pointer the function was entered with,
+which is a machine-provable displacement. `stack_address_roots` says where a
+value is relative to the base its own frame is addressed from, which for a
+function that establishes its own frame is the same fact and for a function
+that *receives* a frame pointer is not: a received frame pointer has no
+provable relation to the entry stack pointer, and no derivation can supply one.
+
+The measurement is unambiguous. Merging the two by adopting the stronger gates
+is byte-identical on all fifty-four corpus cells -- every corpus function
+addresses its frame from the stack pointer -- and it breaks
+`exact_parameter_home_reuses_one_parameter_binding_identity`, whose fixture
+addresses a parameter home from a *received* frame pointer and which then loses
+its stack-slot certificate entirely. That is the corpus behaving exactly as the
+canary it is: silent about a capability it does not exercise.
+
+So `StackAddressBase` is not a second coordinate system smuggled into one
+model. It is the honest statement that two different things can be known about
+a stack position, and which one is available depends on the function. The
+`base == StackPointer` filters scattered through `semantic.rs` are not leaks;
+they are consumers saying they need the stronger fact.
+
+What C2 correctly identified is now done: `rebase_declared_frame_pointer` was
+reduced to an identity function by an earlier commit and left standing as a
+comment carrier, along with the `declared_stack_bases` argument four call sites
+threaded to it. That is deleted.

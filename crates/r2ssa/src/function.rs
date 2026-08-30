@@ -2977,12 +2977,6 @@ impl SSAFunction {
                         &family_state,
                         family_info,
                     ) {
-                        let root = rebase_declared_frame_pointer(
-                            self,
-                            &declared_stack_bases,
-                            &phi.dst,
-                            root,
-                        );
                         changed |= insert_stack_root(
                             &mut facts.stack_address_roots,
                             phi.dst.clone(),
@@ -3035,12 +3029,6 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
-                                let stack_root = rebase_declared_frame_pointer(
-                                    self,
-                                    &declared_stack_bases,
-                                    dst,
-                                    stack_root,
-                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -3088,12 +3076,6 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
-                                let root = rebase_declared_frame_pointer(
-                                    self,
-                                    &declared_stack_bases,
-                                    dst,
-                                    root,
-                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -3126,12 +3108,6 @@ impl SSAFunction {
                                 &family_state,
                                 family_info,
                             ) {
-                                let root = rebase_declared_frame_pointer(
-                                    self,
-                                    &declared_stack_bases,
-                                    dst,
-                                    root,
-                                );
                                 changed |= insert_stack_root(
                                     &mut facts.stack_address_roots,
                                     dst.clone(),
@@ -4777,29 +4753,6 @@ fn stack_address_root_from_sub(
         base: base.base,
         offset: base.offset.checked_sub(delta)?,
     })
-}
-
-fn rebase_declared_frame_pointer(
-    function: &SSAFunction,
-    declared_stack_bases: &BTreeMap<CanonicalStorageId, StackAddressBase>,
-    dst: &SSAVar,
-    inherited: StackAddressRoot,
-) -> StackAddressRoot {
-    // The frame pointer keeps the position it inherited, when it has one.
-    //
-    // Where the function establishes its own frame -- `push rbp; mov rbp, rsp`
-    // -- the frame pointer is the entry stack pointer less eight, and that is
-    // provable. Resetting it to its own base at offset zero threw the proof
-    // away, and the same slot reached through the two registers then carried
-    // two incomparable coordinates; the object model read the disagreement as
-    // ambiguity and refused the slot outright.
-    //
-    // A frame pointer the function receives rather than establishes has no
-    // provable relation to the entry stack pointer, and for that case its own
-    // base is still the honest answer. The seeded root supplies it, and this
-    // no longer overwrites what the body proved.
-    let _ = (function, declared_stack_bases, dst);
-    inherited
 }
 
 /// The displacement an address computation adds, resolved through copies.
