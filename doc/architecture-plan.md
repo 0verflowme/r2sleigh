@@ -2005,3 +2005,42 @@ The right question is the one that path already answers: will this removal be
 accounted, rather than does this statement own an effect. That is the next step,
 and it is a single predicate once the round-trip exclusion for the return
 address is settled, because those two are what make the arm64 store special.
+
+## Track status, checked against the tracks rather than the cell count
+
+**A -- remove the many answerers: done.** `UseInfo` is ten fields, from
+thirty-one. Every string-keyed duplicate named in A2 is gone --
+`value_ids_by_name`, `formatted_defs`, `stable_memory_values_by_value` and the
+`unkeyed_writes` drift counter it measured have no references left. The alias
+ladder A4 names is gone too; the `param_aliases` that remain in `r2types` are a
+different thing, the type database's own parameter aliases.
+
+**B -- make inference unrepresentable: done.** B1 held once `RecordedType`
+became a newtype only the fact layer can construct: the compiler enumerates
+every cast site. B2 is closed now. The two sites that still reached the policy
+with nothing -- a call's derived result lane, and a binary operation whose
+operands are recorded at different types -- now state their type, the first from
+the carrier object's declaration and the second from C's usual arithmetic
+conversions, which is a rule rather than a guess. Every cell that renders
+reaches the policy with a recorded source on all six configurations. Twelve
+decisions remain in `crc32_bitwise` at x64 -O2, on a bit-vector operand with no
+integer conversion rule, in a cell that does not render.
+
+**C -- finish what was started: done, with C2 superseded.** C1's five
+`preserved_carrier_read_before_assignment` cells are resolved -- by following the
+two-hop widening chain and by the `Lane` projection, both above. C3's rules live
+in `binding_plan/rules.rs` and both derivations call them. C2's deletion half is
+done: `rebase_declared_frame_pointer` no longer exists. Its collapse half should
+not be done. The two root maps are no longer one fact keyed twice:
+`stack_address_roots` holds every declared stack base, and
+`entry_stack_address_roots` holds the stability-gated stack-pointer-relative
+subset that the entry-root machinery and the frame-slot certificate depend on.
+Merging them would delete that gate.
+
+**D -- the corpus to parity: not done.** 51 of 54 compile and compute the right
+answer, 48 pass the strict gate, and nothing renders wrong. Three cells do not
+render: two are NEON, which is a feature rather than a defect, and one is a
+vector lane at bit offset 32 needing the use-side liveness question recorded
+above. Three miss the strict gate on an uninitialised stack pointer and two dead
+frame slots. The gate D asks for is fifty-four of fifty-four with all four
+scores equal, and that is the track still open.
