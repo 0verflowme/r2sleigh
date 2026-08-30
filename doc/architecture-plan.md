@@ -1761,3 +1761,47 @@ is the thing to fix; the three consumers below it -- the elision reason, the
 effect-ledger arm keyed on the access's block and op index, and the discarder --
 were written against that certificate and measured inert without it, so they
 were not kept.
+
+### Why a calling function has no frame-slot certificate, traced to the end
+
+The four call cells fail the strict compile on frame slots written and never
+read, and what would let those stores go is a certificate that the slot lies in
+storage this function owns. `collect_callee_stack_allocation_certificates`
+issues one for the corpus's leaf functions and none at all for the two that
+call. The chain is now complete, and every link was measured rather than
+inferred.
+
+`certificates().stack_slots` for `murmur3_32` on arm64 holds eighteen slots and
+not one has a `callee_allocation`. The collector rejects them before it reaches
+its call-related gate: `objects.entry_stack_roots` has no entry for any of
+them, so the slot's address is never tied back to the entry stack pointer.
+
+That set is built in `crates/r2ssa/src/function.rs` around line 2939, and it is
+withheld deliberately. `entry_stack_roots_are_stable` requires, for every call
+in the function, that `call_carriers_are_restored` -- the source interface must
+say the stack pointer, and the frame pointer if there is one, survive a call.
+Without that a call could move the stack under the slot and no entry-relative
+offset means anything.
+
+The interface never says it, because there is no interface. radare2 does set
+`stack_pointer_preserved_across_calls` and its frame-pointer twin early in
+`function_interface_snapshot_collect` (libr/anal/function.c around 3939), with a
+comment saying it does so precisely "so signatureless functions do not lose
+entry-relative facts". Then at function.c:3949 it returns early for any function
+whose signature is not *address*-linked, before `interface->complete` is
+assigned at :4103 -- and `complete` is what sets
+`R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE` at :6129. Our capture
+(`crates/r2source/src/radare_abi138.rs` around 1855) only reads the interface
+when that capability is present, so the flags radare2 published for exactly this
+purpose are discarded, and every non-DWARF binary loses its whole snapshot
+interface.
+
+Two ways to close it, and they are not equivalent. Upstream, `complete` conflates
+a physical interface -- stack pointer, return address, calling convention,
+preservation -- with a signature, and a function with no linked signature still
+has the first; separating them is a radare2 correctness fix and belongs in its
+own PR. On our side, the preservation flags are carried by the interface view
+whether or not it is exact, and reading them without demanding an exact
+interface would be enough on its own, though it means `SourceFunctionInterface`
+growing a partial form -- which is the same distinction `params_known` already
+draws for the function being rendered.
