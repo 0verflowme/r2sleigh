@@ -1904,3 +1904,38 @@ knowledge `structure_switch_region` already computes when it decides which
 
 `switch-chain.patch` now carries all five fixes and is verified against this
 commit. What remains is that one accumulation.
+
+### The switch chain, eight fixes in, and the gate that is left
+
+Three more defects fell after the five above, and `switch-chain.patch` now
+carries all eight, verified against this commit.
+
+Merging same-switch arms in the domain meet is right and not sufficient on its
+own: it hands the block the switch converges on an arm covering every case,
+which says the block runs whatever the selector is -- a guard that constrains
+nothing, and the rendering correctly has none. A merged arm that covers every
+case, and the default where there is one, is dropped.
+
+The renderer needed the same union from the other side. A case body reached by
+its own arm and by falling through from the one above runs for both values, and
+the guard the renderer pushes was its own value alone. `structure_switch_region`
+already computes which regions fall through when it decides where to omit
+`break`, so the reaching set is computed there and the pushed `SwitchArm`
+widened to it, transitively -- `case 3` into `case 2` into `case 1` means case
+1's body runs for all three.
+
+With those the structurer is satisfied: the switch structures, the domains
+cover, and `murmur3_32` at -O1 reaches declaration placement. What stops it
+there is the heading. The selector expression taken from the orphaned producer
+is assembled outside the observation machinery and carries no marker, so
+placement sees a symbol read nothing authorizes -- `active=[]`. Building the
+heading as the selector's own symbol through
+`observe_certified_value_read_expr`, which is what records a read of a value at
+an instruction, moves the unauthorized read to a second binding rather than
+removing it, so the switch statement's own construct is not yet an observation
+scope its heading falls inside.
+
+That is the next thing, and it is the last one this track has surfaced: the
+`switch (...)` heading has to be observed as part of the switch construct, the
+way a conditional's predicate is. Everything before it is done and measured
+safe -- eight fixes, no cell lost, no wrong answer -- and waits in the patch.
