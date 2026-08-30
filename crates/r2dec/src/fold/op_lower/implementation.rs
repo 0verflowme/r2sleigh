@@ -1619,6 +1619,23 @@ impl<'a> FoldingContext<'a> {
     ///
     /// A value the plan inlines has no declaration and so has no type here.
     /// That is an honest absence: the operand is an expression, not a name.
+    /// The declared type of the object a value is bound to.
+    ///
+    /// The same fact `declared_type_for_var` reports, asked of a value rather
+    /// than of a spelling, for the places that hold one -- a call result's
+    /// carrier is named by its certificate, not by a variable.
+    fn declared_type_for_value(&self, value: r2ssa::ValueId) -> Option<RecordedType> {
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        Some(RecordedType::from_declaration(
+            names.plan().binding(*binding)?.declaration_type().clone(),
+        ))
+    }
+
     fn declared_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
         let value = self.prepared_value_id_for_var(var)?;
         let names = self.inputs.binding_names?;
@@ -2922,7 +2939,12 @@ impl<'a> FoldingContext<'a> {
                         .map_or(carrier.clone(), |at| {
                             self.observe_certified_value_read_expr(carrier_value, at, carrier)
                         });
-                    let rhs = self.assignment_rhs_from_source_type(dst, None, carrier);
+                    // The expression is the carrier's own name, so the type it
+                    // has is the type that object is declared with. Passing
+                    // nothing here let the cast policy decide from not knowing,
+                    // which is the thing property 2 forbids.
+                    let carrier_ty = self.declared_type_for_value(carrier_value);
+                    let rhs = self.assignment_rhs_from_source_type(dst, carrier_ty, carrier);
                     return Ok(self.assign_stmt(lhs, rhs));
                 }
                 // Where the call site owns its result the call statement
@@ -3098,7 +3120,33 @@ impl<'a> FoldingContext<'a> {
                 .map(RecordedType::from_operation)
                 .or_else(|| {
                     let left = self.source_type_for_var(a)?;
-                    (self.source_type_for_var(b)? == left).then_some(left)
+                    let right = self.source_type_for_var(b)?;
+                    if right == left {
+                        return Some(left);
+                    }
+                    // Both operands are recorded and they differ. C says what
+                    // the expression's type is then -- the usual arithmetic
+                    // conversions -- so it is still stated, from two recorded
+                    // facts and a rule in the standard, rather than guessed.
+                    // Leaving it unstated let the cast policy decide from not
+                    // knowing, which is the last place on the render path that
+                    // did.
+                    let (left_signed, left_bits) = self.int_meta(left.get())?;
+                    let (right_signed, right_bits) = self.int_meta(right.get())?;
+                    let bits = left_bits.max(right_bits);
+                    let signed = if left_bits == right_bits {
+                        left_signed && right_signed
+                    } else if left_bits > right_bits {
+                        left_signed
+                    } else {
+                        right_signed
+                    };
+                    let converted = if signed {
+                        CType::Int(bits)
+                    } else {
+                        CType::UInt(bits)
+                    };
+                    Some(RecordedType::from_operation(converted))
                 })
         };
         let rhs = self.assignment_rhs_from_source_type(dst, produced, rhs);
