@@ -1805,3 +1805,39 @@ whether or not it is exact, and reading them without demanding an exact
 interface would be enough on its own, though it means `SourceFunctionInterface`
 growing a partial form -- which is the same distinction `params_known` already
 draws for the function being rendered.
+
+### The jump table: what is actually wrong, and a fix that was wrong
+
+The earlier note here said the resolved table's edges never reach the CFG. That
+was wrong and is corrected. The edges are there, the terminator is a
+`BlockTerminator::Switch` on the right block, and the region analyser does build
+a `Region::Switch` -- through the iterative composer at `region.rs:1389`, not
+through `detect_switch`, which is only reachable for a function with no loops
+and so is dead on this route.
+
+The defect is in `get_switch_expression` (`structure.rs`), which declines unless
+the `BranchInd`'s target value *is* the switch selector. For a real jump table
+it never is: `switch (len & 3)` computes the index, loads an address out of a
+table, and dispatches through that address, so the operand is the loaded target
+and the selector is several instructions upstream. The only shape satisfying the
+equality is the unit fixture's undefined target, which is why the tests pass and
+no corpus function has ever rendered a switch. The cutover that introduced the
+gate also orphaned the producer that would answer it:
+`switch_selector_expr_by_block` in `analysis/prepared_semantic.rs` is still
+computed and has had no reader since.
+
+Removing the gate, printing the selector, and accounting the dispatch operand
+and its `ControlTransfer` the way a direct branch's are -- both certified by the
+switch certificate -- takes generation from 49 to 51 and raw from 45 to 47, and
+it is wrong. The differential catches it: `murmur3_32` at -O1 and -O2 compile
+and compute the wrong answer, the first compile-but-wrong cells this corpus has
+produced in this work. The reason is visible in the output. The cases render as
+`/* case 0: goto loc_1000008a9; */` -- comments. The structured form never
+emitted the switch body, so the transfer genuinely was unrendered and the
+obligation refusal was standing in front of that, exactly as this file has
+recorded five times before.
+
+So the order is fixed: `structure_switch_region` has to emit the cases as
+control flow first. Only once the body is there does accounting the dispatch as
+control describe what the rendering does, and until then the two elisions must
+not be added -- they convert a refusal into a wrong answer.
