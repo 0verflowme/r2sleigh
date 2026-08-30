@@ -82,6 +82,14 @@ fn upstream_zero_occurrence_outcome(
     }) {
         return Outcome::Elided(ElisionReason::ReturnControl);
     }
+    // The copies a callee's address reaches its call through. The call spells
+    // the callee's name, so no statement answers for the copy that put the
+    // address in a temporary first.
+    if source_inst.is_some_and(|inst| {
+        crate::binding_plan::certified_direct_call_target_insts(prepared).contains(&inst)
+    }) {
+        return Outcome::Elided(ElisionReason::DirectCallTarget);
+    }
     if source_inst.is_some_and(|inst| prepared.certificates().stack_geometry.insts.contains(&inst))
     {
         return Outcome::Elided(ElisionReason::DeadStackBase);

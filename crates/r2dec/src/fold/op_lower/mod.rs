@@ -227,12 +227,26 @@ impl<'a> CertifiedRenderPlan<'a> {
         }
     }
 
-    fn call_arg_expr(
+    /// Whether this site's certified argument list places this value at this
+    /// index.
+    ///
+    /// This answers admission only. The spelling of an argument is not this
+    /// table's to give: an argument is a read of a value, and the binding plan
+    /// is the single authority on how a value is read. Returning a recovered
+    /// expression here spelled the argument by walking back to the operation
+    /// that defined it, which both re-evaluated a definition the plan had
+    /// already bound to its own variable and named bindings the statement was
+    /// never authorized to read.
+    fn admits_call_arg(&self, site: (u64, usize), index: usize, value: r2ssa::ValueId) -> bool {
+        self.call_arg_admission(site, index, value).is_some()
+    }
+
+    fn call_arg_admission(
         &self,
         site: (u64, usize),
         index: usize,
         value: r2ssa::ValueId,
-    ) -> Option<CExpr> {
+    ) -> Option<()> {
         if !self.proof.expression_is_renderable(value) {
             return None;
         }
@@ -258,7 +272,7 @@ impl<'a> CertifiedRenderPlan<'a> {
         {
             return None;
         }
-        call_view.authoritative_args.get(index).cloned()
+        Some(())
     }
 }
 

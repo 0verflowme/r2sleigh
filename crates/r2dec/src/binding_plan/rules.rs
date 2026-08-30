@@ -20,8 +20,9 @@ use r2ssa::{SsaGraph, ValueId};
 use r2types::SourceOwnedFunctionFacts;
 
 use super::{
-    BindingPlanBuildError, BindingPlanSourceMismatch, certified_direct_control_target_values,
-    certified_return_control_values, certified_stack_frame_values, certified_stack_geometry_values,
+    BindingPlanBuildError, BindingPlanSourceMismatch, certified_direct_call_target_values,
+    certified_direct_control_target_values, certified_return_control_values,
+    certified_stack_frame_values, certified_stack_geometry_values,
 };
 
 /// Which values can be members of a binding at all.
@@ -30,8 +31,9 @@ use super::{
 /// object. The rest are values some other part of the model already answers
 /// for -- an unobserved merge or value, a return-control or direct
 /// control-flow target, the stack frame and its geometry, and values the
-/// obligation ledger records as structurally unused. A binding for one of
-/// those would be a second answer about the same value.
+/// obligation ledger records as structurally unused, and the target of a direct
+/// call, which the call expression spells as the callee's name. A binding for
+/// one of those would be a second answer about the same value.
 pub(super) fn component_eligible_values(
     source_owned: &SourceOwnedFunctionFacts,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
@@ -41,15 +43,15 @@ pub(super) fn component_eligible_values(
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
+    let direct_call_targets = certified_direct_call_target_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
-    let structural_unused =
-        source
-            .obligations()
-            .structural_unused_values(graph)
-            .ok_or(BindingPlanBuildError::Seal(
-                BindingPlanSourceMismatch::Authority,
-            ))?;
+    let structural_unused = source
+        .obligations()
+        .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
+        .ok_or(BindingPlanBuildError::Seal(
+            BindingPlanSourceMismatch::Authority,
+        ))?;
     Ok(graph
         .values
         .iter()
@@ -59,6 +61,7 @@ pub(super) fn component_eligible_values(
                 && !unobserved_values.contains(&value.id)
                 && !return_controls.contains(&value.id)
                 && !direct_control_targets.contains(&value.id)
+                && !direct_call_targets.contains(&value.id)
                 && !stack_frame_values.contains(&value.id)
                 && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)

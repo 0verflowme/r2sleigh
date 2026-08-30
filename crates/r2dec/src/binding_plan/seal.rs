@@ -382,16 +382,16 @@ pub(crate) fn build_upstream_shadow_oracle(
         .map_err(BindingPlanBuildError::MachineProjection)?;
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
+    let direct_call_targets = super::certified_direct_call_target_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
     let unobserved_values = source.unobserved_values();
-    let structural_unused =
-        source
-            .obligations()
-            .structural_unused_values(graph)
-            .ok_or(BindingPlanBuildError::Seal(
-                BindingPlanSourceMismatch::Authority,
-            ))?;
+    let structural_unused = source
+        .obligations()
+        .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
+        .ok_or(BindingPlanBuildError::Seal(
+            BindingPlanSourceMismatch::Authority,
+        ))?;
     let resolved = seal_binding_components(source_owned)?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
@@ -422,6 +422,12 @@ pub(crate) fn build_upstream_shadow_oracle(
         if direct_control_targets.contains(&graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::DirectControlTarget,
+            ));
+            continue;
+        }
+        if direct_call_targets.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::DirectCallTarget,
             ));
             continue;
         }
@@ -531,11 +537,15 @@ impl BindingPlan {
         let unobserved_values = source.unobserved_values();
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
+        let direct_call_targets = super::certified_direct_call_target_values(source);
         let stack_frame_values = certified_stack_frame_values(source);
         let stack_geometry_values = certified_stack_geometry_values(source);
-        let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
-            BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
-        )?;
+        let structural_unused = source
+            .obligations()
+            .structural_unused_values(graph, unobserved_merges.unobserved_uses())
+            .ok_or(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::Authority,
+            ))?;
         for (index, graph_value) in graph.values.iter().enumerate() {
             if graph_value.id.0 as usize != index {
                 return Err(BindingPlanBuildError::Seal(
@@ -595,6 +605,7 @@ impl BindingPlan {
                         && !unobserved_values.contains(&value)
                         && !return_controls.contains(&value)
                         && !direct_control_targets.contains(&value)
+                        && !direct_call_targets.contains(&value)
                         && !stack_frame_values.contains(&value)
                         && !stack_geometry_values.contains(&value)
                         && !structural_unused.contains(&value) => {}
@@ -619,6 +630,11 @@ impl BindingPlan {
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && direct_control_targets.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::DirectCallTarget
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && direct_call_targets.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::StackFrame
                         && proof.authority == *source.authority()

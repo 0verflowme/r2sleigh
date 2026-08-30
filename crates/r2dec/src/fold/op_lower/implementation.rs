@@ -294,11 +294,18 @@ impl<'a> FoldingContext<'a> {
             if var.is_const() {
                 return self.certified_const_expr(var);
             }
-            if prepared
-                .call_result_certificate_for_value(value)
-                .is_some_and(|result| result.relation.is_identity())
+            // A value the callee returned used to render as the call itself,
+            // because the result had no name to render as. Where the call site
+            // owns the result it has one now, and every use that re-rendered
+            // the call was a second evaluation of it -- which is what the
+            // single-evaluation check refuses.
+            if let Some(result) = prepared.call_result_certificate_for_value(value)
+                && result.relation.is_identity()
             {
-                return self.certified_call_result_expr_for_value(value);
+                let site = (result.block_addr, result.op_index);
+                if !self.call_site_assigns_its_own_result(site) {
+                    return self.certified_call_result_expr_for_value(value);
+                }
             }
             let expression_renderable = self
                 .certified_render_context()
@@ -1758,6 +1765,77 @@ impl<'a> FoldingContext<'a> {
             .then(|| self.certified_call_result_owner_expr_for_source(source_call))?
     }
 
+    /// The name a call result carries, for a definition that is a slice of it.
+    ///
+    /// A `Derived` call-result certificate says this value is the call's result
+    /// seen at another width, not a second result. Rendering it from the
+    /// carrier's binding keeps the call to one evaluation.
+    fn derived_call_result_carrier_expr(&self, dst: &SSAVar) -> Option<(ValueId, CExpr)> {
+        let value = self.prepared_value_id_for_var(dst)?;
+        let view = self.prepared_semantic_view()?;
+        let cert = view.call_result_facts_by_value.get(&value);
+        let cert = cert?;
+        if cert.relation.is_identity() {
+            return None;
+        }
+        let carrier = view
+            .call_result_facts_by_value
+            .values()
+            .find(|other| other.callsite == cert.callsite && other.relation.is_identity())?
+            .value;
+        // Whatever the call statement wrote is what this slice reads. Taking
+        // `symbol_for_value` instead gave a name the statement does not
+        // necessarily assign -- the site owns its result through the owner
+        // expression -- so the lane mentioned a variable nothing declared.
+        let owner = self.certified_call_result_owner_expr_for_source((
+            cert.callsite.block_addr,
+            cert.callsite.op_index,
+        ))?;
+        Some((carrier, owner))
+    }
+
+    /// Whether the call statement at this site renders the assignment itself.
+    pub(super) fn call_site_assigns_its_own_result(&self, site: (u64, usize)) -> bool {
+        self.materializable_call_result_expr_for_call_expr(site, &CExpr::IntLit(0))
+            .is_some()
+    }
+
+    /// The value a call site's certified result carries.
+    ///
+    /// A `Call` has no output of its own, so an occurrence at the call site
+    /// names no value, and the call-result obligation the site owns matches
+    /// nothing. What the statement assigns is this value, and naming it is what
+    /// lets the obligation be discharged by the statement that renders it.
+    pub(super) fn certified_call_result_value(&self, site: (u64, usize)) -> Option<ValueId> {
+        let view = self.prepared_semantic_view()?;
+        view.call_result_facts_by_value
+            .values()
+            .find(|cert| {
+                (cert.callsite.block_addr, cert.callsite.op_index) == site
+                    && cert.relation.is_identity()
+            })
+            .map(|cert| cert.value)
+    }
+
+    /// Where the definition of this call site's certified result lives.
+    ///
+    /// One statement implements two instructions: the call supplies the effect
+    /// and the `CallDefine` owns the write. A `Call` has no output, so
+    /// observing the statement against its own site asks for a write target
+    /// that cannot exist and leaves the assignment unaccounted.
+    pub(super) fn certified_call_result_definition_site(
+        &self,
+        site: (u64, usize),
+    ) -> Option<(u64, usize)> {
+        let view = self.prepared_semantic_view()?;
+        let cert = view.call_result_facts_by_value.values().find(|cert| {
+            (cert.callsite.block_addr, cert.callsite.op_index) == site
+                && cert.relation.is_identity()
+        })?;
+        let graph = self.inputs.prepared_ssa?.graph();
+        graph.op_site_for_inst(graph.def_inst(cert.value)?)
+    }
+
     pub(crate) fn call_result_source_for_var(&self, var: &SSAVar) -> Option<(u64, usize)> {
         self.prepared_semantic_view()?
             .call_result_source_for_var(var)
@@ -2072,6 +2150,12 @@ impl<'a> FoldingContext<'a> {
                                 .stack_geometry
                                 .insts
                                 .contains(&inst)
+                            // The copy that puts a callee's address in a
+                            // temporary before the call. The call spells the
+                            // callee's name, so this assigns an object the
+                            // plan has elided and no statement can name.
+                            || crate::binding_plan::certified_direct_call_target_insts(prepared)
+                                .contains(&inst)
                     })
                 })
             {
@@ -2272,7 +2356,14 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or_else(|| type_from_size(val.size));
                 let certified_lhs =
                     self.render_certified_store_access_expr(addr, val, elem_ty.clone())?;
-                let mut rhs = if let Some(source_call) = self.call_result_source_for_var(val) {
+                // A use of a call result used to re-render the call, because
+                // the result had no name of its own. It has one now: the site
+                // assigns it, and rendering the call here as well would call
+                // the function a second time.
+                let mut rhs = if let Some(source_call) = self
+                    .call_result_source_for_var(val)
+                    .filter(|site| !self.call_site_assigns_its_own_result(*site))
+                {
                     match self
                         .call_result_exprs_map()
                         .get(&source_call)
@@ -2694,7 +2785,11 @@ impl<'a> FoldingContext<'a> {
                     }
                     _ => self.resolve_call_target(target),
                 }?;
-                let func_expr = self.observed_input(frame, 0, func_expr);
+                // Deliberately not an observed input. The callee's name is not
+                // a read of the target operand's value -- it is the symbol the
+                // call site resolves to -- and the plan elides that value for
+                // the same reason. Marking it read would claim the function
+                // holds the callee's address in an object it never declares.
                 let call = CExpr::call(func_expr, vec![]);
                 self.call_statement_unless_result_is_named(call)
             }
@@ -2789,10 +2884,48 @@ impl<'a> FoldingContext<'a> {
             // its site. Otherwise the call would appear twice and be made
             // twice.
             SSAOp::CallDefine { dst } => {
+                // Not every `CallDefine` is the call's result. A call defines
+                // one of these for every register it may have destroyed, and
+                // upstream certifies exactly the one the callee returned in --
+                // `murmur3_32` at -O0 has nine clobbers to one result at a
+                // single `memcpy`. Refusing for want of a call-result source
+                // therefore refused every function that called anything, on
+                // account of the registers the call did *not* return in.
+                //
+                // What a clobber holds afterwards is not knowable, and no C
+                // statement says so. Rendering nothing is the honest answer,
+                // and it is not a silent one: the binding is left unassigned,
+                // so anything that goes on to read it is caught by the
+                // declaration placement audit and refuses there, naming the
+                // read rather than the call.
+                let Some(source_call) = self.call_result_source_for_var(dst) else {
+                    return Ok(None);
+                };
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let source_call = self
-                    .call_result_source_for_var(dst)
-                    .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+                // A call also defines the lane its prototype is declared at --
+                // an `int` returned in `rax` gives a `CallDefine` for `RAX` and
+                // one for `EAX`. The lane is that result sliced, which is what
+                // its certificate says, so it renders from the carrier's name
+                // rather than calling the function again.
+                if let Some((carrier_value, carrier)) =
+                    self.derived_call_result_carrier_expr(dst)
+                {
+                    let carrier = self
+                        .value_id_for_rendered_op(dst)
+                        .and_then(|value| {
+                            self.inputs.prepared_ssa?.graph().def_inst(value)
+                        })
+                        .map_or(carrier.clone(), |at| {
+                            self.observe_certified_value_read_expr(carrier_value, at, carrier)
+                        });
+                    let rhs = self.assignment_rhs_from_source_type(dst, None, carrier);
+                    return Ok(self.assign_stmt(lhs, rhs));
+                }
+                // Where the call site owns its result the call statement
+                // assigns it, so rendering here would evaluate the call twice.
+                if self.call_site_assigns_its_own_result(source_call) {
+                    return Ok(None);
+                }
                 let call = self
                     .call_result_exprs_map()
                     .get(&source_call)
@@ -2896,6 +3029,7 @@ impl<'a> FoldingContext<'a> {
                 self.call_result_source_for_var(b),
             )
             && left_source == right_source
+            && !self.call_site_assigns_its_own_result(left_source)
             && let Some(call_expr) = self
                 .call_result_exprs_map()
                 .get(&left_source)

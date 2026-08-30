@@ -1880,6 +1880,19 @@ fn machine_write_disposition(
     if matches!(inst.payload, InstPayload::Phi { .. }) {
         return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
     }
+    // A call's definition of a register preserves nothing. The callee wrote
+    // that register, so whatever sits outside the lane the prototype names is
+    // what the callee left there, not what the caller had before. Reading a
+    // carrier-relative projection off the geometry says otherwise, and for a
+    // definition of a sub-register that comes out as `Insert` -- an assertion
+    // that the call preserved the caller's other bits, which is exactly the
+    // claim a call cannot make.
+    if matches!(
+        inst.payload,
+        InstPayload::Op(crate::op::SSAOp::CallDefine { .. })
+    ) {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+    }
     let Some(storage) = artifact
         .graph()
         .value(output)
@@ -3438,6 +3451,25 @@ impl MachineBuilder {
                     },
                 ))
             }
+            // A call's definition of a register is not computed here. The
+            // callee wrote it, and what this function knows is the machine
+            // location it arrived in -- which is what `Source` says, and what
+            // an entry parameter already uses.
+            SSAOp::CallDefine { .. } => {
+                let value = inst.output.and_then(|output| graph.value(output)).ok_or(
+                    MachineBuildError::UnsupportedOperation {
+                        inst: inst.id,
+                        op: Box::new(op.clone()),
+                    },
+                )?;
+                Ok((
+                    unsigned,
+                    MachineExprKind::Source {
+                        binding: output,
+                        storage: value.canonical_storage,
+                    },
+                ))
+            }
             _ => Err(MachineBuildError::UnsupportedOperation {
                 inst: inst.id,
                 op: Box::new(op.clone()),
@@ -3538,6 +3570,7 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
     matches!(
         (op, kind),
         (SSAOp::Load { .. }, MachineExprKind::MemoryRead { .. })
+            | (SSAOp::CallDefine { .. }, MachineExprKind::Source { .. })
             | (SSAOp::Copy { .. }, MachineExprKind::Copy { .. })
             | (
                 SSAOp::IntAdd { .. },
@@ -3762,6 +3795,7 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
     let unsigned = integer_type(output_bits, MachineSignedness::Unsigned);
     let signed = integer_type(output_bits, MachineSignedness::Signed);
     match op {
+        SSAOp::CallDefine { .. } => *ty == unsigned,
         SSAOp::IntSRight { .. } | SSAOp::IntSExt { .. } => *ty == signed,
         SSAOp::IntEqual { .. }
         | SSAOp::IntNotEqual { .. }

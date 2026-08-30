@@ -17,7 +17,12 @@ impl<'a> FoldingContext<'a> {
             | Error::InvalidPlannedInline { .. }
             | Error::PlannedElidedValueRendered { .. }
             | Error::PlannedRefusedValueRendered { .. }
-            | Error::MissingPlannedValue(_) => OpLoweringRefusal::missing_program_variable(),
+            | Error::MissingPlannedValue(_) => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal from journal error {error:?}");
+                }
+                OpLoweringRefusal::missing_program_variable()
+            }
             other => {
                 if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                     eprintln!("refusal from journal error {other:?}");
@@ -33,12 +38,41 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> std::collections::BTreeSet<r2ssa::SemanticObligationId> {
+        // A call has no `dst`. One statement implements two instructions --
+        // the call supplies the effect, the `CallDefine` owns the write -- so
+        // the value the occurrence names has to come from the site's certified
+        // result rather than from the operation's own output, which does not
+        // exist. Without it the call-result obligation matched no occurrence
+        // and every function that called anything was refused for a result its
+        // rendering did assign.
+        let rendered_value = match op {
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
+                self.certified_call_result_value((block_addr, op_idx))
+            }
+            _ => op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+        };
         let mut obligations = self.exact_effect_obligations_for_normalized_value(
             EffectOccurrenceKind::Expression,
             block_addr,
             op_idx,
-            op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+            rendered_value,
         );
+        // The other half of the same statement. `x = f()` renders the call and
+        // the definition of its result at once, so the `CallDefine`'s own
+        // obligations are answered here; the `CallDefine` itself lowers to no
+        // statement precisely because this one already assigned it, and left
+        // alone its producer obligation had nothing to name.
+        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            && let Some((define_block, define_idx)) =
+                self.certified_call_result_definition_site((block_addr, op_idx))
+        {
+            obligations.extend(self.exact_effect_obligations_for_normalized_value(
+                EffectOccurrenceKind::Expression,
+                define_block,
+                define_idx,
+                rendered_value,
+            ));
+        }
         // Memory-effect ownership comes from the exact source operation and its
         // certified access, not from the finalized C shape. A stack-object
         // assignment is still the same source Store even though its AST no
@@ -669,24 +703,28 @@ impl<'a> FoldingContext<'a> {
         if self.prepared_value_id_for_var(target) != Some(cert.target) {
             return Err(OpLoweringRefusal::missing_machine_projection());
         }
+        // A direct call spells its callee's name, which the call site's own
+        // identity supplies. Asking the plan for the operand's expression
+        // would be asking for the object that holds the callee's address, and
+        // there is none: the plan elides that value, and the operand's
+        // occurrence is elided beside it. Only an indirect call reads a target
+        // the program computed, and only there is the planned expression the
+        // thing being called.
+        if direct {
+            let address = cert
+                .direct_target
+                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+            return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(address)));
+        }
         let planned = self.planned_input_expr(frame, 0).map_err(|error| {
             let refusal = Self::observation_lowering_refusal(&error);
             self.retain_first_observation_error(error);
             refusal
         })?;
-        let target = if direct {
-            let address = cert
-                .direct_target
-                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
-            let canonical =
-                self.callee_identity_expr(&self.callee_identity_for_direct_target(address));
-            crate::ast::carry_outer_expr_observations(&planned, canonical)
-        } else {
-            if cert.direct_target.is_some() {
-                return Err(OpLoweringRefusal::missing_machine_projection());
-            }
-            Self::indirect_callable_expr(planned)
-        };
+        if cert.direct_target.is_some() {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
+        let target = Self::indirect_callable_expr(planned);
         Ok(self.observe_optional_normalized_input_uses_expr(frame.normalized_site, 0, target))
     }
 
@@ -805,10 +843,16 @@ impl<'a> FoldingContext<'a> {
         };
 
         let obligations = self.exact_normalized_op_effects(op, block_addr, op_idx);
-        let stmt = if op.dst().is_some()
-            && !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty)
-        {
+        let rendered = !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty);
+        let stmt = if op.dst().is_some() && rendered {
             self.observe_normalized_output_stmt(block_addr, op_idx, stmt)
+        } else if rendered
+            && matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            && self.call_site_assigns_its_own_result((block_addr, op_idx))
+            && let Some((definition_block, definition_idx)) =
+                self.certified_call_result_definition_site((block_addr, op_idx))
+        {
+            self.observe_normalized_output_stmt(definition_block, definition_idx, stmt)
         } else {
             stmt
         };

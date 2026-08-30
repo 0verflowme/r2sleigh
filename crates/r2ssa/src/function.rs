@@ -1126,34 +1126,72 @@ impl SsaArtifact {
 /// instruction it was recorded against and the target it names both agree with
 /// the machine. A prototype that matches nothing, or matches more than one
 /// call, is dropped rather than guessed at.
+/// The one lifted call whose instruction and target both match this advisory
+/// call, if exactly one does.
+fn unique_call_site_identity(
+    blocks: &[R2ILBlock],
+    call: &r2source::AdvisoryCallSite,
+) -> Option<SourceCallSiteIdentity> {
+    let mut matches = blocks.iter().flat_map(|block| {
+        block
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(move |(op_index, op)| match op {
+                R2ILOp::Call { target } => {
+                    let instruction = block
+                        .op_metadata(op_index)
+                        .and_then(|metadata| metadata.instruction_addr)?;
+                    let storage = CanonicalStorageId::from_varnode(target);
+                    (instruction == call.instruction_address()
+                        && storage.offset == call.target_address())
+                    .then(|| SourceCallSiteIdentity::new(block.addr, op_index, storage))
+                }
+                _ => None,
+            })
+    });
+    match (matches.next(), matches.next()) {
+        (Some(identity), None) => Some(identity),
+        _ => None,
+    }
+}
+
 fn correlate_call_site_interfaces(
     source: &OwnedFunctionSnapshot,
     blocks: &[R2ILBlock],
+    callee_interfaces: &BTreeMap<u64, SourceFunctionInterface>,
 ) -> Vec<SourceCallSiteInterface> {
     let mut interfaces = Vec::new();
     for call in source.advisory_calls() {
+        // A prototype the source recovered, or -- where it recovered none and
+        // this capture carries the callee's own body -- the interface we
+        // derived from that body. radare2 reports no prototype for most local
+        // functions, because it correctly declines to assert a return type it
+        // never inferred, and the call site was then left with no interface at
+        // all. What the callee does is a stronger fact than what was declared
+        // about it, and it is already in hand.
+        let recovered = call
+            .prototype()
+            .is_none()
+            .then(|| callee_interfaces.get(&call.target_address()))
+            .flatten();
         let Some(prototype) = call.prototype() else {
+            let Some(callee) = recovered else {
+                continue;
+            };
+            let Some(identity) = unique_call_site_identity(blocks, call) else {
+                continue;
+            };
+            if let Some(interface) = crate::recover_interface::mint_recovered_call_site_interface(
+                callee,
+                identity,
+                source.source_revision_identity(),
+            ) {
+                interfaces.push(interface);
+            }
             continue;
         };
-        let mut matches = blocks.iter().flat_map(|block| {
-            block
-                .ops
-                .iter()
-                .enumerate()
-                .filter_map(move |(op_index, op)| match op {
-                    R2ILOp::Call { target } => {
-                        let instruction = block
-                            .op_metadata(op_index)
-                            .and_then(|metadata| metadata.instruction_addr)?;
-                        let storage = CanonicalStorageId::from_varnode(target);
-                        (instruction == call.instruction_address()
-                            && storage.offset == call.target_address())
-                        .then(|| SourceCallSiteIdentity::new(block.addr, op_index, storage))
-                    }
-                    _ => None,
-                })
-        });
-        let (Some(identity), None) = (matches.next(), matches.next()) else {
+        let Some(identity) = unique_call_site_identity(blocks, call) else {
             continue;
         };
         let Ok(interface) = SourceCallSiteInterface::new(
@@ -1181,6 +1219,18 @@ impl TrustedSsaArtifact {
         lifted: TrustedLiftedFunction,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
+        Self::prepare_with_callee_interfaces(lifted, control, &BTreeMap::new())
+    }
+
+    /// Prepare, describing each call whose callee body came in this capture.
+    ///
+    /// The interfaces are keyed by callee entry address and are consulted only
+    /// where the source itself recovered no prototype for the call.
+    pub fn prepare_with_callee_interfaces<C: SsaWorkControl + ?Sized>(
+        lifted: TrustedLiftedFunction,
+        control: &C,
+        callee_interfaces: &BTreeMap<u64, SourceFunctionInterface>,
+    ) -> Result<Self, SsaPrepareError> {
         let source = lifted.source().clone();
         let genuine = lifted.lifted();
         let lift_authority = genuine.authority().clone();
@@ -1195,7 +1245,8 @@ impl TrustedSsaArtifact {
         // unavailable, incoherent ABI model, and every consumer filters on
         // coherence. Refusing here instead would suppress the whole function
         // for a fact the pipeline is built to carry.
-        let call_site_interfaces = correlate_call_site_interfaces(&source, &blocks);
+        let call_site_interfaces =
+            correlate_call_site_interfaces(&source, &blocks, callee_interfaces);
         // Every call target the source named, whether or not a prototype was
         // recovered for it: a name and a prototype are independent facts.
         let mut display_names = r2source::DisplayNames::new();

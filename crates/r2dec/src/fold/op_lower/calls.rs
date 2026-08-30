@@ -198,6 +198,19 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
+    /// One argument of a call, spelled by the plan and observed as a read.
+    ///
+    /// The render plan says which value belongs at this index. The binding
+    /// plan says how that value is read, exactly as it does for an operand of
+    /// any other operation, so the argument is whatever the value's own
+    /// disposition renders as.
+    ///
+    /// The read itself has no `UseSite`: `SSAOp::Call` takes only the callee
+    /// as an operand, so an argument value is consumed by the call boundary
+    /// and not by the graph. The callsite certificate is the source's record
+    /// that the read happens, which is the same record the return boundary
+    /// keeps for the value a `Return` carries, and it authorizes the marker
+    /// the same way.
     fn certified_call_arg_expr_for_value_at_site(
         &self,
         site: (u64, usize),
@@ -205,7 +218,33 @@ impl<'a> FoldingContext<'a> {
         value: r2ssa::ValueId,
         render_plan: Option<&CertifiedRenderPlan<'_>>,
     ) -> Option<CExpr> {
-        render_plan?.call_arg_expr(site, index, value)
+        if !render_plan?.admits_call_arg(site, index, value) {
+            return None;
+        }
+        let expr = match self.planned_value_expr(value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return None;
+            }
+        };
+        // An inlined constant is spelled as a literal and reads no program
+        // variable, so there is no read for the placement audit to authorize
+        // and nothing for a marker to name.
+        if !matches!(
+            self.inputs
+                .binding_names
+                .and_then(|names| names.disposition_for_value(value)),
+            Some(crate::binding_plan::ValueDisposition::Bound { .. })
+        ) {
+            return Some(expr);
+        }
+        let at = self
+            .inputs
+            .prepared_ssa?
+            .graph()
+            .inst_id_for_op_site(site.0, site.1)?;
+        Some(self.observe_certified_value_read_expr(value, at, expr))
     }
 
     pub(super) fn known_signature_for_site(

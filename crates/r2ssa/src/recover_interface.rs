@@ -10,7 +10,8 @@
 //! here claims a type or a name, both of which compilation genuinely erases.
 
 use r2source::{
-    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCarrierKind,
+    CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
+    SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface, SourceCarrierKind,
     SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn,
     SourceLogicalValue, SourceMachineRoles, SourceType, SourceTypeGraph, SourceTypeKind,
 };
@@ -265,6 +266,50 @@ pub fn mint_recovered_interface(
     .with_return_address_storage(return_address_storage)
     .ok()?
     .with_stack_pointer_storage(stack_pointer_storage)
+    .ok()
+}
+
+/// Mint a call-site interface from an interface recovered for the callee.
+///
+/// radare2 reports a prototype for a call only when it has one. For a local
+/// function it usually has none: it correctly declines to assert a return type
+/// it never inferred, and the snapshot carries that absence faithfully. The
+/// call site is then left with no interface at all, its boundary never
+/// completes, and every use of the call's result in the caller is refused.
+///
+/// But the callee's body arrives in the same capture, and its interface is
+/// already recovered from its own SSA by `recover_interface` -- which is a
+/// stronger fact than a prototype, because it is derived from the code rather
+/// than declared about it. So where the source names no prototype and we hold
+/// the callee, the call site is described from what the callee does.
+///
+/// The carriers come from the callee; the identity, revision and convention
+/// come from the call site, so the result is indistinguishable from a
+/// source-supplied interface to everything downstream and passes the same
+/// admission gates.
+pub fn mint_recovered_call_site_interface(
+    callee: &SourceFunctionInterface,
+    identity: SourceCallSiteIdentity,
+    revision_identity: &[u8],
+) -> Option<SourceCallSiteInterface> {
+    let arguments = callee
+        .parameters()
+        .iter()
+        .map(|parameter| SourceCallArgumentSpec::new(parameter.index(), parameter.storage()));
+    let result = match callee.return_kind() {
+        SourceFunctionReturn::Void => SourceCallResult::Void,
+        SourceFunctionReturn::Register { storage } => SourceCallResult::Register { storage },
+    };
+    SourceCallSiteInterface::new(
+        revision_identity.to_vec(),
+        identity,
+        true,
+        callee.calling_convention(),
+        arguments,
+        false,
+        false,
+        result,
+    )
     .ok()
 }
 

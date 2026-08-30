@@ -5833,12 +5833,65 @@ fn process_call_result_flow_block(
                     .results
                     .iter()
                     .filter(|result| result.value == value);
-                let Some(result) = exact_results.next() else {
-                    continue;
+                let (result, relation) = match exact_results.next() {
+                    Some(result) => {
+                        if exact_results.next().is_some() {
+                            continue;
+                        }
+                        (result, CallResultValueRelation::Identity)
+                    }
+                    // The call defines the register the callee returned in and
+                    // separately defines the lane of it the callee's prototype
+                    // is declared at: an `int` returned in `rax` gives a
+                    // `CallDefine` for `RAX` and one for `EAX`. The boundary
+                    // certifies the carrier, because that is the storage the
+                    // interface names, so the lane matched nothing and the
+                    // renderer had no source call for the definition the
+                    // program actually reads. `murmur3_32` at -O0 stores `eax`
+                    // to a local after every `memcpy` and was refused for it.
+                    //
+                    // A lane is not a second result. It is this result, sliced,
+                    // which is what `Derived` says.
+                    None => {
+                        let Some(storage) =
+                            graph.value(value).and_then(|value| value.canonical_storage)
+                        else {
+                            continue;
+                        };
+                        let mut lanes = boundary.results.iter().filter(|result| {
+                            graph
+                                .value(result.value)
+                                .and_then(|result| result.canonical_storage)
+                                .is_some_and(|carrier| {
+                                    carrier.space == storage.space
+                                        && carrier.offset == storage.offset
+                                        && carrier.size > storage.size
+                                })
+                        });
+                        let Some(result) = lanes.next() else {
+                            if std::env::var_os("R2SSA_TRACE_CALLDEF").is_some() {
+                                eprintln!(
+                                    "  no lane carrier for {value:?} {storage:?} among {:?}",
+                                    boundary
+                                        .results
+                                        .iter()
+                                        .map(|r| graph
+                                            .value(r.value)
+                                            .and_then(|v| v.canonical_storage))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                            continue;
+                        };
+                        if lanes.next().is_some() {
+                            continue;
+                        }
+                        if std::env::var_os("R2SSA_TRACE_CALLDEF").is_some() {
+                            eprintln!("  lane certified {value:?} from {:?}", result.value);
+                        }
+                        (result, CallResultValueRelation::Derived)
+                    }
                 };
-                if exact_results.next().is_some() {
-                    continue;
-                }
                 let Some(carrier) = return_carrier_for_boundary_slot(result.slot) else {
                     continue;
                 };
@@ -5851,7 +5904,7 @@ fn process_call_result_flow_block(
                     op_index,
                     value,
                     width: dst.size,
-                    relation: CallResultValueRelation::Identity,
+                    relation,
                     carrier,
                     owner: Some(ValueOwner::Value(value)),
                 };

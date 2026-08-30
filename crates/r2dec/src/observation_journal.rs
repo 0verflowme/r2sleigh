@@ -1713,11 +1713,54 @@ impl LegacyObservationJournal {
                     Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
                 }
             }
+            // The instruction renders nothing, so it reads nothing. Its write
+            // was already accounted on that ground and its operands stand on
+            // the same one: an occurrence inside a statement no structured
+            // form emits is not a read. On AArch64 the return address arrives
+            // through a copy of the link register and the copy's operand is
+            // control-only in its own right, so this was never needed; on
+            // amd64 `ret` lifts to a load of the return address through the
+            // stack pointer, and the stack pointer is read elsewhere for
+            // ordinary reasons, so nothing else could ever close that cell.
+            for input_idx in 0..definition.inputs.len() {
+                let site = UseSite { inst, input_idx };
+                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::ReturnControl) {
+                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                }
+            }
         }
         for site in crate::binding_plan::certified_direct_control_target_sites(source.source()) {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectControlTarget) {
                 Some(r2ssa::ledger::ElisionReason::DirectControlTarget) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
+        // A direct call names its callee. The name comes from the symbol
+        // table, not from any object the function holds, so the operand's
+        // occurrence is not a read and the value it names is elided beside it.
+        for site in crate::binding_plan::certified_direct_call_target_sites(source.source()) {
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectCallTarget) {
+                Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+            }
+        }
+        for inst in crate::binding_plan::certified_direct_call_target_insts(source.source()) {
+            let Some(definition) = graph.inst(inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst));
+            };
+            if definition.output.is_some() {
+                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::DirectCallTarget) {
+                    Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+                }
+            }
+            for input_idx in 0..definition.inputs.len() {
+                let site = UseSite { inst, input_idx };
+                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectCallTarget) {
+                    Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                }
             }
         }
         for site in origins.noop_sites() {
@@ -1821,6 +1864,36 @@ impl LegacyObservationJournal {
             })
             .collect::<Vec<_>>();
 
+        // A value the obligation ledger certifies as structurally unused is
+        // defined by an instruction nothing can render: the ledger has already
+        // established that it is structural, owns no semantic obligation, and
+        // that the program never reads what it produces. An unused call
+        // clobber is the case -- `murmur3_32` at -O0 leaves nine of them at its
+        // one call -- and the write cell those definitions carry has no other
+        // answerer, because there is no statement to answer with. This is
+        // deliberately not done for every elided value: most elisions mean some
+        // other rendering answers for the value, and claiming its definition
+        // renders nothing would take the cell away from whatever does.
+        for value in &nonrendered_values {
+            if !matches!(
+                self.plan.disposition(*value),
+                Some(ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                    ..
+                })
+            ) {
+                continue;
+            }
+            let Some(inst) = graph.def_inst(*value) else {
+                continue;
+            };
+            if graph.inst(inst).and_then(|inst| inst.output) != Some(*value) {
+                continue;
+            }
+            elided_writes
+                .entry(inst)
+                .or_insert(r2ssa::ledger::ElisionReason::UnusedStructuralValue);
+        }
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
         }
@@ -1994,14 +2067,10 @@ impl LegacyObservationJournal {
         expr: CExpr,
     ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
-        let exact_certificate = self
-            .source
-            .certificates()
-            .returns_by_inst
-            .get(&at)
-            .and_then(|index| self.source.certificates().returns.get(*index))
-            .is_some_and(|certificate| certificate.at == at && certificate.value == value);
-        if !exact_certificate {
+        // The same boundary record the final placement audit will consult.
+        // Two tables answering for one read is how a marker survives here and
+        // is refused there, so they ask one question.
+        if !crate::placement::certified_boundary_read(&self.source, value, at) {
             return Err(LegacyObservationJournalError::InvalidCertifiedValueRead { value, at });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {

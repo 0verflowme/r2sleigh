@@ -791,13 +791,28 @@ impl SemanticObligationInventory {
     }
 
     /// Values whose exact source instruction is structural, owns no semantic
-    /// obligation, and has no graph occurrence outside its definition.
+    /// obligation, and that the program never reads.
     ///
     /// This is the upstream elision authority for structural outputs such as
     /// unused call-clobber definitions. Consumers must not reclassify an op by
     /// matching its spelling or opcode. A used structural result is omitted
     /// from this set and remains an ordinary value that needs a binding.
-    pub fn structural_unused_values(&self, graph: &SsaGraph) -> Option<BTreeSet<ValueId>> {
+    ///
+    /// A use site is not the same thing as a read. A call clobbers a
+    /// caller-saved register, the clobber reaches a merge, and the merge is one
+    /// the program never observes: the graph records a use, and nothing reads
+    /// the value. `murmur3_32` at -O0 is that case -- the call to `rotl32`
+    /// clobbers `RCX`, the clobber flows into an unobserved phi, and asking the
+    /// graph alone made the clobber an ordinary value owing a binding that no
+    /// statement could ever assign, because what a clobbered register holds is
+    /// not knowable and no C expression says it. So the reads are counted
+    /// against the same dead-merge authority the rest of the model uses, and
+    /// `unobserved_uses` is what says which occurrences are not reads.
+    pub fn structural_unused_values(
+        &self,
+        graph: &SsaGraph,
+        unobserved_uses: &BTreeSet<crate::UseSite>,
+    ) -> Option<BTreeSet<ValueId>> {
         if !self.is_complete()
             || self.source_instruction_count != graph.insts.len()
             || self.by_inst.len() != graph.insts.len()
@@ -822,7 +837,11 @@ impl SemanticObligationInventory {
             if graph.def_inst(value) != Some(inst) || graph.value(value).is_none() {
                 return None;
             }
-            if graph.use_sites(value).is_empty() {
+            if graph
+                .use_sites(value)
+                .iter()
+                .all(|site| unobserved_uses.contains(site))
+            {
                 values.insert(value);
             }
         }
@@ -1927,7 +1946,7 @@ mod tests {
             .expect("unused call-define artifact");
         let unused_values = unused
             .obligations()
-            .structural_unused_values(unused.graph())
+            .structural_unused_values(unused.graph(), unused.unobserved_merges().unobserved_uses())
             .expect("complete structural-value inventory");
         let call_defines = unused
             .graph()
@@ -1945,11 +1964,19 @@ mod tests {
             dst: Varnode::unique(0x80, 8),
             src: Varnode::register(0, 8),
         });
+        // The copy has to reach an observable effect for the call result to be
+        // read. Being copied somewhere nothing goes on to look at is not being
+        // read, and the inventory answers the second question, not the first.
+        used_block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x4300, 8),
+            val: Varnode::unique(0x80, 8),
+        });
         let used = SsaArtifact::for_decompile(&[used_block], Some(&x86_64_call_arch()))
             .expect("used call-define artifact");
         let used_values = used
             .obligations()
-            .structural_unused_values(used.graph())
+            .structural_unused_values(used.graph(), used.unobserved_merges().unobserved_uses())
             .expect("complete structural-value inventory");
         let observed_call_result = used
             .graph()

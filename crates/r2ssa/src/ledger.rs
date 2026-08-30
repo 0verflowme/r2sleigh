@@ -61,6 +61,15 @@ pub enum ElisionReason {
     /// predicates remain ordinary exact uses and are never covered by this
     /// disposition.
     DirectControlTarget,
+    /// A direct call's target operand, which the call expression renders by
+    /// naming the callee.
+    ///
+    /// The address of a called function is not an object the program holds. It
+    /// is spelled once, in the call itself, so the operand's occurrences are
+    /// ordinary rendered uses while the value they name denotes nothing the
+    /// function could declare. An indirect call is not covered: there the
+    /// target really is a value the program computed and reads.
+    DirectCallTarget,
     /// An immutable phi whose inputs and output are one certified renderer
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
@@ -126,6 +135,7 @@ impl std::fmt::Display for ElisionReason {
             Self::StackFrame => "stack-frame",
             Self::ReturnControl => "return-control",
             Self::DirectControlTarget => "direct-control-target",
+            Self::DirectCallTarget => "direct-call-target",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
             Self::CoalescedCarrierEdge => "coalesced-carrier-edge",
             Self::CoalescedCarrierPhi => "coalesced-carrier-phi",
@@ -348,12 +358,23 @@ impl ObligationLedger {
             conflicts: self.conflicts,
             ..LedgerClosure::default()
         };
-        for outcome in self.outcomes.values() {
+        let trace = std::env::var_os("R2DEC_TRACE_REFUSAL").is_some();
+        for (id, outcome) in &self.outcomes {
             match outcome {
                 Outcome::Rendered { .. } => closure.rendered += 1,
                 Outcome::Elided(_) => closure.elided += 1,
-                Outcome::Refused { .. } => closure.refused += 1,
-                Outcome::Unattributed => closure.unattributed += 1,
+                Outcome::Refused { .. } => {
+                    closure.refused += 1;
+                    if trace {
+                        eprintln!("obligation refused {id:?} {outcome:?}");
+                    }
+                }
+                Outcome::Unattributed => {
+                    closure.unattributed += 1;
+                    if trace {
+                        eprintln!("obligation unattributed {id:?}");
+                    }
+                }
             }
         }
         closure

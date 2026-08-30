@@ -305,6 +305,95 @@ pub(super) fn certified_direct_control_target_sites(
         .collect()
 }
 
+/// Exact direct-call target uses the call expression renders as the callee.
+///
+/// Only `Call` operand zero qualifies. `CallInd`'s target is a value the
+/// program computed and reads, and it keeps its ordinary rendering contract.
+pub(super) fn certified_direct_call_target_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
+    let graph = source.graph();
+    graph
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            let r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { target }) = &inst.payload else {
+                return None;
+            };
+            let value = graph.value_id_for_var(target)?;
+            let site = UseSite {
+                inst: inst.id,
+                input_idx: 0,
+            };
+            (inst.inputs.first().copied() == Some(value) && graph.use_sites(value).contains(&site))
+                .then_some(site)
+        })
+        .collect()
+}
+
+/// Direct-call target values whose complete use domain is the callee's name.
+pub(super) fn certified_direct_call_target_values(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let sites = certified_direct_call_target_sites(source);
+    let mut values = sites
+        .iter()
+        .filter_map(|site| graph.inst(site.inst)?.inputs.get(site.input_idx).copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|value| {
+            let uses = graph.use_sites(*value);
+            !uses.is_empty() && uses.iter().all(|site| sites.contains(site))
+        })
+        .collect::<BTreeSet<_>>();
+
+    // Follow the copies a callee's address arrives through, for the same
+    // reason the return-address closure above does. A lift that materializes
+    // the target into a temporary first leaves the call's own operand
+    // certified and the copy one step upstream not, and that copy then lowered
+    // to an assignment of an object the plan had already elided.
+    loop {
+        let mut added = false;
+        for value in &graph.values {
+            if values.contains(&value.id) {
+                continue;
+            }
+            let uses = graph.use_sites(value.id);
+            if uses.is_empty() {
+                continue;
+            }
+            let reaches_only_target = uses.iter().all(|site| {
+                graph.inst(site.inst).is_some_and(|inst| {
+                    matches!(
+                        inst.payload,
+                        r2ssa::InstPayload::Op(r2ssa::SSAOp::Copy { .. })
+                    ) && inst.output.is_some_and(|output| values.contains(&output))
+                })
+            });
+            if reaches_only_target {
+                values.insert(value.id);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    values
+}
+
+/// Definitions whose whole result is a callee's address on its way to the call.
+///
+/// The copy that materializes a call target renders nothing -- the call spells
+/// the callee's name -- so its write and its operands are accounted here rather
+/// than left for a statement that will not be emitted.
+pub(super) fn certified_direct_call_target_insts(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
+    let graph = source.graph();
+    certified_direct_call_target_values(source)
+        .into_iter()
+        .filter_map(|value| graph.def_inst(value))
+        .collect()
+}
+
 /// Direct-control target values whose complete use domain is CFG topology.
 pub(super) fn certified_direct_control_target_values(
     source: &r2ssa::SsaArtifact,

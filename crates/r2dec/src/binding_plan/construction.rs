@@ -486,12 +486,16 @@ impl BindingPlan {
         let graph = source.graph();
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
+        let direct_call_targets = super::certified_direct_call_target_values(source);
         let stack_frame_values = certified_stack_frame_values(source);
         let stack_geometry_values = certified_stack_geometry_values(source);
         let unobserved_values = source.unobserved_values();
-        let structural_unused = source.obligations().structural_unused_values(graph).ok_or(
-            BindingPlanBuildError::Seal(BindingPlanSourceMismatch::Authority),
-        )?;
+        let structural_unused = source
+            .obligations()
+            .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
+            .ok_or(BindingPlanBuildError::Seal(
+                BindingPlanSourceMismatch::Authority,
+            ))?;
         let mut literal_by_value = BTreeMap::<ValueId, MachineExprId>::new();
         for (expr_id, expr) in machine_projection.arena().iter() {
             if let MachineExprKind::Constant { binding, .. } = expr.kind() {
@@ -531,6 +535,14 @@ impl BindingPlan {
             } else if direct_control_targets.contains(&graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::DirectControlTarget,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if direct_call_targets.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DirectCallTarget,
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,

@@ -1178,13 +1178,24 @@ unsafe fn capture_trusted_ssa_from_buffer(
         unsafe { std::slice::from_raw_parts(payload.snapshot_buffer, payload.snapshot_buffer_len) };
     let (source, callees) = r2source::snapshot_wire::decode_snapshot_set(bytes)
         .map_err(|error| BoundaryError::invalid(format!("snapshot buffer rejected: {error}")))?;
-    let root = trusted_from_source(source, execution)?;
+    // Callees first, so the root can describe a call whose prototype the
+    // source never recovered from what the callee's own body does.
+    //
     // A callee that will not lift costs the caller nothing: the solver falls
     // back to knowing nothing about that call, which is where it started.
-    let lifted_callees = callees
-        .into_iter()
-        .filter_map(|callee| trusted_from_source(callee, execution).ok())
-        .collect();
+    let mut lifted_callees = Vec::new();
+    let mut callee_interfaces = std::collections::BTreeMap::new();
+    for callee in callees {
+        let entry = callee.function().address();
+        let Ok(artifact) = trusted_from_source(callee, execution) else {
+            continue;
+        };
+        if let Some(interface) = artifact.artifact().machine_context().function_interface() {
+            callee_interfaces.insert(entry, interface.clone());
+        }
+        lifted_callees.push(artifact);
+    }
+    let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
     Ok(TrustedIngress {
         root,
         callees: lifted_callees,
@@ -1204,6 +1215,16 @@ fn trusted_from_source(
     source: r2source::OwnedFunctionSnapshot,
     execution: &r2engine::EngineExecutionControl,
 ) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+    trusted_from_source_with_callees(source, execution, &std::collections::BTreeMap::new())
+}
+
+/// Lift and prepare one owned snapshot, describing each call whose callee body
+/// arrived in the same capture.
+fn trusted_from_source_with_callees(
+    source: r2source::OwnedFunctionSnapshot,
+    execution: &r2engine::EngineExecutionControl,
+    callee_interfaces: &std::collections::BTreeMap<u64, r2source::SourceFunctionInterface>,
+) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
     let ssa_control = execution.ssa_execution_control();
     r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
         BoundaryError::engine(format!(
@@ -1215,10 +1236,12 @@ fn trusted_from_source(
     r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
         BoundaryError::engine(format!("trusted ingress stopped after lift: {error}"))
     })?;
-    let trusted =
-        r2ssa::TrustedSsaArtifact::prepare_with_control(lifted, &ssa_control).map_err(|error| {
-            BoundaryError::engine(format!("trusted SSA preparation failed: {error}"))
-        })?;
+    let trusted = r2ssa::TrustedSsaArtifact::prepare_with_callee_interfaces(
+        lifted,
+        &ssa_control,
+        callee_interfaces,
+    )
+    .map_err(|error| BoundaryError::engine(format!("trusted SSA preparation failed: {error}")))?;
     Ok(Arc::new(trusted))
 }
 

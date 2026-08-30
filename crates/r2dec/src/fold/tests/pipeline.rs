@@ -1452,7 +1452,23 @@ mod tests {
         install_certified_function_facts(&mut ctx);
         let (plan, names, journal) = install_observed_lowering(&mut ctx, &prepared);
         let mut body = Vec::new();
+        // The folder skips the copy that materializes a direct call's target,
+        // because the call spells the callee's name and the plan elides the
+        // value that copy would assign. Lowering it here anyway would ask for
+        // an object that by then has no name.
+        let target_definitions = prepared
+            .graph()
+            .def_inst(prepared.graph().inst(inst).expect("call row").inputs[0])
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         for prefix_idx in 0..op_idx {
+            if !indirect
+                && ctx
+                    .source_inst_for_normalized_op(block.addr, prefix_idx)
+                    .is_some_and(|prefix_inst| target_definitions.contains(&prefix_inst))
+            {
+                continue;
+            }
             enter_exact_test_site(&ctx, block.addr, prefix_idx);
             if let Some(prefix) = ctx
                 .op_to_stmt_with_args(&block.ops[prefix_idx], block.addr, prefix_idx)
@@ -1517,9 +1533,19 @@ mod tests {
             body,
         );
 
+        // A direct call names its callee, which is not a read of the operand's
+        // value: the symbol comes from the call site, and the plan elides the
+        // value beside it. An indirect call really does read a target the
+        // program computed, and there the operand is an ordinary exact use.
         assert_eq!(
             sealed.observations().use_observation(target_site),
-            Some(exact_legacy_use(&plan, target_site))
+            if indirect {
+                Some(exact_legacy_use(&plan, target_site))
+            } else {
+                Some(crate::shadow_report::LegacyUseObservation::Elided(
+                    r2ssa::ledger::ElisionReason::DirectCallTarget,
+                ))
+            }
         );
         assert_eq!(
             sealed
@@ -2580,7 +2606,29 @@ mod tests {
                 kind: crate::symbol::ExternalKind::Function,
             }
         );
-        assert_eq!(args.as_slice(), &[CExpr::IntLit(7)]);
+        // The argument is a read of the value the callsite certificate names,
+        // spelled by the binding plan and marked as a read. Spelling it from
+        // the operation that defined the value instead would re-evaluate a
+        // definition the plan has already bound, and would name a binding this
+        // statement is not authorized to read.
+        let [argument] = args.as_slice() else {
+            panic!("expected exactly one certified argument, got {args:?}");
+        };
+        let arg_value = prepared
+            .callsite_certificate_for_op(0x1000, 2)
+            .expect("callsite certificate")
+            .argument_certificates
+            .first()
+            .expect("one certified argument")
+            .value;
+        let expected = ctx
+            .planned_value_expr(arg_value)
+            .expect("the plan spells every certified argument value");
+        assert_eq!(argument.unobserved(), &expected);
+        assert!(
+            matches!(argument, CExpr::Observed { .. }),
+            "a call argument is a read and must carry its read marker: {argument:?}"
+        );
     }
 
     #[test]
@@ -3055,10 +3103,7 @@ mod tests {
             &view,
             CertifiedRenderContext::new(&prepared, &render),
         );
-        assert_eq!(
-            adapter.call_arg_expr((0x1000, 2), 0, arg_value),
-            Some(crate::symbol::var_ref(&symbols, "n"))
-        );
+        assert!(adapter.admits_call_arg((0x1000, 2), 0, arg_value));
 
         let unrenderable = render_facts(false);
         let adapter = CertifiedRenderPlan::new(
@@ -3066,7 +3111,7 @@ mod tests {
             &view,
             CertifiedRenderContext::new(&prepared, &unrenderable),
         );
-        assert_eq!(adapter.call_arg_expr((0x1000, 2), 0, arg_value), None);
+        assert!(!adapter.admits_call_arg((0x1000, 2), 0, arg_value));
 
         let wrong_value_view =
             prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
@@ -3075,7 +3120,7 @@ mod tests {
             &wrong_value_view,
             CertifiedRenderContext::new(&prepared, &render),
         );
-        assert_eq!(adapter.call_arg_expr((0x1000, 2), 0, arg_value), None);
+        assert!(!adapter.admits_call_arg((0x1000, 2), 0, arg_value));
     }
 
     #[test]

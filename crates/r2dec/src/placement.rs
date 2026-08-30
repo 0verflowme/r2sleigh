@@ -1578,8 +1578,86 @@ fn target_authorizes_binding(
     }
 }
 
+/// Whether the source certifies that this instruction reads this value at a
+/// boundary for which the graph records no use.
+///
+/// A value crossing a boundary is read by an instruction that does not take it
+/// as an operand. `SSAOp::Return` carries only the control target and
+/// `SSAOp::Call` only the callee, so a returned value and a call argument
+/// alike have no `UseSite` anywhere in the graph. The boundary certificate is
+/// the only record that the read happens, and it is the same kind of record in
+/// both directions: the return certificate names the one value leaving the
+/// function, and the callsite certificate names each value entering the
+/// callee.
+pub(crate) fn certified_boundary_read(
+    source: &r2ssa::SsaArtifact,
+    value: r2ssa::ValueId,
+    at: InstId,
+) -> bool {
+    let graph = source.graph();
+    let Some(site) = graph.op_site_for_inst(at) else {
+        return false;
+    };
+    let Some(payload) = graph.inst(at).map(|inst| &inst.payload) else {
+        return false;
+    };
+    let certificates = source.certificates();
+    let returns = certificates
+        .returns_by_inst
+        .get(&at)
+        .and_then(|index| certificates.returns.get(*index))
+        .is_some_and(|certificate| {
+            certificate.at == at
+                && certificate.value == value
+                && (certificate.block_addr, certificate.op_index) == site
+                && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
+        });
+    // A call result seen at another width reads the carrier it is a slice of.
+    // The `Derived` certificate is that proof: it names this value, the call
+    // site, and the identity result it derives from, so the read of the
+    // carrier's name is certified in the same sense the return and argument
+    // boundaries are.
+    // A call result seen at another width reads the carrier it is a slice of.
+    // The instruction here defines that slice, and its `Derived` certificate
+    // names the call site; the value being read is the identity result of the
+    // same site. That pair is the proof, in the same sense the return and
+    // argument boundaries are proofs.
+    let derived_result = graph
+        .inst(at)
+        .and_then(|inst| inst.output)
+        .and_then(|defined| source.call_result_certificate_for_value(defined))
+        .is_some_and(|slice| {
+            !slice.relation.is_identity()
+                && source
+                    .call_result_certificate_for_value(value)
+                    .is_some_and(|carrier| {
+                        carrier.relation.is_identity() && carrier.call_site == slice.call_site
+                    })
+        });
+    returns
+        || derived_result
+        || certificates
+            .callsites_by_inst
+            .get(&at)
+            .and_then(|call_site| certificates.callsites.get(call_site))
+            .is_some_and(|certificate| {
+                certificate.at == at
+                    && (certificate.block_addr, certificate.op_index) == site
+                    && certificate
+                        .argument_certificates
+                        .iter()
+                        .any(|argument| argument.value == value)
+                    && matches!(
+                        payload,
+                        r2ssa::InstPayload::Op(
+                            r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }
+                        )
+                    )
+            })
+}
+
 /// Revalidate the complete source-to-render identity chain carried by a
-/// certified value-read marker. The return certificate owns `(ValueId,
+/// certified value-read marker. The boundary certificate owns `(ValueId,
 /// InstId)`; the sealed binding plan owns `ValueId -> BindingId`; and name
 /// resolution owns `BindingId -> SymbolId`. No one of those links is a
 /// substitute for the others.
@@ -1591,24 +1669,7 @@ fn certified_value_read_matches(
     binding: BindingId,
     symbol: crate::symbol::SymbolId,
 ) -> bool {
-    let graph = source.graph();
-    let Some(certificate) = source
-        .certificates()
-        .returns_by_inst
-        .get(&at)
-        .and_then(|index| source.certificates().returns.get(*index))
-    else {
-        return false;
-    };
-    certificate.at == at
-        && certificate.value == value
-        && graph.op_site_for_inst(at) == Some((certificate.block_addr, certificate.op_index))
-        && graph.inst(at).is_some_and(|inst| {
-            matches!(
-                inst.payload,
-                r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. })
-            )
-        })
+    certified_boundary_read(source, value, at)
         && matches!(
             names.disposition_for_value(value),
             Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
@@ -1717,7 +1778,17 @@ pub(crate) enum PlacementDecision {
     /// Nothing reads this object, so it needs no declaration and its writes
     /// need no statement. The obligations those statements carried are
     /// accounted as elided when the journal seals.
-    DeadStore,
+    ///
+    /// `region` is where the binding is declared if the removal turns out not
+    /// to be expressible, for the same reason `Inline` carries one. The
+    /// occurrence set records placement-relevant reads, which is not every
+    /// mention: a read folded into another expression names the symbol without
+    /// leaving an occurrence. When the trial removal finds the name still
+    /// there, the object is not dead after all, and it needs the declaration
+    /// this names. Leaving the decision as it was dropped the declaration and
+    /// kept the statements -- an undeclared identifier, which is the one thing
+    /// placement must never emit.
+    DeadStore { region: Option<RegionId> },
     /// Honest C cannot be emitted for this binding.
     Refused(PlacementRefusal),
 }
@@ -1887,7 +1958,7 @@ fn apply_decisions_once(
                     symbol,
                 ));
             }
-            Some(PlacementDecision::DeadStore) => {
+            Some(PlacementDecision::DeadStore { region }) => {
                 // The occurrence set records placement-relevant reads, which is
                 // not the same as every mention: a read folded into another
                 // expression leaves no occurrence but still names the symbol.
@@ -1909,6 +1980,23 @@ fn apply_decisions_once(
                     candidate = trial;
                     discarded_bindings.insert(binding);
                     discarded_observations.append(&mut trial_observations);
+                } else if function_body_mentions_symbol(&candidate.body, symbol)
+                    && let Some(region) = region
+                {
+                    // The name survived the removal, so something reads the
+                    // object without leaving a placement occurrence, and it is
+                    // not dead after all. The trial is dropped -- every
+                    // statement stays -- and the binding takes the declaration
+                    // it would have had. Keeping the dead-store decision here
+                    // would leave those statements naming a symbol nothing
+                    // declares. A binding whose name is nowhere in the body is
+                    // the ordinary dead store and still gets no declaration.
+                    candidate.locals.retain(|local| local.name != symbol);
+                    declarations.entry(region).or_default().push((
+                        binding,
+                        binding_fact.declaration_type().clone(),
+                        symbol,
+                    ));
                 }
             }
             Some(PlacementDecision::Inline { write, .. }) => {
@@ -1969,7 +2057,7 @@ fn apply_decisions_once(
                 !discarded_bindings.contains(binding)
                     && matches!(
                         decision,
-                        None | Some(PlacementDecision::DeadStore)
+                        None | Some(PlacementDecision::DeadStore { .. })
                             | Some(PlacementDecision::LexicalDeclaration { .. })
                             | Some(PlacementDecision::Inline { .. })
                     )
@@ -2595,7 +2683,9 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             .iter()
             .all(|occurrence| matches!(occurrence.kind, OccurrenceKind::Write { .. }))
         {
-            decisions[binding_index] = Some(PlacementDecision::DeadStore);
+            decisions[binding_index] = Some(PlacementDecision::DeadStore {
+                region: lowest_dominating_region(regions, cfg, binding_occurrences),
+            });
             continue;
         }
         if !occurrence_regions_have_proven_order(regions, binding_occurrences) {

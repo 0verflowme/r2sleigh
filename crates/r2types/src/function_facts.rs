@@ -116,6 +116,20 @@ impl FunctionCallResultFacts {
             Ok(None) => {}
         }
 
+        // A result carried in a register and owned by a value. Every branch
+        // above requires a stack slot, so a register-carried result never had
+        // an owner and the call site was never recorded as assigning it.
+        let register_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
+            result.relation.is_identity()
+                && matches!(&result.carrier, r2ssa::ReturnCarrier::Register { .. })
+                && matches!(owner, r2ssa::ValueOwner::Value(_))
+        });
+        match register_owner {
+            Ok(Some(owner)) => return Some(owner),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+
         self.unique_owner_for_site_matching(callsite, |result, owner| {
             result.relation.is_identity() && matches!(owner, r2ssa::ValueOwner::StackSlot { .. })
         })
@@ -3374,10 +3388,14 @@ fn prepared_call_render_facts(
                 block_addr: cert.block_addr,
                 op_index: cert.op_index,
             };
-            let disposition = if call_results
-                .results_for_site(callsite)
-                .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. })))
-            {
+            // Whether the call site assigns its result is one question, and
+            // `owner_for_site` answers it. Asking a second, narrower one here
+            // -- does some result have a *stack slot* owner -- made the two
+            // disagree the moment a register-carried result gained an owner:
+            // the disposition said side effect while the owner lookup named a
+            // value, so the call rendered as a bare statement *and* as its
+            // definition's right-hand side, and one site was evaluated twice.
+            let disposition = if call_results.owner_for_site(callsite).is_some() {
                 CallsiteRenderDisposition::AssignedResult
             } else {
                 CallsiteRenderDisposition::SideEffectStatement
