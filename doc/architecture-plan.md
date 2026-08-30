@@ -1963,3 +1963,45 @@ to the proof machinery's vocabulary rather than to a rule inside it, which is
 why it is written down here rather than attempted at the end of a long session:
 the whole point of that vocabulary is that each kind means one thing, and adding
 one carelessly is how two tables come to answer for the same read.
+
+### The frame slots, and why the certificate finally issues
+
+The chain that withheld `CalleeStackAllocationCertificate` from every calling
+function is now fully understood and the fix is written, in
+`frame-slot-chain.patch`, verified against this commit. It is not kept, because
+no arrangement of its last two pieces beats what is already here.
+
+What was wrong is worth stating. `entry_stack_roots_are_stable` asks whether a
+call leaves the frame carriers alone, and asked the *function interface*.
+radare2 computes that from the calling convention and records it even for a
+function whose signature it never linked -- its own comment says so -- but the
+interface block is only written when `CAP_EXACT_FUNCTION_INTERFACE` is set,
+which radare2 withholds for exactly those functions. The interface still
+arrives, reconstructed with both flags defaulted to false, so the answerer that
+did not know was the one being asked. Carrying the fact beside the machine
+roles, where the carriers themselves already travel for the same reason, and
+preferring it over the interface's copy, makes the certificate issue: sixteen
+objects in `murmur3_32` on arm64 where there were none. That part is right and
+the wire format carries it at version 4.
+
+With the certificate, `certified_dead_frame_slot_accesses` answers the
+`ObservableMemoryWrite` obligation for a slot written and never read, and
+teaching `discard_observed_statement` to recognise a write marked on its
+assignment target lets those stores actually go. `stack_m*` disappears from
+`murmur3_32`.
+
+What is unresolved is the last store of the arm64 prologue's `stp x29, x30`.
+Its object has one write and reads, so it is not a dead slot; it is a frame
+round trip, and `collect_stack_frame_round_trip_certificates` declines it
+because the saved register overlaps the return-address storage. Removing that
+exclusion does not help on its own. So the discarder removes a statement whose
+obligation nothing answers, and the two arm64 cells stop generating. Guarding
+removal on "owns an effect nothing answers" restores them and costs `adler32`
+at x64 -O0, where the same pass removes a statement that owns an
+`ObservableMemoryWrite` and is accounted through `placement_elided_observations`
+instead -- so the guard is asking the wrong question too.
+
+The right question is the one that path already answers: will this removal be
+accounted, rather than does this statement own an effect. That is the next step,
+and it is a single predicate once the round-trip exclusion for the return
+address is settled, because those two are what make the arm64 store special.
