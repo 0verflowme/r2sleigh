@@ -1478,3 +1478,32 @@ and the fix belongs wherever that phi's value is dropped. Recorded here because
 the shape is exactly the failure mode the project has already paid for once: a
 detector that looks wrong, a one-line discharge that satisfies it, and a
 function that compiles cleanly and computes nothing.
+
+### The merge-materialization predicate, and what it hides
+
+`materialize_certified_loop_carriers_with_control` admits a merge for
+materialization when it is a certified loop carrier or when some predecessor
+branches, and leaves a merge at a plain join alone on the stated theory that
+"the fold can render it as an expression". That theory is false at least once:
+`xxhash32`'s `RCX` merge at `0x10000098d` is left as a phi, the fold renders
+nothing for it, and readers fall back to a pre-merge value.
+
+Admitting every live merge -- deadness still winning first -- discharges the
+obligations that refusal was reporting, and takes the corpus from 37 to 42 of
+54. Two of those five, `murmur3_32` at arm64 O1 and O2, are correct.
+
+The other three are `xxhash32` itself, and they are the reason this is not in
+the tree. Two fail the raw gate on `unused-but-set-variable`, which is a real
+accounting mismatch: the binding has a read occurrence while the statement that
+would read it is not emitted. The third compiles and returns wrong answers for
+every input of four bytes or more.
+
+So the function was refusing for a correct reason, and behind that refusal is a
+second defect in its loop rendering. The materialization change makes it
+visible without causing it. The pointer-policy fix it also exposes -- the
+certified hint saying "pointer" while the declaration says `uint64_t`, so a load
+rendered as `*RDI_0` -- is the same two-answerer defect already fixed for the
+assignment policy, and is fixed the same way.
+
+Recorded rather than committed, because the change as it stands admits a cell
+that compiles and computes the wrong thing.
