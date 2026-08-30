@@ -664,6 +664,34 @@ pub enum MachineWriteProjection {
         from_width_bits: u32,
         to_width_bits: u32,
     },
+    /// The definition assigns one carrier-relative slice and says nothing about
+    /// the rest of the carrier, because the graph has no value for it.
+    ///
+    /// This is neither `Full` nor `Insert`. `Full` would claim the write
+    /// defines the whole register, which a byte write does not; `Insert` would
+    /// claim it preserves the register's other bits, which requires having
+    /// them, and an instruction has a value only by taking it as an input. A
+    /// write whose operands include nothing at this carrier is handed nothing
+    /// to preserve, and produces no carrier value for anything to read: the
+    /// bits outside the lane are not represented at all.
+    ///
+    /// Only ever a lane at the carrier's own offset, so it never displaces the
+    /// bit-field insert that a write into the middle of a register is.
+    ///
+    /// `pearson` at -O2 is the case. `xor r9b, byte [rdx + r8]` computes a byte
+    /// from two bytes, the only thing that goes on to read it is
+    /// `movzx edx, r9b`, and `R9`'s other seven bytes are neither defined nor
+    /// read before the next iteration overwrites the register. Reading the
+    /// projection off the register geometry alone made the write a read of the
+    /// object it was defining. `crc32_bitwise` at -O2 is the same shape at
+    /// vector width, where Ghidra models `XMM0` as a 128-bit lane of a 512-bit
+    /// `ZMM0` and the legacy SSE write really does leave the rest alone --
+    /// alone, and unread.
+    Lane {
+        bit_offset: u32,
+        width_bits: u32,
+        carrier_width_bits: u32,
+    },
 }
 
 /// Why one surviving definition has no honest carrier write projection.
@@ -1952,14 +1980,53 @@ fn machine_write_disposition(
         return MachineWriteDisposition::Exact(zero_extend);
     }
     if geometry.bit_offset == 0 && geometry.width_bits == geometry.carrier_bits {
-        MachineWriteDisposition::Exact(MachineWriteProjection::Full)
-    } else {
-        MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+    }
+    // An insert keeps the carrier's other bits, so the instruction has to have
+    // them, and in SSA it has a value only by taking it as an input. Where no
+    // operand sits at this carrier there is nothing to keep and no carrier
+    // value for anything to read.
+    //
+    // Only for a lane at the carrier's own offset. A write into the middle of a
+    // register -- `mov ah, bl` is the one the genuine-lift tests keep -- is a
+    // bit-field insert in its own right, and the value it produces is the one a
+    // later read of the carrier is composed from, so the preservation is real
+    // whether or not this instruction was handed the carrier.
+    if geometry.bit_offset != 0 || instruction_carries_wider_value_at(artifact, inst, storage) {
+        return MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
             bit_offset: geometry.bit_offset,
             width_bits: geometry.width_bits,
             carrier_width_bits: geometry.carrier_bits,
-        })
+        });
     }
+    MachineWriteDisposition::Exact(MachineWriteProjection::Lane {
+        bit_offset: geometry.bit_offset,
+        width_bits: geometry.width_bits,
+        carrier_width_bits: geometry.carrier_bits,
+    })
+}
+
+/// Whether some operand of this instruction holds the bits an insert would
+/// keep: the same storage location, reaching beyond the lane being written.
+fn instruction_carries_wider_value_at(
+    artifact: &SsaArtifact,
+    inst: &GraphInst,
+    storage: CanonicalStorageId,
+) -> bool {
+    let graph = artifact.graph();
+    let written_end = storage.offset.saturating_add(u64::from(storage.size));
+    inst.inputs.iter().any(|input| {
+        graph
+            .value(*input)
+            .and_then(|value| value.canonical_storage)
+            .is_some_and(|operand| {
+                let operand_end = operand.offset.saturating_add(u64::from(operand.size));
+                operand.space == storage.space
+                    && operand.offset <= storage.offset
+                    && operand_end >= written_end
+                    && operand.size > storage.size
+            })
+    })
 }
 
 fn validate_machine_use_slice(slice: MachineUseSlice, carrier_width_bits: u32) -> Result<(), ()> {
@@ -5622,7 +5689,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_write_projections_cover_full_insert_high_slice_and_zero_extension() {
+    fn dense_write_projections_cover_full_lane_insert_and_zero_extension() {
         let arch = register_geometry_arch();
         let full = artifact_with_arch(
             [R2ILOp::Copy {
@@ -5647,11 +5714,35 @@ mod tests {
         let low_projection = MachineProjection::from_artifact(&low).expect("low projection");
         assert_eq!(
             exact_write(&low_projection, &low, 0),
+            MachineWriteProjection::Lane {
+                bit_offset: 0,
+                width_bits: 32,
+                carrier_width_bits: 64,
+            },
+            "a constant copied into a lane is handed nothing of the carrier to keep"
+        );
+
+        // The same lane, written from the carrier itself. Here the instruction
+        // does hold the bits outside the lane, so the write can and does
+        // preserve them.
+        let inserting = artifact_with_arch(
+            [R2ILOp::Subpiece {
+                dst: Varnode::register(0, 4),
+                src: Varnode::register(0, 8),
+                offset: 0,
+            }],
+            &arch,
+        );
+        let inserting_projection =
+            MachineProjection::from_artifact(&inserting).expect("inserting projection");
+        assert_eq!(
+            exact_write(&inserting_projection, &inserting, 0),
             MachineWriteProjection::Insert {
                 bit_offset: 0,
                 width_bits: 32,
                 carrier_width_bits: 64,
-            }
+            },
+            "an operand at the carrier is what makes preservation expressible"
         );
 
         // The clear is the lift's own statement, not an architecture name:
@@ -5696,7 +5787,8 @@ mod tests {
                 bit_offset: 8,
                 width_bits: 8,
                 carrier_width_bits: 64,
-            }
+            },
+            "a write into the middle of a register is a bit-field insert"
         );
 
         let zero_extend = artifact_with_arch(

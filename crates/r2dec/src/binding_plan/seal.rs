@@ -324,6 +324,23 @@ fn seal_width_evidence(
         };
         match *write {
             MachineWriteProjection::Full => lower_bounds.push(member_width_bits),
+            // The same question the construction pass asks: a lane write is no
+            // evidence that the object is carrier-wide.
+            MachineWriteProjection::Lane {
+                bit_offset,
+                width_bits,
+                carrier_width_bits,
+            } => {
+                let valid_end = bit_offset
+                    .checked_add(width_bits)
+                    .is_some_and(|end| end <= carrier_width_bits);
+                if width_bits == 0 || !valid_end {
+                    return Ok(SealWidthEvidence::Refused(
+                        ValueRefusal::IncoherentWriteProjection { value: *value },
+                    ));
+                }
+                lower_bounds.push(width_bits);
+            }
             MachineWriteProjection::Insert {
                 bit_offset,
                 width_bits,

@@ -423,6 +423,23 @@ fn binding_width(
         };
         let carrier_width_bits = match *write {
             MachineWriteProjection::Full => member_width_bits,
+            // A lane write says nothing about the carrier, so it is no evidence
+            // that the object is carrier-wide. Only the lane it assigns is.
+            MachineWriteProjection::Lane {
+                bit_offset,
+                width_bits,
+                carrier_width_bits,
+            } => {
+                let valid_end = bit_offset
+                    .checked_add(width_bits)
+                    .is_some_and(|end| end <= carrier_width_bits);
+                if width_bits == 0 || !valid_end {
+                    return Ok(BindingWidth::Refused(
+                        ValueRefusal::IncoherentWriteProjection { value: *value },
+                    ));
+                }
+                width_bits
+            }
             MachineWriteProjection::Insert {
                 bit_offset,
                 width_bits,

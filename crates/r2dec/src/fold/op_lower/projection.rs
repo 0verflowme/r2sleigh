@@ -153,6 +153,13 @@ pub(super) fn project_machine_write(
 ) -> Result<(CExpr, CExpr), MachineWriteProjectionError> {
     match projection {
         MachineWriteProjection::Full => Ok((lhs, rhs)),
+        // The lane is assigned and the carrier's other bits are not mentioned,
+        // which is the whole difference from `Insert`: there is no read of the
+        // target here, because there is nothing to preserve.
+        MachineWriteProjection::Lane { width_bits, .. } => {
+            let lane = checked_write_uint_type(width_bits)?;
+            Ok((lhs, CExpr::cast(lane, rhs)))
+        }
         MachineWriteProjection::ZeroExtend {
             from_width_bits,
             to_width_bits,
