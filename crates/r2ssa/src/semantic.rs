@@ -7513,6 +7513,22 @@ fn collect_control_domain_facts(
             }
         }
     }
+    // Every way out of each switch, so a merged arm that covers all of them can
+    // be recognised as no constraint at all.
+    let mut switch_arity = BTreeMap::<u64, (BTreeSet<u64>, bool)>::new();
+    for &addr in function.block_addrs() {
+        if let Some(block) = function.cfg().get_block(addr)
+            && let BlockTerminator::Switch { cases, default } = &block.terminator
+        {
+            switch_arity.insert(
+                addr,
+                (
+                    cases.iter().map(|(value, _)| *value).collect(),
+                    default.is_some(),
+                ),
+            );
+        }
+    }
     let mut states = function
         .block_addrs()
         .iter()
@@ -7578,7 +7594,7 @@ fn collect_control_domain_facts(
 
             let mut guards = incoming[0].guards.clone();
             for state in &incoming[1..] {
-                guards = guards.intersection(&state.guards).cloned().collect();
+                guards = meet_control_guards(&guards, &state.guards, &switch_arity);
             }
             let state = Some(ControlDomainState {
                 guards,
@@ -7641,6 +7657,70 @@ fn collect_control_domain_facts(
         by_block.insert(block_addr, id);
     }
     ControlDomainFacts { domains, by_block }
+}
+
+/// Meet two guard sets: what is true on both paths into a block.
+///
+/// A plain intersection for everything except two arms of the same switch. A
+/// case body reached by its own arm and by falling through from the arm above
+/// it has no guard common to both paths, and reporting nothing says the block
+/// runs unconditionally, which is false. `SwitchArm` carries a vector of case
+/// values precisely so it can say "the selector is one of these", so the arms
+/// are merged rather than dropped. Growth is bounded by the switch's own case
+/// count, so the fixpoint still converges.
+fn meet_control_guards(
+    left: &BTreeSet<ControlGuard>,
+    right: &BTreeSet<ControlGuard>,
+    switch_arity: &BTreeMap<u64, (BTreeSet<u64>, bool)>,
+) -> BTreeSet<ControlGuard> {
+    let mut met = left.intersection(right).cloned().collect::<BTreeSet<_>>();
+    for guard in left {
+        let ControlGuard::SwitchArm {
+            block_addr,
+            case_values,
+            includes_default,
+        } = guard
+        else {
+            continue;
+        };
+        if met.contains(guard) {
+            continue;
+        }
+        for other in right {
+            let ControlGuard::SwitchArm {
+                block_addr: other_block,
+                case_values: other_values,
+                includes_default: other_default,
+            } = other
+            else {
+                continue;
+            };
+            if other_block != block_addr {
+                continue;
+            }
+            let mut merged = case_values.clone();
+            merged.extend(other_values.iter().copied());
+            merged.sort_unstable();
+            merged.dedup();
+            let includes_default = *includes_default || *other_default;
+            // A merged arm that covers every way out of the switch says
+            // nothing: the block runs whatever the selector is. That is the
+            // block the switch converges on, and giving it a guard would demand
+            // one from a rendering that correctly has none.
+            if let Some((all_values, has_default)) = switch_arity.get(block_addr)
+                && all_values.iter().all(|value| merged.contains(value))
+                && (includes_default || !has_default)
+            {
+                continue;
+            }
+            met.insert(ControlGuard::SwitchArm {
+                block_addr: *block_addr,
+                case_values: merged,
+                includes_default,
+            });
+        }
+    }
+    met
 }
 
 fn control_guard_for_edge(

@@ -54,8 +54,6 @@ pub(crate) struct PreparedSemanticView {
     pub(crate) call_view_by_site: BTreeMap<(u64, usize), PreparedCallView>,
     pub(crate) call_result_facts_by_value: BTreeMap<ValueId, r2types::CallResultFact>,
     pub(crate) call_result_source_by_value: HashMap<ValueId, (u64, usize)>,
-    pub(crate) switch_selector_value_by_block: BTreeMap<u64, ValueId>,
-    pub(crate) switch_selector_expr_by_block: BTreeMap<u64, CExpr>,
     /// Byte offset and width of every access the capture projects onto a struct
     /// member rather than an array element. An index must not be invented for
     /// these: the offset reaches a field, and its stride is not an element size.
@@ -220,7 +218,6 @@ impl PreparedSemanticView {
         populate_call_result_sources(&mut view, inputs.call_result_facts());
         populate_calls(symbols, &mut view, &inputs);
         populate_predicates(symbols, &mut view, &inputs);
-        populate_switches(symbols, &mut view, &inputs);
         view
     }
 
@@ -1721,29 +1718,6 @@ fn compare_def_expr_for_predicate_operand(
         _ => {
             let _ = block;
             None
-        }
-    }
-}
-
-fn populate_switches(
-    symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-    view: &mut PreparedSemanticView,
-    inputs: &PreparedSemanticViewInputs<'_>,
-) {
-    let Some(control_facts) = inputs.control_facts() else {
-        return;
-    };
-
-    for (block_addr, switch) in &control_facts.switches {
-        if let Some(selector_value) = switch.selector
-            && let Some(selector) = prepared_var(inputs.prepared, selector_value).cloned()
-        {
-            let Some(expr) = expr_for_compare_operand(symbols, inputs, selector, view) else {
-                continue;
-            };
-            view.switch_selector_value_by_block
-                .insert(*block_addr, selector_value);
-            view.switch_selector_expr_by_block.insert(*block_addr, expr);
         }
     }
 }

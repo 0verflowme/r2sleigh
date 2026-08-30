@@ -1634,8 +1634,27 @@ pub(crate) fn certified_boundary_read(
                         carrier.relation.is_identity() && carrier.call_site == slice.call_site
                     })
         });
+    // The value a certified switch dispatches on, read at its dispatch. The
+    // switch certificate names the block and the selector, and the instruction
+    // is that block's indirect branch: the same pair of facts the return and
+    // argument boundaries are proved by. A dispatch has no operand for the
+    // selector -- its only input is the address it computed -- so without this
+    // the `switch (...)` heading reads a program variable no table authorizes,
+    // which is what refused every function with a jump table.
+    let switch_selector = graph
+        .inst(at)
+        .and_then(|inst| graph.block(inst.block))
+        .and_then(|block| certificates.switches.get(&block.addr))
+        .is_some_and(|certificate| {
+            certificate.selector == Some(value)
+                && matches!(
+                    payload,
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::BranchInd { .. })
+                )
+        });
     returns
         || derived_result
+        || switch_selector
         || certificates
             .callsites_by_inst
             .get(&at)

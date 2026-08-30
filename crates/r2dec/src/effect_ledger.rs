@@ -190,11 +190,17 @@ fn upstream_zero_occurrence_outcome(
     if id.kind == SemanticObligationKind::ControlTransfer
         && source_inst
             .and_then(|inst| graph.inst(inst))
-            .is_some_and(|inst| {
-                matches!(
-                    &inst.payload,
-                    r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. })
-                )
+            .is_some_and(|inst| match &inst.payload {
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. }) => true,
+                // A certified jump table transfers by which case block the
+                // structured form put the code in, exactly as an unconditional
+                // branch transfers by where its block sits.
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::BranchInd { .. }) => {
+                    graph.block(inst.block).is_some_and(|block| {
+                        prepared.certificates().switches.contains_key(&block.addr)
+                    })
+                }
+                _ => false,
             })
     {
         return Outcome::Elided(ElisionReason::DirectControlTarget);

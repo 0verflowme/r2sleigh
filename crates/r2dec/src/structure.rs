@@ -1043,6 +1043,32 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    /// Widen the switch arm the active domains carry to every value that
+    /// reaches this body, which is what falling through means.
+    fn widen_switch_arm_values(domains: &mut [RenderedBlockDomain], reaching: &[u64]) {
+        for domain in domains {
+            let widened = domain
+                .guards
+                .iter()
+                .map(|guard| match guard {
+                    ControlGuard::SwitchArm {
+                        block_addr,
+                        case_values,
+                        includes_default,
+                    } if case_values.iter().all(|value| reaching.contains(value)) => {
+                        ControlGuard::SwitchArm {
+                            block_addr: *block_addr,
+                            case_values: reaching.to_vec(),
+                            includes_default: *includes_default,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            domain.guards = widened;
+        }
+    }
+
     fn certify_transfer_domain_join(
         &mut self,
         block_addr: u64,
@@ -1614,12 +1640,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(block) = self.func.get_block(switch_addr) else {
             return Ok(None);
         };
-        let Some(op_idx) = block.ops.len().checked_sub(1) else {
+        // The dispatch is not always the block's last operation. Materializing
+        // a merge's incoming edges appends copies after the terminator, and
+        // taking the last op then found one of those and declined, which is one
+        // of the two reasons no real jump table has ever structured.
+        let mut dispatches = block.ops.iter().enumerate().filter_map(|(index, op)| {
+            if let SSAOp::BranchInd { target } = op {
+                Some((index, target))
+            } else {
+                None
+            }
+        });
+        let Some((op_idx, target)) = dispatches.next() else {
             return Ok(None);
         };
-        let SSAOp::BranchInd { target } = &block.ops[op_idx] else {
+        if dispatches.next().is_some() {
             return Ok(None);
-        };
+        }
         let Some(fact) = self
             .fold_ctx
             .control_facts()
@@ -1633,13 +1670,44 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(selector) = fact.selector else {
             return Ok(None);
         };
-        if self.fold_ctx.prepared_value_id_for_var(target) != Some(selector) {
-            return Ok(None);
-        }
-        let expr = self
+        // The dispatch operand is not the selector, and requiring it to be was
+        // why no real jump table ever structured. `switch (len & 3)` computes
+        // the index, loads an address out of a table, and dispatches through
+        // that address, so the operand is the loaded target while the selector
+        // is several instructions upstream. The two are different values, the
+        // equality never held, and the only shape that satisfied it was the
+        // unit fixture's undefined target.
+        //
+        // What the switch prints is the selector. The dispatch operand is
+        // control, accounted beside the case topology that expresses it.
+        let _ = target;
+        // The heading names the selector object, and it has to be built through
+        // the observation machinery: an expression assembled outside it carries
+        // no marker, so declaration placement sees a symbol read that nothing
+        // authorizes. `observe_certified_value_read_expr` is what records a read
+        // of a value at an instruction, which is exactly what the dispatch does
+        // with the selector.
+        let Some(symbol) = self
             .fold_ctx
-            .planned_input_expr_at(switch_addr, op_idx, 0)
-            .map_err(ControlFlowStructureError::from)?;
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(selector))
+        else {
+            return Ok(None);
+        };
+        let Some(at) = self
+            .fold_ctx
+            .inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.graph().inst_id_for_op_site(switch_addr, op_idx))
+        else {
+            return Ok(None);
+        };
+        let expr = self.fold_ctx.observe_certified_value_read_expr(
+            selector,
+            at,
+            crate::ast::CExpr::Var(symbol),
+        );
         Ok(Some((expr, selector)))
     }
 
@@ -1676,7 +1744,18 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .filter_map(|(value, region)| value.map(|value| (value, region.entry())))
             .collect::<Vec<_>>();
         rendered_cases.sort_unstable();
-        let mut certified_cases = control_fact.cases.clone();
+        // A case whose target is where the switch converges is an empty case.
+        // The region composer drops it, and dropping it is what C means: with
+        // no arm for that value the switch falls past itself, which is exactly
+        // the merge. `murmur3_32`'s `case 0` is that -- a remainder of zero has
+        // nothing to mix in -- and requiring the certified list to match
+        // literally refused the whole switch for it.
+        let mut certified_cases = control_fact
+            .cases
+            .iter()
+            .copied()
+            .filter(|(_, target)| Some(*target) != merge_block)
+            .collect::<Vec<_>>();
         certified_cases.sort_unstable();
         if rendered_cases != certified_cases || default.map(Region::entry) != control_fact.default {
             return Ok(CStmt::Block(vec![CStmt::comment(format!(
@@ -1698,6 +1777,63 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .filter(|(value, _)| value.is_some())
             .map(|(_, region)| region.entry())
             .collect();
+        // Which case values reach each body. A case that falls into the next
+        // is expressed in C by omitting `break`, so the body below runs for its
+        // own value *and* for every value that falls into it. The control
+        // domain says the same thing -- one `SwitchArm` whose value vector is
+        // that union -- and a body guarded by its own value alone does not
+        // match it, which is what left the switch structured and uncovered.
+        let mut falls_into = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+        for (case_value, case_region) in cases {
+            let Some(case_value) = case_value else {
+                continue;
+            };
+            let region_blocks: std::collections::HashSet<u64> =
+                case_region.blocks().into_iter().collect();
+            let successor_entry = region_blocks.iter().find_map(|block| {
+                self.func
+                    .successors(*block)
+                    .into_iter()
+                    .find(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
+            });
+            falls_into
+                .entry(case_region.entry())
+                .or_default()
+                .push(*case_value);
+            if let Some(entry) = successor_entry {
+                falls_into.entry(entry).or_default().push(*case_value);
+            }
+        }
+        // Transitively: case 3 falls into case 2 which falls into case 1, so
+        // case 1's body runs for all three.
+        for _ in 0..cases.len() {
+            let snapshot = falls_into.clone();
+            for (case_value, case_region) in cases {
+                let Some(case_value) = case_value else {
+                    continue;
+                };
+                let region_blocks: std::collections::HashSet<u64> =
+                    case_region.blocks().into_iter().collect();
+                let Some(entry) = region_blocks.iter().find_map(|block| {
+                    self.func
+                        .successors(*block)
+                        .into_iter()
+                        .find(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
+                }) else {
+                    continue;
+                };
+                let carried = snapshot
+                    .get(&case_region.entry())
+                    .cloned()
+                    .unwrap_or_else(|| vec![*case_value]);
+                falls_into.entry(entry).or_default().extend(carried);
+            }
+        }
+        for values in falls_into.values_mut() {
+            values.sort_unstable();
+            values.dedup();
+        }
+
         let mut switch_cases = Vec::new();
         for (case_value, case_region) in cases {
             let outer_domains = self.active_domains.clone();
@@ -1714,7 +1850,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     .any(|succ| case_entries.contains(succ) && !region_blocks.contains(succ))
             });
             let case_stmt = match self.push_exact_edge_guard(switch_block, case_region.entry()) {
-                Ok(()) => self.structure_region(case_region)?,
+                Ok(()) => {
+                    if let Some(reaching) = falls_into.get(&case_region.entry()) {
+                        Self::widen_switch_arm_values(&mut self.active_domains, reaching);
+                    }
+                    self.structure_region(case_region)?
+                }
                 Err(reason) => {
                     self.safety_reason = Some(reason);
                     self.active_domains = outer_domains;

@@ -278,8 +278,10 @@ pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BT
 
 /// Exact direct-branch target uses already represented by CFG topology.
 ///
-/// Only `Branch` and `CBranch` target operand zero qualify. Indirect branch,
-/// call, predicate, and return operands have different rendering contracts.
+/// `Branch` and `CBranch` target operand zero qualify, and so does a
+/// `BranchInd` whose switch is certified: the case topology is what expresses
+/// it. Unresolved indirect branches, call, predicate, and return operands have
+/// different rendering contracts.
 pub(super) fn certified_direct_control_target_sites(
     source: &r2ssa::SsaArtifact,
 ) -> BTreeSet<UseSite> {
@@ -292,6 +294,21 @@ pub(super) fn certified_direct_control_target_sites(
                 r2ssa::InstPayload::Op(
                     r2ssa::SSAOp::Branch { target } | r2ssa::SSAOp::CBranch { target, .. },
                 ) => target,
+                // A resolved jump table is control too. The structured form
+                // prints `switch` on the selector and puts each case where its
+                // block sits, so the computed target it dispatches through is
+                // expressed by the topology exactly as a direct branch's is.
+                // Only where the switch is certified: an indirect branch nobody
+                // resolved keeps its ordinary rendering contract.
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::BranchInd { target }) => {
+                    let block_addr = graph.block(inst.block).map(|block| block.addr);
+                    if !block_addr
+                        .is_some_and(|addr| source.certificates().switches.contains_key(&addr))
+                    {
+                        return None;
+                    }
+                    target
+                }
                 _ => return None,
             };
             let value = graph.value_id_for_var(target)?;
