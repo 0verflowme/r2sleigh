@@ -1698,3 +1698,34 @@ definition for the function that one calls. `verify_rendering` knows only
 what the renderer emits. Making these cells pass needs the harness to render and
 include the callee as well -- the natural next corpus capability now that calls
 render at all, and worth doing before more renderer work is aimed at these four.
+
+### The lane projection, and where it deliberately stops
+
+`MachineWriteProjection::Lane` closes the gap this file recorded: `Full` claims
+a write defines its whole register, `Insert` claims it preserves the rest, and a
+byte computed from two bytes does neither. The admission condition is that no
+operand of the instruction sits at the carrier -- preserving bits requires
+having them, and in SSA an instruction has a value only by taking it as an
+input. That cleared `pearson` and `crc32_bitwise` at -O2, and unlike the `Full`
+rule rejected earlier it keeps `bit_offset`, so it never asserts the register
+was filled.
+
+It is restricted to a lane at the carrier's own offset, and that restriction is
+the interesting part. `mov ah, bl` writes bits 8..16 of `RAX` from `BL` and
+takes no `RAX` operand, so the input-side condition alone would call it a lane;
+but a later read of `AL` or `RAX` is composed from the value that write
+produces, so the preservation is real. Requiring offset zero keeps every
+genuine-lift high-slice expectation intact.
+
+The cost is the one cell that needs the general answer. `crc32_bitwise` at x64
+-O2 now stops on `XMM2_Db`, a 32-bit lane at bit offset 32 of a 512-bit `ZMM2`,
+written by one of the four per-lane adds a `paddd` decomposes into. Nothing
+reads `ZMM2` outside its lanes -- each sibling write reads its own lane -- so
+the preservation is as fictional there as it was for the byte case, and the
+offset restriction is what keeps it. Telling that apart from `mov ah, bl` needs
+the use-side question rather than the operand-side one: does anything read a bit
+of this carrier outside this lane. That is the same "ask what the program
+reads" move this file already credits five times, and it is what the next
+attempt should implement -- as a condition on `Lane`, not as a placement gate,
+because the renderer must emit a plain assignment or the uninitialised read
+simply moves to the compiler.
