@@ -2142,7 +2142,11 @@ fn apply_decisions_once(
                 // entry frame pointer -- and a declaration for an object the
                 // body never mentions states nothing. `RBP_0` was left declared
                 // and unused exactly this way.
-                if candidate.locals.iter().any(|local| local.name == symbol) {
+                let was_declared = candidate.locals.iter().any(|local| local.name == symbol)
+                    || declarations
+                        .values()
+                        .any(|declared| declared.iter().any(|(id, _, _)| *id == binding));
+                if was_declared {
                     candidate.locals.retain(|local| local.name != symbol);
                     for declared in declarations.values_mut() {
                         declared.retain(|(declared, _, _)| *declared != binding);
