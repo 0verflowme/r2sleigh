@@ -447,6 +447,9 @@ impl MachineType {
     }
 }
 
+/// The widest constant a C integer literal can spell.
+const MAX_SPELLABLE_CONSTANT_BITS: u32 = 128;
+
 /// Exact bitvector constant carried by prepared SSA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct MachineBitVector {
@@ -456,7 +459,7 @@ pub struct MachineBitVector {
 
 impl MachineBitVector {
     pub const fn zero(width_bits: u32) -> Option<Self> {
-        if width_bits == 0 || width_bits > 64 {
+        if width_bits == 0 || width_bits > MAX_SPELLABLE_CONSTANT_BITS {
             return None;
         }
         Some(Self {
@@ -3535,10 +3538,21 @@ fn bit_vector(
     width_bits: u32,
     bits: u64,
 ) -> Result<MachineBitVector, MachineBuildError> {
-    if width_bits > 64 {
+    // The width is the varnode's, and the value is the `u64` the varnode
+    // carried, so a constant wider than eight bytes is one whose value provably
+    // fits and whose *size* is what makes it wide. Ghidra's three-operand
+    // `imul r64, r/m64, imm32` is that: both operands are sign-extended to
+    // sixteen bytes, multiplied, and the result sliced, and the immediate
+    // arrives as a sixteen-byte constant carrying `0x2001f`. Refusing on the
+    // size alone refused `adler32` and `fletcher32` at x64 -O2 while the
+    // register form of the same instruction rendered.
+    //
+    // The ceiling is what the rest of the model spells: declaration widths go
+    // to 512, but a C integer is spellable only to 128.
+    if width_bits > MAX_SPELLABLE_CONSTANT_BITS {
         return Err(MachineBuildError::ConstantTooWide { value, width_bits });
     }
-    let mask = if width_bits == 64 {
+    let mask = if width_bits >= 64 {
         u64::MAX
     } else {
         (1u64 << width_bits) - 1
@@ -4036,13 +4050,16 @@ mod tests {
 
     #[test]
     fn zero_bitvector_is_checked_and_exact() {
-        for width_bits in [1, 8, 16, 32, 64] {
+        // 128 is included: a constant whose varnode is wider than a machine
+        // word still carries its value in a `u64`, and 128 is the widest a C
+        // integer literal can spell.
+        for width_bits in [1, 8, 16, 32, 64, 65, 128] {
             let zero = MachineBitVector::zero(width_bits).expect("supported zero bitvector");
             assert_eq!(zero.width_bits(), width_bits);
             assert_eq!(zero.bits(), 0);
         }
         assert_eq!(MachineBitVector::zero(0), None);
-        assert_eq!(MachineBitVector::zero(65), None);
+        assert_eq!(MachineBitVector::zero(129), None);
         assert_eq!(MachineBitVector::zero(u32::MAX), None);
     }
 
