@@ -1729,3 +1729,35 @@ reads" move this file already credits five times, and it is what the next
 attempt should implement -- as a condition on `Lane`, not as a placement gate,
 because the renderer must emit a plain assignment or the uninitialised read
 simply moves to the compiler.
+
+### The one thing between the four call cells and compiling
+
+`murmur3_32` and `xxhash32` at -O0 render a call on both architectures and now
+fail the strict compile on exactly one class: frame slots the function writes
+and never reads, declared and assigned and never used. Everything else that
+stood there is gone -- the undeclared callee, the prototype that contradicted
+the callee's own rendering, and the machine's return-address push through an
+uninitialised stack pointer.
+
+The mechanism is understood end to end. Placement decides `DeadStore` for those
+slots and its trial removal discards nothing, because
+`discard_observed_statement` matches only a marker on the statement while a
+stack write is marked on the expression the assignment writes to. Teaching it to
+recognise a statement whose assignment target carries the mark makes the removal
+work, and the removal then loses each store's `ObservableMemoryWrite`, so the
+effect ledger refuses the function. Guarding the removal on that obligation is
+not the answer either: it restores the cells and costs `adler32` at x64 -O0,
+where the same pass legitimately removes a statement owning one.
+
+What closes it is a certificate that a slot in this function's own frame,
+written and never read, is not observable from outside -- observable is the
+word the obligation uses, and it means observable by someone else.
+`CalleeStackAllocationCertificate` is exactly that proof, and the reason this
+does not simply work is worth recording: for `murmur3_32` on arm64 all
+eighteen stack slots come back with `callee_allocation: None`. The allocation
+proof is not issued for these functions at all, and they are the functions that
+call. Whatever excludes them in `collect_callee_stack_allocation_certificates`
+is the thing to fix; the three consumers below it -- the elision reason, the
+effect-ledger arm keyed on the access's block and op index, and the discarder --
+were written against that certificate and measured inert without it, so they
+were not kept.
