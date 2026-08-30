@@ -1157,8 +1157,17 @@ unsafe fn capture_machine_roles(
     } else {
         return Err(RadareAbi138CaptureError::InactivePayload);
     };
+    // Whether a call leaves the frame carriers alone. radare2 publishes this
+    // for a function whose signature it never linked -- deliberately, so
+    // signatureless functions do not lose entry-relative facts -- and it lands
+    // on the roles rather than on the interface, because the interface is
+    // withheld for exactly those functions.
     let roles = SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
-        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)?;
+        .map_err(|_| RadareAbi138CaptureError::InvalidInterface)?
+        .with_call_preserved_carriers(SourceCallPreservedCarriers::new(
+            wire_bool(view.stack_pointer_preserved_across_calls)?,
+            wire_bool(view.frame_pointer_preserved_across_calls)?,
+        ));
     // SAFETY: the optional scalar callback is copied from the validated table
     // and read twice while the snapshot borrow remains live.
     unsafe { capture_stack_allocation_contract(snapshot, accessors, has_stack_allocation, roles) }

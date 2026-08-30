@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp};
 use r2sleigh_lift::{GenuineLiftedFunction, GenuineLiftedFunctionAuthority, TrustedLiftedFunction};
-use r2source::OwnedFunctionSnapshot;
+use r2source::{OwnedFunctionSnapshot, SourceCallPreservedCarriers};
 use serde::{Deserialize, Serialize};
 
 use crate::aggregate_access::{
@@ -479,11 +479,14 @@ impl SsaArtifact {
             call_site_interfaces,
         );
         Some(Self::new_with_context(
-            SSAFunction::from_blocks_for_decompile_with_interface(
+            SSAFunction::from_blocks_for_decompile_with_interface_and_control(
                 blocks,
                 arch,
                 coherent_function_interface(&machine_context),
-            )?,
+                machine_context.machine_roles().call_preserved_carriers(),
+                &UncheckedSsaWorkControl,
+            )
+            .ok()?,
             FunctionPrepareMode::Decompile,
             machine_context,
         ))
@@ -529,6 +532,7 @@ impl SsaArtifact {
             blocks,
             arch,
             coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
             control,
         )?;
         control.poll()?;
@@ -579,6 +583,7 @@ impl SsaArtifact {
             blocks.as_slice(),
             Some(arch),
             coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
             control,
         )?;
         if function.entry != lifted.authority().layout().entry_addr() {
@@ -1299,6 +1304,7 @@ impl TrustedSsaArtifact {
             blocks.as_slice(),
             Some(&arch),
             coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
             control,
         )?;
         // What the source calls this function. A name radare2 derived from the
@@ -1453,6 +1459,12 @@ impl DecompilePrepFacts {
 /// It contains the CFG, dominator tree, and SSA operations for all blocks.
 #[derive(Debug)]
 pub struct SSAFunction {
+    /// Whether a call leaves the carriers that address this frame alone.
+    ///
+    /// Held here rather than read off the function interface, because the
+    /// source publishes it for functions whose interface it withholds, and
+    /// those are the ones that need it.
+    call_preserved_carriers: Option<SourceCallPreservedCarriers>,
     /// The function's name (if known).
     pub name: Option<String>,
     /// Entry point address.
@@ -1485,6 +1497,7 @@ struct SsaQueryIndex {
 impl Clone for SSAFunction {
     fn clone(&self) -> Self {
         Self {
+            call_preserved_carriers: self.call_preserved_carriers,
             name: self.name.clone(),
             entry: self.entry,
             cfg: self.cfg.clone(),
@@ -1951,6 +1964,7 @@ impl SSAFunction {
         let domtree = DomTree::compute(&cfg);
         let block_order = cfg.reverse_postorder();
         Self {
+            call_preserved_carriers: None,
             name: None,
             entry,
             cfg,
@@ -2012,31 +2026,21 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
-        Self::from_blocks_for_decompile_with_interface_and_control(blocks, arch, None, control)
-    }
-
-    fn from_blocks_for_decompile_with_interface(
-        blocks: &[R2ILBlock],
-        arch: Option<&ArchSpec>,
-        function_interface: Option<&SourceFunctionInterface>,
-    ) -> Option<Self> {
         Self::from_blocks_for_decompile_with_interface_and_control(
-            blocks,
-            arch,
-            function_interface,
-            &UncheckedSsaWorkControl,
+            blocks, arch, None, None, control,
         )
-        .ok()
     }
 
     fn from_blocks_for_decompile_with_interface_and_control<C: SsaWorkControl + ?Sized>(
         blocks: &[R2ILBlock],
         arch: Option<&ArchSpec>,
         function_interface: Option<&SourceFunctionInterface>,
+        call_preserved_carriers: Option<SourceCallPreservedCarriers>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
         let mut func = Self::from_blocks_raw_for_decompile_with_control(blocks, arch, control)?;
+        func.call_preserved_carriers = call_preserved_carriers;
         func.prepare_for_decompile_with_interface_and_control(
             &crate::optimize::DecompilePrepConfig::default(),
             function_interface,
@@ -2251,6 +2255,7 @@ impl SSAFunction {
         }
 
         let mut function = Self {
+            call_preserved_carriers: None,
             name: None,
             entry,
             cfg,
@@ -2931,11 +2936,30 @@ impl SSAFunction {
         //
         // Operations whose effect the model does not describe are a different
         // matter: nothing says what they leave behind, so they still stop this.
-        let call_carriers_are_restored = function_interface.is_some_and(|interface| {
-            interface.stack_pointer_preserved_across_calls()
-                && (interface.frame_pointer_storage().is_none()
-                    || interface.frame_pointer_preserved_across_calls())
-        });
+        // The convention fact the source published, and only then the
+        // interface's copy of it.
+        //
+        // radare2 determines whether a call preserves the frame carriers from
+        // the calling convention, and records it even for a function whose
+        // signature it never linked -- deliberately, so signatureless functions
+        // keep their entry-relative facts. It travels beside the machine roles
+        // because the interface block is withheld for exactly those functions;
+        // when it is withheld the interface still arrives, reconstructed with
+        // both flags defaulted to false. Asking the interface first therefore
+        // asked the answerer that does not know, and every function that calls
+        // lost every fact about its own frame: no stack roots, so no
+        // certificate that a slot is its own, so its dead spills could not be
+        // dropped and rendered as variables set and never used.
+        let call_carriers_are_restored = self.call_preserved_carriers.map_or_else(
+            || {
+                function_interface.is_some_and(|interface| {
+                    interface.stack_pointer_preserved_across_calls()
+                        && (interface.frame_pointer_storage().is_none()
+                            || interface.frame_pointer_preserved_across_calls())
+                })
+            },
+            SourceCallPreservedCarriers::frame_survives_a_call,
+        );
         let entry_stack_roots_are_stable = self.blocks().all(|block| {
             block.ops.iter().all(|op| match op {
                 SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallDefine { .. } => {

@@ -937,6 +937,18 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		r2sleigh_wire_bool (writer, false);
 	}
 
+	/* Whether a call leaves those carriers alone. radare2 determines this from
+	 * the calling convention and records it even when it never linked a
+	 * signature -- its own comment says so -- and the interface block above is
+	 * withheld for exactly those functions, so it travels here instead. Without
+	 * it a function that calls loses every entry-relative fact about its frame:
+	 * no stack roots, and so no certificate that a slot is its own. */
+	r2sleigh_wire_bool (writer, carriers_read);
+	if (carriers_read) {
+		r2sleigh_wire_bool (writer, carriers.stack_pointer_preserved_across_calls);
+		r2sleigh_wire_bool (writer, carriers.frame_pointer_preserved_across_calls);
+	}
+
 	/* The convention's candidate slots describe where a caller would leave
 	 * arguments and the result. They are emitted whether or not a prototype was
 	 * recovered, because a consumer recovering parameters from machine code has

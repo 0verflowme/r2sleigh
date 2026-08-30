@@ -2446,6 +2446,42 @@ pub struct SourceMachineRoles {
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
     stack_allocation_contract: Option<SourceStackAllocationContract>,
+    call_preserved_carriers: Option<SourceCallPreservedCarriers>,
+}
+
+/// Whether a call leaves the carriers that address the frame where they were.
+///
+/// A convention fact, like the stack allocation contract beside it, and the
+/// source publishes it whether or not it recovered a prototype -- which is the
+/// point. Everything entry-relative about a frame depends on it: if a call may
+/// move the stack pointer, no offset taken before one means anything after, so
+/// a function that calls loses every fact about its own frame without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCallPreservedCarriers {
+    stack_pointer: bool,
+    frame_pointer: bool,
+}
+
+impl SourceCallPreservedCarriers {
+    pub const fn new(stack_pointer: bool, frame_pointer: bool) -> Self {
+        Self {
+            stack_pointer,
+            frame_pointer,
+        }
+    }
+
+    pub const fn stack_pointer(self) -> bool {
+        self.stack_pointer
+    }
+
+    pub const fn frame_pointer(self) -> bool {
+        self.frame_pointer
+    }
+
+    /// Whether both carriers that can address a frame survive a call.
+    pub const fn frame_survives_a_call(self) -> bool {
+        self.stack_pointer && self.frame_pointer
+    }
 }
 
 /// Where the calling convention would place arguments and the result.
@@ -2542,7 +2578,24 @@ impl SourceMachineRoles {
             return_address_storage,
             stack_pointer_storage,
             stack_allocation_contract: None,
+            call_preserved_carriers: None,
         })
+    }
+
+    /// Bind what a call leaves the frame carriers holding. Like the allocation
+    /// contract, this is a convention fact and stays available when no exact
+    /// prototype was recovered.
+    #[must_use]
+    pub const fn with_call_preserved_carriers(
+        mut self,
+        carriers: SourceCallPreservedCarriers,
+    ) -> Self {
+        self.call_preserved_carriers = Some(carriers);
+        self
+    }
+
+    pub const fn call_preserved_carriers(&self) -> Option<SourceCallPreservedCarriers> {
+        self.call_preserved_carriers
     }
 
     /// Bind exact geometric ownership around the architectural stack pointer.

@@ -77,6 +77,13 @@ pub enum ElisionReason {
     /// bookkeeping the C has no statement for, in the same way a return's own
     /// transfer is.
     CallReturnAddress,
+    /// A store into a frame slot this function owns and never reads.
+    ///
+    /// Writing memory is an effect, but observable means observable from
+    /// outside. Where the object is certified to lie wholly inside storage this
+    /// function allocated, and every access to it is a write, nothing can read
+    /// what was stored and no C statement has to carry it.
+    DeadFrameSlotStore,
     /// An immutable phi whose inputs and output are one certified renderer
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
@@ -153,6 +160,7 @@ impl std::fmt::Display for ElisionReason {
             Self::DirectControlTarget => "direct-control-target",
             Self::DirectCallTarget => "direct-call-target",
             Self::CallReturnAddress => "call-return-address",
+            Self::DeadFrameSlotStore => "dead-frame-slot-store",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
             Self::CoalescedCarrierEdge => "coalesced-carrier-edge",
             Self::CoalescedCarrierPhi => "coalesced-carrier-phi",

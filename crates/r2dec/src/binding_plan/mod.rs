@@ -486,6 +486,49 @@ pub(super) fn certified_call_return_address_values(
         .collect()
 }
 
+/// Accesses to a frame slot this function writes and never reads.
+///
+/// A store into memory is an effect, and the ledger holds the rendering to it,
+/// which is why a dead frame slot cannot simply be dropped: the obligation
+/// would go unanswered. But observable means observable from outside, and a
+/// `CalleeStackAllocationCertificate` is the proof that the object lies wholly
+/// inside storage this function owns at every access. Where every one of those
+/// accesses is a write, nothing here or anywhere else can read what was stored,
+/// and the store has no meaning the C has to carry.
+///
+/// This is what left `stack_m48` and its neighbours declared, assigned and
+/// unused in `murmur3_32` and `xxhash32` at -O0: the slots an argument is
+/// spilled into and then read back out of through the object rather than the
+/// slot.
+pub(super) fn certified_dead_frame_slot_accesses(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<(u64, usize)> {
+    let certificates = source.certificates();
+    let mut accesses = BTreeSet::new();
+    for slot in certificates.stack_slots.values() {
+        let Some(allocation) = slot.callee_allocation.as_ref() else {
+            continue;
+        };
+        let Some(owned) = allocation
+            .accesses
+            .iter()
+            .map(|access| certificates.memory_accesses.get(access))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if owned.is_empty() || owned.iter().any(|access| !access.is_write) {
+            continue;
+        }
+        accesses.extend(
+            owned
+                .iter()
+                .map(|access| (access.block_addr, access.op_index)),
+        );
+    }
+    accesses
+}
+
 /// Direct-control target values whose complete use domain is CFG topology.
 pub(super) fn certified_direct_control_target_values(
     source: &r2ssa::SsaArtifact,

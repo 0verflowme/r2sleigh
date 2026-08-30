@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 3;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 4;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -346,11 +346,12 @@ impl<'a> SnapshotWireReader<'a> {
 
 use crate::contracts::{
     CanonicalStorageId, CanonicalStorageSpace, SourceAbiClass, SourceAbiParameterSpec,
-    SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult,
-    SourceCarrierKind, SourceCarrierProjection, SourceConventionSlots, SourceFunctionInterface,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceReturnMechanism,
-    SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
-    SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
+    SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
+    SourceCallPreservedCarriers, SourceCallResult, SourceCarrierKind, SourceCarrierProjection,
+    SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
+    SourceMachineRoles, SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth,
+    SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind,
+    StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -803,6 +804,20 @@ fn write_machine_roles_for_format(
             None => writer.bool(false),
         }
     }
+    // Whether a call leaves the frame carriers alone. A convention fact, and it
+    // travels with the roles rather than with the interface because the source
+    // publishes it for functions whose interface it withholds -- which are the
+    // functions that need it.
+    if format_version >= 4 {
+        match roles.call_preserved_carriers() {
+            Some(carriers) => {
+                writer.bool(true);
+                writer.bool(carriers.stack_pointer());
+                writer.bool(carriers.frame_pointer());
+            }
+            None => writer.bool(false),
+        }
+    }
 }
 
 pub fn read_machine_roles(
@@ -826,6 +841,14 @@ fn read_machine_roles_with_legacy_contract(
     } else {
         legacy_contract
     };
+    let carriers = if reader.format_version() >= 4 && reader.bool()? {
+        Some(SourceCallPreservedCarriers::new(
+            reader.bool()?,
+            reader.bool()?,
+        ))
+    } else {
+        None
+    };
     // new() revalidates the register constraint, so a buffer cannot mint roles
     // the in-crate constructor would have rejected.
     let mut roles = SourceMachineRoles::new(return_address_storage, stack_pointer_storage)
@@ -840,6 +863,9 @@ fn read_machine_roles_with_legacy_contract(
                 contract: "SourceMachineRoles::with_stack_allocation_contract",
                 reason: format!("{error:?}"),
             })?;
+    }
+    if let Some(carriers) = carriers {
+        roles = roles.with_call_preserved_carriers(carriers);
     }
     Ok(roles)
 }

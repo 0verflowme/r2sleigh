@@ -82,6 +82,17 @@ fn upstream_zero_occurrence_outcome(
     }) {
         return Outcome::Elided(ElisionReason::ReturnControl);
     }
+    // A store into a frame slot this function owns and never reads. The
+    // obligation is real -- writing memory is an effect -- and it is answered
+    // by the certificate that nothing can observe the result.
+    if id.kind == SemanticObligationKind::ObservableMemoryWrite
+        && let CanonicalInstructionSite::Op(op_index) = id.instruction.site
+        && let Ok(op_index) = usize::try_from(op_index)
+        && crate::binding_plan::certified_dead_frame_slot_accesses(prepared)
+            .contains(&(id.instruction.block_addr, op_index))
+    {
+        return Outcome::Elided(ElisionReason::DeadFrameSlotStore);
+    }
     // The push that records a call's return address. The call statement is the
     // transfer, and no C statement writes the machine's return address.
     if source_inst.is_some_and(|inst| {

@@ -61,6 +61,9 @@ pub(crate) struct FinalBindingWrite {
     /// Whether this exact occurrence is a statement assignment that C permits
     /// the final emitter to replace with a declaration initializer.
     pub(crate) inline_eligible: bool,
+    /// Whether removing this write's statement would lose an effect nothing
+    /// else answers for.
+    pub(crate) effectful: bool,
 }
 
 /// Placement-relevant projection of the observation journal's private target.
@@ -232,6 +235,7 @@ pub(crate) fn collect_final_placement_occurrences(
     }
 
     let graph = source.graph();
+    let answered_effect_sites = crate::binding_plan::certified_dead_frame_slot_accesses(source);
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     for (index, target) in targets.iter().copied().enumerate() {
@@ -312,6 +316,11 @@ pub(crate) fn collect_final_placement_occurrences(
                         inline_eligible: statement_assignment[index]
                             == names.symbol_for_binding(binding)
                             && !after_label.contains(&observation),
+                        effectful: removing_statement_would_lose_an_effect(
+                            source,
+                            inst_id,
+                            &answered_effect_sites,
+                        ),
                     });
                 }
             }
@@ -348,6 +357,11 @@ pub(crate) fn collect_final_placement_occurrences(
                         order,
                         observation,
                         inline_eligible: false,
+                        effectful: removing_statement_would_lose_an_effect(
+                            source,
+                            access.inst,
+                            &answered_effect_sites,
+                        ),
                     });
                 } else {
                     reads.push(FinalBindingRead {
@@ -370,6 +384,40 @@ pub(crate) fn collect_final_placement_occurrences(
         reads: reads.into_boxed_slice(),
         writes: writes.into_boxed_slice(),
     })
+}
+
+/// Whether removing this instruction's statement would lose an effect.
+///
+/// A dead store drops the statements that write an object nothing reads, and
+/// the effect ledger answers separately for whatever else those statements did.
+/// That holds for producing a value and for a read whose result nothing wants.
+/// It does not hold for an effect the program can observe from outside: a store
+/// into memory is one, and dropping it leaves the ledger with an obligation no
+/// rendering answers.
+///
+/// Unless something already answers it. A slot certified to lie in this
+/// function's own frame, written and never read, has its stores elided by the
+/// effect ledger on that certificate, and those may go.
+fn removing_statement_would_lose_an_effect(
+    source: &r2ssa::SsaArtifact,
+    inst: InstId,
+    answered: &BTreeSet<(u64, usize)>,
+) -> bool {
+    use r2ssa::SemanticObligationKind as Kind;
+    let site = source.graph().op_site_for_inst(inst);
+    if site.is_some_and(|site| answered.contains(&site)) {
+        return false;
+    }
+    source
+        .obligations()
+        .obligations_for_inst(inst)
+        .any(|obligation| {
+            // Only a write into memory. The others in this family are either
+            // answered when the statement goes -- a trap belongs to the
+            // operation the removal takes with it -- or cannot arise on a
+            // statement that only writes an object nothing reads.
+            matches!(obligation.id.kind, Kind::ObservableMemoryWrite)
+        })
 }
 
 fn bound_value(
@@ -2088,6 +2136,29 @@ fn apply_decisions_once(
                 continue;
             };
             if !function_body_mentions_symbol(&candidate.body, symbol) {
+                // Nothing names it any more. Something this pass already
+                // removed took its last mention with it -- a frame slot's
+                // store, say, whose address was the only thing that read the
+                // entry frame pointer -- and a declaration for an object the
+                // body never mentions states nothing. `RBP_0` was left declared
+                // and unused exactly this way.
+                if candidate.locals.iter().any(|local| local.name == symbol) {
+                    candidate.locals.retain(|local| local.name != symbol);
+                    for declared in declarations.values_mut() {
+                        declared.retain(|(declared, _, _)| *declared != binding);
+                    }
+                    discarded_bindings.insert(binding);
+                    removed_any = true;
+                }
+                continue;
+            }
+            // The same bar the dead-store decision keeps: a statement whose
+            // effect nothing else answers for is not removable, however unread
+            // the object it writes.
+            if writes
+                .iter()
+                .any(|write| write.binding == binding && write.effectful)
+            {
                 continue;
             }
             let mut trial = candidate.clone();
@@ -2371,6 +2442,23 @@ fn discard_observed_statement(
     removed
 }
 
+/// Whether this expression is marked with an observation, at any of the layers
+/// wrapping the expression itself.
+fn expr_carries_observation(expr: &CExpr, target: RenderObservationId) -> bool {
+    let mut current = expr;
+    loop {
+        match current {
+            CExpr::Observed { id, expr } => {
+                if *id == target {
+                    return true;
+                }
+                current = expr;
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn discard_observed_statement_in_stmt(
     statement: &mut CStmt,
     target: RenderObservationId,
@@ -2379,6 +2467,29 @@ fn discard_observed_statement_in_stmt(
     if let CStmt::Observed { id, .. } = statement
         && *id == target
     {
+        collect_statement_observations(statement, discarded);
+        *statement = CStmt::Empty;
+        return 1;
+    }
+    // A write is not always marked on the statement. A store into a stack
+    // object is marked on the object expression the assignment writes to, so
+    // the statement performing the write is the one whose assignment target
+    // carries the mark. Looking only at statement markers found nothing to
+    // discard for those, and a frame slot the function writes and never reads
+    // survived as a variable that is set and not used.
+    //
+    // Only the assignment target. A mark anywhere else belongs to something the
+    // statement reads, and removing the statement for it would discard a write
+    // on the strength of a read.
+    let assigns_target = matches!(
+        statement.unobserved(),
+        CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            ..
+        }) if expr_carries_observation(left, target)
+    );
+    if assigns_target {
         collect_statement_observations(statement, discarded);
         *statement = CStmt::Empty;
         return 1;
@@ -2701,6 +2812,9 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         if binding_occurrences
             .iter()
             .all(|occurrence| matches!(occurrence.kind, OccurrenceKind::Write { .. }))
+            && !writes
+                .iter()
+                .any(|write| write.binding == binding && write.effectful)
         {
             decisions[binding_index] = Some(PlacementDecision::DeadStore {
                 region: lowest_dominating_region(regions, cfg, binding_occurrences),
@@ -3289,6 +3403,7 @@ mod tests {
         let merge_region = region_with_entry(&regions, 0x1030, StructuredRegionKind::Block);
         let writes = [
             FinalBindingWrite {
+                effectful: false,
                 binding,
                 inst: InstId(1),
                 region: then_region,
@@ -3298,6 +3413,7 @@ mod tests {
                 inline_eligible: true,
             },
             FinalBindingWrite {
+                effectful: false,
                 binding,
                 inst: InstId(2),
                 region: else_region,
@@ -3347,6 +3463,7 @@ mod tests {
             input_idx: 0,
         };
         let writes = [FinalBindingWrite {
+            effectful: false,
             binding,
             inst: InstId(1),
             region: then_region,
@@ -3403,6 +3520,7 @@ mod tests {
             order,
         }];
         let writes = [FinalBindingWrite {
+            effectful: false,
             binding,
             inst,
             region: block_region,
@@ -3461,6 +3579,7 @@ mod tests {
                 order: FinalOccurrenceOrder(2),
             }],
             &[FinalBindingWrite {
+                effectful: false,
                 binding,
                 inst: write,
                 region: write_region,
