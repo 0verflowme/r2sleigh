@@ -1517,6 +1517,42 @@ impl<'a> FoldingContext<'a> {
         base_expr
     }
 
+    /// The C type the emitted declaration gives the name this value renders as.
+    ///
+    /// This is not a hint and not a belief about what the value means. The
+    /// binding plan seals a `declaration_type` per binding and `placement.rs`
+    /// emits the declaration with exactly that type, so an operand spelled as
+    /// that name has exactly this type in the program the compiler reads.
+    ///
+    /// A value the plan inlines has no declaration and so has no type here.
+    /// That is an honest absence: the operand is an expression, not a name.
+    fn declared_type_for_var(&self, var: &SSAVar) -> Option<CType> {
+        let value = self.prepared_value_id_for_var(var)?;
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        Some(names.plan().binding(*binding)?.declaration_type().clone())
+    }
+
+    /// The recorded type of an operand, for deciding whether a cast is needed.
+    ///
+    /// The declaration wins over the certified hint, because the two answer
+    /// different questions and only one of them is about the emitted C. Every
+    /// binding is declared at `CType::machine_bits`, i.e. unsigned, while
+    /// `type_hint_for_var` reports what upstream proved the value *means* --
+    /// signed, a pointer, a typedef. Deciding a cast from the meaning while
+    /// the compiler reads the declaration is how a value declared `uint32_t`
+    /// and believed `int32_t` reached a comparison with no cast and was
+    /// compared unsigned, which is the shape of the sign-flag defect that made
+    /// `crc32_bitwise` return a CRC of nothing while compiling cleanly.
+    fn source_type_for_var(&self, var: &SSAVar) -> Option<CType> {
+        self.declared_type_for_var(var)
+            .or_else(|| self.type_hint_for_var(var))
+    }
+
     fn type_hint_for_var(&self, var: &SSAVar) -> Option<CType> {
         let value = self.prepared_value_id_for_var(var)?;
         let render = self.inputs.render_facts()?;
@@ -1792,11 +1828,32 @@ impl<'a> FoldingContext<'a> {
         src: Option<&SSAVar>,
         rhs: CExpr,
     ) -> CExpr {
-        let Some(dst_ty) = self.type_hint_for_var(dst) else {
+        self.assignment_rhs_from_source_type(dst, src.and_then(|var| self.source_type_for_var(var)), rhs)
+    }
+
+    /// The assignment cast policy, from a source type rather than a variable.
+    ///
+    /// Some operations know the type of the expression they produce without
+    /// there being a variable to ask: a binary operation whose operands were
+    /// both cast to a stated type produces that type. Passing `None` there
+    /// meant the policy decided from not knowing, which is what property 2
+    /// forbids.
+    fn assignment_rhs_from_source_type(
+        &self,
+        dst: &SSAVar,
+        src_ty: Option<CType>,
+        rhs: CExpr,
+    ) -> CExpr {
+        // The target is the declared type for the same reason the source is:
+        // a cast is a statement about the emitted C, and the declaration is
+        // what the compiler reads. Casting to what upstream believes the value
+        // means, while the declaration says otherwise, produced
+        // `X1_0 = (int64_t)(...)` for an object declared `uint64_t` -- correct
+        // arithmetic that will not compile under `-Wsign-conversion`.
+        let Some(dst_ty) = self.source_type_for_var(dst) else {
             return rhs;
         };
 
-        let src_ty = src.and_then(|var| self.type_hint_for_var(var));
         let rhs = self.cast_expr_if_needed(rhs, dst_ty.clone(), src_ty.as_ref());
         self.rewrite_typed_assignment_literal_expr(rhs, &dst_ty)
     }
@@ -2718,6 +2775,7 @@ impl<'a> FoldingContext<'a> {
             self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
         let mut rhs_expr =
             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
+        let produced_ty = operand_ty.clone();
         if let Some(ty) = operand_ty {
             // Stated, not hinted. This type is the operation: `IntSLess` and
             // `IntLess` differ only in the signedness of the operands they
@@ -2747,7 +2805,27 @@ impl<'a> FoldingContext<'a> {
         } else {
             rhs_raw
         };
-        let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
+        // Both operands were cast to the stated operand type, so that is the
+        // type of the expression this produces -- except for a comparison,
+        // whose value in C is an `int`. Either way it is stated rather than
+        // guessed, which is what the policy needs.
+        let produced = if matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        ) {
+            Some(CType::Int(32))
+        } else {
+            // No stated operand type means the operation did not require one,
+            // not that the expression has no type. Where both operands are
+            // recorded at the same type, the wrapping arithmetic C performs on
+            // them produces that type, and that is a derivation rather than a
+            // guess. Where they disagree there is nothing to state.
+            produced_ty.or_else(|| {
+                let left = self.source_type_for_var(a)?;
+                (self.source_type_for_var(b)? == left).then_some(left)
+            })
+        };
+        let rhs = self.assignment_rhs_from_source_type(dst, produced, rhs);
         self.assign_stmt(lhs, rhs)
     }
 
