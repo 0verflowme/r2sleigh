@@ -40,6 +40,33 @@ impl RecordedType {
         Self(ty)
     }
 
+    /// The type of the machine expression the plan inlines for a value.
+    ///
+    /// A value the plan inlines has no declaration, so it has no declared
+    /// type, and it was previously left with no source at all. It is not
+    /// typeless: the sealed machine projection holds the expression that will
+    /// be rendered in its place, and that expression has a width and a
+    /// signedness. That is a recorded fact about the value, not a reading of
+    /// the C the renderer is about to emit.
+    ///
+    /// An address is taken at its machine width. Without a recorded pointee
+    /// there is nothing to say about what it points at, and saying the width
+    /// is the honest half of the answer.
+    fn from_inline_expression(ty: &r2ssa::MachineType) -> Self {
+        Self(match ty {
+            r2ssa::MachineType::Bool { .. } => CType::Bool,
+            r2ssa::MachineType::Integer {
+                width_bits,
+                signedness,
+            } => match signedness {
+                r2ssa::MachineSignedness::Signed => CType::Int(*width_bits),
+                r2ssa::MachineSignedness::Unsigned => CType::UInt(*width_bits),
+            },
+            r2ssa::MachineType::Address { width_bits, .. } => CType::UInt(*width_bits),
+        })
+    }
+
+
     /// A source for a fixture, which has no upstream to record one.
     ///
     /// Deliberately test-only: production must name the evidence.
@@ -1612,7 +1639,23 @@ impl<'a> FoldingContext<'a> {
     fn source_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
         self.declared_type_for_var(var)
             .or_else(|| self.type_hint_for_var(var).map(RecordedType::from_certified_fact))
+            .or_else(|| self.inline_expression_type_for_var(var))
     }
+
+    /// The recorded type of the expression the plan inlines for this value.
+    fn inline_expression_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
+        let value = self.prepared_value_id_for_var(var)?;
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::ValueDisposition::Inline { expr, .. } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        Some(RecordedType::from_inline_expression(
+            names.inline_expr(*expr)?.ty(),
+        ))
+    }
+
 
     fn type_hint_for_var(&self, var: &SSAVar) -> Option<CType> {
         let value = self.prepared_value_id_for_var(var)?;
