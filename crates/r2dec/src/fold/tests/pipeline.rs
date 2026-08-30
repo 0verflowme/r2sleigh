@@ -1700,7 +1700,7 @@ mod tests {
             stmt,
             CStmt::Expr(CExpr::call(
                 CExpr::External {
-                    name: "sym.imp.printf".to_string(),
+                    name: "sym_imp_printf".to_string(),
                     kind: crate::symbol::ExternalKind::Import,
                 },
                 vec![]
@@ -1827,7 +1827,7 @@ mod tests {
 
         let poisoned_rendered_call = CExpr::call(
             CExpr::External {
-                name: "sym.imp.free".to_string(),
+                name: "sym_imp_free".to_string(),
                 kind: crate::symbol::ExternalKind::Import,
             },
             vec![ctx.name_ref("ptr")],
@@ -1856,7 +1856,7 @@ mod tests {
 
         let rendered_unknown_call = CExpr::call(
             CExpr::External {
-                name: "sym.local.rendered_name".to_string(),
+                name: "sym_local_rendered_name".to_string(),
                 kind: crate::symbol::ExternalKind::Function,
             },
             vec![ctx.name_ref("ptr")],
@@ -1893,7 +1893,7 @@ mod tests {
 
         let poisoned_rendered_call = CExpr::call(
             CExpr::External {
-                name: "sym.local.poison".to_string(),
+                name: "sym_local_poison".to_string(),
                 kind: crate::symbol::ExternalKind::Function,
             },
             vec![CExpr::UIntLit(16)],
@@ -2500,7 +2500,7 @@ mod tests {
         assert_eq!(
             ctx.resolve_call_target_for_site(block.addr, 1, target),
             Ok(CExpr::External {
-                name: "sym.imp.fact_helper".to_string(),
+                name: "sym_imp_fact_helper".to_string(),
                 kind: crate::symbol::ExternalKind::Import,
             })
         );
@@ -2602,7 +2602,7 @@ mod tests {
         assert_eq!(
             func.unobserved(),
             &CExpr::External {
-                name: "sym.helper".to_string(),
+                name: "sym_helper".to_string(),
                 kind: crate::symbol::ExternalKind::Function,
             }
         );

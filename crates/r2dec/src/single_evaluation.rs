@@ -280,6 +280,7 @@ mod tests {
         body: Vec<CStmt>,
     ) -> CFunction {
         CFunction {
+            externs: Vec::new(),
             name: "f".to_string(),
             ret_type: CType::Int(32),
             params: Vec::<CParam>::new(),

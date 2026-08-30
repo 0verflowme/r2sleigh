@@ -1138,6 +1138,53 @@ pub struct CFunction {
     /// asserts the function takes no arguments; a function whose interface is
     /// unknown must not make that claim.
     pub params_known: bool,
+    /// The functions this one calls, in the order their names sort.
+    ///
+    /// C requires a declaration before a call, and a decompiled function that
+    /// calls another is not readable, compilable or checkable without one.
+    /// These are emitted above the definition.
+    pub externs: Vec<CExternDecl>,
+}
+
+/// A machine symbol spelled as a C identifier.
+///
+/// radare2 names a symbol `sym._rotl32`, and a decompiler that puts that in its
+/// output has written something no C compiler will parse -- it reads as a
+/// member access on an undeclared `sym`. The name still has to be recognisable,
+/// so every character C does not allow becomes an underscore and nothing else
+/// changes.
+pub fn c_identifier(name: &str) -> String {
+    let mut identifier = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            identifier.push(character);
+        } else {
+            identifier.push('_');
+        }
+    }
+    if identifier.is_empty() {
+        return "_".to_string();
+    }
+    if identifier.starts_with(|character: char| character.is_ascii_digit()) {
+        identifier.insert(0, '_');
+    }
+    identifier
+}
+
+/// A prototype for a function this one calls.
+///
+/// Only what the call needs to be well formed: the name, what it returns, and
+/// the types of the arguments the call passes. Where the callee's interface is
+/// not recovered the parameter list is left unspecified rather than asserted
+/// empty, for the same reason `params_known` exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CExternDecl {
+    /// The callee's name, as the call spells it.
+    pub name: String,
+    /// What the callee returns.
+    pub ret_type: CType,
+    /// The callee's parameter types, or `None` when they are unknown.
+    pub params: Option<Vec<CType>>,
 }
 
 /// A function parameter.
@@ -1167,6 +1214,7 @@ impl CFunction {
             symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             name: name.into(),
             ret_type,
+            externs: Vec::new(),
             params: Vec::new(),
             locals: Vec::new(),
             body: Vec::new(),

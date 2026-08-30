@@ -4645,7 +4645,13 @@ impl Decompiler {
         let body = self.stmt_to_vec(body_stmt);
         let mut c_function = CFunction {
             symbols: std::rc::Rc::clone(&symbol_table),
-            name: func_name.clone(),
+            name: crate::ast::c_identifier(&func_name),
+            externs: fold_ctx
+                .callee_declarations
+                .borrow()
+                .values()
+                .cloned()
+                .collect(),
             ret_type: render_signature
                 .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
                 .unwrap_or_else(|| inferred_ret_type.clone()),
@@ -10008,6 +10014,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
+            externs: Vec::new(),
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10060,6 +10067,7 @@ mod tests {
             None,
         );
         let mut func = CFunction {
+            externs: Vec::new(),
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),
@@ -10116,6 +10124,7 @@ mod tests {
             vec![crate::symbol::var_ref(&symbols, "n")],
         ))];
         let mut func = CFunction {
+            externs: Vec::new(),
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int(8)),
             params: Vec::new(),

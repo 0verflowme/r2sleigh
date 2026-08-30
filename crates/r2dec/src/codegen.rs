@@ -172,6 +172,37 @@ impl CodeGenerator {
         self.output.push_str(")\n{\n");
         self.indent_level += 1;
 
+        // Declarations for what this function calls.
+        //
+        // Inside the body rather than above it. A block-scope declaration of an
+        // external function is ordinary C and still has external linkage, and
+        // it keeps the rendering self-contained: the text of one function is
+        // the whole translation unit anything needs to compile it, which is not
+        // true of a prototype the reader has to be handed separately.
+        for declaration in &func.externs {
+            self.emit_indent();
+            self.emit_type(&declaration.ret_type);
+            self.output.push(' ');
+            self.output.push_str(&declaration.name);
+            self.output.push('(');
+            match &declaration.params {
+                Some(params) if params.is_empty() => self.output.push_str("void"),
+                Some(params) => {
+                    for (index, param) in params.iter().enumerate() {
+                        if index > 0 {
+                            self.output.push_str(", ");
+                        }
+                        self.emit_type(param);
+                    }
+                }
+                None => {}
+            }
+            self.output.push_str(");\n");
+        }
+        if !func.externs.is_empty() {
+            self.output.push('\n');
+        }
+
         // Local variable declarations
         for local in &func.locals {
             self.emit_indent();
@@ -1050,6 +1081,7 @@ mod tests {
     fn test_generate_simple_function() {
         let symbols = test_table();
         let func = CFunction {
+            externs: Vec::new(),
             name: "add".to_string(),
             ret_type: CType::i32(),
             params: vec![
@@ -1082,6 +1114,7 @@ mod tests {
         let symbols = test_table();
         let value = crate::symbol::declare(&symbols, "value");
         let plain = CFunction {
+            externs: Vec::new(),
             name: "observed".to_string(),
             ret_type: CType::i32(),
             params: vec![],
@@ -1367,6 +1400,7 @@ mod tests {
         let symbols = test_table();
         let x = crate::symbol::declare(&symbols, "x");
         let func = CFunction {
+            externs: Vec::new(),
             name: "test".to_string(),
             ret_type: CType::Void,
             params: vec![],

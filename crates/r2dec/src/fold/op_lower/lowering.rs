@@ -751,6 +751,12 @@ impl<'a> FoldingContext<'a> {
                                 self.certified_call_target_expr(frame, target, cert, true)?;
                             let certified_args =
                                 self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            self.record_callee_declaration(
+                                &func_expr,
+                                source_block,
+                                source_op_idx,
+                                &certified_args,
+                            );
                             let call = CExpr::call_at(
                                 (source_block, source_op_idx),
                                 func_expr,

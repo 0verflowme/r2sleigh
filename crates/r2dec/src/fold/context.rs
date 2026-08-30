@@ -132,6 +132,12 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
     /// Blocks the fold walked, which is what expresses a merge standing at their head.
     pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// A prototype for each function this rendering calls, keyed by the name
+    /// the call spells, collected while the calls are lowered because that is
+    /// where the callee's interface is in hand. Handed to the function when it
+    /// is built.
+    pub(crate) callee_declarations:
+        std::cell::RefCell<std::collections::BTreeMap<String, crate::ast::CExternDecl>>,
     /// Names minted while folding, handed to the function when it is built.
     ///
     /// A cell because the builders take `&self`. Minting has to borrow, insert
@@ -186,6 +192,7 @@ impl<'a> FoldingContext<'a> {
             #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
             folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            callee_declarations: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             observation_error: std::cell::RefCell::new(None),
             pending_lowering_refusal: Cell::new(None),
         }

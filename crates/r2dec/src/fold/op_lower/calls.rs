@@ -53,14 +53,82 @@ impl<'a> FoldingContext<'a> {
     /// look exactly like a local, and it leaves the reader a name no
     /// declaration accounts for.
     pub(super) fn callee_identity_expr(&self, identity: &CalleeIdentity) -> CExpr {
-        let name = identity
-            .display_name
-            .clone()
-            .unwrap_or_else(|| identity.primary_key());
+        let name = crate::ast::c_identifier(
+            &identity
+                .display_name
+                .clone()
+                .unwrap_or_else(|| identity.primary_key()),
+        );
         CExpr::External {
             name,
             kind: external_kind_for_callee(identity.class),
         }
+    }
+
+    /// Note the prototype the rendering owes for a call it just lowered.
+    ///
+    /// C needs a declaration before the call, and this is the point where the
+    /// callee's recovered signature is in hand. Where the signature is not
+    /// recovered the parameter list is left unspecified rather than asserted,
+    /// which is the same distinction `params_known` draws for the function
+    /// being rendered: an empty list would claim the callee takes nothing.
+    pub(super) fn record_callee_declaration(
+        &self,
+        func_expr: &CExpr,
+        block_addr: u64,
+        op_idx: usize,
+        args: &CertifiedCallArgs,
+    ) {
+        let CExpr::External { name, .. } = func_expr.unobserved() else {
+            return;
+        };
+        // The callee's recorded prototype where it has one, and otherwise the
+        // widths the call itself proves: the storage its result is defined at
+        // and the storage each certified argument occupies. A recorded type
+        // that says nothing is worse than the machine's own answer, because it
+        // spells `/* unknown */` and the result does not parse.
+        let signature = self.known_signature_for_site(block_addr, op_idx);
+        let recorded_return = signature
+            .as_ref()
+            .map(|signature| crate::variable::type_like_to_ctype(&signature.return_type))
+            .filter(|ty| !matches!(ty, CType::Unknown));
+        let recorded_params = signature.as_ref().and_then(|signature| {
+            let params = signature
+                .params
+                .iter()
+                .map(crate::variable::type_like_to_ctype)
+                .collect::<Vec<_>>();
+            params
+                .iter()
+                .all(|ty| !matches!(ty, CType::Unknown))
+                .then_some(params)
+        });
+        let declaration = crate::ast::CExternDecl {
+            name: name.clone(),
+            ret_type: recorded_return.unwrap_or_else(|| {
+                self.certified_call_result_value((block_addr, op_idx))
+                    .and_then(|value| self.machine_value_width_bits(value))
+                    .map_or(CType::Void, CType::UInt)
+            }),
+            params: recorded_params.or_else(|| {
+                args.values
+                    .iter()
+                    .map(|value| self.machine_value_width_bits(*value).map(CType::UInt))
+                    .collect::<Option<Vec<_>>>()
+            }),
+        };
+        self.callee_declarations
+            .borrow_mut()
+            .entry(declaration.name.clone())
+            .or_insert(declaration);
+    }
+
+    /// The width a value occupies in machine storage, in bits.
+    fn machine_value_width_bits(&self, value: r2ssa::ValueId) -> Option<u32> {
+        let graph = self.inputs.prepared_ssa?.graph();
+        let size = graph.value(value)?.canonical_storage?.size;
+        size.checked_mul(8)
+            .filter(|bits| matches!(bits, 8 | 16 | 32 | 64))
     }
 
     fn resolved_callee_target(
