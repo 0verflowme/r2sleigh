@@ -1939,3 +1939,27 @@ That is the next thing, and it is the last one this track has surfaced: the
 `switch (...)` heading has to be observed as part of the switch construct, the
 way a conditional's predicate is. Everything before it is done and measured
 safe -- eight fixes, no cell lost, no wrong answer -- and waits in the patch.
+
+The heading, traced to its end. A conditional's predicate is observed as
+`planned_input_expr_at(block, branch_idx, 1)` -- the condition is an *operand*
+of the `CBranch`, so there is an input to observe. A dispatch has no such
+operand: `BranchInd`'s only input is the computed target, which is why the
+identity gate existed at all. The selector is several instructions upstream and
+is not an operand of anything the switch renders.
+
+`observe_certified_value_read_expr` looked like the answer and is not. It
+records a read against the same boundary record the placement audit uses, and
+that record is about call results and returns; a selector read at a dispatch is
+not one, so the observer takes its silent fallback and returns the expression
+unwrapped. Placement then sees a symbol read with `active=[]` -- no target at
+all -- which is exactly what it is for: an unauthorized read of a program
+variable.
+
+So the last step on this track is a new observation target: the value a switch
+dispatches on, read at the dispatch. It has to be minted in the journal
+alongside `CertifiedValueRead`, projected in `placement_target_for` the way that
+one is, and accepted by `target_authorizes_binding` for a read. That is a change
+to the proof machinery's vocabulary rather than to a rule inside it, which is
+why it is written down here rather than attempted at the end of a long session:
+the whole point of that vocabulary is that each kind means one thing, and adding
+one carelessly is how two tables come to answer for the same read.
