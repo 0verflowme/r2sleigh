@@ -1772,11 +1772,16 @@ impl<'a> FoldingContext<'a> {
             return addr_expr;
         }
 
+        // The declaration first, for the same reason as every other cast: it
+        // is what the compiler reads. Taking the certified hint alone said
+        // `RDI_0` was a pointer while its declaration said `uint64_t`, so no
+        // cast was emitted and the load rendered as `*RDI_0` -- a dereference
+        // of an integer, which does not compile.
         let source_ty = self
             .expr_type_hint(&addr_expr)
-            .or_else(|| self.type_hint_for_var(addr));
+            .map(RecordedType::from_certified_fact)
+            .or_else(|| self.source_type_for_var(addr));
         if let Some(source_ty) = source_ty {
-            let source_ty = RecordedType::from_certified_fact(source_ty);
             return self.cast_expr_if_needed(addr_expr, target_ptr_ty.clone(), Some(&source_ty));
         }
 
@@ -1848,11 +1853,15 @@ impl<'a> FoldingContext<'a> {
             return dst_signed != src_signed || dst_bits != src_bits;
         }
 
+        // Two pointers that are not the same pointer still need the
+        // conversion spelled: `target == source` was already excluded above,
+        // so reaching here with both pointers means they point at different
+        // things and the load or store would read the wrong width.
         matches!(
             (target, source),
             (
                 CType::Pointer(_),
-                CType::Int(_) | CType::UInt(_) | CType::Bool
+                CType::Int(_) | CType::UInt(_) | CType::Bool | CType::Pointer(_)
             ) | (CType::Int(_) | CType::UInt(_), CType::Pointer(_))
         )
     }

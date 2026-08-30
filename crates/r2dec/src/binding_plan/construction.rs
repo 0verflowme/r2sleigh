@@ -273,6 +273,7 @@ pub(super) fn binding_components(
             }
         }
         super::rules::set_interferes(&read_together, &members)
+            || super::rules::set_outlives_a_redefinition(graph, &members)
     };
 
     if let Some(render) = source_owned.report().render() {

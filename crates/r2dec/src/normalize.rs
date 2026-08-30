@@ -1244,19 +1244,18 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
             if render_facts.loop_carrier_for_value(value).is_some() {
                 return true;
             }
-            // A merge nothing observes costs nothing to leave alone, and a merge at
-            // a plain join -- every predecessor leading only here -- the fold can
-            // render as an expression, which is what keeps ordinary merges
-            // immutable.
+            // Every merge something observes is materialized. The rule used to
+            // exempt a merge at a plain join -- every predecessor leading only
+            // here -- on the ground that the fold could render it as an
+            // expression. It cannot, at least not always: `xxhash32`'s `RCX`
+            // merge sits at such a join, the fold rendered nothing for it, and
+            // its readers silently took the value from before the merge. The
+            // obligation ledger caught it and refused the function, which is
+            // the only reason it was not a wrong answer.
             //
-            // A merge reached from a *branching* predecessor is different: its copy
-            // has to sit on one edge of a two-way branch, and the fold has no way to
-            // spell that. It rendered nothing at all, and the reader never saw that
-            // a value went missing -- `djb2` at x86-64 -O2 dropped the `+ rdx` its
-            // remainder loop starts from and returned a plausible wrong hash.
-            phi.sources
-                .iter()
-                .any(|(pred, _)| func.successors(*pred).len() > 1)
+            // Deadness still wins first, above, so a merge nothing observes
+            // still costs nothing.
+            true
         },
     )
 }

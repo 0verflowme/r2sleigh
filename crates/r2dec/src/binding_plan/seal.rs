@@ -206,7 +206,8 @@ pub(super) fn seal_binding_components(
                     merged.extend(span_members.iter().copied());
                 }
             }
-            let interferes = super::rules::set_interferes(&read_together, &merged);
+            let interferes = super::rules::set_interferes(&read_together, &merged)
+                || super::rules::set_outlives_a_redefinition(graph, &merged);
             if !members.is_empty() && !interferes {
                 members_by_source
                     .entry(BindingCertificateSource::CertifiedEntity(entity.id()))

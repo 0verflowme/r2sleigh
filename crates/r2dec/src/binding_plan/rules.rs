@@ -124,3 +124,59 @@ pub(super) fn set_interferes(
         .iter()
         .any(|(left, right)| members.contains(left) && members.contains(right))
 }
+
+/// Whether any member of a candidate set is still needed where another member
+/// is redefined.
+///
+/// Values read together by one instruction are the obvious interference and
+/// `values_read_together` finds them. They are not the only one. Two values can
+/// interfere without any single instruction naming both: it is enough that one
+/// is still going to be read at a point after the other has been given a new
+/// value, because putting them in one object means that new value overwrote it.
+///
+/// `xxhash32`'s remainder loop is the case. The machine computes
+/// `x15 = x12 + 4`, loads through `x12` with a post-increment of eight, and
+/// then does `x12 = x15`, so the pointer advances by four. A loop-carrier
+/// certificate coalesced `x15` and `x12` into one object; no instruction reads
+/// both, so the co-read test allowed it; and the rendering became
+/// `x12 = x12 + 4` followed by a load through the already-advanced `x12`. It
+/// compiled and hashed the wrong bytes.
+///
+/// The test is deliberately conservative and local: within one block, a member
+/// defined before another member and read after it is interference. That is
+/// exact for the straight-line case this exists for, and declining a
+/// coalescing costs an assignment in the output and nothing in correctness.
+pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<ValueId>) -> bool {
+    let site_of = |value: ValueId| {
+        let inst = graph.def_inst(value)?;
+        let inst = graph.inst(inst)?;
+        Some((inst.block, inst.ordinal))
+    };
+    for member in members {
+        let Some((block, defined_at)) = site_of(*member) else {
+            continue;
+        };
+        let last_use = graph
+            .use_sites(*member)
+            .iter()
+            .filter_map(|site| {
+                let inst = graph.inst(site.inst)?;
+                (inst.block == block).then_some(inst.ordinal)
+            })
+            .max();
+        let Some(last_use) = last_use else {
+            continue;
+        };
+        for other in members {
+            if other == member {
+                continue;
+            }
+            if site_of(*other).is_some_and(|(other_block, other_at)| {
+                other_block == block && other_at > defined_at && other_at < last_use
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
