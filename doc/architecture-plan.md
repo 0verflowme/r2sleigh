@@ -1669,3 +1669,32 @@ own frame, written and never read, is not observable from outside, which is what
 would let the obligation elide and the store go. `CalleeStackAllocationCertificate`
 already proves the allocation is this function's; `collect_stack_frame_round_trip_certificates`
 declines these objects only because `reads.is_empty()`.
+
+### The jump table never reaches the CFG
+
+`murmur3_32` at -O1 and -O2 refuse with an unaccounted use of a `BranchInd`
+target, and the reason is upstream of the renderer. radare2 resolves the table
+-- `jmp r8 ; switch table (4 cases)` at `0x10000087a` -- but no block in the
+function we build has three or more successors, so `detect_switch` is never
+reached, no `Region::Switch` is formed, and the only thing that would render the
+dispatch operand (`get_switch_expression`, through `planned_input_expr_at`) is
+never called. The four case blocks are reachable in the binary and unreachable
+in our control-flow graph.
+
+So the fix is not in the structurer or in the observation journal: the resolved
+table's edges have to reach the SSA function's successors in the first place.
+The facts are already imported -- `control_facts().switch_for_block` answers for
+this block -- and what is missing is the edge set that would let the region
+analyser see a multi-way dispatch. Until then a jump table cannot be rendered on
+any function, which is why no corpus cell has ever exercised that path.
+
+### What the four call cells now need, which is not a renderer change
+
+`murmur3_32` and `xxhash32` at -O0 render a call and fail to compile. Two of the
+errors are ours and recorded above. The third thing is not: the corpus harness
+builds one function into a whole program, and it has no way to supply a
+definition for the function that one calls. `verify_rendering` knows only
+`dec_<name>`, so `sym__rotl32` is an undefined symbol at link time no matter
+what the renderer emits. Making these cells pass needs the harness to render and
+include the callee as well -- the natural next corpus capability now that calls
+render at all, and worth doing before more renderer work is aimed at these four.
