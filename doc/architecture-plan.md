@@ -2044,3 +2044,52 @@ vector lane at bit offset 32 needing the use-side liveness question recorded
 above. Three miss the strict gate on an uninitialised stack pointer and two dead
 frame slots. The gate D asks for is fifty-four of fifty-four with all four
 scores equal, and that is the track still open.
+
+### Track D's last three cells, traced to their causes
+
+Three cells render, compute the right answer, and miss the strict gate. Both
+were traced to a named predicate; neither fix landed, and the notes below say
+why each attempt failed so the next one starts further on.
+
+**`stack_m8` on arm64 -- the saved link register.** The slot at entry-SP minus
+eight is the `x30` half of the prologue's `stp x29, x30`. Its reload is already
+elided, by the return-control certificate rather than by the frame round trip,
+which is why the rendering shows a save and no matching load: a variable set and
+never used, assigned from an `X30_0` nothing initialised. The `x29` half passes
+the round-trip collector and is elided; `x30` fails it three times over -- the
+saved register overlaps the return-address storage
+(`collect_stack_frame_round_trip_certificates`, the `roles.return_address_storage()`
+arm), `exact_copy_chain_to_storage` requires the restored value to have no use
+sites and the restored `x30` is the return's operand, and the closure check
+rejects that same use.
+
+Removing only the first of those changes nothing, which is measured. The right
+owner is the certificate that already holds the reload: absorb the slot's single
+write and the copy chain from the entry return address into
+`collect_machine_return_control_certificates`, so one collector owns the pair
+and the double-claim refusal in the observation journal cannot fire. Attempting
+that showed the walk never reaches its `Load` arm for these functions -- the
+certificate that matters ends with five instructions and is then rejected for one
+escaping value -- so the chain terminates before the load, and finding where is
+the next step. The companion edit is already known: the two places that elide a
+stack object's declaration accept only objects in `stack_frame_round_trips`, and
+must also accept one a return-control certificate claims.
+
+**`RSP_0` on x64 -- one frame-address computation that escapes.** The return
+address pushes are all elided; what renders is `push rbp` and the stack-pointer
+decrement of eight calls, and they render only because `RBP_1` acquires exactly
+one reader: `tmp_4700_68 = RBP_1 + -0x20`, the address operand of a load that
+already renders as its named slot. It is the only one of thirty-six such
+computations in the function that escapes `StackGeometryCertificate`; its
+byte-identical twin four instructions later is elided. Its single use is that
+load's address, and it has no reader in the C at all -- removing that one
+statement leaves `RBP_1` unread, which takes the whole `RSP` chain onto the
+unobserved path `murmur3_32` already follows.
+
+The arm64 sibling shows one predicate that can do this: `add x29, sp, #0x60`
+carries its immediate through a copy, and the certificate's `is_constant`
+required a literal varnode. Teaching it to follow a copy chain to a constant is
+measured and changes nothing, so that is not the x64 case, and the exclusion is
+somewhere in the closure -- either the load's use missing from
+`stack_address_uses`, or `resolve_entry_stack_root` returning nothing for that
+temp. That is one instrumented run away.
