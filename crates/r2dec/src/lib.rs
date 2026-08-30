@@ -4000,6 +4000,21 @@ impl Decompiler {
         fold_ctx: &FoldingContext<'_>,
     ) -> structure::ControlFlowStructureResult<Vec<CStmt>> {
         let blocks: Vec<_> = func.blocks().cloned().collect();
+        // A multi-way dispatch cannot be linearized. The terminator arm below
+        // described one -- `/* case 0: goto loc_...; */` -- and a comment is not
+        // a transfer: the block fell through to whichever arm the linearizer
+        // placed next, and the function compiled cleanly and computed the wrong
+        // answer. Refusing is the honest answer, and it is what the structured
+        // path already does when it cannot express the switch.
+        if blocks.iter().any(|block| {
+            func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
+                matches!(cfg_block.terminator, BlockTerminator::Switch { .. })
+            })
+        }) {
+            return Err(
+                crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
+            );
+        }
         let mut labelled = Vec::new();
 
         for block in &blocks {
