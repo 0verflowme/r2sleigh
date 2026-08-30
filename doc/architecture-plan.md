@@ -1889,3 +1889,18 @@ expressible: the block runs when the selector is one of `[2, 3]`. Making the
 domain merge same-switch arms rather than drop them is the change, and it has to
 be made in the intersection itself rather than in the comparison, because the
 comparison is what catches a genuinely unrendered block.
+
+The union was implemented and it is not sufficient on its own, which sharpens
+the remaining work once more. With same-switch arms merged in the meet, the
+source domain for `0x100000885` becomes `SwitchArm { case_values: [2, 3] }` --
+correct, and it says the block runs when the selector is 2 or 3. The rendered
+occurrence still says `[2]`, because on the renderer's side a guard is
+accumulated per CFG edge and the fall-through from `case 3` is not an edge it
+walks: in the emitted C that path is textual adjacency, the absence of a
+`break`. So the third side of the same question is the renderer's occurrence
+accumulation, which has to union the arms of the cases that fall into a body --
+knowledge `structure_switch_region` already computes when it decides which
+`break`s to omit.
+
+`switch-chain.patch` now carries all five fixes and is verified against this
+commit. What remains is that one accumulation.
