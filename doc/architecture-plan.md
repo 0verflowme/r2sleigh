@@ -1545,3 +1545,69 @@ The general lesson is the one the four conforming call sites already embody: in
 a model that deliberately keeps facts it does not intend to render, "named" and
 "read" are different questions, and a rule that asks the first while meaning the
 second will be wrong exactly where the model is doing its job.
+
+### Direct calls render, and the four defects that reach past them
+
+The corpus went from 42 of 54 correct to 46 generating, with `murmur3_32` and
+`xxhash32` at -O0 on both architectures now emitting `sym._rotl32(...)` and its
+arguments. The commit message records the seven causes; what belongs here is
+the pattern they share, because four of the seven are the same mistake this
+file has now recorded three times.
+
+`structural_unused_values` asked `graph.use_sites(value).is_empty()`. A call
+clobbers a caller-saved register, the clobber reaches a merge nothing observes,
+and the graph records a use where the program has no reader. That is the same
+"named" versus "read" confusion as the round-trip certificate above, in a
+fourth answerer. The count of answerers that had to be taught the difference is
+now five, and the fix is always the same: pass `DeadPhis::unobserved_uses` and
+ask what the program reads.
+
+Two more are the same shape one level up. A direct call's target had no
+disposition of its own, so a callee's address became an object; and a return
+transfer's operands were left unaccounted although its write was already
+elided. In both, one part of a construct was recognised as unrendered while
+another part of the same construct was left for a statement that would never
+exist. `DirectCallTarget` and the return-transfer operand loop close them.
+
+### The preserved-carrier read, and an unsound fix measured and rejected
+
+`pearson` at -O1 and -O2 and `crc32_bitwise` at -O2 refuse with
+`preserved_carrier_read_before_assignment`. The trace is exact. In `pearson`,
+`xor cl, al` produces a one-byte value at `RCX`'s offset; the next two
+instructions zero-extend it to `ECX` and then to `RCX`; and the binding
+coalesces all three into one 64-bit object. Because the object is 64 bits and
+the write is 8, the geometry gives the write an `Insert` projection, placement
+records the preservation as a read of the object, and the read is the object's
+first occurrence -- so the function is refused for an uninitialised read.
+
+The graph does not support the preservation. Instruction 64's inputs are two
+one-byte values at other locations; no value at `RCX`'s location and no wider
+width reaches it. The bits the insert claims to keep are bits the program never
+had and never reads: the zero-extension two instructions later defines them.
+
+Making `machine_write_disposition` return `Full` when no input carries a wider
+value at the written location clears all three cells and takes the corpus to 43
+of 54 with nothing lost and nothing rendered wrong. It was reverted anyway. The
+rule is unsound: `write_projection_uses_source_certified_unnamed_vector_lanes`
+writes a four-byte lane at bit offset 32 of a 128-bit carrier from two
+temporaries, and the rule calls that `Full` -- an assertion that a write at a
+non-zero offset fills the carrier, which is simply false. Narrowing it to
+offset zero does not rescue it either: `Full` still claims the upper bits are
+defined by this write, and only `exact_zero_extend_write` may claim that.
+
+What the case actually needs is a distinction the projection vocabulary does
+not carry. `Full` means "this write defines the carrier", `Insert` means "this
+write preserves the rest of it", and the truth here is neither: the write
+defines its lane and the rest of the carrier is dead. Two ways out are open,
+and the second looks better. Either the vocabulary gains that third case, and
+the renderer emits a plain narrow assignment for it -- which also requires the
+object to be narrow, or the upper bits are undefined in the C as well; or the
+coalescing declines in the first place, on the ground that a value and its own
+zero-extension are different objects rather than one object at two widths.
+`rules.rs` already owns that decision and already declines two other unsound
+coalescings, which is where the next attempt should start.
+
+Not attempted: three cells are blocked on vector width rather than on the
+binding spine. `adler32` at x64 -O2 refuses with a 128-bit constant, and
+`crc32_bitwise` and `xxhash32` at arm64 -O2 refuse for a missing literal
+projection on NEON code. Those need vector types, not a spine fix.
