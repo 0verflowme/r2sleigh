@@ -1841,3 +1841,37 @@ So the order is fixed: `structure_switch_region` has to emit the cases as
 control flow first. Only once the body is there does accounting the dispatch as
 control describe what the rendering does, and until then the two elisions must
 not be added -- they convert a refusal into a wrong answer.
+
+### The switch, four gates further, and the one that is a modelling gap
+
+Four separate defects sat between a resolved jump table and a structured
+switch. Each was traced, fixed and measured, and the chain is saved as
+`switch-chain.patch` rather than kept, because together they still render
+nothing: the fifth gate holds.
+
+The identity gate in `get_switch_expression` required the `BranchInd`'s target
+to *be* the selector, which is true only of the unit fixture. The dispatch was
+looked for as the block's last operation, and it is not: materializing a
+merge's incoming edges appends copies after the terminator, so the search found
+a `Copy` and declined. The selector's expression had no reader --
+`switch_selector_expr_by_block` has been computed and unread since the
+exact-lowering cutover removed its only consumer. And the certified case list
+was compared literally against the rendered one, so `murmur3_32`'s `case 0`,
+whose target is the merge block, counted as missing; it is an empty case, and
+omitting it is exactly what C means, because with no arm for that value the
+switch falls past itself to the merge.
+
+With those four the switch structures. What stops it now is not a gate to
+relax. `rendered_branch_occurrences_cover_source` compares the rendered guard
+vector against the source control domain's, and for case block `0x100000885`
+the rendered side is `[SwitchArm { case_values: [2] }]` while the source side is
+**empty**. An empty domain says the block executes on every path, which is false
+for a case body, and no comparison can be made to hold between a guard and
+nothing. `control_domains` does not express switch-arm membership for the blocks
+a dispatch reaches, and until it does, accepting the mismatch would be
+suppressing the one check that noticed.
+
+That is the whole remaining distance on this track, and it is one thing:
+give the control-domain model a switch-arm guard for each case block, including
+the fall-through case where a block is reached both by its own arm and from the
+arm above it. The four fixes above are re-applied with it.
