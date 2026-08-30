@@ -1824,30 +1824,57 @@ fn exact_adjacent_cleared_carrier_write(
         .collect();
     following.sort_by_key(|candidate| candidate.ordinal);
 
+    // The carrier is not always cleared in one step. amd64 writes a byte and
+    // then widens it twice -- `xor cl, ...` is followed by `movzx ecx, cl` and
+    // `movzx rcx, ecx` -- so the instruction that finally answers for `RCX`
+    // zero-extends `ECX`, not the byte this write produced. Looking only for a
+    // single extension of the written slice found nothing there and left the
+    // write asserting that it preserved `RCX`'s other seven bytes, which the
+    // next two instructions go on to define as zero. `pearson` is refused for
+    // that at both -O1 and -O2.
+    //
+    // So the chain is followed: each step must extend something the chain has
+    // already established, and `covered_bytes` records how much of the carrier
+    // that is. It also decides what may be read on the way -- see below.
+    let carrier_start = carrier.offset;
+    let carrier_end = carrier_start.saturating_add(u64::from(carrier.size));
+    let in_carrier = |candidate: CanonicalStorageId| {
+        candidate.space == CanonicalStorageSpace::Register
+            && candidate.offset >= carrier_start
+            && candidate.offset.saturating_add(u64::from(candidate.size)) <= carrier_end
+    };
+    let mut covered_bytes = u64::from(slice.size);
+
     for next in following {
         // A read of the carrier before it is cleared means the carrier still
         // held something this write did not put there, so the write did not
-        // define it.
-        if next
-            .inputs
-            .iter()
-            .any(|input| storage_of(*input) == Some(carrier))
-        {
+        // define it. With a chain that has to be asked of every storage inside
+        // the carrier, not only of the carrier itself: reading `ECX` after the
+        // byte write and before the widening would see the six stale bytes the
+        // projection is about to claim are zero.
+        if next.inputs.iter().any(|input| {
+            storage_of(*input).is_some_and(|read| {
+                in_carrier(read)
+                    && (read.offset != carrier_start || u64::from(read.size) > covered_bytes)
+            })
+        }) {
             return None;
         }
         let Some(defined) = next.output.and_then(storage_of) else {
             continue;
         };
-        // The slice written again before the carrier was cleared: whatever
-        // clears the carrier later is about that later value, not this one.
-        if defined == slice {
-            return None;
-        }
-        if defined != carrier {
+        if !in_carrier(defined) {
             continue;
         }
-        // The op that answers for the carrier. It certifies this write only if
-        // it is a zero-extension of what this write left in the slice.
+        // Anything the chain has already established, written again before the
+        // carrier was cleared: whatever clears the carrier later is about that
+        // later value, not this one. A write anywhere else inside the carrier
+        // disturbs bits the extension would have to have zeroed.
+        if defined.offset != carrier_start || u64::from(defined.size) <= covered_bytes {
+            return None;
+        }
+        // The op that answers for this much of the carrier. It certifies the
+        // chain only if it is a zero-extension of what the chain has so far.
         let InstPayload::Op(SSAOp::IntZExt { .. }) = &next.payload else {
             return None;
         };
@@ -1857,10 +1884,15 @@ fn exact_adjacent_cleared_carrier_write(
         if !written.contains(extended) {
             return None;
         }
-        return Some(MachineWriteProjection::ZeroExtend {
-            from_width_bits: output.width_bits,
-            to_width_bits: output.carrier_bits,
-        });
+        if defined == carrier {
+            return Some(MachineWriteProjection::ZeroExtend {
+                from_width_bits: output.width_bits,
+                to_width_bits: output.carrier_bits,
+            });
+        }
+        let widened = next.output?;
+        written.push(widened);
+        covered_bytes = u64::from(defined.size);
     }
     None
 }
