@@ -1875,3 +1875,17 @@ That is the whole remaining distance on this track, and it is one thing:
 give the control-domain model a switch-arm guard for each case block, including
 the fall-through case where a block is reached both by its own arm and from the
 arm above it. The four fixes above are re-applied with it.
+
+Read once more, the fifth gate is sharper than "no switch-arm membership".
+`control_guard_for_edge` does produce a `ControlGuard::SwitchArm` for a switch
+edge, so the guard exists. What empties the domain is that a domain is the
+guards common to every path into the block, and `0x100000885` is reached both by
+its own arm and by falling through from the arm above it. The intersection of
+`{arm 2}` and `{arm 3}` is empty, which is a true statement about common guards
+and a useless one about when the block runs.
+
+`SwitchArm` already carries `case_values` as a vector, so the union is
+expressible: the block runs when the selector is one of `[2, 3]`. Making the
+domain merge same-switch arms rather than drop them is the change, and it has to
+be made in the intersection itself rather than in the comparison, because the
+comparison is what catches a genuinely unrendered block.
