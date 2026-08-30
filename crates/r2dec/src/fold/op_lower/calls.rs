@@ -82,40 +82,29 @@ impl<'a> FoldingContext<'a> {
         let CExpr::External { name, .. } = func_expr.unobserved() else {
             return;
         };
-        // The callee's recorded prototype where it has one, and otherwise the
-        // widths the call itself proves: the storage its result is defined at
-        // and the storage each certified argument occupies. A recorded type
-        // that says nothing is worse than the machine's own answer, because it
-        // spells `/* unknown */` and the result does not parse.
-        let signature = self.known_signature_for_site(block_addr, op_idx);
-        let recorded_return = signature
-            .as_ref()
-            .map(|signature| crate::variable::type_like_to_ctype(&signature.return_type))
-            .filter(|ty| !matches!(ty, CType::Unknown));
-        let recorded_params = signature.as_ref().and_then(|signature| {
-            let params = signature
-                .params
-                .iter()
-                .map(crate::variable::type_like_to_ctype)
-                .collect::<Vec<_>>();
-            params
-                .iter()
-                .all(|ty| !matches!(ty, CType::Unknown))
-                .then_some(params)
-        });
+        // The widths the call itself proves: the storage the result is defined
+        // at, and the storage each certified argument occupies.
+        //
+        // Deliberately not radare2's recorded prototype. A prototype has to
+        // describe the call as this rendering makes it, and the arguments this
+        // rendering passes are machine words. radare2 records `rotl32` as
+        // taking `int64_t`, so declaring that made every argument a
+        // signed-conversion error, and it also contradicts the callee's own
+        // rendering -- decompiling both into one translation unit is then a
+        // hard `conflicting types` error rather than a warning. Recorded types
+        // are also often absent, and an absent one spells `/* unknown */`,
+        // which does not parse at all.
         let declaration = crate::ast::CExternDecl {
             name: name.clone(),
-            ret_type: recorded_return.unwrap_or_else(|| {
-                self.certified_call_result_value((block_addr, op_idx))
-                    .and_then(|value| self.machine_value_width_bits(value))
-                    .map_or(CType::Void, CType::UInt)
-            }),
-            params: recorded_params.or_else(|| {
-                args.values
-                    .iter()
-                    .map(|value| self.machine_value_width_bits(*value).map(CType::UInt))
-                    .collect::<Option<Vec<_>>>()
-            }),
+            ret_type: self
+                .certified_call_result_value((block_addr, op_idx))
+                .and_then(|value| self.machine_value_width_bits(value))
+                .map_or(CType::Void, CType::UInt),
+            params: args
+                .values
+                .iter()
+                .map(|value| self.machine_value_width_bits(*value).map(CType::UInt))
+                .collect::<Option<Vec<_>>>(),
         };
         self.callee_declarations
             .borrow_mut()
