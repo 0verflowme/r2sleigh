@@ -1,3 +1,62 @@
+/// A C type the renderer is allowed to decide a conversion from.
+///
+/// Property 2 asks that inference be unrepresentable rather than merely
+/// avoided. A cast is a statement that one type becomes another, and the
+/// renderer may only make it from types something recorded. So the source of a
+/// conversion is this type, whose field is private to this module and whose
+/// constructors each name the evidence they come from: a binding's emitted
+/// declaration, a certified upstream fact, the operation's own requirement, or
+/// a callee's recorded signature.
+///
+/// A caller that has none of those cannot manufacture one. It has to pass
+/// `None`, and every `None` is therefore a site the compiler points at -- which
+/// is the enumeration Track B's first stage asks for, kept honest by the type
+/// rather than by a convention.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RecordedType(CType);
+
+impl RecordedType {
+    /// The type the emitted declaration gives this object.
+    fn from_declaration(ty: CType) -> Self {
+        Self(ty)
+    }
+
+    /// A type upstream certified for this value.
+    fn from_certified_fact(ty: CType) -> Self {
+        Self(ty)
+    }
+
+    /// The type the operation itself requires of its operands and result.
+    ///
+    /// `IntSLess` and `IntLess` differ only in the signedness of what they
+    /// compare, so this is the operation's meaning, not a reading of its
+    /// operands.
+    fn from_operation(ty: CType) -> Self {
+        Self(ty)
+    }
+
+    /// The return type recorded for the callee a call names.
+    fn from_callee_signature(ty: CType) -> Self {
+        Self(ty)
+    }
+
+    /// A source for a fixture, which has no upstream to record one.
+    ///
+    /// Deliberately test-only: production must name the evidence.
+    #[cfg(test)]
+    pub(crate) fn for_test(ty: CType) -> Self {
+        Self(ty)
+    }
+
+    pub(crate) fn get(&self) -> &CType {
+        &self.0
+    }
+
+    fn into_inner(self) -> CType {
+        self.0
+    }
+}
+
 impl<'a> FoldingContext<'a> {
     fn certified_parameter_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
         let slot = self
@@ -1526,7 +1585,7 @@ impl<'a> FoldingContext<'a> {
     ///
     /// A value the plan inlines has no declaration and so has no type here.
     /// That is an honest absence: the operand is an expression, not a name.
-    fn declared_type_for_var(&self, var: &SSAVar) -> Option<CType> {
+    fn declared_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
         let value = self.prepared_value_id_for_var(var)?;
         let names = self.inputs.binding_names?;
         let crate::binding_plan::ValueDisposition::Bound { binding } =
@@ -1534,7 +1593,9 @@ impl<'a> FoldingContext<'a> {
         else {
             return None;
         };
-        Some(names.plan().binding(*binding)?.declaration_type().clone())
+        Some(RecordedType::from_declaration(
+            names.plan().binding(*binding)?.declaration_type().clone(),
+        ))
     }
 
     /// The recorded type of an operand, for deciding whether a cast is needed.
@@ -1548,9 +1609,9 @@ impl<'a> FoldingContext<'a> {
     /// and believed `int32_t` reached a comparison with no cast and was
     /// compared unsigned, which is the shape of the sign-flag defect that made
     /// `crc32_bitwise` return a CRC of nothing while compiling cleanly.
-    fn source_type_for_var(&self, var: &SSAVar) -> Option<CType> {
+    fn source_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
         self.declared_type_for_var(var)
-            .or_else(|| self.type_hint_for_var(var))
+            .or_else(|| self.type_hint_for_var(var).map(RecordedType::from_certified_fact))
     }
 
     fn type_hint_for_var(&self, var: &SSAVar) -> Option<CType> {
@@ -1714,8 +1775,9 @@ impl<'a> FoldingContext<'a> {
         let source_ty = self
             .expr_type_hint(&addr_expr)
             .or_else(|| self.type_hint_for_var(addr));
-        if let Some(source_ty) = source_ty.as_ref() {
-            return self.cast_expr_if_needed(addr_expr, target_ptr_ty.clone(), Some(source_ty));
+        if let Some(source_ty) = source_ty {
+            let source_ty = RecordedType::from_certified_fact(source_ty);
+            return self.cast_expr_if_needed(addr_expr, target_ptr_ty.clone(), Some(&source_ty));
         }
 
         if self.looks_like_pointer(&addr_expr) {
@@ -1771,8 +1833,8 @@ impl<'a> FoldingContext<'a> {
             _ => None,
         }
     }
-    fn cast_needed(&self, target: &CType, source: Option<&CType>) -> bool {
-        let Some(source) = source else {
+    fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
+        let Some(source) = source.map(RecordedType::get) else {
             return false;
         };
 
@@ -1809,7 +1871,12 @@ impl<'a> FoldingContext<'a> {
         CExpr::cast(target, expr)
     }
 
-    fn cast_expr_if_needed(&self, expr: CExpr, target: CType, source: Option<&CType>) -> CExpr {
+    fn cast_expr_if_needed(
+        &self,
+        expr: CExpr,
+        target: CType,
+        source: Option<&RecordedType>,
+    ) -> CExpr {
         if let CExpr::Cast { ty, .. } = expr.unobserved()
             && *ty == target
         {
@@ -1841,7 +1908,7 @@ impl<'a> FoldingContext<'a> {
     fn assignment_rhs_from_source_type(
         &self,
         dst: &SSAVar,
-        src_ty: Option<CType>,
+        src_ty: Option<RecordedType>,
         rhs: CExpr,
     ) -> CExpr {
         // The target is the declared type for the same reason the source is:
@@ -1850,7 +1917,7 @@ impl<'a> FoldingContext<'a> {
         // means, while the declaration says otherwise, produced
         // `X1_0 = (int64_t)(...)` for an object declared `uint64_t` -- correct
         // arithmetic that will not compile under `-Wsign-conversion`.
-        let Some(dst_ty) = self.source_type_for_var(dst) else {
+        let Some(dst_ty) = self.source_type_for_var(dst).map(RecordedType::into_inner) else {
             return rhs;
         };
 
@@ -2636,7 +2703,14 @@ impl<'a> FoldingContext<'a> {
                     then_expr: Box::new(input(1, if_true)?),
                     else_expr: Box::new(input(2, if_false)?),
                 };
-                let rhs = self.assignment_rhs_with_type_policy(dst, None, rhs);
+                // A ternary's type is the type of its arms. Where they are
+                // recorded at the same one that is what this produces; where
+                // they disagree there is nothing to state, and saying nothing
+                // is the honest answer rather than a guess.
+                let arms = self
+                    .source_type_for_var(if_true)
+                    .filter(|arm| Some(arm) == self.source_type_for_var(if_false).as_ref());
+                let rhs = self.assignment_rhs_from_source_type(dst, arms, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Return { .. } => {
@@ -2673,7 +2747,17 @@ impl<'a> FoldingContext<'a> {
                     .cloned()
                     .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
                     .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
-                let rhs = self.assignment_rhs_with_type_policy(dst, None, call);
+                // The callee's recorded return type is what the call
+                // produces, and it is a fact rather than a shape read off the
+                // expression.
+                let returned = self
+                    .known_signature_for_site(source_call.0, source_call.1)
+                    .map(|signature| {
+                        RecordedType::from_callee_signature(crate::variable::type_like_to_ctype(
+                            &signature.return_type,
+                        ))
+                    });
+                let rhs = self.assignment_rhs_from_source_type(dst, returned, call);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Nop => None,
@@ -2813,17 +2897,19 @@ impl<'a> FoldingContext<'a> {
             op,
             BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
         ) {
-            Some(CType::Int(32))
+            Some(RecordedType::from_operation(CType::Int(32)))
         } else {
             // No stated operand type means the operation did not require one,
             // not that the expression has no type. Where both operands are
             // recorded at the same type, the wrapping arithmetic C performs on
             // them produces that type, and that is a derivation rather than a
             // guess. Where they disagree there is nothing to state.
-            produced_ty.or_else(|| {
-                let left = self.source_type_for_var(a)?;
-                (self.source_type_for_var(b)? == left).then_some(left)
-            })
+            produced_ty
+                .map(RecordedType::from_operation)
+                .or_else(|| {
+                    let left = self.source_type_for_var(a)?;
+                    (self.source_type_for_var(b)? == left).then_some(left)
+                })
         };
         let rhs = self.assignment_rhs_from_source_type(dst, produced, rhs);
         self.assign_stmt(lhs, rhs)

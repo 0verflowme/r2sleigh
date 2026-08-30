@@ -2101,7 +2101,8 @@ mod tests {
     fn assignment_cast_policy_is_observation_transparent() {
         let ctx = FoldingContext::new(64);
         let target = CType::Int(32);
-        let source = CType::UInt(64);
+        let source =
+            RecordedType::for_test(CType::UInt(64));
         let cast = CExpr::cast(target.clone(), ctx.name_ref("value"));
         let plain = ctx.cast_expr_if_needed(cast.clone(), target.clone(), Some(&source));
         let mut owner = crate::ast::RenderObservationOwner::new();
