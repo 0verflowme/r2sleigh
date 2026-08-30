@@ -1093,7 +1093,9 @@ pub struct CalleeStackAllocationCertificate {
 /// same-width copy chain from the entry frame pointer into the store, the
 /// store itself, every reload, and each reload's same-width copy chain back to
 /// the exact entry storage. The collector issues this only when every value in
-/// those chains has no use outside this domain, the object has no other access,
+/// those chains has no observed use outside this domain -- a use no program
+/// observation depends on, per [`crate::deadphi::DeadPhis`], is not a read the
+/// program makes -- the object has no other access,
 /// and the storage owns no parameter, result, call-boundary, stack-pointer, or
 /// return-control role. Consumers therefore project an upstream disposition;
 /// they never recognize prologue or epilogue syntax themselves.
@@ -1425,6 +1427,13 @@ impl PreparedFunctionFacts {
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
         let obligations = SemanticObligationInventory::collect(graph, &structured, &boundaries);
+        // A lifted body merges every storage live across a join, so the graph
+        // records uses that carry no program observation. `DeadPhis` names
+        // exactly those, and the merges stay in the function by design, so a
+        // certificate that asks whether the program reads a value has to ask
+        // this rather than count raw use sites.
+        let unobserved =
+            crate::deadphi::DeadPhis::find_from(graph, &live_out, &obligations, &boundaries);
         let certificates = collect_prepared_function_certificates(
             &boundaries,
             function,
@@ -1435,6 +1444,7 @@ impl PreparedFunctionFacts {
             &predicates,
             &call_sites,
             &structured,
+            &unobserved,
         );
         let (applied_assumption_bindings, assumption_usage) = collect_prepared_assumption_usage(
             graph,
@@ -3982,6 +3992,7 @@ fn collect_stack_frame_round_trip_certificates(
     machine_context: Option<&SourceMachineContext>,
     structured: &StructuredDataflowFacts,
     callee_allocations: &BTreeMap<ObjectId, CalleeStackAllocationCertificate>,
+    unobserved: &crate::deadphi::DeadPhis,
 ) -> (
     BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
     BTreeMap<InstId, ObjectId>,
@@ -4132,12 +4143,23 @@ fn collect_stack_frame_round_trip_certificates(
             values.extend(restore_values);
             load_accesses.push(load.id);
         }
+        // A use the program does not observe is not a read of the saved
+        // register. The lifted body merges every storage live across a join, so
+        // a callee-saved entry value picks up loop-header and exit merges -- and
+        // the lane projections register alias repair materializes to feed them
+        // -- for a register the program writes before it reads. Those merges
+        // stay in the function on purpose, for the consumers that simulate
+        // machine state, so the certificate that decides whether they mean
+        // anything has to consult the upstream unobserved-value proof instead of
+        // counting raw use sites. Nothing else is relaxed: the domain is still
+        // the exact copy/store/load chains, and `DeadPhis` is empty unless the
+        // obligation inventory is complete, so an incompletely proven function
+        // still declines.
         if !complete
             || values.iter().any(|value| {
-                graph
-                    .use_sites(*value)
-                    .iter()
-                    .any(|site| !insts.contains(&site.inst))
+                graph.use_sites(*value).iter().any(|site| {
+                    !insts.contains(&site.inst) && !unobserved.unobserved_uses().contains(site)
+                })
             })
             || insts.iter().any(|inst| by_inst.contains_key(inst))
         {
@@ -4572,6 +4594,7 @@ fn collect_prepared_function_certificates(
     predicates: &PredicateFacts,
     call_sites: &CallSiteFacts,
     structured: &StructuredDataflowFacts,
+    unobserved: &crate::deadphi::DeadPhis,
 ) -> PreparedFunctionCertificates {
     let mut exact_stack_slots = BTreeMap::new();
     let mut ambiguous_stack_slots = BTreeSet::new();
@@ -4729,6 +4752,7 @@ fn collect_prepared_function_certificates(
             machine_context,
             structured,
             &callee_stack_allocations,
+            unobserved,
         );
     let (machine_return_controls, machine_return_control_by_inst) =
         collect_machine_return_control_certificates(boundaries, graph, objects, structured);
@@ -8842,6 +8866,7 @@ mod tests {
             &facts.predicates,
             &facts.call_sites,
             &structured,
+            artifact.unobserved_merges(),
         );
         assert_eq!(
             certificates
@@ -8886,6 +8911,7 @@ mod tests {
             &facts.predicates,
             &facts.call_sites,
             &structured,
+            artifact.unobserved_merges(),
         );
         assert!(!certificates.stack_slots.contains_key(&access.object));
 
@@ -9354,6 +9380,7 @@ mod tests {
             &allocated_facts.predicates,
             &allocated_facts.call_sites,
             &incomplete_structured,
+            allocated.unobserved_merges(),
         );
         assert!(
             incomplete
@@ -9386,6 +9413,7 @@ mod tests {
             &allocated_facts.predicates,
             &allocated_facts.call_sites,
             &allocated_facts.structured,
+            allocated.unobserved_merges(),
         );
         assert!(
             overlapping
@@ -10899,6 +10927,118 @@ mod tests {
                     inst: stack_sub,
                     input_idx: 0,
                 })
+        );
+    }
+
+    /// A save/restore pair still certifies when the only thing outside the
+    /// round trip that names the saved entry value is a merge nothing observes.
+    ///
+    /// The lifted body merges every storage live across a join, so a register
+    /// the program overwrites at a loop head still collects a phi carrying its
+    /// entry value on the entry edge. Counting that phi as a read left the
+    /// prologue store rendered and its slot set but never used.
+    #[test]
+    fn frame_round_trip_certifies_through_a_merge_no_observation_depends_on() {
+        let sp = Varnode::register(32, 8);
+        let saved = Varnode::register(0, 8);
+        let spilled = Varnode::unique(0x70a0, 8);
+        let reloaded = Varnode::unique(0x70a8, 8);
+
+        let mut entry = R2ILBlock::new(0x7000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: spilled.clone(),
+            src: saved.clone(),
+        });
+        entry.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+            val: spilled,
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7010, 8),
+        });
+
+        // The loop head overwrites the register before anything reads it, so
+        // the merge its entry value reaches carries no observation.
+        let mut header = R2ILBlock::new(0x7010, 4);
+        header.push(R2ILOp::Copy {
+            dst: saved.clone(),
+            src: Varnode::constant(5, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7010, 8),
+            cond: Varnode::register(24, 1),
+        });
+
+        let mut exit = R2ILBlock::new(0x7014, 4);
+        exit.push(R2ILOp::Load {
+            dst: reloaded.clone(),
+            space: SpaceId::Ram,
+            addr: sp.clone(),
+        });
+        exit.push(R2ILOp::IntAdd {
+            dst: sp.clone(),
+            a: sp,
+            b: Varnode::constant(8, 8),
+        });
+        exit.push(R2ILOp::Copy {
+            dst: saved,
+            src: reloaded,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        let roles =
+            SourceMachineRoles::new(Some(register_storage(16, 8)), Some(register_storage(32, 8)))
+                .and_then(|roles| {
+                    roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                        SourceStackGrowth::LowerAddresses,
+                    ))
+                })
+                .expect("exact downward stack allocation roles");
+        let artifact = SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &[entry, header, exit],
+            Some(&return_boundary_arch()),
+            Some(preserved_stack_interface()),
+            roles,
+            Vec::new(),
+        )
+        .expect("callee-saved round-trip artifact");
+        let [store] = artifact
+            .memory_defs_for_op_site(0x7000, 2)
+            .expect("callee-saved save")
+        else {
+            panic!("one callee-saved save")
+        };
+        let certificate = artifact
+            .certificates()
+            .stack_frame_round_trips
+            .get(&store.location.object)
+            .expect("an unobserved merge must not revoke the save/reload proof");
+        assert_eq!(certificate.storage, register_storage(0, 8));
+
+        let escaping = certificate
+            .values
+            .iter()
+            .flat_map(|value| artifact.graph().use_sites(*value))
+            .filter(|site| !certificate.insts.contains(&site.inst))
+            .collect::<Vec<_>>();
+        assert!(
+            !escaping.is_empty(),
+            "this function must reproduce the escaping merge the certificate has to discount"
+        );
+        assert!(
+            escaping.iter().all(|site| artifact
+                .unobserved_merges()
+                .unobserved_uses()
+                .contains(site)),
+            "only uses no program observation depends on may be discounted"
         );
     }
 

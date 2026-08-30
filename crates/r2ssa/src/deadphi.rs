@@ -27,8 +27,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::graph::{InstId, SsaGraph, UseSite, ValueId};
 use crate::liveout::FunctionLiveOut;
-use crate::obligation::SemanticInstructionState;
-use crate::semantic::{PreparedFunctionFacts, SourceCallArgumentValue};
+use crate::obligation::{SemanticInstructionState, SemanticObligationInventory};
+use crate::semantic::{PreparedFunctionFacts, SourceBoundaryFacts, SourceCallArgumentValue};
 
 /// Which merges no observation depends on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -120,24 +120,38 @@ impl DeadPhis {
         live_out: &FunctionLiveOut,
         facts: &PreparedFunctionFacts,
     ) -> Self {
+        Self::find_from(graph, live_out, &facts.obligations, &facts.boundaries)
+    }
+
+    /// The same answer, from the two fact tables it actually reads.
+    ///
+    /// Fact collection itself needs this set: a rule that asks whether the
+    /// program reads a value must ask it before the certificates that depend
+    /// on the answer are formed, and both inputs are complete by then.
+    pub(crate) fn find_from(
+        graph: &SsaGraph,
+        live_out: &FunctionLiveOut,
+        obligations: &SemanticObligationInventory,
+        boundaries: &SourceBoundaryFacts,
+    ) -> Self {
         // The obligation inventory is the canonical answer to whether an
         // instruction is observable. In particular, exact ABI call arguments
         // are boundary inputs rather than graph inputs, so reconstructing the
         // answer here from opcodes would silently delete their producers.
-        if !facts.obligations.is_complete() {
+        if !obligations.is_complete() {
             return Self::default();
         }
         let mut roots = BTreeSet::from_iter(live_out.iter());
-        for obligation in facts.obligations.obligations().values() {
+        for obligation in obligations.obligations().values() {
             roots.extend(obligation.inputs.iter().copied());
         }
         // Parameters are rendered program variables even when the body does
         // not read them, so their canonical entry values remain in the named
         // domain independently of effect liveness.
-        for parameter in facts.boundaries.parameters.values() {
+        for parameter in boundaries.parameters.values() {
             roots.insert(parameter.value);
         }
-        for boundary in facts.boundaries.calls.values() {
+        for boundary in boundaries.calls.values() {
             for argument in &boundary.arguments {
                 if let SourceCallArgumentValue::Value(value) = argument.value {
                     roots.insert(value);
@@ -155,7 +169,7 @@ impl DeadPhis {
                 !observed.contains(&value.id)
                     && graph
                         .def_inst(value.id)
-                        .and_then(|inst| facts.obligations.instruction_for_inst(inst))
+                        .and_then(|inst| obligations.instruction_for_inst(inst))
                         .is_none_or(|instruction| {
                             instruction.state == SemanticInstructionState::ProvenDead
                         })
