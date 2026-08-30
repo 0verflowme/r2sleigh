@@ -1508,36 +1508,40 @@ assignment policy, and is fixed the same way.
 Recorded rather than committed, because the change as it stands admits a cell
 that compiles and computes the wrong thing.
 
-### The callee-saved spill slots, traced to where it stops being tractable
+### The callee-saved spill slots -- and a wrong cause, corrected
 
-`xxhash32` at x64 O1 and O2 render correct answers and fail the strict gate on
-`-Wunused-but-set-variable` for `stack_m24` and `stack_m16`. Those are the slots
-`push r14` and `push rbx` write. Traced, layer by layer:
+`xxhash32` at x64 O1 and O2 rendered correct answers and failed the strict gate
+on `-Wunused-but-set-variable` for the slots `push r14` and `push rbx` write.
+The mechanism that should have elided them, `StackFrameRoundTripCertificate`,
+declined because the entry values of `rbx` and `r14` had uses outside the round
+trip.
 
-- Placement records a read occurrence for each slot, from the matching `pop`, so
-  the slot is not a dead store and keeps its declaration.
-- The `pop`'s value is `Bound`, so restricting the occurrence to readers the
-  plan renders changes nothing -- measured inert.
-- Placement's reconsideration loop, which exists to remove exactly this kind of
-  orphaned declaration, reaches both bindings and gives up with `discarded=0`:
-  the write occurrence's observation does not match the statement that carries
-  the write.
-- The mechanism that should have elided the pair upstream is
-  `StackFrameRoundTripCertificate`, which certifies a callee-saved register
-  stored on entry and restored on exit and elides both as frame setup. It
-  declines here on `escapes`: the entry value of `rbx` has uses outside the
-  round trip.
-- Those uses are `tmp:regalias:phi:*` subpieces and phis -- artifacts of
-  register alias repair, not of the program. The certificate is behaving
-  correctly given what the graph says; what the graph says about the entry
-  value's liveness is what is wrong.
+This section previously recorded those uses as register-alias-repair artifacts
+and named alias repair as the origin. That was wrong, and the way it was wrong
+is worth keeping. Two of the four escaping uses per register are bare SSA
+merges carrying no `regalias` name at all, so removing alias repair would not
+have moved them. The earlier trace stopped at the first plausible name it
+recognised instead of walking the whole set.
 
-So the defect is real and its origin is alias repair attributing uses of a
-callee-saved entry value that the program does not make. That is a fifth layer
-down from the symptom, and each layer above it is behaving correctly given its
-input. Recorded rather than guessed at, because a change to alias repair made
-without tracing that attribution would be a change to the layer that reports
-the problem rather than the one that causes it.
+The actual cause is a contract this file already states elsewhere. `deadphi.rs`
+records the decision that a dead merge is *published rather than deleted*,
+because the symbolic executor needs it to say what a register holds at a loop
+head. What follows from that is an obligation on every rule that chooses among
+candidates: ask `DeadPhis`, not the raw use sites. `binding_plan/rules.rs`,
+`binding_plan/seal.rs`, `binding_plan/construction.rs` and
+`observation_journal.rs` all do. The round-trip certificate did not. It asked
+`graph.use_sites`, which answers "is this value named anywhere" rather than
+"does the program read it", and every one of the escaping uses terminates in a
+merge nothing observes.
 
-Both cells compute the right answer; this is a strict-gate defect, not a
-correctness one.
+Discounting `DeadPhis::unobserved_uses` -- and nothing else -- takes raw from 40
+to 42 of 54 and brings all four scores level at 42, with nothing rendered wrong
+and no cell lost. The set discounted is the complement of the transitive
+closure of live-out, obligation inputs, parameters and call arguments, and
+`DeadPhis` returns empty unless the obligation inventory is complete, so a
+function whose deadness is not proven still declines.
+
+The general lesson is the one the four conforming call sites already embody: in
+a model that deliberately keeps facts it does not intend to render, "named" and
+"read" are different questions, and a rule that asks the first while meaning the
+second will be wrong exactly where the model is doing its job.
