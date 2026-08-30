@@ -1454,3 +1454,27 @@ What C2 correctly identified is now done: `rebase_declared_frame_pointer` was
 reduced to an identity function by an earlier commit and left standing as a
 comment carrier, along with the `declared_stack_bases` argument four call sites
 threaded to it. That is deleted.
+
+### The three `xxhash32` cells are protected by a correct refusal
+
+`xxhash32` refuses at O1 and O2 on both architectures with `2 refused, 0
+unaccounted, 0 conflicts`. The ledger names them: `codegen/block-not-rendered`
+for a `LiveValueProducer` obligation belonging to a phi at `0x10000098d`, a
+merge of an eight-byte register.
+
+The name is misleading and the refusal is right. The block *is* rendered --
+223 of the function's 267 obligations render and 42 are elided -- so what is
+missing is not the block but the attribution of that phi's value to anything
+emitted. It would be easy to read that as an accounting gap and discharge it.
+
+It is not. Downgrading the refusal to an elision makes all three cells render
+and compile, and all three then **fail the differential oracle**: they return
+wrong answers. The obligation is unaccounted because the value really is not
+carried, and the ledger is the only thing standing between that defect and a
+silent miscompile.
+
+So this class is a rendering defect at a register merge, not an accounting one,
+and the fix belongs wherever that phi's value is dropped. Recorded here because
+the shape is exactly the failure mode the project has already paid for once: a
+detector that looks wrong, a one-line discharge that satisfies it, and a
+function that compiles cleanly and computes nothing.
