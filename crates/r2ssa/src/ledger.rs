@@ -70,6 +70,13 @@ pub enum ElisionReason {
     /// function could declare. An indirect call is not covered: there the
     /// target really is a value the program computed and reads.
     DirectCallTarget,
+    /// The push that carries a call's return address.
+    ///
+    /// The structured form spells the call, and the transfer is the call. The
+    /// stack write the machine performs to record where to come back to is
+    /// bookkeeping the C has no statement for, in the same way a return's own
+    /// transfer is.
+    CallReturnAddress,
     /// An immutable phi whose inputs and output are one certified renderer
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
@@ -145,6 +152,7 @@ impl std::fmt::Display for ElisionReason {
             Self::ReturnControl => "return-control",
             Self::DirectControlTarget => "direct-control-target",
             Self::DirectCallTarget => "direct-call-target",
+            Self::CallReturnAddress => "call-return-address",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
             Self::CoalescedCarrierEdge => "coalesced-carrier-edge",
             Self::CoalescedCarrierPhi => "coalesced-carrier-phi",

@@ -504,6 +504,7 @@ impl BindingPlan {
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
         let direct_call_targets = super::certified_direct_call_target_values(source);
+        let call_return_addresses = super::certified_call_return_address_values(source);
         let stack_frame_values = certified_stack_frame_values(source);
         let stack_geometry_values = certified_stack_geometry_values(source);
         let unobserved_values = source.unobserved_values();
@@ -600,6 +601,14 @@ impl BindingPlan {
             } else if structural_unused.contains(&graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if call_return_addresses.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::CallReturnAddress,
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,

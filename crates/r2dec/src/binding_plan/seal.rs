@@ -400,6 +400,7 @@ pub(crate) fn build_upstream_shadow_oracle(
     let return_controls = certified_return_control_values(source);
     let direct_control_targets = certified_direct_control_target_values(source);
     let direct_call_targets = super::certified_direct_call_target_values(source);
+    let call_return_addresses = super::certified_call_return_address_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
     let unobserved_values = source.unobserved_values();
@@ -445,6 +446,12 @@ pub(crate) fn build_upstream_shadow_oracle(
         if direct_call_targets.contains(&graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::DirectCallTarget,
+            ));
+            continue;
+        }
+        if call_return_addresses.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::CallReturnAddress,
             ));
             continue;
         }
@@ -555,6 +562,7 @@ impl BindingPlan {
         let return_controls = certified_return_control_values(source);
         let direct_control_targets = certified_direct_control_target_values(source);
         let direct_call_targets = super::certified_direct_call_target_values(source);
+        let call_return_addresses = super::certified_call_return_address_values(source);
         let stack_frame_values = certified_stack_frame_values(source);
         let stack_geometry_values = certified_stack_geometry_values(source);
         let structural_unused = source
@@ -652,6 +660,11 @@ impl BindingPlan {
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && direct_call_targets.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::CallReturnAddress
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && call_return_addresses.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::StackFrame
                         && proof.authority == *source.authority()

@@ -1745,6 +1745,24 @@ impl LegacyObservationJournal {
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
+        for inst in crate::binding_plan::certified_call_return_address_insts(source.source()) {
+            let Some(definition) = graph.inst(inst) else {
+                return Err(LegacyObservationJournalError::InvalidWrite(inst));
+            };
+            if definition.output.is_some() {
+                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CallReturnAddress) {
+                    Some(r2ssa::ledger::ElisionReason::CallReturnAddress) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+                }
+            }
+            for input_idx in 0..definition.inputs.len() {
+                let site = UseSite { inst, input_idx };
+                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CallReturnAddress) {
+                    Some(r2ssa::ledger::ElisionReason::CallReturnAddress) | None => {}
+                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                }
+            }
+        }
         for inst in crate::binding_plan::certified_direct_call_target_insts(source.source()) {
             let Some(definition) = graph.inst(inst) else {
                 return Err(LegacyObservationJournalError::InvalidWrite(inst));

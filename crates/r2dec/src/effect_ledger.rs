@@ -82,6 +82,13 @@ fn upstream_zero_occurrence_outcome(
     }) {
         return Outcome::Elided(ElisionReason::ReturnControl);
     }
+    // The push that records a call's return address. The call statement is the
+    // transfer, and no C statement writes the machine's return address.
+    if source_inst.is_some_and(|inst| {
+        crate::binding_plan::certified_call_return_address_insts(prepared).contains(&inst)
+    }) {
+        return Outcome::Elided(ElisionReason::CallReturnAddress);
+    }
     // The copies a callee's address reaches its call through. The call spells
     // the callee's name, so no statement answers for the copy that put the
     // address in a temporary first.

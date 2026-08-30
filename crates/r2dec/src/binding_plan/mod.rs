@@ -394,6 +394,81 @@ pub(super) fn certified_direct_call_target_insts(source: &r2ssa::SsaArtifact) ->
         .collect()
 }
 
+/// The stores that push a call's return address, and the values they consume.
+///
+/// A `call` on amd64 subtracts from the stack pointer and writes the address of
+/// the instruction after it, and Sleigh lifts both. The structured form says
+/// `f(...)`, which is the transfer; rendering the push beside it emits the
+/// machine's bookkeeping as if it were program text, through a stack pointer
+/// the function never assigned. That is where `murmur3_32`'s
+/// `RSP_0 = RSP_0 - 8; *(int64_t*)RSP_0 = 0x1000009ce;` comes from.
+///
+/// A store qualifies only when the value it writes is the constant address the
+/// call site falls through to, and it precedes that call in its own block.
+/// Nothing else in a function stores its own continuation address.
+pub(super) fn certified_call_return_address_insts(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
+    let graph = source.graph();
+    let Some(stack_pointer) = source.machine_context().stack_pointer_carrier() else {
+        return BTreeSet::new();
+    };
+    let mut insts = BTreeSet::new();
+    for certificate in source.certificates().callsites.values() {
+        let Some(call) = graph.inst(certificate.at) else {
+            continue;
+        };
+        // The nearest store before the call that writes a bare constant
+        // through the stack pointer. Sleigh lifts `call` as a stack-pointer
+        // decrement, this store of the address to come back to, and the
+        // transfer; nothing else in a function stores a literal at the stack
+        // pointer immediately before calling.
+        let push = graph
+            .insts
+            .iter()
+            .filter(|candidate| candidate.block == call.block && candidate.ordinal < call.ordinal)
+            .filter(|candidate| {
+                let r2ssa::InstPayload::Op(r2ssa::SSAOp::Store { val, .. }) = &candidate.payload
+                else {
+                    return false;
+                };
+                let through_stack_pointer =
+                    candidate.inputs.first().is_some_and(|address: &ValueId| {
+                        graph
+                            .value(*address)
+                            .and_then(|value| value.canonical_storage)
+                            .is_some_and(|storage| storage.location() == stack_pointer.location())
+                    });
+                val.constant_bits().is_some() && through_stack_pointer
+            })
+            .max_by_key(|candidate| candidate.ordinal);
+        if let Some(push) = push {
+            insts.insert(push.id);
+        }
+    }
+    insts
+}
+
+/// The return addresses those pushes write.
+///
+/// The constant is the machine's continuation address. Nothing in the C names
+/// it, because the call statement is the transfer, so once the push is elided
+/// the literal has no occurrence and no other answerer.
+pub(super) fn certified_call_return_address_values(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let pushes = certified_call_return_address_insts(source);
+    pushes
+        .iter()
+        .filter_map(|inst| graph.inst(*inst)?.inputs.get(1).copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|value| {
+            let uses = graph.use_sites(*value);
+            !uses.is_empty() && uses.iter().all(|site| pushes.contains(&site.inst))
+        })
+        .collect()
+}
+
 /// Direct-control target values whose complete use domain is CFG topology.
 pub(super) fn certified_direct_control_target_values(
     source: &r2ssa::SsaArtifact,

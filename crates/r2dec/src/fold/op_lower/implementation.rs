@@ -2156,6 +2156,10 @@ impl<'a> FoldingContext<'a> {
                             // plan has elided and no statement can name.
                             || crate::binding_plan::certified_direct_call_target_insts(prepared)
                                 .contains(&inst)
+                            // The push that records where the call comes back
+                            // to. The call statement is the transfer.
+                            || crate::binding_plan::certified_call_return_address_insts(prepared)
+                                .contains(&inst)
                     })
                 })
             {
