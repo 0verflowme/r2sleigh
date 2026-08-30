@@ -30,8 +30,18 @@ functions=(
     pearson
 )
 
+# Helpers the corpus functions call. They are not scored -- SPECS names the nine
+# above -- but a rendered call needs the callee's definition in the same
+# translation unit, so the verifier looks for a section by this name and uses it
+# when the caller declares that callee. At -O1 and above the compiler inlines
+# them and the symbol is gone, which the verifier treats as "no callee section"
+# rather than as a failure.
+callees=(
+    rotl32
+)
+
 command_text="a:sla; aaa"
-for function in "${functions[@]}"; do
+for function in "${functions[@]}" "${callees[@]}"; do
     command_text+="; ?e R2SLEIGH_CORPUS_BEGIN__${function}"
     command_text+="; s sym._${function}"
     command_text+="; pdd"

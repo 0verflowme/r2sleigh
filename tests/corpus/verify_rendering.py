@@ -1203,6 +1203,62 @@ def normalize_linkage_name(source: str, name: str) -> tuple[str, dict[str, Any]]
     }
 
 
+CALLEE_PROTOTYPE = re.compile(
+    r"^\s*[A-Za-z_][A-Za-z0-9_ *]*\s+(?P<name>sym__[A-Za-z0-9_]+)\s*\([^)]*\)\s*;",
+    re.MULTILINE,
+)
+
+
+def declared_callees(source: str) -> list[str]:
+    """The functions this rendering declares and therefore calls.
+
+    The decompiler emits a block-scope prototype for each callee, so the
+    rendering says which definitions the translation unit still needs. Reading
+    them from the text keeps the harness from having to know the call graph.
+    """
+    seen: list[str] = []
+    for match in CALLEE_PROTOTYPE.finditer(source):
+        name = match.group("name")
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
+def callee_definitions(
+    sections: dict[str, list[str]], source: str
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Renderings of the callees, for the same translation unit.
+
+    A call needs its callee defined, and the only honest definition is the one
+    this decompiler produced: linking the original would prove the caller
+    correct given a correct callee, which is a weaker claim than the one this
+    corpus makes. A callee with no section is left out -- at -O1 and above these
+    helpers are inlined and have no symbol -- and the caller then fails to link,
+    which is the truth about that rendering.
+    """
+    definitions: list[str] = []
+    notes: list[dict[str, Any]] = []
+    for spelled in declared_callees(source):
+        bare = spelled.removeprefix("sym__")
+        found = sections.get(bare, [])
+        if len(found) != 1:
+            notes.append(
+                {
+                    "callee": bare,
+                    "status": "absent" if not found else "duplicate",
+                }
+            )
+            continue
+        section = parse_render_audits(found[0])[0]
+        body, error = extract_function(section, bare)
+        if body is None:
+            notes.append({"callee": bare, "status": "unparsable", "detail": error})
+            continue
+        definitions.append(body)
+        notes.append({"callee": bare, "status": "rendered"})
+    return definitions, notes
+
+
 def rendered_arity(source: str) -> int | None:
     opening = source.find("(")
     closing = source.find(")", opening + 1)
@@ -1363,9 +1419,14 @@ def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]]
         "return_retype", r"^\S+\s+dec_", "long dec_", signature, semantic=True
     )
     rest = rewrite("comment_removal", r"/\*.*?\*/", "", rest, flags=re.DOTALL)
+    # Not a function declaration. The diagnostic pass widens local variables to
+    # `long` on purpose, and a callee prototype looks like one: retyping its
+    # return gave `long sym__rotl32(...)` against a definition returning
+    # `uint64_t`, which is a hard `conflicting types` error rather than the
+    # widened-but-compiling program this gate exists to produce.
     rest = rewrite(
         "local_retype",
-        r"\b(?:u?int(?:8|16|32|64|128|512)_t)\s+(\w+)",
+        r"\b(?:u?int(?:8|16|32|64|128|512)_t)\s+(?=(\w+))\1(?!\s*\()",
         r"long \1",
         rest,
     )
@@ -1626,6 +1687,7 @@ def runner_source(
     cases: list[dict[str, Any]],
     *,
     diagnostic: bool,
+    callee_sources: list[str] | None = None,
     declared_parameters: list[str] | None = None,
 ) -> str:
     arrays = []
@@ -1682,6 +1744,7 @@ def runner_source(
             BITVECTOR_PRELUDE,
             *blobs,
             *arrays,
+            *(callee_sources or []),
             function_source,
             *type_check,
             "int main(int argc, char **argv) {",
@@ -1904,6 +1967,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "parameters_match": declared_parameters == expected_parameters,
             "return_matches": declared_return == spec.c_result_type,
         }
+        callee_sources, callee_notes = callee_definitions(sections, raw_mapped)
+        if callee_notes:
+            entry["callees"] = callee_notes
         raw_program = runner_source(
             raw_mapped,
             raw_blobs,
@@ -1911,6 +1977,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             spec,
             cases,
             diagnostic=False,
+            callee_sources=callee_sources,
             declared_parameters=declared_parameters,
         )
         raw_compile = compile_runner(
@@ -1937,6 +2004,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 spec,
                 cases,
                 diagnostic=True,
+                callee_sources=callee_definitions(sections, diagnostic_mapped)[0],
             )
             diagnostic_compile = compile_runner(
                 diagnostic_program,
