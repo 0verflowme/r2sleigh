@@ -279,7 +279,13 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         (
             first_existing(&["pc", "$pc", "rip", "eip", "ip"]),
             first_existing(&["sp", "$sp", "rsp", "esp"]),
-            first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]),
+            // `x29` before `s8`: `s8` is MIPS's frame pointer and AArch64's
+            // 32-bit SIMD register, and taking the collision made radare2
+            // resolve the frame-pointer alias to a floating-point register.
+            // Everything that asks whether a call preserves the frame pointer
+            // then asked about the wrong one and got no, which withholds every
+            // entry-relative fact from a function that calls.
+            first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "x29", "s8", "$s8"]),
         )
     };
 
