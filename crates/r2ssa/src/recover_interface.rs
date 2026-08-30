@@ -20,16 +20,44 @@ use crate::function::SSAFunction;
 use crate::graph::SsaGraph;
 use crate::var::SSAVar;
 
+/// One argument slot the machine code proves the function reads.
+///
+/// The slot is what the convention names, and the read is what the function
+/// actually did with it. They differ whenever a parameter is narrower than the
+/// register that carries it: an `int` third argument on amd64 arrives in `rdx`
+/// and the callee reads `edx`. Keeping only the slot claimed the function reads
+/// all eight bytes, and no value of that width exists, so the parameter was
+/// left without a fact and eventually rendered as an unnamed binding or trimmed
+/// away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredParameter {
+    slot: CanonicalStorageId,
+    observed: CanonicalStorageId,
+}
+
+impl RecoveredParameter {
+    /// The convention's argument register.
+    pub const fn slot(&self) -> CanonicalStorageId {
+        self.slot
+    }
+
+    /// The entry read that satisfied it, never wider than the slot.
+    pub const fn observed(&self) -> CanonicalStorageId {
+        self.observed
+    }
+}
+
 /// What the machine code proves about a function's interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredInterface {
-    parameters: Box<[CanonicalStorageId]>,
+    parameters: Box<[RecoveredParameter]>,
     result: Option<CanonicalStorageId>,
 }
 
 impl RecoveredInterface {
-    /// Parameter storages in convention order, contiguous from index zero.
-    pub const fn parameters(&self) -> &[CanonicalStorageId] {
+    /// Parameter slots in convention order, contiguous from index zero, each
+    /// with the entry read that proved it.
+    pub const fn parameters(&self) -> &[RecoveredParameter] {
         &self.parameters
     }
 
@@ -139,10 +167,22 @@ pub fn recover_interface(
     let reads = observed_entry_read_storages(func, &graph, &observations);
     let mut parameters = Vec::new();
     for slot in slots.argument_slots() {
-        if !reads.iter().any(|read| read_covers_slot(*read, *slot)) {
+        // The widest read that lands in this slot. A callee that both spills
+        // the whole register and uses its low half proves the wider one, and
+        // taking the widest keeps the recovered width from depending on which
+        // read the scan happened to see first.
+        let observed = reads
+            .iter()
+            .copied()
+            .filter(|read| read_covers_slot(*read, *slot))
+            .max_by_key(|read| read.size);
+        let Some(observed) = observed else {
             break;
-        }
-        parameters.push(*slot);
+        };
+        parameters.push(RecoveredParameter {
+            slot: *slot,
+            observed,
+        });
     }
     Some(RecoveredInterface {
         parameters: parameters.into_boxed_slice(),
@@ -187,10 +227,17 @@ pub fn mint_recovered_interface(
         }
         Some(bits)
     };
+    // The logical value is typed by what the function read, not by the size of
+    // the register the convention put it in.
     let parameter_widths = recovered
         .parameters()
         .iter()
-        .map(|storage| width_of(*storage))
+        .map(|parameter| width_of(parameter.observed()))
+        .collect::<Option<Vec<_>>>()?;
+    let parameter_slot_widths = recovered
+        .parameters()
+        .iter()
+        .map(|parameter| width_of(parameter.slot()))
         .collect::<Option<Vec<_>>>()?;
     let result_width = match recovered.result() {
         Some(storage) => Some(width_of(storage)?),
@@ -218,12 +265,19 @@ pub fn mint_recovered_interface(
             .position(|candidate| *candidate == bits)
             .and_then(|index| u32::try_from(index).ok())
     };
-    let logical = |bits: u32| -> Option<SourceLogicalValue> {
+    // `Full` where the read is the whole register, `LowBits` where it is the
+    // register's low half. The second is what an `int` parameter looks like in
+    // a 64-bit argument register, and it is the projection the parameter-fact
+    // collector already knows how to narrow.
+    let logical = |bits: u32, carrier_bits: u32| -> Option<SourceLogicalValue> {
+        let kind = if bits < carrier_bits {
+            SourceCarrierKind::LowBits
+        } else {
+            SourceCarrierKind::Full
+        };
         Some(SourceLogicalValue::new(
             type_id(bits)?,
-            // Full: the value occupies the whole carrier, because the carrier
-            // is the register width the read named.
-            SourceCarrierProjection::new(SourceCarrierKind::Full, 0, u64::from(bits)),
+            SourceCarrierProjection::new(kind, 0, u64::from(bits)),
         ))
     };
 
@@ -231,21 +285,22 @@ pub fn mint_recovered_interface(
         .parameters()
         .iter()
         .enumerate()
-        .map(|(index, storage)| {
+        .map(|(index, parameter)| {
             Some(SourceAbiParameterSpec::new(
                 u32::try_from(index).ok()?,
-                *storage,
+                parameter.slot(),
             ))
         })
         .collect::<Option<Vec<_>>>()?;
     let parameter_logical_values = parameter_widths
         .iter()
-        .map(|bits| logical(*bits))
+        .zip(parameter_slot_widths.iter())
+        .map(|(bits, carrier_bits)| logical(*bits, *carrier_bits))
         .collect::<Option<Vec<_>>>()?;
     let (return_kind, return_logical_value) = match (recovered.result(), result_width) {
         (Some(storage), Some(bits)) => (
             SourceFunctionReturn::Register { storage },
-            Some(logical(bits)?),
+            Some(logical(bits, bits)?),
         ),
         _ => (SourceFunctionReturn::Void, None),
     };
@@ -365,7 +420,14 @@ mod tests {
             b: Varnode::register(8, 8),
         });
         let interface = recovered(block);
-        assert_eq!(interface.parameters(), &[register(0, 8), register(8, 8)]);
+        assert_eq!(
+            interface
+                .parameters()
+                .iter()
+                .map(RecoveredParameter::slot)
+                .collect::<Vec<_>>(),
+            &[register(0, 8), register(8, 8)]
+        );
         // x0 was written, so the result carrier is defined
         assert_eq!(interface.result(), Some(register(0, 8)));
     }
@@ -400,7 +462,14 @@ mod tests {
             b: Varnode::register(16, 8),
         });
         let interface = recovered(block);
-        assert_eq!(interface.parameters(), &[register(0, 8)]);
+        assert_eq!(
+            interface
+                .parameters()
+                .iter()
+                .map(RecoveredParameter::slot)
+                .collect::<Vec<_>>(),
+            &[register(0, 8)]
+        );
     }
 
     #[test]
@@ -412,7 +481,14 @@ mod tests {
             src: Varnode::register(0, 4),
         });
         let interface = recovered(block);
-        assert_eq!(interface.parameters(), &[register(0, 8)]);
+        assert_eq!(
+            interface
+                .parameters()
+                .iter()
+                .map(RecoveredParameter::slot)
+                .collect::<Vec<_>>(),
+            &[register(0, 8)]
+        );
     }
 
     #[test]
@@ -444,7 +520,14 @@ mod tests {
             b: Varnode::constant(1, 8),
         });
         let interface = recovered(block);
-        assert_eq!(interface.parameters(), &[register(0, 8), register(8, 8)]);
+        assert_eq!(
+            interface
+                .parameters()
+                .iter()
+                .map(RecoveredParameter::slot)
+                .collect::<Vec<_>>(),
+            &[register(0, 8), register(8, 8)]
+        );
     }
 
     #[test]

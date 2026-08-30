@@ -323,7 +323,11 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
         r2ssa::recover_interface::recover_interface(&recovered_function, &convention_slots)
             .expect("machine-code ABI recovery");
     assert_eq!(
-        recovered.parameters(),
+        recovered
+            .parameters()
+            .iter()
+            .map(r2ssa::recover_interface::RecoveredParameter::slot)
+            .collect::<Vec<_>>(),
         convention_slots.argument_slots(),
         "{} machine code must independently recover the captured contiguous ABI inputs without granting the legacy JSON endpoint source authority",
         function.name
@@ -393,10 +397,10 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
                 .parameters()
                 .iter()
                 .enumerate()
-                .map(|(index, storage)| {
+                .map(|(index, parameter)| {
                     r2ssa::SourceAbiParameterSpec::new(
                         u32::try_from(index).expect("parameter index fits u32"),
-                        *storage,
+                        parameter.slot(),
                     )
                 }),
             recovered
