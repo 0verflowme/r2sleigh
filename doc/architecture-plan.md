@@ -2208,9 +2208,16 @@ exists to make unrepresentable, so the name has to travel first.
   `define pcodeop`, but recovering an index from declaration order would be
   reconstructing the compiler's own numbering by inference -- the exact thing
   Track B removed -- and it would break silently the first time the
-  specification changed. So E1 waits on an upstream change to `libsla` that
-  exposes the userop names, which is its own contribution to raise, not
-  something to vendor around.
+  specification changed. So E1 waits on an upstream change that exposes the
+  userop names.
+
+  **Raised:** mnemonikr/libsla-sys#8 adds `SleighProxy::getUserOpNamesProxy`,
+  exposed as `user_op_names`, reaching the list `SleighBase` already keeps and
+  `Translate::getUserOpNames` already declares. The capability has to land in
+  the `-sys` crate because that is where the bridge is; `libsla` then needs a
+  thin safe passthrough, which follows once the `-sys` change is released. Until
+  both land, E1.2 through E1.4 have nothing to key on and the two arm64 -O2
+  cells stay refused.
 - **E1.2** Carry the resolved name on the lifted operation, so `CallOther`
   states which userop it is rather than which slot it occupies. Gate: the
   wire and the SSA operation both round-trip the name.
