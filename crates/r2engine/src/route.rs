@@ -74,24 +74,6 @@ impl EngineFunctionIdentity {
             &self.canonical_name
         }
     }
-
-    pub fn name_route_facts(&self) -> r2sym::NativeWorkerNameRouteFacts {
-        r2sym::NativeWorkerNameRouteFacts::for_candidates(
-            self.function_addr,
-            &self.display_name,
-            &self.canonical_name,
-            self.name_candidates(),
-            self.primary_name(),
-        )
-    }
-
-    pub fn summary_probe_name(&self) -> String {
-        self.name_route_facts().summary_probe_name
-    }
-
-    pub fn has_summary_family(&self) -> bool {
-        self.name_route_facts().summary_family
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -271,13 +253,8 @@ impl EngineRequestPlan {
 pub struct DecompileProbeDecision {
     pub op_count: usize,
     pub cfg_guard_reason: Option<String>,
-    pub display_summary_family: bool,
-    pub canonical_summary_family: bool,
-    pub named_worker_guarded: bool,
-    pub summary_probe_name: String,
     pub summary_probe_needed: bool,
     pub summary_probe_skipped_large_cfg: bool,
-    pub block_guarded: bool,
 }
 
 pub(super) fn raw_cfg_risk_summary_for_preprobe(blocks: &[R2ILBlock]) -> CFGRiskSummary {
@@ -356,22 +333,7 @@ fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
     matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
 }
 
-#[cfg(test)]
-pub(crate) fn decompile_probe_decision(
-    blocks: &[R2ILBlock],
-    function_addr: u64,
-    canonical_name: &str,
-    display_name: &str,
-) -> DecompileProbeDecision {
-    let identity = EngineFunctionIdentity::new(function_addr, canonical_name, display_name);
-    decompile_probe_decision_for_identity(blocks, &identity)
-}
-
-pub(crate) fn decompile_probe_decision_for_identity(
-    blocks: &[R2ILBlock],
-    identity: &EngineFunctionIdentity,
-) -> DecompileProbeDecision {
-    let name_facts = identity.name_route_facts();
+pub(crate) fn decompile_probe_decision(blocks: &[R2ILBlock]) -> DecompileProbeDecision {
     let cfg_guard_reason = cfg_guard_reason(blocks);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
     let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
@@ -383,21 +345,14 @@ pub(crate) fn decompile_probe_decision_for_identity(
     let skipped_large_cfg_guarded = cfg_guard_reason.is_some()
         || blocks.len() > crate::ENGINE_DECOMPILE_MAX_BLOCKS
         || op_count > crate::ENGINE_DECOMPILE_MAX_OPS;
-    let named_worker_guarded = name_facts.summary_family && skipped_large_cfg_guarded;
-    let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
     let summary_probe_needed =
-        block_guarded || cfg_guard_reason.is_some() || small_structural_worker_probe;
+        skipped_large_cfg_guarded || cfg_guard_reason.is_some() || small_structural_worker_probe;
 
     DecompileProbeDecision {
         op_count,
         cfg_guard_reason,
-        display_summary_family: name_facts.display_summary_family,
-        canonical_summary_family: name_facts.canonical_summary_family,
-        named_worker_guarded,
-        summary_probe_name: name_facts.summary_probe_name,
         summary_probe_needed,
         summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
-        block_guarded,
     }
 }
 

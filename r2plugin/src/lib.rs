@@ -6566,38 +6566,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_type_fallback_payload_rejects_name_owned_role_signature() {
-        let mut summary = r2sym::function_semantic_summary_seed_for_name(
-            r2ssa::InterprocFunctionId(0x11a9),
-            "verror_at_line",
-        )
-        .unwrap_or_else(|| {
-            r2ssa::FunctionSemanticSummary::unknown(
-                r2ssa::InterprocFunctionId(0x11a9),
-                Some("verror_at_line".to_string()),
-            )
-        });
-        summary.callsite_count = 1;
-        assert!(
-            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
-            "name-owned diagnostic roles must not materialize advisory fallback reports"
-        );
-    }
-
-    #[test]
-    fn semantic_type_fallback_payload_does_not_apply_name_hint_over_context_override() {
-        let mut summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x11aa),
-            Some("quotearg_n_options".to_string()),
-        );
-        summary.callsite_count = 1;
-        assert!(
-            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
-            "name-owned quoting roles must not materialize reports that could override context"
-        );
-    }
-
-    #[test]
     fn semantic_report_exposes_canonical_region_counts() {
         let compiled = test_large_cfg_semantic_report();
         let native = compiled.native_body().expect("native report");

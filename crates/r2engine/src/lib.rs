@@ -38,9 +38,9 @@ pub use route::{
     should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
     type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
 };
+use route::{decompile_probe_decision, decompile_route_decision};
 #[cfg(test)]
-use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
-use route::{decompile_probe_decision_for_identity, decompile_route_decision};
+use route::{plan_decompile_request, semantic_route_reason};
 pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
 pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
@@ -4420,12 +4420,7 @@ impl EngineSession {
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
-        let identity = EngineFunctionIdentity::new(
-            analysis_request.function_addr,
-            &canonical_name,
-            &display_name,
-        );
-        let probe = decompile_probe_decision_for_identity(&analysis_request.blocks, &identity);
+        let probe = decompile_probe_decision(&analysis_request.blocks);
         if actual_lifted_blocks > ENGINE_DECOMPILE_MAX_BLOCKS
             || probe.op_count > ENGINE_DECOMPILE_MAX_OPS
         {
@@ -9373,15 +9368,10 @@ mod tests {
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5000 + idx, 1));
         }
-        let decision =
-            decompile_probe_decision(&blocks, 0x4b30, "fcn.00004b30", "readlinebuffer_delim");
+        let decision = decompile_probe_decision(&blocks);
 
-        assert!(!decision.display_summary_family);
-        assert!(!decision.named_worker_guarded);
-        assert!(decision.block_guarded);
         assert!(decision.summary_probe_needed);
         assert!(decision.summary_probe_skipped_large_cfg);
-        assert_eq!(decision.summary_probe_name, "readlinebuffer_delim");
     }
 
     #[test]
@@ -9396,14 +9386,10 @@ mod tests {
             });
         }
 
-        let decision =
-            decompile_probe_decision(&blocks, 0x6000, "dbg.medium_helper", "dbg.medium_helper");
+        let decision = decompile_probe_decision(&blocks);
 
-        assert!(!decision.block_guarded);
         assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
-        assert_eq!(decision.summary_probe_name, "dbg.medium_helper");
-        assert!(!decision.named_worker_guarded);
     }
 
     #[test]
@@ -9416,10 +9402,8 @@ mod tests {
             });
         }
 
-        let decision = decompile_probe_decision(&blocks, 0x4bc0, "sym.diagnose", "sym.diagnose");
+        let decision = decompile_probe_decision(&blocks);
 
-        assert!(!decision.display_summary_family);
-        assert!(decision.block_guarded);
         assert!(decision.summary_probe_needed);
         assert!(decision.summary_probe_skipped_large_cfg);
     }
@@ -9433,13 +9417,11 @@ mod tests {
             .map(|idx| R2ILBlock::new(0x8000 + idx, 1))
             .collect::<Vec<_>>();
 
-        let at_limit = decompile_probe_decision(&exactly_limit, 0x7000, "dbg.helper", "dbg.helper");
-        let over_limit = decompile_probe_decision(&over_limit, 0x8000, "dbg.helper", "dbg.helper");
+        let at_limit = decompile_probe_decision(&exactly_limit);
+        let over_limit = decompile_probe_decision(&over_limit);
 
         assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(!at_limit.block_guarded);
         assert!(over_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.block_guarded);
     }
 
     #[test]
@@ -9461,15 +9443,11 @@ mod tests {
             src: r2il::Varnode::constant(0x900, 8),
         });
 
-        let at_limit =
-            decompile_probe_decision(&[exactly_limit], 0x9000, "dbg.helper", "dbg.helper");
-        let over_limit =
-            decompile_probe_decision(&[over_limit], 0xa000, "dbg.helper", "dbg.helper");
+        let at_limit = decompile_probe_decision(&[exactly_limit]);
+        let over_limit = decompile_probe_decision(&[over_limit]);
 
         assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(!at_limit.block_guarded);
         assert!(over_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.block_guarded);
     }
 
     #[test]
@@ -9546,10 +9524,9 @@ mod tests {
         });
         let blocks = vec![switch_block, R2ILBlock::new(0xb010, 1)];
 
-        let decision = decompile_probe_decision(&blocks, 0xb000, "dbg.helper", "dbg.helper");
+        let decision = decompile_probe_decision(&blocks);
 
         assert!(!decision.summary_probe_skipped_large_cfg);
-        assert!(!decision.block_guarded);
         assert!(decision.summary_probe_needed);
     }
 
@@ -9573,40 +9550,6 @@ mod tests {
                 "dbg.limfield"
             ]
         );
-        assert_eq!(identity.summary_probe_name(), "sym.limfield.isra.0");
-        assert!(
-            !identity.has_summary_family(),
-            "name aliases alone must not create summary-family applicability"
-        );
-    }
-
-    #[test]
-    fn function_identity_rejects_raw_import_name_summary_family() {
-        let identity = EngineFunctionIdentity::with_aliases(
-            0x401000,
-            "sym.imp.memcpy",
-            "sym.imp.memcpy",
-            ["fcn.00401000", "memcpy"],
-        );
-
-        assert!(
-            !identity.has_summary_family(),
-            "raw import aliases must not create evidence-backed summary-family applicability"
-        );
-        assert_eq!(identity.summary_probe_name(), "sym.imp.memcpy");
-    }
-
-    #[test]
-    fn function_identity_uses_address_name_aliases_for_route_policy() {
-        let identity = EngineFunctionIdentity::with_aliases(
-            0x8b50,
-            "fcn.00008b50",
-            "fcn.00008b50",
-            ["dbg.init_node"],
-        );
-
-        assert!(!identity.has_summary_family());
-        assert_eq!(identity.summary_probe_name(), "fcn.00008b50");
     }
 
     #[test]
@@ -9669,12 +9612,7 @@ mod tests {
         let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry.clone()], None)
             .expect("loop ssa")
             .with_name("dbg.flag_expanded_loop_worker");
-        let decision = decompile_probe_decision(
-            &[entry],
-            0x9050,
-            "dbg.flag_expanded_loop_worker",
-            "dbg.flag_expanded_loop_worker",
-        );
+        let decision = decompile_probe_decision(&[entry]);
 
         assert!(should_probe_native_worker_summary_before_full_semantics(
             &loop_ssa, None
@@ -9685,7 +9623,7 @@ mod tests {
     #[test]
     fn prefer_full_named_workers_need_evidence_before_decompile_preprobe() {
         let blocks = const_return_blocks(0x401000, 0);
-        let decision = decompile_probe_decision(&blocks, 0x401000, "dbg.diagnose", "dbg.diagnose");
+        let decision = decompile_probe_decision(&blocks);
 
         assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
