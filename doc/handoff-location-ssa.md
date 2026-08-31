@@ -5974,6 +5974,16 @@ same parameters a second time, and `dbg.palya` rendered with four parameters for
 a two-parameter function -- so it needs a guard against double-counting against
 debug info. That guard is the whole remaining work.
 
+**The register roles are half sourced.** The program counter is now read from
+the processor specification's `<programcounter register="..."/>` rather than
+guessed from a list of spellings; all thirty specifications this plugin ships
+declare it, so nothing was lost by dropping the guess. The stack pointer, the
+frame pointer, the argument registers and the link register are the same kind of
+fact and live in the `.cspec`, which `sleigh-config` did not export --
+mnemonikr/sleigh-config#8 adds that, and once it lands those lists can go the
+same way. Until then they remain guesses, and the three collisions they have
+already produced are recorded in the plan.
+
 **Two radare2 defects are noted and unraised.** A fully recovered signature is
 discarded for name-linked, non-DWARF functions at `libr/anal/function.c:3949`.
 And `SNAPSHOT_MAX_CALLEE_SNAPSHOTS 4` truncates callee bodies, so a caller past
