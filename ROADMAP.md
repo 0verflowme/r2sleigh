@@ -507,12 +507,18 @@ Known Heuristic Debt
 The following items are intentional short-term debt and should be retired, not
 expanded:
 
-- name-first native worker family matching in `r2sym`
-- hardcoded role/signature tables used as authoritative facts -- half retired,
-  see the August 2026 entry: the program counter is now read from the processor
-  specification, the stack pointer, frame pointer, argument and return registers
-  and the link register are still guessed from spelling lists, and the x86
-  register family seeding in `r2ssa` is a second such table
+- hardcoded role/signature tables used as authoritative facts -- mostly retired.
+  The name-keyed coreutils registries in `r2types::role_registry` and
+  `r2sym::native_worker` are deleted, and name-first native worker family
+  matching went with them. What remains is `semantic_typedef_is_authoritative`,
+  which is still an ungated name list and still live on the emitted-C path; the
+  program counter is now read from the processor specification, while the stack
+  pointer, frame pointer, argument and return registers and the link register
+  are still guessed from spelling lists; and the x86 register family seeding in
+  `r2ssa` is one of roughly fourteen hand-written register tables that should
+  collapse onto the spec-derived `RegisterFamilyInfo::from_arch`
+- thresholds with no derivation in `r2engine`'s decompile route and in
+  `r2plugin`'s stack-address recursion
 - duplicated route policy in `r2dec` and `r2engine`
 - shape-only loop/switch rendering without checked certificates
 - summary pseudo-calls standing in for real loop/control reconstruction

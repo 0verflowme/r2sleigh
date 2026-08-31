@@ -6002,3 +6002,80 @@ absolute addresses into it, which is how any function reading a constant table
 passes. So the score does not say those cells emit self-contained, independently
 compilable C. The diagnostic column likewise compiles with warnings off after a
 repair pass. The corpus remains a canary and not a specification.
+
+**The name-keyed role registries are gone; one name-keyed check is not.** Two
+tables answered for a function's role by matching its symbol name against
+hardcoded GNU coreutils and gnulib internals: `r2types`'s `role_registry`, 381
+signature entries keyed on names like `xalloc_die` and `canonicalize_filename_mode`,
+and `r2sym`'s `native_worker` family registry, roughly 290 names in
+`has_native_worker_summary_family` plus a 335-name `semantic_family_worker_summaries`
+dispatch and the `is_direct_*` matchers behind the summary route policy. Both
+were unreachable for the same reason: every path into them required
+`FunctionSemanticSummary.linkage == Imported`, and production never sets that --
+`interproc.rs` writes `Unknown` at all four construction sites, all eight
+production mentions of `Imported` are comparisons, and every assignment sits
+behind `#[cfg(test)]` or `#[cfg(kani)]`. Their last consumer,
+`NativeWorkerNameRouteFacts`, was written by the engine's decompile probe and
+read only by tests. Deleting them removed 9,660 lines and left all fifty-four
+rendered outputs byte-identical, which was checked by measuring the parent
+commit and comparing `section_sha256` per cell rather than by reading the four
+scores.
+
+What survives in `native_worker` is the libc and XNU import models, which key on
+an actual import marker rather than a bare name, and that is ordinary decompiler
+practice.
+
+`semantic_typedef_is_authoritative` is the part that did not go. It is a raw
+`matches!` over a list of coreutils type names -- `cp_options`, `fts`, `ftsent`,
+`cycle_check_state` -- with no evidence, linkage or confidence gate, and it is
+live at seven sites on the emitted-C path. Deleting it is not a uniform refusal.
+At `facts.rs:1000` and `:1052` and `writeback.rs:9968` a `false` answer declines
+cleanly, but at `facts.rs:1280` the synthetic `sla_struct_N *` then stays in the
+output where a real typedef pointer would have landed, at `writeback.rs:3278` a
+typedef parameter is rewritten to `void *` and dropped from the variable-typing
+context, and at `writeback.rs:9833` the polarity is inverted, so every listed
+typedef would become eligible for struct re-badging. It needs a derived source
+for "is this typedef a real named aggregate" before it can go;
+`external_named_aggregate_has_real_layout` is already the OR-fallback at two of
+those sites and is the obvious candidate.
+
+**Fabricated pointee types are gone from the summary-kind signatures.** Those
+signatures dispatch on a recovered kind, which is sound, but they named their
+pointee with types private to coreutils -- `sortfile`, `keyfield`, `line`,
+`linebuffer`, `arguments`, and a `printf_status_t` return. A structural kind
+proves a parameter is a pointer and not what it points at, so those are now
+`void *` and `int`. The standard and system spellings the same tables use
+(`FILE`, `size_t`, `uintptr_t`, `__va_list_tag`, `FTS`, `FTSENT`) stay.
+
+**One compensation was removed at the consumer because its cause was already
+fixed.** `is_zero_expr` treated a variable spelled `"0"` or `"elf_header"` as the
+integer zero, `elf_header` being radare2's flag for address 0 in a base-0 ELF.
+The producer was the pre-rewrite `FoldingContext::const_to_expr`, which looked
+every constant up in the symbol table, and its `ram:` sibling, which did so with
+no magnitude guard; both were deleted in 69c80ab, and `lookup_symbol`,
+`lookup_function` and `extract_call_address` no longer exist. A constant now
+reaches the AST only as a literal, and the single site that mints a `Var`
+spelling sanitizes it through `c_identifier_for_presentation`, which prefixes a
+leading digit, so `"0"` is unreachable by construction. The arm's only remaining
+match was a genuine parameter named `elf_header`, which it would have rendered as
+a signed-negative test of an unrelated value -- a wrong answer rather than a
+missing one.
+
+**What the sweep found and did not fix.** Three things are named here so they
+are not rediscovered. The x86 register knowledge is spread across roughly
+fourteen independently maintained hand-written tables --
+`seed_x86_low_register_aliases` at `r2ssa/src/function.rs:3997` is the largest,
+`writeback.rs:8698` duplicates it outright, and `function.rs:3564` matches
+`rbp`/`rsp`/`ebp`/`esp` without gating on the architecture at all -- while
+`RegisterFamilyInfo::from_arch` in the same file already derives families
+correctly by union-find over overlapping `arch.registers` ranges. Consolidating
+onto that derivation is the fix. Second, `r2sym/src/loops.rs:1551` classifies a
+memory term by testing whether a region's display name contains `argv`, `stdin`
+or `input`, when `MemoryRegionKind::Input` already carries that as a typed field.
+Third, several bounds have no derivation: `STACK_RESOLVE_MAX_DEPTH = 8` in
+`r2plugin/src/lib.rs:1697` justifies itself with "in practice, most stack
+accesses resolve within 2-4 levels" while the `visited` set beside it is what
+actually prevents the recursion, and `r2engine/src/route.rs` decides whether a
+function gets real C or a summary on a dozen unsourced thresholds. The nearby
+`is_stack_reg_name` calls any register whose name merely *contains* `sp`, `bp` or
+`fp` a stack register.
