@@ -188,29 +188,26 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
     let mut reg_meta: std::collections::HashMap<String, (u32, u64, String)> =
         std::collections::HashMap::new();
 
-    // Emit all original register names from Sleigh.
+    // Every register, named in lower case.
+    //
+    // radare2's convention is that an arch plugin's register profile names
+    // registers in lower case, because upper case is what `RReg` uses for the
+    // alias namespace -- `PC`, `SP`, `A0` and the rest. A Sleigh specification
+    // spells its registers whichever way it likes, and the x86 one spells them
+    // in upper case, so emitting them verbatim put names like `SP` into the
+    // namespace radare2 reserves for aliases and left every consumer comparing
+    // `RDX` against a convention that says `rdx`. Lowering here is the fix; the
+    // register the name denotes is unchanged, and this plugin resolves a
+    // spelling back to the specification's own when it needs to.
     for reg in &arch.registers {
+        let name = reg.name.to_ascii_lowercase();
         profile.push_str(&format!(
             "gpr\t{}\t.{}\t{}\t0\n",
-            reg.name,
+            name,
             reg.size * 8,
             reg.offset
         ));
-        reg_meta.insert(
-            reg.name.to_ascii_lowercase(),
-            (reg.size * 8, reg.offset, reg.name.clone()),
-        );
-    }
-
-    // Emit lowercase aliases for case-insensitive lookups.
-    let mut lowercase_aliases = Vec::new();
-    for (name_lower, (bits, offset, original)) in &reg_meta {
-        if original != name_lower {
-            lowercase_aliases.push((name_lower.clone(), *bits, *offset));
-        }
-    }
-    for (name_lower, bits, offset) in lowercase_aliases {
-        profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", name_lower, bits, offset));
+        reg_meta.insert(name.clone(), (reg.size * 8, reg.offset, name));
     }
 
     let mut stripped_aliases = Vec::new();
