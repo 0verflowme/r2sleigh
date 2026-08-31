@@ -3209,7 +3209,12 @@ mod tests {
         let address_symbol = names
             .symbol_for_value(memory.address)
             .expect("the exact address value has one sealed binding");
-        assert_eq!(address_expr, CExpr::Var(address_symbol));
+        // The address is marked as the read it is, so the expression is the
+        // binding's symbol under an observation marker rather than a bare
+        // variable. What the test is about is unchanged: the address comes from
+        // the sealed binding and not from a bypass.
+        assert!(matches!(address_expr, CExpr::Observed { .. }));
+        assert_eq!(*address_expr.unobserved(), CExpr::Var(address_symbol));
         let access = ctx
             .render_certified_load_access_expr(dst, addr, CType::UInt(64))
             .expect("exact memory and field facts must render");

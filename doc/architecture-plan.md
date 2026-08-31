@@ -2179,7 +2179,7 @@ patch: userop semantics with lane-wise rendering, and constant-data emission.
 ## Track E -- the two capabilities Track D's last three cells need
 
 Track D's gate was written as fifty-four of fifty-four with the four scores
-equal. Fifty-one of those cells are there. The other three are not blocked by
+equal. Fifty-two of those cells are there. The other three are not blocked by
 anything Track D describes: each needs a capability the model does not have, and
 a gate that requires unplanned capabilities is a defect in the plan rather than
 a debt in the code. They are specified here so the work is scoped, and Track D's
@@ -2336,11 +2336,22 @@ a table the rendered program does not have.
   contain that shape, which is exactly why the corpus cannot be the authority
   here.
 
-  The completing step is therefore specific: the write rule has to consult the
-  same "no read reaches outside this value" predicate the use rule does, which
-  means the projection build has to compute operation-relative uses for the whole
-  function before deciding writes, rather than deciding both in one pass. The
-  guard test is kept in the tree so the unsound version cannot land quietly. The rendering that follows
+  **Done.** The projection build now settles every operand read before it
+  settles any write, so both rules consult one predicate instead of the write
+  rule guessing from the writing instruction's own operands. Two things had to be
+  narrowed before it was sound:
+
+  A write at a non-zero offset is a lane only when nothing reads the value
+  outside itself; at offset zero the rule is unchanged, so a value nothing reads
+  keeps the conservative answer it had. And a read is taken as the value itself
+  only when a lane write actually *defined* that value -- a sub-register the
+  function merely reads is a window onto machine state the whole register still
+  owns, and its reads stay carrier-relative. That distinction is what separates
+  the vector lanes from `mov ah, bl`, and from an entry sub-register read.
+
+  Every invariant test in the tree passes unchanged, including the guard above,
+  which fails against the unsound version. The corpus reads **52 of 54 with all
+  four scores equal and the differential oracle green**. The rendering that follows
   from that is a single composed assignment of the whole object, not four writes
   into a carrier-wide object that must then be read to preserve what they did
   not touch. Gate: `crc32_bitwise` at x64 -O2 renders, compiles under the strict

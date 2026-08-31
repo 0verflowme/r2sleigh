@@ -746,6 +746,26 @@ impl<'a> FoldingContext<'a> {
                 return None;
             }
         };
+        // An address is an operand like any other, and reading it is a read of
+        // the value. This path builds the operand's expression itself rather
+        // than going through the operand-observation path, so the read went
+        // unmarked -- invisible while the address is a computation whose parts
+        // are observed on their way here, and fatal when it is a bare literal,
+        // which is then a planned inline value that no rendered occurrence
+        // accounts for and the journal refuses the function over.
+        let site = self
+            .current_source_op_site()
+            .and_then(|(block_addr, op_idx)| self.normalized_site(block_addr, op_idx));
+        let input_idx = self
+            .prepared_ssa()
+            .and_then(|prepared| prepared.graph().inst(fact.access.inst))
+            .and_then(|inst| inst.inputs.iter().position(|input| *input == fact.address));
+        let expr = match (site, input_idx) {
+            (Some(_), Some(input_idx)) => {
+                self.observe_optional_normalized_input_value_expr(site, input_idx, expr)
+            }
+            _ => expr,
+        };
         Some((addr, expr))
     }
 

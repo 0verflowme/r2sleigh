@@ -1037,6 +1037,11 @@ pub struct MachineProjection {
     use_dispositions: Box<[Box<[MachineUseDisposition]>]>,
     /// Dense by `InstId`; `None` is reserved for graph instructions with no output.
     write_dispositions: Box<[Option<MachineWriteDisposition>]>,
+    /// Values no read reaches outside of; see [`self_contained_values`].
+    self_contained: BTreeSet<ValueId>,
+    /// The subset of those a lane write actually defined; see
+    /// [`values_read_as_themselves`].
+    read_as_themselves: BTreeSet<ValueId>,
 }
 
 impl MachineProjection {
@@ -1050,6 +1055,7 @@ impl MachineProjection {
         let mut entities = Vec::new();
         let mut failures = Vec::new();
         let mut write_dispositions = Vec::with_capacity(graph.insts.len());
+        let mut pending_roots = vec![None; graph.insts.len()];
 
         for (inst_index, inst) in graph.insts.iter().enumerate() {
             if inst.id.0 as usize != inst_index {
@@ -1070,12 +1076,12 @@ impl MachineProjection {
             let output = binding_for_value(graph_value)?;
             match builder.lower_inst(artifact, inst, disposition.id, output) {
                 Ok(root) => {
-                    let root_expr = builder
-                        .nodes
-                        .get(root.index())
-                        .ok_or(MachineBuildError::MissingWriteDisposition(inst.id))?;
-                    write_dispositions
-                        .push(Some(machine_write_disposition(artifact, inst, root_expr)));
+                    // The write decision is deferred. Whether a partial write
+                    // preserves anything depends on what reads the carrier
+                    // elsewhere in the function, and that is not known until
+                    // every instruction has been lowered.
+                    pending_roots[inst_index] = Some(root);
+                    write_dispositions.push(None);
                     entities.push(MachineEntity {
                         output,
                         root,
@@ -1098,8 +1104,35 @@ impl MachineProjection {
             }
         }
 
-        let use_dispositions =
-            canonical_machine_use_dispositions(artifact, builder.use_dispositions)?;
+        // Now that every operand read is known, decide which values hold
+        // exactly themselves, and settle the deferred writes against that.
+        let self_contained = self_contained_values(artifact, &builder.use_dispositions);
+        for (inst_index, inst) in graph.insts.iter().enumerate() {
+            let Some(root) = pending_roots[inst_index] else {
+                continue;
+            };
+            let root_expr = builder
+                .nodes
+                .get(root.index())
+                .ok_or(MachineBuildError::MissingWriteDisposition(inst.id))?;
+            write_dispositions[inst_index] = Some(machine_write_disposition(
+                artifact,
+                inst,
+                root_expr,
+                &self_contained,
+            ));
+        }
+
+        // Only a value a lane write actually defined is read as itself. A
+        // sub-register the function merely reads is a window onto machine state
+        // the carrier still owns, and its reads stay carrier-relative.
+        let read_as_themselves =
+            values_read_as_themselves(artifact, &self_contained, &write_dispositions);
+        let use_dispositions = canonical_machine_use_dispositions(
+            artifact,
+            builder.use_dispositions,
+            &read_as_themselves,
+        )?;
         let projection = Self {
             machine: MachineFunction {
                 arena: MachineExprArena {
@@ -1115,6 +1148,8 @@ impl MachineProjection {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             write_dispositions: write_dispositions.into_boxed_slice(),
+            self_contained,
+            read_as_themselves,
         };
         projection.validate_against(artifact)?;
         Ok(projection)
@@ -1305,6 +1340,7 @@ impl MachineProjection {
                     input,
                     operation_relative,
                     *disposition,
+                    &self.read_as_themselves,
                 )?;
             }
         }
@@ -1340,7 +1376,7 @@ impl MachineProjection {
                     .machine
                     .expr(entity.root())
                     .ok_or(MachineBuildError::WriteDispositionMismatch(inst.id))?;
-                machine_write_disposition(artifact, inst, root)
+                machine_write_disposition(artifact, inst, root, &self.self_contained)
             } else if let Some(failure) = failures.get(&output) {
                 MachineWriteDisposition::Refused(write_refusal_for_error(failure.error()))
             } else {
@@ -1452,6 +1488,7 @@ fn canonical_machine_value_geometry(
 fn canonical_machine_use_dispositions(
     artifact: &SsaArtifact,
     operation_relative: Vec<Vec<MachineUseDisposition>>,
+    read_as_themselves: &BTreeSet<ValueId>,
 ) -> Result<Vec<Vec<MachineUseDisposition>>, MachineBuildError> {
     let graph = artifact.graph();
     if operation_relative.len() != graph.insts.len() {
@@ -1481,6 +1518,7 @@ fn canonical_machine_use_dispositions(
                 site,
                 input,
                 disposition,
+                read_as_themselves,
             )?);
         }
         canonical.push(canonical_row);
@@ -1488,11 +1526,92 @@ fn canonical_machine_use_dispositions(
     Ok(canonical)
 }
 
+/// The values that hold exactly themselves, and nothing of the register around
+/// them.
+///
+/// A partial write preserves the rest of its carrier, and that preservation is
+/// real as soon as something reads the carrier -- `mov ah, bl` followed by a
+/// read of `ax` is the case the genuine-lift tests keep. It is not real when
+/// every read of the value is expressed against the value's own width, whole or
+/// one of its own lanes: then nothing is composed out of the register, and the
+/// register is not the object's business. The x86 vector lanes are that case,
+/// written four at a time and recomposed by an explicit `Piece`.
+///
+/// A value nothing reads is deliberately excluded. There is nothing to observe
+/// either way, and the conservative answer keeps the model's statement about
+/// such a write as strong as it was.
+///
+/// This is asked of operand reads only, so it does not depend on any write
+/// decision -- which is why the projection settles every read before it settles
+/// any write, and why both rules can consult one answer.
+fn self_contained_values(
+    artifact: &SsaArtifact,
+    operation_relative: &[Vec<MachineUseDisposition>],
+) -> BTreeSet<ValueId> {
+    let graph = artifact.graph();
+    let mut self_contained = BTreeSet::new();
+    for value in &graph.values {
+        let Some(width_bits) = value.var.size.checked_mul(8).filter(|bits| *bits > 0) else {
+            continue;
+        };
+        let uses = graph.use_sites(value.id);
+        if uses.is_empty() {
+            continue;
+        }
+        let every_read_is_within = uses.iter().all(|site| {
+            matches!(
+                operation_relative
+                    .get(site.inst.0 as usize)
+                    .and_then(|row| row.get(site.input_idx)),
+                Some(MachineUseDisposition::Exact(slice))
+                    if slice.carrier_width_bits() == width_bits
+            )
+        });
+        if every_read_is_within {
+            self_contained.insert(value.id);
+        }
+    }
+    self_contained
+}
+
+/// The self-contained values a lane write actually defined.
+///
+/// Being read only at one's own width is not enough on its own: a sub-register
+/// the function merely reads, and never writes, is a window onto machine state
+/// the whole register still owns, and its reads have to stay relative to that
+/// register. Narrowing to values a lane write defined leaves exactly the case
+/// this exists for -- lanes the function itself wrote and recomposes through an
+/// explicit `Piece`.
+fn values_read_as_themselves(
+    artifact: &SsaArtifact,
+    self_contained: &BTreeSet<ValueId>,
+    write_dispositions: &[Option<MachineWriteDisposition>],
+) -> BTreeSet<ValueId> {
+    let graph = artifact.graph();
+    self_contained
+        .iter()
+        .copied()
+        .filter(|value| {
+            matches!(
+                graph.def_inst(*value).and_then(|inst| write_dispositions
+                    .get(inst.0 as usize)
+                    .and_then(|disposition| disposition.as_ref())),
+                Some(MachineWriteDisposition::Exact(MachineWriteProjection::Lane {
+                    width_bits,
+                    carrier_width_bits,
+                    ..
+                })) if width_bits != carrier_width_bits
+            )
+        })
+        .collect()
+}
+
 fn canonical_machine_use_disposition(
     artifact: &SsaArtifact,
     site: UseSite,
     input: ValueId,
     operation_relative: MachineUseDisposition,
+    read_as_themselves: &BTreeSet<ValueId>,
 ) -> Result<MachineUseDisposition, MachineBuildError> {
     let MachineUseDisposition::Exact(slice) = operation_relative else {
         return Ok(operation_relative);
@@ -1540,6 +1659,13 @@ fn canonical_machine_use_disposition(
             MachineUseRefusal::InvalidBitRange,
         ));
     }
+    // The object is the value, so reading it is not a projection at all.
+    // Re-basing here would apply the lane's offset a second time -- the
+    // extracting operation already applies it -- and every lane above the first
+    // would read as zero while still compiling.
+    if read_as_themselves.contains(&input) {
+        return Ok(MachineUseDisposition::Exact(whole_machine_use(source)));
+    }
     let slice = match compose_machine_use_slice(slice, geometry.bit_offset, geometry.carrier_bits) {
         Ok(slice) => slice,
         Err(reason) => return Ok(MachineUseDisposition::Refused(reason)),
@@ -1553,6 +1679,7 @@ fn validate_canonical_machine_use_disposition(
     input: ValueId,
     operation_relative: MachineUseDisposition,
     actual: MachineUseDisposition,
+    read_as_themselves: &BTreeSet<ValueId>,
 ) -> Result<(), MachineBuildError> {
     let mismatch = || MachineBuildError::UseDispositionMismatch(site);
     let MachineUseDisposition::Exact(operation_slice) = operation_relative else {
@@ -1609,6 +1736,14 @@ fn validate_canonical_machine_use_disposition(
                 .ok_or_else(mismatch);
         }
     };
+    // Mirrors the derivation, from the one predicate both consult, and at the
+    // same point in the sequence: after the geometry is known to be exact, so
+    // that a refused geometry is still reported as a refusal by both.
+    if read_as_themselves.contains(&input) {
+        return (actual == MachineUseDisposition::Exact(whole_machine_use(source)))
+            .then_some(())
+            .ok_or_else(mismatch);
+    }
     let MachineUseDisposition::Exact(actual_slice) = actual else {
         return Err(mismatch());
     };
@@ -1929,6 +2064,7 @@ fn machine_write_disposition(
     artifact: &SsaArtifact,
     inst: &GraphInst,
     root: &MachineExpr,
+    self_contained: &BTreeSet<ValueId>,
 ) -> MachineWriteDisposition {
     let Some(output) = inst.output else {
         return MachineWriteDisposition::Refused(MachineWriteRefusal::IncoherentOperation);
@@ -1992,7 +2128,12 @@ fn machine_write_disposition(
     // bit-field insert in its own right, and the value it produces is the one a
     // later read of the carrier is composed from, so the preservation is real
     // whether or not this instruction was handed the carrier.
-    if geometry.bit_offset != 0 || instruction_carries_wider_value_at(artifact, inst, storage) {
+    // A lane at a non-zero offset is still a lane when nothing composes the
+    // register around it -- see `self_contained_values`. Where something does,
+    // the preservation is real and this is a bit-field insert.
+    if instruction_carries_wider_value_at(artifact, inst, storage)
+        || (geometry.bit_offset != 0 && !self_contained.contains(&output))
+    {
         return MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
             bit_offset: geometry.bit_offset,
             width_bits: geometry.width_bits,
