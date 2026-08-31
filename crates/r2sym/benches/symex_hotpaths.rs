@@ -19,7 +19,14 @@ const TMP0: u64 = 0x80;
 const TMP1: u64 = 0x88;
 
 fn leaked_ctx() -> &'static Context {
-    Box::leak(Box::new(Context::thread_local()))
+    // Criterion re-runs `iter_batched` setup once per batch element, so leaking
+    // here per call leaked a whole z3 context per measured iteration and grew
+    // the process across a run. `Context::thread_local()` is thread-affine, so
+    // the leak is kept but made once per thread.
+    thread_local! {
+        static CTX: &'static Context = Box::leak(Box::new(Context::thread_local()));
+    }
+    CTX.with(|ctx| *ctx)
 }
 
 fn make_reg(offset: u64, size: u32) -> Varnode {
