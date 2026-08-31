@@ -2258,6 +2258,37 @@ Until that lands, `NEON_ushl` stays unexpanded and the cell stays refused. A
 refusal is worth more than a silent wrong answer, and this one has already shown
 it can pass the ledger.
 
+
+### What is left of the last cell
+
+The false deadness proof is fixed: a merge source is now composed from the parts
+that define it, so `fmov w11, s0` reaches the merge and `xxhash32` at arm64 -O2
+no longer computes `PRIME1 + len`. With `NEON_ushl` expanded, all fifty-four
+cells generate, and what remains is an honest compile error rather than a wrong
+answer.
+
+The error is a narrow value assigned to a carrier-wide object:
+`S0_2 = (uint32_t)...` where `S0_2` is declared `struct r2sleigh_bits_256`. Four
+objects in that function are declared at 256 bits; `crc32_bitwise` on the same
+architecture, which passes, declares none. The difference is not the vector code
+-- it is that `xxhash32`'s vector registers cross a loop back edge, so they are
+merged, and a merge is built at the register family's *maximal* slot. On AArch64
+that slot is the 32-byte SVE `z0`, and the phi-source projections are made at its
+width, which drags the 32-bit lane values into 256-bit objects even though
+nothing in the program ever holds or reads more than 128 bits.
+
+So the remaining question is the same one the x86 vector lanes asked, arriving
+from the other side: an object should be as wide as what the program does with
+it, not as wide as the widest register the specification nests it in. Bounding
+the binding by how far reads reach was measured once and cost four cells; the
+lane work since then answers the read side but not the merge side, where the
+width is chosen before any read is considered.
+
+`NEON_ushl` stays unexpanded until that is settled. It is written, it is verified
+exact against the architecture over three million vectors, and it is one measured
+change away from landing -- but a cell that does not compile is worth no more
+than one that refuses.
+
 ## Track E -- the two capabilities Track D's last three cells need
 
 Track D's gate was written as fifty-four of fifty-four with the four scores
