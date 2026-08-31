@@ -30,6 +30,7 @@ fn worker_summary_display_selection(
 fn append_worker_summary_evidence_comments(
     body: &mut Vec<CStmt>,
     summaries: &[r2sym::NativeWorkerSummary],
+    names: crate::SummaryArgNames<'_>,
 ) {
     body.push(CStmt::comment(format!(
         "native worker summaries: {}",
@@ -37,7 +38,7 @@ fn append_worker_summary_evidence_comments(
     )));
     let displayed_worker_summaries = worker_summary_display_selection(summaries, 6);
     for summary in &displayed_worker_summaries {
-        if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary) {
+        if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary, names) {
             body.push(CStmt::comment(format!(
                 "worker loop: {}",
                 crate::sanitize_comment_text(&pseudocode)
@@ -45,7 +46,7 @@ fn append_worker_summary_evidence_comments(
         }
         body.push(CStmt::comment(format!(
             "worker summary: {}",
-            crate::sanitize_comment_text(&crate::native_worker_summary_detail(summary))
+            crate::sanitize_comment_text(&crate::native_worker_summary_detail(summary, names))
         )));
     }
     if summaries.len() > displayed_worker_summaries.len() {
@@ -91,10 +92,7 @@ pub(crate) fn reported_field_access_labels(type_facts: &FunctionTypeFacts) -> Ve
                 .merged_signature
                 .as_ref()
                 .and_then(|signature| signature.params.get(cert.slot));
-            let base = param
-                .map(|param| param.name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| format!("arg{}", cert.slot + 1));
+            let base = summary_param_label(type_facts, cert.slot, param);
             let separator = if param
                 .and_then(|param| param.ty.as_ref())
                 .is_some_and(|ty| matches!(ty, CTypeLike::Pointer(_)))
@@ -117,6 +115,7 @@ pub(crate) fn render_for_route(
     route: &r2types::DecompileRouteFacts,
     codegen_config: CodeGenConfig,
 ) -> Option<String> {
+    let names = crate::SummaryArgNames::new(function_facts.type_facts());
     let (reason, route_kind) = match route.kind {
         r2types::DecompileRouteKind::StructuredWorker => {
             (crate::route_reason(route), "structured_worker_summary")
@@ -266,7 +265,7 @@ pub(crate) fn render_for_route(
                 native.summary.region_summaries.len()
             )));
             for summary in native.summary.region_summaries.iter().take(12) {
-                if let Some(pseudocode) = crate::native_region_summary_pseudocode(summary) {
+                if let Some(pseudocode) = crate::native_region_summary_pseudocode(summary, names) {
                     body.push(CStmt::comment(format!(
                         "summary island: {}",
                         crate::sanitize_comment_text(&pseudocode)
@@ -287,6 +286,7 @@ pub(crate) fn render_for_route(
                 append_worker_summary_evidence_comments(
                     &mut body,
                     &native.summary.worker_summaries,
+                    names,
                 );
             }
         } else if !native.summary.worker_summaries.is_empty() {
@@ -297,7 +297,7 @@ pub(crate) fn render_for_route(
             let displayed_worker_summaries =
                 worker_summary_display_selection(&native.summary.worker_summaries, 6);
             for summary in &displayed_worker_summaries {
-                if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary) {
+                if let Some(pseudocode) = crate::native_worker_summary_pseudocode(summary, names) {
                     body.push(CStmt::comment(format!(
                         "worker loop: {}",
                         crate::sanitize_comment_text(&pseudocode)
@@ -305,7 +305,9 @@ pub(crate) fn render_for_route(
                 }
                 body.push(CStmt::comment(format!(
                     "worker summary: {}",
-                    crate::sanitize_comment_text(&crate::native_worker_summary_detail(summary))
+                    crate::sanitize_comment_text(&crate::native_worker_summary_detail(
+                        summary, names
+                    ))
                 )));
             }
             if native.summary.worker_summaries.len() > displayed_worker_summaries.len() {
@@ -404,10 +406,48 @@ pub(crate) fn render_for_route(
             }
         }
     }
-    Some(crate::rewrite_summary_arg_labels(
-        out,
-        function_facts.type_facts(),
-    ))
+    Some(out)
+}
+
+/// The name to print for a summary parameter slot.
+///
+/// The summary route used to write `arg<N>` here and then scan its own emitted
+/// C for that token afterwards, substituting a better name found in a *different*
+/// place -- the render-authorized signature, or the register parameters. Two
+/// consequences followed from recovering by text what was structured a few lines
+/// earlier: the scan indexed its replacement table with the printed number while
+/// the table was built from parameter positions, an off-by-one that only the
+/// text could hide, and any identifier that merely looked like `arg12` was a
+/// candidate for rewriting.
+///
+/// Resolving the name where the label is built removes both. The order of
+/// preference is the one the scan used: the merged signature, then the
+/// render-authorized signature, then the register parameters, and finally a
+/// numbered placeholder that says plainly that no source named this slot.
+fn summary_param_label(
+    type_facts: &r2types::FunctionTypeFacts,
+    slot: usize,
+    merged_param: Option<&r2types::FunctionParamSpec>,
+) -> String {
+    let named = |name: &str| {
+        let name = name.trim();
+        (!name.is_empty() && !crate::is_generic_arg_name(name)).then(|| name.to_string())
+    };
+    merged_param
+        .and_then(|param| named(&param.name))
+        .or_else(|| {
+            type_facts
+                .render_authorized_signature()
+                .and_then(|signature| signature.params.get(slot))
+                .and_then(|param| named(&param.name))
+        })
+        .or_else(|| {
+            type_facts
+                .register_params
+                .get(slot)
+                .and_then(|param| named(&param.name))
+        })
+        .unwrap_or_else(|| format!("summary_input{}", slot + 1))
 }
 
 #[cfg(test)]

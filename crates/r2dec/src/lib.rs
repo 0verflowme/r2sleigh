@@ -79,7 +79,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 pub(crate) use structure::ControlFlowStructurer;
 
-fn is_generic_arg_name(name: &str) -> bool {
+pub(crate) fn is_generic_arg_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     lower
         .strip_prefix("arg")
@@ -510,17 +510,23 @@ fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'s
     }
 }
 
-fn summary_memory_region_label(region: r2ssa::SummaryMemoryRegion) -> String {
+fn summary_memory_region_label(
+    region: r2ssa::SummaryMemoryRegion,
+    names: SummaryArgNames<'_>,
+) -> String {
     match region {
-        r2ssa::SummaryMemoryRegion::Arg { index } => format!("arg{index}"),
+        r2ssa::SummaryMemoryRegion::Arg { index } => names.label(index),
         r2ssa::SummaryMemoryRegion::Global { address } => format!("global[0x{address:x}]"),
         r2ssa::SummaryMemoryRegion::HeapReturn => "heap_return".to_string(),
         r2ssa::SummaryMemoryRegion::Unknown => "unknown".to_string(),
     }
 }
 
-fn summary_memory_location_label(location: &r2ssa::SummaryMemoryLocation) -> String {
-    let base = summary_memory_region_label(location.region);
+fn summary_memory_location_label(
+    location: &r2ssa::SummaryMemoryLocation,
+    names: SummaryArgNames<'_>,
+) -> String {
+    let base = summary_memory_region_label(location.region, names);
     if let Some(range) = location.range {
         let width = range
             .width
@@ -535,9 +541,12 @@ fn summary_memory_location_label(location: &r2ssa::SummaryMemoryLocation) -> Str
     }
 }
 
-fn summary_transfer_length_label(len: r2ssa::SummaryTransferLength) -> String {
+fn summary_transfer_length_label(
+    len: r2ssa::SummaryTransferLength,
+    names: SummaryArgNames<'_>,
+) -> String {
     match len {
-        r2ssa::SummaryTransferLength::Arg(index) => format!("arg{index}"),
+        r2ssa::SummaryTransferLength::Arg(index) => names.label(index),
         r2ssa::SummaryTransferLength::Const(value) => value.to_string(),
         r2ssa::SummaryTransferLength::Unknown => "unknown".to_string(),
     }
@@ -638,31 +647,120 @@ fn native_worker_loop_detail(loop_summary: &r2sym::NativeWorkerLoopSummary) -> S
     parts.join(" ")
 }
 
-fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Option<String> {
+/// Names for the argument slots a summary refers to by index.
+///
+/// A summary records `SummaryMemoryRegion::Arg { index }` -- structured, exact,
+/// and nameless. Rendering it as the literal `arg{index}` and then scanning the
+/// emitted C afterwards to substitute a real name is how this used to work, and
+/// two different producers wrote that token with two different index bases while
+/// one post-pass tried to undo both. The index is structured the whole way down;
+/// only the label needs a name, so the name is resolved here.
+#[derive(Clone, Copy)]
+pub(crate) struct SummaryArgNames<'a> {
+    type_facts: &'a r2types::FunctionTypeFacts,
+}
+
+impl<'a> SummaryArgNames<'a> {
+    pub(crate) fn new(type_facts: &'a r2types::FunctionTypeFacts) -> Self {
+        Self { type_facts }
+    }
+
+    /// Whether anything at all is known about this function's parameters.
+    ///
+    /// If something is, an unnamed slot still must not print as `arg2`: that
+    /// reads as a name the rendering recovered, and the summary route is
+    /// precisely the route that could not recover one.
+    fn function_has_parameter_facts(&self) -> bool {
+        // A merged signature does not count. It can exist for a function
+        // whose parameters were never established, and the summary route is
+        // reached precisely when that recovery did not happen.
+        !self.type_facts.register_params.is_empty()
+            || self.type_facts.render_authorized_signature().is_some()
+    }
+
+    /// The name for one argument slot, or a placeholder that says no source
+    /// named it.
+    pub(crate) fn label(&self, index: usize) -> String {
+        let named = |name: &str| {
+            let name = name.trim();
+            (!name.is_empty() && !is_generic_arg_name(name)).then(|| name.to_string())
+        };
+        self.type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|signature| signature.params.get(index))
+            .and_then(|param| named(&param.name))
+            .or_else(|| {
+                self.type_facts
+                    .render_authorized_signature()
+                    .and_then(|signature| signature.params.get(index))
+                    .and_then(|param| named(&param.name))
+            })
+            .or_else(|| {
+                self.type_facts
+                    .register_params
+                    .get(index)
+                    .and_then(|param| named(&param.name))
+            })
+            .unwrap_or_else(|| {
+                // Nothing named this slot. If the function is known to take
+                // parameters at all, saying `arg0` would read as a name the
+                // rendering had recovered, so it gets a placeholder that
+                // plainly is not one. With no parameter facts at all the slot
+                // index is the honest label: the summary really does mean
+                // "argument 0" and says nothing more.
+                if !self.function_has_parameter_facts() {
+                    format!("arg{index}")
+                } else {
+                    format!("summary_input{index}")
+                }
+            })
+    }
+}
+
+fn native_worker_summary_pseudocode(
+    summary: &r2sym::NativeWorkerSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     match summary.kind {
         r2sym::NativeWorkerSummaryKind::ProgramOrchestrator => {
             Some("orchestrate program phases from argc, argv, and environment".to_string())
         }
         r2sym::NativeWorkerSummaryKind::MemoryTransfer => {
-            let dst = summary.dst.as_ref().map(summary_memory_location_label)?;
-            let src = summary.src.as_ref().map(summary_memory_location_label)?;
+            let dst = summary
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = summary
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = summary
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("copy {len} bytes from {src} to {dst}"))
         }
         r2sym::NativeWorkerSummaryKind::FileTransfer => {
-            let dst = summary.dst.as_ref().map(summary_memory_location_label)?;
-            let src = summary.src.as_ref().map(summary_memory_location_label)?;
+            let dst = summary
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = summary
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = summary
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "bounded chunks".to_string());
             Some(format!("copy file data from {src} to {dst} ({len})"))
         }
         r2sym::NativeWorkerSummaryKind::StringScan => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let terminator = summary
                 .loop_summary
                 .as_ref()
@@ -672,7 +770,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             Some(format!("scan {memory} until {terminator}"))
         }
         r2sym::NativeWorkerSummaryKind::MemoryRead | r2sym::NativeWorkerSummaryKind::TableWalk => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let terminator = summary
                 .loop_summary
                 .as_ref()
@@ -682,35 +783,59 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             Some(format!("scan {memory} until {terminator}"))
         }
         r2sym::NativeWorkerSummaryKind::PathWalk => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("walk path components from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::DirectoryTraversal => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("traverse directory entries from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::RecordStream => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("read records from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::FieldSelection => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("select fields using {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::OutputStream => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("write output stream from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::FormatRender => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("render formatted output from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::MetadataProbe => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("probe file metadata for {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::SortMerge => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("merge sorted records from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::NumericTransform => {
@@ -723,10 +848,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
                 let memory = summary
                     .memory
                     .as_ref()
-                    .map(summary_memory_location_label)
+                    .map(|location| summary_memory_location_label(location, names))
                     .unwrap_or_else(|| "summary_input".to_string());
                 let length = summary_worker_length(summary)
-                    .map(summary_transfer_length_label)
+                    .map(|len| summary_transfer_length_label(len, names))
                     .unwrap_or_else(|| "unknown length".to_string());
                 if let Some(predicate) = fold.predicate.as_ref() {
                     return Some(format!(
@@ -749,12 +874,15 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let dst = summary
                 .dst
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "return value".to_string());
             Some(format!("compute numeric transform into {dst}"))
         }
         r2sym::NativeWorkerSummaryKind::HashFold => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let fold = summary.loop_summary.as_ref()?.fold.as_ref()?;
             Some(format!(
                 "{} fold over {} into {}",
@@ -764,7 +892,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             ))
         }
         r2sym::NativeWorkerSummaryKind::Parser => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let parser = summary
                 .parser
                 .as_ref()
@@ -776,7 +907,7 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let fmt = summary
                 .memory
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "format argument".to_string());
             Some(format!("diagnose formatted error from {fmt}"))
         }
@@ -784,12 +915,12 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let dst = summary
                 .dst
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "argument table".to_string());
             let src = summary
                 .src
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "va_list".to_string());
             Some(format!("fetch printf arguments from {src} into {dst}"))
         }
@@ -809,35 +940,45 @@ fn summary_worker_length(
     })
 }
 
-fn native_worker_summary_detail(summary: &r2sym::NativeWorkerSummary) -> String {
+fn native_worker_summary_detail(
+    summary: &r2sym::NativeWorkerSummary,
+    names: SummaryArgNames<'_>,
+) -> String {
     let mut parts = Vec::new();
     if let Some(dst) = summary.dst.as_ref() {
-        parts.push(format!("dst={}", summary_memory_location_label(dst)));
+        parts.push(format!("dst={}", summary_memory_location_label(dst, names)));
     }
     if let Some(src) = summary.src.as_ref() {
-        parts.push(format!("src={}", summary_memory_location_label(src)));
+        parts.push(format!("src={}", summary_memory_location_label(src, names)));
     }
     if let Some(memory) = summary.memory.as_ref() {
-        parts.push(format!("mem={}", summary_memory_location_label(memory)));
+        parts.push(format!(
+            "mem={}",
+            summary_memory_location_label(memory, names)
+        ));
     }
     if let Some(len) = summary.len {
-        parts.push(format!("len={}", summary_transfer_length_label(len)));
+        parts.push(format!("len={}", summary_transfer_length_label(len, names)));
     }
     if let Some(allocation) = summary.allocation {
         parts.push(format!(
             "alloc_size={} zeroed={}",
             allocation
                 .size_arg
-                .map(|index| format!("arg{index}"))
+                .map(|index| names.label(index))
                 .unwrap_or_else(|| "unknown".to_string()),
             allocation.zeroed
         ));
     }
     if let Some(lifetime) = summary.lifetime {
-        parts.push(format!("lifetime={:?}(arg{})", lifetime.op, lifetime.arg));
+        parts.push(format!(
+            "lifetime={:?}({})",
+            lifetime.op,
+            names.label(lifetime.arg)
+        ));
     }
     if let Some(sync) = summary.sync {
-        parts.push(format!("sync={:?}(arg{})", sync.op, sync.arg));
+        parts.push(format!("sync={:?}({})", sync.op, names.label(sync.arg)));
     }
     if let Some(atomic) = summary.atomic {
         parts.push(format!("atomic={:?}/{:?}", atomic.op, atomic.ordering));
@@ -903,14 +1044,23 @@ fn native_region_loop_detail(loop_summary: &r2sym::NativeLoopSummary) -> String 
     parts.join(" ")
 }
 
-fn native_region_access_pseudocode(access: &r2sym::NativeMemoryAccessSummary) -> Option<String> {
+fn native_region_access_pseudocode(
+    access: &r2sym::NativeMemoryAccessSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     match access.kind {
         r2sym::NativeMemoryAccessKind::Transfer => {
-            let dst = access.dst.as_ref().map(summary_memory_location_label)?;
-            let src = access.src.as_ref().map(summary_memory_location_label)?;
+            let dst = access
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = access
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = access
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("copy {len} bytes from {src} to {dst}"))
         }
@@ -918,33 +1068,36 @@ fn native_region_access_pseudocode(access: &r2sym::NativeMemoryAccessSummary) ->
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("read stream from {memory}"))
         }
         r2sym::NativeMemoryAccessKind::Write => {
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("write stream to {memory}"))
         }
         r2sym::NativeMemoryAccessKind::Atomic => {
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("atomic update at {memory}"))
         }
         _ => None,
     }
 }
 
-fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Option<String> {
+fn native_region_summary_pseudocode(
+    summary: &r2sym::NativeRegionSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     if let Some(reduction) = summary.reductions.first() {
         let source = reduction
             .source
             .as_ref()
-            .map(summary_memory_location_label)
+            .map(|location| summary_memory_location_label(location, names))
             .unwrap_or_else(|| "unknown".to_string());
         return Some(format!(
             "{} fold over {} into {}",
@@ -959,7 +1112,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         return Some(format!("scan {memory} until zero byte"));
     }
     if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser)
@@ -968,7 +1121,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         let parser = summary
             .parser
             .as_ref()
@@ -1003,7 +1156,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         return Some(format!("walk path components from {memory}"));
     }
     if matches!(
@@ -1039,7 +1192,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
     summary
         .memory_accesses
         .iter()
-        .find_map(native_region_access_pseudocode)
+        .find_map(|access| native_region_access_pseudocode(access, names))
 }
 
 fn native_region_summary_detail(summary: &r2sym::NativeRegionSummary) -> String {
@@ -1574,86 +1727,6 @@ fn summary_rollup_return_expr(function_facts: &FunctionFacts) -> Option<CExpr> {
         | r2ssa::SummaryReturnRelation::HeapAlloc
         | r2ssa::SummaryReturnRelation::Global(_) => None,
     }
-}
-
-fn rewrite_summary_arg_labels(output: String, type_facts: &FunctionTypeFacts) -> String {
-    let mut replacements: Vec<Option<String>> = Vec::new();
-    let extra_index_base;
-    if let Some(signature) = type_facts.render_authorized_signature() {
-        extra_index_base = 0usize;
-        for (idx, param) in signature.params.iter().enumerate() {
-            let name = param.name.trim();
-            if name.is_empty() || is_generic_arg_name(name) {
-                continue;
-            }
-            if replacements.len() <= idx {
-                replacements.resize(idx + 1, None);
-            }
-            replacements[idx] = Some(name.to_string());
-        }
-    } else if !type_facts.register_params.is_empty() {
-        extra_index_base = 1usize;
-        replacements = type_facts
-            .register_params
-            .iter()
-            .enumerate()
-            .map(|(idx, param)| {
-                let name = param.name.trim();
-                if name.is_empty() || is_generic_arg_name(name) {
-                    Some(format!("summary_input{}", idx + 1))
-                } else {
-                    Some(name.to_string())
-                }
-            })
-            .collect();
-    } else {
-        return output;
-    }
-
-    let bytes = output.as_bytes();
-    let mut rewritten = String::with_capacity(output.len());
-    let mut copied = 0usize;
-    let mut cursor = 0usize;
-    while cursor < output.len() {
-        if cursor + 3 <= output.len()
-            && &bytes[cursor..cursor + 3] == b"arg"
-            && (cursor == 0 || !is_summary_ident_byte(bytes[cursor - 1]))
-        {
-            let mut end = cursor + 3;
-            while end < output.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > cursor + 3
-                && (end == output.len() || !bytes[end].is_ascii_alphanumeric())
-                && let Ok(index) = output[cursor + 3..end].parse::<usize>()
-            {
-                let replacement = replacements
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .cloned()
-                    .or_else(|| Some(format!("summary_input{}", index + extra_index_base)));
-                if let Some(name) = replacement {
-                    rewritten.push_str(&output[copied..cursor]);
-                    rewritten.push_str(&name);
-                    copied = end;
-                    cursor = end;
-                    continue;
-                }
-            }
-        }
-
-        cursor += output[cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-    }
-    rewritten.push_str(&output[copied..]);
-    rewritten
-}
-
-fn is_summary_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
@@ -8853,7 +8926,10 @@ mod tests {
         assert!(!output.contains("summary locals are synthetic"));
         assert!(!output.contains("while ("));
         assert!(!output.contains("return summary_value;"));
-        assert!(output.contains("worker loop: parse base10 numeric stream from arg0"));
+        // `str`, not `arg0`. The parameter was named all along; this summary
+        // path simply never ran the text scan that substituted names, so it
+        // printed the slot index instead of the name the facts already held.
+        assert!(output.contains("worker loop: parse base10 numeric stream from str"));
         assert!(output.contains("worker summary: parser"));
     }
 
