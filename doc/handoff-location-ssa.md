@@ -6198,33 +6198,35 @@ the list outright was rejected because it is not a uniform refusal: at
 `facts.rs:1280` and `writeback.rs:3278` it degrades output silently rather than
 declining, and at `writeback.rs:9833` the polarity inverts.
 
-**The derived replacement for `semantic_typedef_is_authoritative`, worked out and
-not landed.** The predicate should be: a type name is authoritative when
-something can actually resolve it -- when the C language resolves it, which
-`parse_c_type_like` already answers, or when the external type database holds a
-real layout for it, which `external_named_aggregate_has_real_layout` already
-answers, or when the database holds a typedef entry that eventually names one.
-That is three lines over facts the tree already has, and unlike a list of about
-two hundred coreutils and gnulib spellings it says the same thing about a
-coreutils typedef and about anybody else's.
+**The last name-keyed coreutils table is gone.**
+`semantic_typedef_is_authoritative` was a list of about two hundred spellings --
+`cp_options`, `cycle_check_state`, `randread_source`, alongside standard ones
+like `size_t` -- that decided whether a typedef was concrete enough to keep
+rather than replace. A name on the list was authoritative for every binary and a
+name off it for none, whether or not the binary carried the type.
 
-It was written and then reverted, because wiring it in is the actual work and
-the tree does not keep a change that alters nothing. The three consumers --
-`facts::pointer_hint_is_authoritative` and the two `*_can_replace_*` predicates
--- have no type database in scope, and threading one to them reaches about
-twenty-three call sites across `facts.rs`, `function_facts.rs` and
-`writeback.rs`, each of which then needs it from its own callers. An attempt at
-that threading spread further than it should have and was reverted whole.
+`type_db_resolves_type_name` answers the same question from evidence: the C
+language resolves the name, or the external type database holds a real layout
+for it, or a typedef entry that eventually names one. Two spellings are
+authoritative by construction rather than by evidence -- `allocation_ptr` and
+`memory_ptr` -- because this decompiler mints them itself and defines them in
+the emitted prelude, so no binary could declare them.
 
-The reason it spreads is worth stating, because it points at the better shape.
-These predicates ask "is this typedef resolvable" at the moment of *use*, which
-is why every one of them needs the database. A typedef should instead be
-resolved against the database once, where a spelling becomes a `CTypeLike` --
-`parse_c_type_like` is already that seam, and already folds the builtin
-spellings. Then an unresolved `CTypeLike::Typedef` means exactly "nothing could
-resolve this name", the predicates become a pattern match with no database
-argument at all, and the list has nowhere left to live. That is the change to
-make, and it subsumes the threading rather than adding to it.
+Wiring it in meant threading the database to the three consumers and their
+callers, about twenty sites across `facts.rs`, `function_facts.rs` and
+`writeback.rs`. Two places take it as a disjoint field borrow beside a mutable
+one, and `build_type_writeback_analysis_inner` binds it after the last mutation
+of the parsed context so it is borrowed rather than copied -- the database is
+per binary and that function runs per function.
+
+Three tests changed, and each says something worth keeping. Two now build a type
+database that declares the type they depend on, rather than relying on a
+spelling being on a list. The third,
+`exact_role_signature_prunes_generated_aggregate_override`, now asserts the
+opposite outcome: with nothing declaring `FTS`, the locally inferred
+`sla_struct_fts` layout is the only description of that parameter anything can
+point at, so it is kept rather than pruned. That is the behaviour the list was
+hiding.
 
 **Two clone findings that measurement did not support.** An architecture audit
 reported `FunctionFacts` being deep-cloned five or six times per function and

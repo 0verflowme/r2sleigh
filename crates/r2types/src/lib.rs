@@ -97,8 +97,8 @@ pub use prepare::{
 pub use r2source::DisplayNames;
 pub use r2ssa::AssumptionUsageReport;
 pub use role_registry::{
-    semantic_typedef_is_authoritative, signature_hint_for_role_identity,
-    signature_hint_for_summary_kinds, type_projection_for_role_identity,
+    signature_hint_for_role_identity, signature_hint_for_summary_kinds,
+    type_projection_for_role_identity,
 };
 pub use signature::{ResolvedSignature, SignatureRegistry};
 pub use signature_infer::{

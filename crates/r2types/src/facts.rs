@@ -780,12 +780,16 @@ impl FunctionTypeFacts {
             );
         }
 
+        // Borrowed before the mutable one below: these are disjoint fields, so
+        // the type database stays readable while the signature is edited.
+        let type_db = &self.external_type_db;
         let Some(existing) = self.merged_signature.as_mut() else {
             self.merged_signature = Some(projection.signature);
             return SignatureProjectionResult::applied(true);
         };
 
-        let changed = apply_signature_projection_to_existing(existing, &projection, ptr_bits);
+        let changed =
+            apply_signature_projection_to_existing(existing, &projection, ptr_bits, type_db);
         SignatureProjectionResult::applied(changed)
     }
 
@@ -910,6 +914,7 @@ pub fn signature_hint_can_replace_existing(
     existing: &CTypeLike,
     hint: Option<&CTypeLike>,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if is_generic_signature_type(Some(existing)) {
         return true;
@@ -920,7 +925,9 @@ pub fn signature_hint_can_replace_existing(
     if crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits) {
         return false;
     }
-    if type_is_generated_local_struct_pointer(existing) && pointer_hint_is_authoritative(hint) {
+    if type_is_generated_local_struct_pointer(existing)
+        && pointer_hint_is_authoritative(hint, ptr_bits, type_db)
+    {
         return true;
     }
     match (existing, hint) {
@@ -932,7 +939,7 @@ pub fn signature_hint_can_replace_existing(
             CTypeLike::Typedef(name),
         ) => {
             let normalized = name.trim().to_ascii_lowercase();
-            semantic_typedef_is_authoritative(&normalized)
+            crate::writeback::type_db_resolves_type_name(type_db, &normalized, ptr_bits)
                 || matches!(normalized.as_str(), "int" | "unsigned int")
                 || (normalized == "uintptr_t" && *bits == ptr_bits)
         }
@@ -964,6 +971,7 @@ pub fn signature_hint_can_replace_existing(
                     inner.as_ref(),
                     Some(new_inner.as_ref()),
                     ptr_bits,
+                    type_db,
                 )
                 || (matches!(
                     (inner.as_ref(), new_inner.as_ref()),
@@ -996,7 +1004,7 @@ pub fn signature_hint_can_replace_existing(
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
             is_weak_storage_scalar_typedef(existing_name, ptr_bits)
-                && semantic_typedef_is_authoritative(hint_name)
+                && crate::writeback::type_db_resolves_type_name(type_db, hint_name, ptr_bits)
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
             is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
@@ -1009,8 +1017,9 @@ pub fn signature_return_hint_can_replace_existing(
     existing: &CTypeLike,
     hint: Option<&CTypeLike>,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
-    if signature_hint_can_replace_existing(existing, hint, ptr_bits) {
+    if signature_hint_can_replace_existing(existing, hint, ptr_bits, type_db) {
         return true;
     }
     matches!(hint, Some(CTypeLike::Void)) && is_weak_storage_scalar_type(existing, ptr_bits)
@@ -1020,6 +1029,7 @@ pub fn summary_hint_can_replace_weak_existing(
     existing: &CTypeLike,
     hint: &CTypeLike,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if is_generic_signature_type(Some(existing)) {
         return true;
@@ -1048,7 +1058,7 @@ pub fn summary_hint_can_replace_weak_existing(
         ) => *bits == ptr_bits,
         (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
             is_weak_storage_scalar_typedef(existing_name, ptr_bits)
-                && semantic_typedef_is_authoritative(hint_name)
+                && crate::writeback::type_db_resolves_type_name(type_db, hint_name, ptr_bits)
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
             is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
@@ -1120,13 +1130,14 @@ fn apply_signature_projection_to_existing(
     existing: &mut FunctionSignatureSpec,
     projection: &FunctionSignatureProjection,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     let mut changed = false;
     let hint = &projection.signature;
     let exact_strong_projection =
         projection.exact_arity && projection.has_strong_signature_confidence();
     let can_replace_signature = exact_strong_projection
-        && signature_can_be_replaced_by_projection(existing, hint, ptr_bits);
+        && signature_can_be_replaced_by_projection(existing, hint, ptr_bits, type_db);
 
     if can_replace_signature && existing.params.len() > hint.params.len() {
         existing.params.truncate(hint.params.len());
@@ -1157,6 +1168,7 @@ fn apply_signature_projection_to_existing(
                             existing_ty,
                             hint.ret_type.as_ref(),
                             ptr_bits,
+                            type_db,
                         )
                 }
             }
@@ -1196,7 +1208,12 @@ fn apply_signature_projection_to_existing(
             }
             Some(existing_ty) => {
                 can_replace_signature
-                    || signature_hint_can_replace_existing(existing_ty, Some(hint_ty), ptr_bits)
+                    || signature_hint_can_replace_existing(
+                        existing_ty,
+                        Some(hint_ty),
+                        ptr_bits,
+                        type_db,
+                    )
             }
         };
         if should_replace_ty && existing_param.ty.as_ref() != Some(hint_ty) {
@@ -1212,6 +1229,7 @@ fn signature_can_be_replaced_by_projection(
     existing: &FunctionSignatureSpec,
     hint: &FunctionSignatureSpec,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if existing.params.is_empty() {
         return true;
@@ -1228,7 +1246,12 @@ fn signature_can_be_replaced_by_projection(
         let weak_type = param.ty.as_ref().is_none_or(|ty| {
             is_generic_signature_type(Some(ty))
                 || hint_param.is_some_and(|hint_param| {
-                    signature_hint_can_replace_existing(ty, hint_param.ty.as_ref(), ptr_bits)
+                    signature_hint_can_replace_existing(
+                        ty,
+                        hint_param.ty.as_ref(),
+                        ptr_bits,
+                        type_db,
+                    )
                 })
                 || (hint_param.is_none() && type_is_generated_local_struct_pointer(ty))
                 || is_weak_storage_scalar_type(ty, ptr_bits)
@@ -1265,7 +1288,11 @@ fn anonymous_function_name(function_name: &str) -> bool {
     )
 }
 
-fn pointer_hint_is_authoritative(hint: &CTypeLike) -> bool {
+fn pointer_hint_is_authoritative(
+    hint: &CTypeLike,
+    ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
+) -> bool {
     let CTypeLike::Pointer(inner) = hint else {
         return false;
     };
@@ -1276,13 +1303,11 @@ fn pointer_hint_is_authoritative(hint: &CTypeLike) -> bool {
         | CTypeLike::Union(_)
         | CTypeLike::Enum(_)
         | CTypeLike::Pointer(_) => true,
-        CTypeLike::Typedef(name) => semantic_typedef_is_authoritative(name),
+        CTypeLike::Typedef(name) => {
+            crate::writeback::type_db_resolves_type_name(type_db, name, ptr_bits)
+        }
         _ => false,
     }
-}
-
-fn semantic_typedef_is_authoritative(name: &str) -> bool {
-    crate::role_registry::semantic_typedef_is_authoritative(name)
 }
 
 fn generated_local_struct_name(name: &str) -> bool {

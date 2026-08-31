@@ -2785,6 +2785,7 @@ impl FunctionFacts {
     /// certified path to one ABI parameter and the callee identity carries a
     /// typed signature. Conflicting callees leave the caller type unchanged.
     pub fn apply_certified_call_argument_type_constraints(&mut self, ptr_bits: u32) -> usize {
+        let type_db = &self.types.external_type_db;
         let mut constraints = BTreeMap::<usize, CTypeLike>::new();
         let mut conflicted = BTreeSet::new();
         for (callsite, arguments) in &self.callsites.by_callsite {
@@ -2816,6 +2817,7 @@ impl FunctionFacts {
                             existing,
                             Some(hint),
                             ptr_bits,
+                            type_db,
                         ) =>
                     {
                         constraints.insert(slot, hint.clone());
@@ -2825,6 +2827,7 @@ impl FunctionFacts {
                             hint,
                             Some(existing),
                             ptr_bits,
+                            type_db,
                         ) => {}
                     Some(_) => {
                         constraints.remove(&slot);
@@ -2852,6 +2855,7 @@ impl FunctionFacts {
                             existing,
                             Some(&hint),
                             ptr_bits,
+                            type_db,
                         )
                 }
             };
@@ -2981,6 +2985,7 @@ impl FunctionFacts {
         recovered: &crate::EvidenceTypes,
         ptr_bits: u32,
     ) {
+        let type_db = &self.types.external_type_db;
         let Some(signature) = self.types.merged_signature.as_ref() else {
             return;
         };
@@ -3006,7 +3011,7 @@ impl FunctionFacts {
         let Some(candidate) = candidate else {
             return;
         };
-        if !recovered_type_outranks(&existing, &candidate, ptr_bits) {
+        if !recovered_type_outranks(&existing, &candidate, ptr_bits, type_db) {
             return;
         }
         if let Some(signature) = self.types.merged_signature.as_mut() {
@@ -3022,6 +3027,7 @@ impl FunctionFacts {
         recovered: &crate::EvidenceTypes,
         ptr_bits: u32,
     ) {
+        let type_db = &self.types.external_type_db;
         let mut retyped: Vec<(String, CTypeLike)> = Vec::new();
         for (key, ty) in recovered.stack_slot_types() {
             let Some(slot) = self.types.stack_slots.get_mut(key) else {
@@ -3029,7 +3035,7 @@ impl FunctionFacts {
             };
             let replace = match slot.ty.as_ref() {
                 None => true,
-                Some(existing) => recovered_type_outranks(existing, ty, ptr_bits),
+                Some(existing) => recovered_type_outranks(existing, ty, ptr_bits, type_db),
             };
             if !replace {
                 continue;
@@ -3049,7 +3055,7 @@ impl FunctionFacts {
             {
                 let replace = match binding.ty.as_ref() {
                     None => true,
-                    Some(existing) => recovered_type_outranks(existing, &ty, ptr_bits),
+                    Some(existing) => recovered_type_outranks(existing, &ty, ptr_bits, type_db),
                 };
                 if replace {
                     binding.ty = Some(ty.clone());
@@ -3184,11 +3190,21 @@ fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa
 /// of the register that spilled it, and any structured type outranks that; a
 /// type that is already structured is never demoted, so a recovered type cannot
 /// overwrite a declared one.
-fn recovered_type_outranks(existing: &CTypeLike, recovered: &CTypeLike, ptr_bits: u32) -> bool {
+fn recovered_type_outranks(
+    existing: &CTypeLike,
+    recovered: &CTypeLike,
+    ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
+) -> bool {
     if crate::signature_infer::signature_types_are_equivalent(existing, recovered, ptr_bits) {
         return false;
     }
-    if crate::facts::signature_hint_can_replace_existing(existing, Some(recovered), ptr_bits) {
+    if crate::facts::signature_hint_can_replace_existing(
+        existing,
+        Some(recovered),
+        ptr_bits,
+        type_db,
+    ) {
         return true;
     }
     crate::facts::is_weak_storage_scalar_type(existing, ptr_bits)
@@ -5248,7 +5264,12 @@ mod tests {
             signedness: crate::Signedness::Signed,
         };
         let recovered = CTypeLike::Pointer(Box::new(CTypeLike::Void));
-        assert!(recovered_type_outranks(&existing, &recovered, 64));
+        assert!(recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
     }
 
     #[test]
@@ -5263,7 +5284,12 @@ mod tests {
             CTypeLike::Typedef("int64_t".to_string()),
         ] {
             assert!(
-                !recovered_type_outranks(&existing, &recovered, 64),
+                !recovered_type_outranks(
+                    &existing,
+                    &recovered,
+                    64,
+                    &crate::ExternalTypeDb::default()
+                ),
                 "{recovered:?} must not replace a struct pointer"
             );
         }
@@ -5276,7 +5302,12 @@ mod tests {
             bits: 32,
             signedness: crate::Signedness::Signed,
         };
-        assert!(!recovered_type_outranks(&existing, &recovered, 64));
+        assert!(!recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
     }
 
     #[test]
@@ -5289,7 +5320,12 @@ mod tests {
             bits: 32,
             signedness: crate::Signedness::Unsigned,
         };
-        assert!(!recovered_type_outranks(&existing, &recovered, 64));
+        assert!(!recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
     }
 
     #[test]
