@@ -6215,6 +6215,41 @@ mod tests {
         );
     }
 
+    /// The other half of the lane rule, and the half that keeps it sound.
+    ///
+    /// A partial write preserves the rest of its carrier, and that preservation
+    /// is real as soon as something reads the carrier. Here the byte written at
+    /// offset eight is followed by a read of the whole eight-byte register, so
+    /// the write must stay an insert: rendering it as a lane would assign the
+    /// whole object from one byte and lose the other seven.
+    #[test]
+    fn a_partial_write_read_through_its_carrier_stays_an_insert() {
+        let arch = register_geometry_arch();
+        let artifact = artifact_with_arch(
+            [
+                R2ILOp::Copy {
+                    dst: Varnode::register(1, 1),
+                    src: Varnode::constant(7, 1),
+                },
+                R2ILOp::Copy {
+                    dst: Varnode::register(16, 8),
+                    src: Varnode::register(0, 8),
+                },
+            ],
+            &arch,
+        );
+        let projection = MachineProjection::from_artifact(&artifact).expect("projection");
+        assert_eq!(
+            exact_write(&projection, &artifact, 0),
+            MachineWriteProjection::Insert {
+                bit_offset: 8,
+                width_bits: 8,
+                carrier_width_bits: 64,
+            },
+            "the carrier is read whole, so the write's preservation is observable"
+        );
+    }
+
     #[test]
     fn corrupted_write_disposition_is_rejected() {
         let arch = register_geometry_arch();

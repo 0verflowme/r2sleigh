@@ -2310,9 +2310,37 @@ a table the rendered program does not have.
   same failure mode as the linearized switch arms: it compiles, it looks right,
   and it is wrong, which is worse than the refusal it replaced.
 
-  So the object width is not the thing to attack at all. What remains is that
-  all four lanes of these vectors are always written together and consumed only
-  by an explicit `Piece`. The rendering that follows
+  A seventh attempt found what the sixth had actually done, and it was not what
+  the sixth's conclusion said. Reading the wrong output against the machine code
+  shows one expression shape repeated fifteen times: a lane read applies its bit
+  offset **twice** -- `(uint32_t)((__uint128_t)(uint32_t)(X >> N) >> N)` -- once
+  in the operand's projection and once in the extracting operation, which
+  already applies it. Every lane above the first therefore reads as identically
+  zero, `pcmpeqd` compares zero against zero and answers all-ones, and the
+  horizontal XOR reduction collapses to lane zero. Verified numerically: a model
+  following the instructions reproduces the reference CRC for all 256 single
+  bytes, and a model following the rendered C reproduces the wrong `8bb1d29a`.
+  So the composition does *not* depend on the re-basing; the sixth attempt
+  simply double-counted, and its conclusion was wrong.
+
+  Reading a self-contained value as itself -- no projection at all, since the
+  object *is* the value -- fixes that, and the corpus then reads **52 of 54 with
+  all four scores equal and the differential oracle green**, `pearson` included.
+
+  It is still not landable, and the reason is worth more than the score. A test
+  written to guard the other half of the rule fails: a byte written at offset
+  eight and then read back through the whole eight-byte register comes out as a
+  lane, so the rendering would assign the whole object from one byte and lose the
+  other seven. The write rule decides lane-versus-insert from the writing
+  instruction's own operands and cannot see the later read. The corpus does not
+  contain that shape, which is exactly why the corpus cannot be the authority
+  here.
+
+  The completing step is therefore specific: the write rule has to consult the
+  same "no read reaches outside this value" predicate the use rule does, which
+  means the projection build has to compute operation-relative uses for the whole
+  function before deciding writes, rather than deciding both in one pass. The
+  guard test is kept in the tree so the unsound version cannot land quietly. The rendering that follows
   from that is a single composed assignment of the whole object, not four writes
   into a carrier-wide object that must then be read to preserve what they did
   not touch. Gate: `crc32_bitwise` at x64 -O2 renders, compiles under the strict
