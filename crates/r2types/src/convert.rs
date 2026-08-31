@@ -68,6 +68,10 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
             signedness: Signedness::Signed,
         } => "int64_t".to_string(),
         CTypeLike::Int {
+            bits: 128,
+            signedness: Signedness::Signed | Signedness::Unknown,
+        } => "__int128_t".to_string(),
+        CTypeLike::Int {
             bits,
             signedness: Signedness::Signed | Signedness::Unknown,
         } => format!("int{bits}_t"),
@@ -87,6 +91,14 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
             bits: 64,
             signedness: Signedness::Unsigned,
         } => "uint64_t".to_string(),
+        // A 128-bit integer has exactly one spelling a C compiler accepts, and
+        // `uint128_t` is not it. `r2dec` already knew this for the C it emits;
+        // this renderer feeds radare2's type database, which had been getting a
+        // type name no compiler would take.
+        CTypeLike::Int {
+            bits: 128,
+            signedness: Signedness::Unsigned,
+        } => "__uint128_t".to_string(),
         CTypeLike::Int {
             bits,
             signedness: Signedness::Unsigned,
@@ -106,9 +118,293 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
     }
 }
 
+/// Parse a C type spelling into the model.
+///
+/// This is the inverse of `render_c_type_like`, and it exists because the tree
+/// had no canonical one: six separate parsers had grown at the seams where a
+/// type had been stored as a rendered string, and they did not agree with each
+/// other. A spelling is data arriving from radare2's type database, from DWARF,
+/// or from our own renderer, so the parser has to accept more spellings than
+/// the renderer emits -- `unsigned int` as well as `uint32_t`, `char *` as well
+/// as `char*`.
+///
+/// `ptr_bits` is a parameter rather than an assumption because the width of
+/// `long` and `size_t` is a property of the target, and guessing it is how two
+/// of the previous parsers came to disagree.
+pub fn parse_c_type_like(spelling: &str, ptr_bits: u32) -> CTypeLike {
+    let normalized = crate::external::normalize_external_type_name(spelling);
+    parse_normalized(normalized.trim(), ptr_bits)
+}
+
+fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
+    let spelling = spelling.trim();
+    if spelling.is_empty() || spelling == "/* unknown */" {
+        return CTypeLike::Unknown;
+    }
+    if let Some(inner) = spelling.strip_suffix('*') {
+        return CTypeLike::Pointer(Box::new(parse_normalized(inner, ptr_bits)));
+    }
+    if let Some(open) = spelling.rfind('[')
+        && spelling.ends_with(']')
+    {
+        let len = spelling[open + 1..spelling.len() - 1].trim();
+        let len = if len.is_empty() {
+            None
+        } else {
+            len.parse::<usize>().ok()
+        };
+        return CTypeLike::Array(Box::new(parse_normalized(&spelling[..open], ptr_bits)), len);
+    }
+    for (keyword, build) in [
+        ("struct ", CTypeLike::Struct as fn(String) -> CTypeLike),
+        ("union ", CTypeLike::Union as fn(String) -> CTypeLike),
+        ("enum ", CTypeLike::Enum as fn(String) -> CTypeLike),
+    ] {
+        if let Some(name) = spelling.strip_prefix(keyword) {
+            return build(name.trim().to_string());
+        }
+    }
+    if spelling.contains("(*)") {
+        return CTypeLike::Function;
+    }
+
+    let collapsed = spelling.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(width) = fixed_width_integer(&collapsed) {
+        return width;
+    }
+    match collapsed.as_str() {
+        "void" => CTypeLike::Void,
+        "bool" | "_Bool" => CTypeLike::Bool,
+        "float" => CTypeLike::Float(32),
+        "double" | "long double" => CTypeLike::Float(64),
+        _ => match named_integer_bits(&collapsed, ptr_bits) {
+            Some((bits, signedness)) => CTypeLike::Int { bits, signedness },
+            None => CTypeLike::Typedef(collapsed),
+        },
+    }
+}
+
+/// The `intN_t` family, including the `__int128_t` spelling that is the only
+/// one a C compiler accepts for that width.
+fn fixed_width_integer(spelling: &str) -> Option<CTypeLike> {
+    let (rest, signedness) = match spelling
+        .strip_prefix("__")
+        .unwrap_or(spelling)
+        .strip_prefix('u')
+    {
+        Some(rest) => (rest, Signedness::Unsigned),
+        None => (
+            spelling.strip_prefix("__").unwrap_or(spelling),
+            Signedness::Signed,
+        ),
+    };
+    let bits = rest.strip_prefix("int")?.strip_suffix("_t")?;
+    Some(CTypeLike::Int {
+        bits: bits.parse::<u32>().ok()?,
+        signedness,
+    })
+}
+
+/// The spellings whose width depends on the target, plus the plain C keywords.
+fn named_integer_bits(spelling: &str, ptr_bits: u32) -> Option<(u32, Signedness)> {
+    let (base, signedness) = match spelling.strip_prefix("unsigned") {
+        Some(rest) => (rest.trim(), Signedness::Unsigned),
+        None => match spelling.strip_prefix("signed") {
+            Some(rest) => (rest.trim(), Signedness::Signed),
+            None => (spelling, Signedness::Signed),
+        },
+    };
+    let base = if base.is_empty() { "int" } else { base };
+    let bits = match base {
+        "char" => 8,
+        "short" | "short int" => 16,
+        "int" => 32,
+        "long" | "long int" | "size_t" | "ssize_t" | "uintptr_t" | "intptr_t" | "ptrdiff_t" => {
+            ptr_bits
+        }
+        "long long" | "long long int" => 64,
+        _ => return None,
+    };
+    let signedness = match base {
+        "size_t" | "uintptr_t" => Signedness::Unsigned,
+        "ssize_t" | "intptr_t" | "ptrdiff_t" => Signedness::Signed,
+        _ => signedness,
+    };
+    Some((bits, signedness))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every type the renderer can emit, rendered and parsed back.
+    ///
+    /// This is the property the seam depends on: a type that survives a trip
+    /// through its own spelling is one that can safely be stored as a spelling
+    /// at a boundary that needs one. Any case that fails is a place where a
+    /// string is lossy and the type must be carried instead.
+    #[test]
+    fn every_rendered_type_parses_back_to_itself() {
+        let mut cases = vec![
+            CTypeLike::Void,
+            CTypeLike::Bool,
+            CTypeLike::Float(32),
+            CTypeLike::Float(64),
+            CTypeLike::Struct("Demo".to_string()),
+            CTypeLike::Union("Demo".to_string()),
+            CTypeLike::Enum("Demo".to_string()),
+            CTypeLike::Typedef("demo_t".to_string()),
+            CTypeLike::Unknown,
+            CTypeLike::Function,
+        ];
+        for bits in [8u32, 16, 32, 64, 128] {
+            for signedness in [Signedness::Signed, Signedness::Unsigned] {
+                cases.push(CTypeLike::Int { bits, signedness });
+            }
+        }
+        let scalars = cases.clone();
+        for scalar in scalars {
+            cases.push(CTypeLike::Pointer(Box::new(scalar.clone())));
+            cases.push(CTypeLike::Array(Box::new(scalar), Some(4)));
+        }
+
+        let mut lossy = Vec::new();
+        for case in &cases {
+            let rendered = render_c_type_like(case);
+            let parsed = parse_c_type_like(&rendered, 64);
+            if parsed != *case {
+                lossy.push(format!("{case:?} rendered {rendered:?} parsed {parsed:?}"));
+            }
+        }
+        assert!(
+            lossy.is_empty(),
+            "types lost through their spelling:\n{}",
+            lossy.join("\n")
+        );
+    }
+
+    /// The spellings that arrive from radare2 and DWARF rather than from us.
+    #[test]
+    fn external_spellings_parse_to_the_same_types_our_own_do() {
+        let ptr_bits = 64;
+        for (spelling, expected) in [
+            (
+                "unsigned int",
+                CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Unsigned,
+                },
+            ),
+            (
+                "int",
+                CTypeLike::Int {
+                    bits: 32,
+                    signedness: Signedness::Signed,
+                },
+            ),
+            (
+                "unsigned char",
+                CTypeLike::Int {
+                    bits: 8,
+                    signedness: Signedness::Unsigned,
+                },
+            ),
+            (
+                "long",
+                CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Signed,
+                },
+            ),
+            (
+                "size_t",
+                CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Unsigned,
+                },
+            ),
+            (
+                "char *",
+                CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                    bits: 8,
+                    signedness: Signedness::Signed,
+                })),
+            ),
+            (
+                "const char *",
+                CTypeLike::Pointer(Box::new(CTypeLike::Int {
+                    bits: 8,
+                    signedness: Signedness::Signed,
+                })),
+            ),
+            (
+                "struct Demo *",
+                CTypeLike::Pointer(Box::new(CTypeLike::Struct("Demo".to_string()))),
+            ),
+            (
+                "__uint128_t",
+                CTypeLike::Int {
+                    bits: 128,
+                    signedness: Signedness::Unsigned,
+                },
+            ),
+            (
+                "uint64_t",
+                CTypeLike::Int {
+                    bits: 64,
+                    signedness: Signedness::Unsigned,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_c_type_like(spelling, ptr_bits),
+                expected,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// A width whose signedness is unknown cannot survive a spelling.
+    ///
+    /// C has no way to write "thirty-two bits, signedness not established", so
+    /// the renderer has to pick one and picks signed. That is not a bug in the
+    /// renderer -- it is the reason a type must be carried as a type across the
+    /// writeback boundary rather than as the string it renders to, because the
+    /// boundary is exactly where the distinction is still live.
+    #[test]
+    fn unknown_signedness_is_the_one_thing_a_spelling_cannot_carry() {
+        let unknown = CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Unknown,
+        };
+        assert_eq!(render_c_type_like(&unknown), "int32_t");
+        assert_eq!(
+            parse_c_type_like("int32_t", 64),
+            CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed,
+            }
+        );
+    }
+
+    /// `long` is target-width, so the caller supplies the width.
+    #[test]
+    fn target_width_spellings_follow_the_pointer_width_given() {
+        assert_eq!(
+            parse_c_type_like("long", 32),
+            CTypeLike::Int {
+                bits: 32,
+                signedness: Signedness::Signed
+            }
+        );
+        assert_eq!(
+            parse_c_type_like("long", 64),
+            CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed
+            }
+        );
+    }
 
     #[test]
     fn render_c_type_like_preserves_unknown_without_materializing() {
