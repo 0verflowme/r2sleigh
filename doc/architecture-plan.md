@@ -2022,9 +2022,11 @@ with nothing -- a call's derived result lane, and a binary operation whose
 operands are recorded at different types -- now state their type, the first from
 the carrier object's declaration and the second from C's usual arithmetic
 conversions, which is a rule rather than a guess. Every cell that renders
-reaches the policy with a recorded source on all six configurations. Twelve
-decisions remain in `crc32_bitwise` at x64 -O2, on a bit-vector operand with no
-integer conversion rule, in a cell that does not render.
+reaches the policy with a recorded source on all six configurations. The twelve
+decisions this paragraph recorded as remaining were in `crc32_bitwise` at x64
+-O2, on a bit-vector operand with no integer conversion rule, in a cell that did
+not render at the time. That cell renders now, and whether those decisions
+survived the object-width change has not been re-measured.
 
 **C -- finish what was started: done, with C2 superseded.** C1's five
 `preserved_carrier_read_before_assignment` cells are resolved -- by following the
@@ -2037,13 +2039,18 @@ not be done. The two root maps are no longer one fact keyed twice:
 subset that the entry-root machinery and the frame-slot certificate depend on.
 Merging them would delete that gate.
 
-**D -- the corpus to parity: not done.** 51 of 54 compile and compute the right
-answer, 48 pass the strict gate, and nothing renders wrong. Three cells do not
-render: two are NEON, which is a feature rather than a defect, and one is a
-vector lane at bit offset 32 needing the use-side liveness question recorded
-above. Three miss the strict gate on an uninitialised stack pointer and two dead
-frame slots. The gate D asks for is fifty-four of fifty-four with all four
-scores equal, and that is the track still open.
+**D -- the corpus to parity: done.** Fifty-four of fifty-four, with generation,
+the strict gate, the diagnostic gate and the differential oracle all reading
+fifty-four. What this paragraph used to say -- 51 of 54, three cells refusing,
+two of them NEON and "a feature rather than a defect" -- was wrong about the
+last part: the NEON cells needed two user operations given their semantics and
+one offset stopped being applied twice, all of which are defects. The closing
+entry at the end of this document records what actually closed it.
+
+One caveat belongs with the number, not against it: the verifier rewrites the C
+it checks, cutting the image's bytes into a blob and rewriting absolute addresses
+into it. So the score does not say those cells emit self-contained, independently
+compilable C, and the corpus remains a canary rather than a specification.
 
 ### Track D closed to the vectorised cells
 
