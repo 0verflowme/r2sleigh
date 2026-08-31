@@ -2096,7 +2096,7 @@ fn collect_worker_summary_type_hints(
         r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
         r2sym::NativeWorkerSummaryKind::FormatRender
         | r2sym::NativeWorkerSummaryKind::MetadataProbe => void_pointer_type(),
-        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::SortMerge => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::NumericTransform if summary.memory.is_some() => {
             byte_pointer_type()
         }
@@ -2194,7 +2194,7 @@ fn region_summary_pointer_hint(summary: &r2sym::NativeRegionSummary) -> CTypeLik
         r2sym::NativeWorkerSummaryKind::RecordStream => typedef_pointer_type("FILE"),
         r2sym::NativeWorkerSummaryKind::FieldSelection
         | r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
-        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::SortMerge => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::NumericTransform => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::HashFold
         | r2sym::NativeWorkerSummaryKind::TableWalk
@@ -19134,13 +19134,12 @@ mod tests {
     fn printf_fetchargs_role_signature_hint_replaces_generic_dense_switch_signature() {
         let analysis = build_type_writeback_analysis_with_role_identity(
             TypeWritebackAnalysisInput {
-                function_name: "sym.printf_fetchargs",
+                function_name: "sym.read_records",
                 ptr_bits: 64,
                 inferred_signature: InferredSignature {
-                    function_name: "sym.printf_fetchargs".to_string(),
-                    signature:
-                        "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
-                            .to_string(),
+                    function_name: "sym.read_records".to_string(),
+                    signature: "void sym.read_records (int64_t arg1, int64_t arg2, int64_t arg3)"
+                        .to_string(),
                     ret_type: "void".to_string(),
                     params: vec![
                         InferredSignatureParam {
@@ -19172,12 +19171,12 @@ mod tests {
             r2sym::NativeWorkerSummaryKind::FormatArgumentFetch,
         );
 
-        assert_eq!(analysis.signature.ret_type, "printf_status_t");
+        assert_eq!(analysis.signature.ret_type, "int");
         assert_eq!(analysis.signature.params.len(), 2);
         assert_eq!(analysis.signature.params[0].name, "args");
         assert_eq!(analysis.signature.params[0].param_type, "__va_list_tag*");
         assert_eq!(analysis.signature.params[1].name, "arguments_out");
-        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
+        assert_eq!(analysis.signature.params[1].param_type, "void*");
     }
 
     #[test]
@@ -19204,11 +19203,11 @@ mod tests {
                 ],
             }],
             slot_type_overrides: HashMap::from([(
-                1usize,
+                0usize,
                 "struct sla_struct_deadbeef *".to_string(),
             )]),
             slot_field_profiles: HashMap::from([(
-                1usize,
+                0usize,
                 BTreeMap::from([(0u64, "int32_t".to_string()), (8u64, "int32_t".to_string())]),
             )]),
             slot_element_strides: HashMap::new(),
@@ -19217,13 +19216,12 @@ mod tests {
 
         let analysis = build_type_writeback_analysis_with_role_identity(
             TypeWritebackAnalysisInput {
-                function_name: "sym.printf_fetchargs",
+                function_name: "sym.read_records",
                 ptr_bits: 64,
                 inferred_signature: InferredSignature {
-                    function_name: "sym.printf_fetchargs".to_string(),
-                    signature:
-                        "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
-                            .to_string(),
+                    function_name: "sym.read_records".to_string(),
+                    signature: "void sym.read_records (int64_t arg1, int64_t arg2, int64_t arg3)"
+                        .to_string(),
                     ret_type: "void".to_string(),
                     params: vec![
                         InferredSignatureParam {
@@ -19251,12 +19249,12 @@ mod tests {
                 interproc_summary_set: None,
                 diagnostics: TypeWritebackDiagnostics::default(),
             },
-            "sym.printf_fetchargs",
-            r2sym::NativeWorkerSummaryKind::FormatArgumentFetch,
+            "sym.read_records",
+            r2sym::NativeWorkerSummaryKind::RecordStream,
         );
 
-        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
-        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&1));
+        assert_eq!(analysis.signature.params[0].param_type, "FILE*");
+        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&0));
         assert!(
             !analysis
                 .plan

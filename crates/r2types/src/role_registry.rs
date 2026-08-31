@@ -27,6 +27,10 @@ fn signed_byte_pointer_type() -> CTypeLike {
     CTypeLike::Pointer(Box::new(signed_int_type(8)))
 }
 
+fn void_pointer_type() -> CTypeLike {
+    CTypeLike::Pointer(Box::new(CTypeLike::Void))
+}
+
 fn typedef_type(name: &str) -> CTypeLike {
     CTypeLike::Typedef(name.to_string())
 }
@@ -89,10 +93,10 @@ fn diagnostic_signature(current_param_count: usize) -> FunctionSignatureSpec {
 
 fn format_argument_fetch_signature() -> FunctionSignatureSpec {
     sig(
-        typedef_type("printf_status_t"),
+        c_int_type(),
         vec![
             p("args", typedef_pointer_type("__va_list_tag")),
-            p("arguments_out", typedef_pointer_type("arguments")),
+            p("arguments_out", void_pointer_type()),
         ],
     )
 }
@@ -113,8 +117,8 @@ fn string_scan_signature(current_param_count: usize) -> FunctionSignatureSpec {
 fn field_selection_signature(current_param_count: usize) -> FunctionSignatureSpec {
     param_only_sig(extend_params_to_count(
         vec![
-            p("line", typedef_pointer_type("line")),
-            p("key", typedef_pointer_type("keyfield")),
+            p("record", void_pointer_type()),
+            p("key", void_pointer_type()),
             p("offset", typedef_type("size_t")),
         ],
         current_param_count,
@@ -140,7 +144,7 @@ fn record_stream_signature(current_param_count: usize) -> FunctionSignatureSpec 
     param_only_sig(extend_params_to_count(
         vec![
             p("stream", typedef_pointer_type("FILE")),
-            p("linebuffer", typedef_pointer_type("linebuffer")),
+            p("linebuffer", void_pointer_type()),
         ],
         current_param_count,
         "record_arg",
@@ -151,7 +155,7 @@ fn record_stream_signature(current_param_count: usize) -> FunctionSignatureSpec 
 fn sort_merge_signature(current_param_count: usize) -> FunctionSignatureSpec {
     param_only_sig(extend_params_to_count(
         vec![
-            p("files", typedef_pointer_type("sortfile")),
+            p("files", void_pointer_type()),
             p("nfiles", typedef_type("size_t")),
             p("output", typedef_pointer_type("FILE")),
         ],
@@ -429,7 +433,7 @@ mod tests {
         };
         let signature = signature_hint_for_role_identity(&structural, 0)
             .expect("structural role identity should project signature");
-        assert_eq!(signature.ret_type, Some(typedef_type("printf_status_t")));
+        assert_eq!(signature.ret_type, Some(c_int_type()));
         assert!(type_projection_for_role_identity(&structural, 0).is_some());
     }
 
@@ -485,11 +489,8 @@ mod tests {
         let fetch = BTreeSet::from([r2sym::NativeWorkerSummaryKind::FormatArgumentFetch]);
         let signature =
             signature_hint_for_summary_kinds(&fetch, 0).expect("expected fetchargs signature");
-        assert_eq!(signature.ret_type, Some(typedef_type("printf_status_t")));
-        assert_eq!(
-            signature.params[1].ty,
-            Some(typedef_pointer_type("arguments"))
-        );
+        assert_eq!(signature.ret_type, Some(c_int_type()));
+        assert_eq!(signature.params[1].ty, Some(void_pointer_type()));
 
         let numeric = BTreeSet::from([r2sym::NativeWorkerSummaryKind::NumericTransform]);
         assert!(
