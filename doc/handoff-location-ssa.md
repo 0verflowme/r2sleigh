@@ -6162,3 +6162,38 @@ nearby reconstructs from a rendered identifier whether it was an SSA-versioned
 register by matching a hardcoded sixty-entry register list. Both re-derive from
 text what was structured data three layers earlier. The binding plan already
 owns the naming decision, so the renderer should emit the final name once.
+
+**Four decisions taken for the remaining cleanup tracks.** They are recorded
+because each one changes what "done" means for the work that follows.
+
+*A justified fix may move rendered output.* Byte-identical stays the default
+expectation and a diff has to be argued in its own commit, but a fix is no
+longer blocked by moving output: the differential oracle is the correctness
+check, and the per-cell change is measured and reported rather than avoided.
+This is what unblocks the two predicates that disagree and the identity key that
+collides, both of which are behaviour changes by construction.
+
+*There will be one type model.* `r2dec`'s `CType` folds into `r2types`'
+`CTypeLike` rather than the two continuing side by side with two renderers. The
+enum needs `BitVector` and function signatures before that is lossless, and the
+call sites move from tuple variants to struct variants. The reason to pay for it
+is that the two renderers already disagreed about 128-bit integers and nothing
+would have caught the next divergence either.
+
+*The snapshot baseline is blessed at the current fifty-four outputs.* It had
+been stale since output legitimately improved, so every cell reported
+`snapshot=mismatch` and the column detected nothing. It now passes its own gate,
+which means an unintended output change in the remaining tracks trips
+immediately instead of hiding inside a column that was already all-mismatch.
+Blessing it is only safe because the four scores are at parity and the
+differential oracle passes on all fifty-four; the baseline records what is
+believed correct today, not what is proven correct.
+
+*`semantic_typedef_is_authoritative` gets a derived replacement rather than
+deletion.* A typedef becomes authoritative when the external type database
+actually holds a layout for it -- `external_named_aggregate_has_real_layout`,
+which is already the OR-fallback at two of the seven sites -- instead of when
+its name appears in a list of about two hundred coreutils spellings. Deleting
+the list outright was rejected because it is not a uniform refusal: at
+`facts.rs:1280` and `writeback.rs:3278` it degrades output silently rather than
+declining, and at `writeback.rs:9833` the polarity inverts.
