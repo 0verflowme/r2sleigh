@@ -2281,6 +2281,14 @@ a table the rendered program does not have.
   measured and rejected; the next attempt should not be a fifth projection
   tweak.
 
+  A fifth attempt narrowed the fourth: skip the re-basing only for a lane value
+  *every* one of whose reads takes the whole value, which is true of the vector
+  lanes and was expected to be false of `pearson`. It is not false of `pearson`,
+  which refuses as well. So the re-basing is load-bearing for a reason the
+  operation-relative slices do not express, and no predicate written at this
+  layer has separated the two cases in five tries. The next attempt should come
+  from the renderer, not the projection.
+
   What remains is that all four lanes of these vectors are always written
   together and consumed only by an explicit `Piece`. The rendering that follows
   from that is a single composed assignment of the whole object, not four writes
