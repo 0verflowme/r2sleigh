@@ -2277,12 +2277,22 @@ that slot is the 32-byte SVE `z0`, and the phi-source projections are made at it
 width, which drags the 32-bit lane values into 256-bit objects even though
 nothing in the program ever holds or reads more than 128 bits.
 
-So the remaining question is the same one the x86 vector lanes asked, arriving
-from the other side: an object should be as wide as what the program does with
-it, not as wide as the widest register the specification nests it in. Bounding
-the binding by how far reads reach was measured once and cost four cells; the
-lane work since then answers the read side but not the merge side, where the
-width is chosen before any read is considered.
+Traced further, the shape is sharper than that. `S0_2` is read *both* ways in
+the same function: `r2sleigh_bits_extract_256_32(S0_2, 0U)` inside the loop, and
+plainly as `(uint32_t)S0_2` in the setup before it. Those are two different SSA
+values sharing one binding, and self-containment is decided per value while the
+object is shared per binding. So one member is narrow and another
+carrier-relative, the binding takes the wider, and the narrow member's write
+becomes a narrow value assigned to a wide object.
+
+The requirement is therefore uniformity: every value sharing an object must
+agree about whether it is read as itself. Imposing that in the projection, by
+requiring every value overlapping a value's storage to agree, is too strong and
+**costs all three vector cells** -- on x86 each lane overlaps the whole register,
+so one carrier-relative wide value poisons every lane in it. Overlap is not the
+grouping that matters; the storage *span* is, and that grouping is formed in the
+binding plan, a layer above the projection. So the check belongs there: when a
+binding's members disagree, the binding is carrier-relative for all of them.
 
 `NEON_ushl` stays unexpanded until that is settled. It is written, it is verified
 exact against the architecture over three million vectors, and it is one measured
