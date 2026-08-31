@@ -6958,10 +6958,13 @@ mod integration_tests {
         println!("Profile: {}", profile);
         let arch = ctx.arch.as_ref().expect("x86-64 ArchSpec");
         assert_eq!(arch.addr_size, 8);
-        for (role, target) in [("PC", "RIP"), ("SP", "RSP"), ("BP", "RBP")] {
+        // The role targets a register by the profile's own spelling, which is
+        // lower case: radare2 keeps upper case for the alias namespace these
+        // roles live in.
+        for (role, target) in [("PC", "rip"), ("SP", "rsp"), ("BP", "rbp")] {
             assert_eq!(role_target(profile, role).as_deref(), Some(target));
             let expected = arch
-                .get_register(target)
+                .get_register(&target.to_ascii_uppercase())
                 .expect("full-width x86 address register");
             assert_eq!(expected.size, arch.addr_size);
             assert_eq!(
@@ -7199,10 +7202,11 @@ mod integration_tests {
         let (arch, _) = create_disassembler_for_arch("x86").expect("x86 disassembler");
         assert_eq!(arch.addr_size, 4);
         let profile = profile_for_arch("x86");
-        for (role, target) in [("PC", "EIP"), ("SP", "ESP"), ("BP", "EBP")] {
+        // Lower case, as the profile now spells every register.
+        for (role, target) in [("PC", "eip"), ("SP", "esp"), ("BP", "ebp")] {
             assert_eq!(role_target(&profile, role).as_deref(), Some(target));
             let expected = arch
-                .get_register(target)
+                .get_register(&target.to_ascii_uppercase())
                 .expect("full-width x86 address register");
             assert_eq!(expected.size, arch.addr_size);
             assert_eq!(
