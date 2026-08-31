@@ -6225,3 +6225,28 @@ spellings. Then an unresolved `CTypeLike::Typedef` means exactly "nothing could
 resolve this name", the predicates become a pattern match with no database
 argument at all, and the list has nowhere left to live. That is the change to
 make, and it subsumes the threading rather than adding to it.
+
+**Two clone findings that measurement did not support.** An architecture audit
+reported `FunctionFacts` being deep-cloned five or six times per function and
+recommended `Arc`. Counting the actual sites finds eight `.clone()` calls in the
+whole tree that touch `FunctionFacts` or its `type_facts`, and most of the
+places the audit pointed at pass the struct *by value* -- a move, which costs
+nothing. `Arc<FunctionFacts>` is not warranted, and wrapping it would add
+indirection to buy nothing.
+
+The one large clone that is real is `function_facts.rs:1484`, where the seal
+clones the whole report, rebuilds the source-owned evidence into the copy, and
+requires the two to match on seven fields. That is not waste. It is the same
+independent-re-derivation pattern the binding plan uses, and its own comment
+says why: a stale row could otherwise validate against itself. A proof that
+shared the construction's working would prove nothing, and the clone is what
+keeps the second derivation independent.
+
+The genuinely expensive clone is in `placement.rs` -- `:1951`, `:1954`, `:1995`,
+`:2035` and `:2168` copy the whole `CFunction` AST per binding per demotion
+round. That one is also deliberate, and the comment above `:2035` states the
+reason: dropping a declaration can leave an undeclared identifier, so the tree
+is asked before anything is removed. Making it cheaper means implementing
+rollback instead of trial-on-a-copy, which is an optimisation with a correctness
+property to preserve rather than a defect to fix. It is the right next
+performance target and it is not a small change.

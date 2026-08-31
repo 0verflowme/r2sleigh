@@ -520,6 +520,8 @@ expanded:
 - thresholds with no derivation in `r2engine`'s decompile route and in
   `r2plugin`'s stack-address recursion
 - duplicated route policy in `r2dec` and `r2engine`
+- `r2engine` is two files for 25,000 lines, and its `EngineSession` is a
+  zero-sized unit struct carrying twenty `&self` methods over about 990 lines
 - shape-only loop/switch rendering without checked certificates
 - summary pseudo-calls standing in for real loop/control reconstruction
 - remaining decompiler-side stack-home/call-argument rescue paths
