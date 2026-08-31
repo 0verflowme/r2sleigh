@@ -2211,11 +2211,16 @@ exists to make unrepresentable, so the name has to travel first.
   specification changed. So E1 waits on an upstream change that exposes the
   userop names.
 
-  **Raised:** mnemonikr/libsla-sys#8 adds `SleighProxy::getUserOpNamesProxy`,
-  exposed as `user_op_names`, reaching the list `SleighBase` already keeps and
-  `Translate::getUserOpNames` already declares. The capability has to land in
-  the `-sys` crate because that is where the bridge is; `libsla` then needs a
-  thin safe passthrough, which follows once the `-sys` change is released. Until
+  **Raised, and verified end to end:** mnemonikr/libsla-sys#8 adds
+  `SleighProxy::getUserOpNamesProxy`, exposed as `user_op_names`, reaching the
+  list `SleighBase` already keeps and `Translate::getUserOpNames` already
+  declares. mnemonikr/libsla#18 is the safe passthrough on top of it --
+  `Sleigh::user_op_names` and `user_op_name(index)` -- raised as a draft because
+  it depends on the first. Both were built together locally and the property
+  E1.2 needs was tested rather than assumed: a name the x86 specification
+  declares resolves back to itself through its own index, and an index past the
+  end resolves to nothing. So the premise of this track is confirmed, not
+  hoped for. Until
   both land, E1.2 through E1.4 have nothing to key on and the two arm64 -O2
   cells stay refused.
 - **E1.2** Carry the resolved name on the lifted operation, so `CallOther`
