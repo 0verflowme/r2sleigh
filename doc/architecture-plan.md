@@ -2265,8 +2265,12 @@ a table the rendered program does not have.
   A fourth attempt: suppressing the re-basing of a read onto the register
   carrier when the value's own definition was a lane write -- on the ground that
   a lane write preserves nothing, so there is no carrier content for a read to
-  be composed out of. That is coherent, and it **cost a cell**, so the re-basing
-  carries something else as well. Four approaches at this layer have now been
+  be composed out of. That is coherent, and it **costs `pearson` at x64 -O2**, a
+  cell that passes today and then refuses for a missing machine projection. So
+  the re-basing is load-bearing for a lane-written value that is genuinely read
+  as part of its carrier, and any rule that skips it has to tell that case
+  apart -- the candidate being a value every one of whose uses reads exactly the
+  lane it wrote, true of the vector lanes and false of `pearson`. Four approaches at this layer have now been
   measured and rejected; the next attempt should not be a fifth projection
   tweak.
 
