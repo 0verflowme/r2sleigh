@@ -508,7 +508,11 @@ The following items are intentional short-term debt and should be retired, not
 expanded:
 
 - name-first native worker family matching in `r2sym`
-- hardcoded role/signature tables used as authoritative facts
+- hardcoded role/signature tables used as authoritative facts -- half retired,
+  see the August 2026 entry: the program counter is now read from the processor
+  specification, the stack pointer, frame pointer, argument and return registers
+  and the link register are still guessed from spelling lists, and the x86
+  register family seeding in `r2ssa` is a second such table
 - duplicated route policy in `r2dec` and `r2engine`
 - shape-only loop/switch rendering without checked certificates
 - summary pseudo-calls standing in for real loop/control reconstruction
@@ -2362,3 +2366,106 @@ Established by tracing:
 The remaining step is the same one the seam needs: a single value-rendering
 entry point, so that what the load renderer answers is what the statement
 carries. Until then the marker at least says the line is not program text.
+
+
+
+Current State (August 2026)
+---------------------------
+
+The four tracks of the spine rewrite are complete and the corpus gate is met.
+What that does and does not mean is worth stating precisely, because the two
+numbers below measure different things and only one of them is a claim about
+real programs.
+
+**The corpus gate: fifty-four of fifty-four.** Generation, the strict compile
+(`-Werror -Wconversion -Wsign-conversion`), the diagnostic compile and the
+differential oracle all read fifty-four across nine functions and six
+configurations. Nothing renders wrong.
+
+The caveat belongs with the number rather than against it: the verifier rewrites
+the C it checks, cutting the image's bytes into a blob and rewriting absolute
+addresses into it, and the diagnostic column compiles with warnings off after a
+repair pass. So the score does not say those cells emit self-contained,
+independently compilable C. The corpus is a canary, not a specification.
+
+**Real-world coverage: about one function in ten.** On `/bin/ls`, 122 of 136
+functions fall back to the legacy path. Every one of those is an honest refusal
+rather than wrong output, which is the design working -- but the certifying
+approach is currently paying for its guarantees with a great deal of silence,
+and that gap, not the corpus, is the honest measure of where the project stands.
+
+Why they refuse, measured:
+
+| count | refusal |
+|-------|---------|
+| 86 | observation journal |
+| 13 | missing machine projection authorization |
+| 6 | unrepresentable control flow |
+| 5 | unprovable execution order |
+| 5 | effect obligations refused |
+| 4 | declaration placement, various |
+
+Eighty-six of a hundred and twenty-two share one cause. On the corpus, refusals
+that looked like many defects repeatedly collapsed into one or two once traced,
+so the first question is how few distinct causes those eighty-six are. That is
+the single highest-leverage measurement available right now.
+
+**Performance is not a constraint.** Radare2's own analysis dominates
+end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
+of it costs 12.6s, about 93ms per function. On the corpus binaries `aaa` alone is
+1.62s against 1.70s for `aaa` plus one decompilation. Cost scales linearly with
+function count and nothing here needs optimising before it needs finishing.
+
+**Where the subsystems actually stand.** `r2sym` is sixty-seven thousand lines
+using z3 in eighty places, and `r2dec` reaches a solver exactly once: the render
+path consumes summaries and evidence, not live symbolic execution. That may be
+the right shape, but the engagement is thin enough to be worth a deliberate
+answer rather than an assumption. There is no VM or emulator crate.
+
+
+Roadmap to Completion
+---------------------
+
+In order, highest leverage first.
+
+1. **Take the eighty-six.** Group the observation-journal refusals on `/bin/ls`
+   by their underlying cause rather than their message. The corpus taught that
+   these collapse; until that grouping exists, every other coverage estimate is
+   guesswork.
+
+2. **Retire the register-role tables.** The program counter is read from the
+   processor specification now. mnemonikr/sleigh-config#8 exposes the compiler
+   specification, which states the stack pointer and the ordered parameter
+   storage; when it lands, the remaining lists follow. Three collisions have
+   already come out of those lists and are recorded in the plan.
+
+3. **Audit the second spelling table.** `seed_x86_low_register_aliases` in
+   `r2ssa` hardcodes the x86 register families and is gated on the architecture
+   name. Those facts look derivable from the register table's own offsets and
+   sizes, which is how families are computed everywhere else. Either it
+   compensates for something in the x86 table or it is redundant, and which one
+   is unknown.
+
+4. **Decide what the dependency patch becomes.** `Cargo.toml` patches `libsla`
+   and `libsla-sys` to fork branches carrying two open pull requests, and the
+   corpus depends on them. Wait, ask, or vendor.
+
+5. **Generalise the user operations.** `NEON_ext` and `NEON_ushl` are
+   implemented because the corpus needs those two. Identification is sourced
+   from the specification's own table and anything else refuses honestly, but
+   this is not `CALLOTHER` coverage.
+
+6. **Clean the undefined behaviour in emitted vector C.** The `ushl` expansion
+   evaluates both shift directions before selecting, so the discarded branch
+   shifts by a negative count, and several `__uint128_t` loads are misaligned.
+   Both render correct values on this target, which is exactly why they are easy
+   to leave.
+
+7. **Re-measure Track B's residual.** Twelve type decisions were recorded as
+   remaining in a cell that did not render at the time. It renders now, and
+   whether they survived the object-width change has not been checked.
+
+8. **Audit the changed test expectations.** Roughly eight assertions moved and
+   one lift-capture golden was re-blessed during the run to fifty-four. Each is
+   argued in its commit, but a changed test is the easiest place for a mistake
+   to hide, and that audit has not been run.
