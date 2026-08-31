@@ -2217,6 +2217,47 @@ whose promotion to `int` trips `-Wimplicit-int-conversion` at twenty-eight sites
 Both are value-preserving here, which is why the cell's wrong answer survives
 fixing either.
 
+
+### The last cell, and the correctness hole behind it
+
+`NEON_ushl` expanded per element makes `xxhash32` at arm64 -O2 render, and all
+fifty-four cells then generate and compile under the strict flags. The digest is
+wrong for every input of sixteen bytes or more -- exactly where the function
+enters its vectorised stripe loop -- and the expansion is not the reason. It was
+checked op for op against the architecture over three million random per-element
+vectors and all two hundred and fifty-six shift bytes, with no disagreement, and
+it yields the correct digest when executed.
+
+What is wrong is upstream, and it is a correctness hole rather than a missing
+capability. `fmov w11, s0` publishes the vector merge into a general register.
+The specification writes that as two halves: the low four bytes of `x11`, and
+`zext_rs`, which is `reg[32,32] = 0`, zeroing the upper four. Both writes are in
+the SSA -- `w11` version one, and `reg:405c` version one set to zero -- and
+**neither composes into a definition of `x11`**. Every later read of `x11`
+therefore reaches back past them to the prologue's `x11` version eight, a dead
+constant holding `PRIME1` that exists only to feed a `dup`. The rendered function
+computes `PRIME1 + len` where the machine computes the accumulator merge.
+Substituting `PRIME1` for the merge reproduces all four wrong digests bit-exact.
+
+Two things make this worse than a wrong answer in one cell. The whole vector
+chain -- twenty instructions -- is then genuinely unreachable from any
+observation, so the elision machinery removes it and is right to; the falsehood
+is one step earlier. And the obligation ledger recorded twenty-five elisions and
+**zero refusals**, so a use-visible miscompile passed as a clean proof. Every
+`ElisionReason` is documented as a form of proven-dead, and here the deadness was
+a consequence of the missing definition rather than a fact about the program.
+
+The fix belongs where the halves are written: a pair of adjacent writes that
+together cover a register must define that register. `machine.rs` already has
+exactly this reasoning for write *projections*, in
+`exact_adjacent_cleared_carrier_write`, which follows a narrow write into the
+extension that clears the rest of its carrier. The same fact has to reach the SSA
+definition, not only the projection, or a full-width read cannot see it.
+
+Until that lands, `NEON_ushl` stays unexpanded and the cell stays refused. A
+refusal is worth more than a silent wrong answer, and this one has already shown
+it can pass the ledger.
+
 ## Track E -- the two capabilities Track D's last three cells need
 
 Track D's gate was written as fifty-four of fifty-four with the four scores
