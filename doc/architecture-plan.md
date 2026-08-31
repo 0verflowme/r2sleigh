@@ -2198,6 +2198,19 @@ exists to make unrepresentable, so the name has to travel first.
   names through `build_arch_spec` into `ArchSpec`, the way register names are
   carried. Gate: the name for a known index is retrievable from the artifact,
   and an index the specification does not define resolves to nothing.
+
+  **Blocked, and the blocker is outside this repository.** `libsla` 1.2.0 --
+  pinned exactly -- exposes no userop table: its public surface has no accessor
+  over Ghidra's `UserOpManage`, and its `PseudoOp::CallOther` carries only the
+  opcode. The compiled `.sla` cannot be read around it either: it is packed
+  (`sla.x`), and `NEON_ext` and `NEON_ushl` appear nowhere in its bytes. The
+  `.slaspec` sources do ship with `sleigh-config` and declare both with
+  `define pcodeop`, but recovering an index from declaration order would be
+  reconstructing the compiler's own numbering by inference -- the exact thing
+  Track B removed -- and it would break silently the first time the
+  specification changed. So E1 waits on an upstream change to `libsla` that
+  exposes the userop names, which is its own contribution to raise, not
+  something to vendor around.
 - **E1.2** Carry the resolved name on the lifted operation, so `CallOther`
   states which userop it is rather than which slot it occupies. Gate: the
   wire and the SSA operation both round-trip the name.
