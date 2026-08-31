@@ -826,7 +826,7 @@ pub fn collect_signature_type_evidence_for_var(
     var: &SSAVar,
     initial_ty: &CTypeLike,
 ) -> SignatureTypeEvidence {
-    let key = format!("{}_{}", var.name.to_ascii_lowercase(), var.version);
+    let key = crate::prepare::ssa_var_key(var);
     let family = scalar_register_family_key(&var.name);
     let mut evidence = SignatureTypeEvidence::default();
     if evidence_ctx.pointer_vars.contains(&key) {
@@ -901,10 +901,7 @@ fn width_hint_for_register_family(
 }
 
 fn key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+    crate::prepare::ssa_var_key_matches_register_family_version(key, family, version)
 }
 
 pub fn infer_signature_return_type(

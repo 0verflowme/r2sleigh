@@ -523,19 +523,25 @@ mod tests {
 
         let evidence = collect_signature_type_evidence_context(&blocks);
         assert_eq!(
-            evidence.width_bits.get("x0_0"),
+            evidence
+                .width_bits
+                .get(&r2types::ssa_var_key(&r2ssa::SSAVar::new("X0", 0, 8))),
             Some(&32),
             "{:?}",
             evidence.width_bits
         );
         assert_eq!(
-            evidence.width_bits.get("x9_1"),
+            evidence
+                .width_bits
+                .get(&r2types::ssa_var_key(&r2ssa::SSAVar::new("X9", 1, 8))),
             Some(&32),
             "{:?}",
             evidence.width_bits
         );
         assert_eq!(
-            evidence.width_bits.get("x10_1"),
+            evidence
+                .width_bits
+                .get(&r2types::ssa_var_key(&r2ssa::SSAVar::new("X10", 1, 8))),
             Some(&32),
             "{:?}",
             evidence.width_bits

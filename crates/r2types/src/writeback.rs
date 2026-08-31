@@ -34,6 +34,7 @@ use crate::function_facts::{FunctionFacts, InterprocSummaryView, SourceOwnedFunc
 use crate::inferred_signature_from_signature_spec;
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
+use crate::prepare::ssa_var_block_key;
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11399,14 +11400,6 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
     } else {
         v as i64
     }
-}
-
-fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
-    format!(
-        "{}_{}@{block_addr:x}",
-        var.name.to_ascii_lowercase(),
-        var.version
-    )
 }
 
 #[cfg(test)]

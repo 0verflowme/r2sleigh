@@ -141,7 +141,13 @@ impl SSAVar {
         self
     }
 
-    pub(crate) const fn rename_disambiguator(&self) -> u32 {
+    /// The construction-time discriminator that separates two exact storages
+    /// which project to the same display name and width.
+    ///
+    /// Public because anything building an identity key for a variable has to
+    /// include it, or the key collides on precisely the case this field exists
+    /// to keep apart.
+    pub const fn rename_disambiguator(&self) -> u32 {
         self.rename_disambiguator
     }
 

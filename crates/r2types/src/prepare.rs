@@ -283,12 +283,60 @@ pub fn size_to_type(size: u32) -> String {
     }
 }
 
+/// A key that identifies one SSA variable across its width views.
+///
+/// This deliberately does *not* include `size`. The maps it keys pool the
+/// register's width views on purpose -- arm64 evidence has to flow between
+/// `x0` and `w0`, and the x86 low-carrier tests fail immediately if it cannot.
+///
+/// It does now include `rename_disambiguator`, which it dropped before. That
+/// field exists, by its own documentation, to separate "two exact source
+/// storages that project to the same display name and width", so leaving it out
+/// made the key collide on precisely the case it had been added to prevent, and
+/// `DefUseInfo` carried the resulting ambiguity at runtime as an
+/// `Option<usize>` meaning "the key collided". Width views of one register
+/// share a disambiguator, so pooling still works.
 pub fn ssa_var_key(var: &SSAVar) -> String {
-    format!("{}_{}", var.name.to_ascii_lowercase(), var.version)
+    format!(
+        "{}_{}_{}",
+        var.name.to_ascii_lowercase(),
+        var.version,
+        var.rename_disambiguator()
+    )
 }
 
 pub fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
     format!("{}@{block_addr:x}", ssa_var_key(var))
+}
+
+/// Whether a key names the given register family at the given version.
+///
+/// This lives beside `ssa_var_key` because it takes the key apart, and a
+/// builder and a parser that disagree about a format are the same defect twice.
+/// It used to be a `rsplit_once('_')` in `signature_infer`, which silently began
+/// reading the disambiguator as the version the moment the key gained a field.
+/// The variable name a key was built from.
+pub fn ssa_var_key_name(key: &str) -> Option<&str> {
+    let mut parts = key.rsplitn(3, '_');
+    parts.next()?;
+    parts.next()?;
+    parts.next()
+}
+
+pub fn ssa_var_key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
+    // Built as `name_version_disambiguator`, and a name may itself contain
+    // underscores, so the three fields are taken from the right.
+    let mut parts = key.rsplitn(3, '_');
+    let Some(_disambiguator) = parts.next() else {
+        return false;
+    };
+    let Some(version_str) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
 }
 
 pub fn scalar_register_family_key(name: &str) -> String {
@@ -920,17 +968,11 @@ fn strongest_hint_for_aliases(
 }
 
 fn width_hint_key_matches_family(key: &str, family: &str) -> bool {
-    let Some((name, _version)) = key.rsplit_once('_') else {
-        return false;
-    };
-    scalar_register_family_key(name) == family
+    ssa_var_key_name(key).is_some_and(|name| scalar_register_family_key(name) == family)
 }
 
 fn width_hint_key_matches_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+    ssa_var_key_matches_register_family_version(key, family, version)
 }
 
 fn recovered_arg_family_width_hint(
@@ -2825,9 +2867,21 @@ mod tests {
 
         let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
 
-        assert!(evidence.pointer_vars.contains("x9_2"));
-        assert!(!evidence.pointer_vars.contains("x9_1"));
-        assert!(!evidence.pointer_vars.contains("x1_0"));
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X9", 2, 8)))
+        );
+        assert!(
+            !evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X9", 1, 8)))
+        );
+        assert!(
+            !evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X1", 0, 8)))
+        );
     }
 
     #[test]
@@ -2864,8 +2918,17 @@ mod tests {
 
         let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
 
-        assert!(evidence.pointer_vars.contains("x0_0"));
-        assert_eq!(evidence.pointer_pointee_width_bytes.get("x0_0"), Some(&4));
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X0", 0, 8)))
+        );
+        assert_eq!(
+            evidence
+                .pointer_pointee_width_bytes
+                .get(&ssa_var_key(&SSAVar::new("X0", 0, 8))),
+            Some(&4)
+        );
     }
 
     #[test]
@@ -2931,9 +2994,15 @@ mod tests {
 
         let evidence =
             collect_signature_type_evidence_context_with_arch(&[entry, body], Some("aarch64"));
-        assert!(evidence.pointer_vars.contains("x0_0"));
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X0", 0, 8)))
+        );
         assert_eq!(
-            evidence.pointer_pointee_width_bytes.get("x0_0"),
+            evidence
+                .pointer_pointee_width_bytes
+                .get(&ssa_var_key(&SSAVar::new("X0", 0, 8))),
             Some(&4),
             "pointer_vars={:?} pointee_widths={:?}",
             evidence.pointer_vars,
