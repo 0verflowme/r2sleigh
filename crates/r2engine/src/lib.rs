@@ -325,6 +325,9 @@ struct EngineTypeWritebackPlanReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTypeWritebackPayload {
+    /// The target's pointer width, carried so the JSON edge can spell the
+    /// plan's types without guessing which target they were recovered for.
+    pub ptr_bits: u32,
     pub signature: r2types::InferredSignature,
     pub signature_render_authorized: bool,
     pub signature_writeback_authorized: bool,
@@ -783,6 +786,7 @@ fn type_writeback_payload_from_plan_report(
         solver_warnings: plan.diagnostics.solver_warnings,
     };
     EngineTypeWritebackPayload {
+        ptr_bits: plan.ptr_bits,
         signature: plan.signature,
         signature_render_authorized,
         signature_writeback_authorized: signature_writeback.authorized,
@@ -858,6 +862,7 @@ fn struct_fields_json(
 pub fn type_writeback_json_core(
     payload: EngineTypeWritebackPayload,
 ) -> EngineTypeWritebackJsonCore {
+    let ptr_bits = payload.ptr_bits;
     EngineTypeWritebackJsonCore {
         function_name: payload.signature.function_name,
         signature: payload.signature.signature,
@@ -946,7 +951,7 @@ pub fn type_writeback_json_core(
             .into_iter()
             .map(|candidate| EngineGlobalTypeLinkCandidateJson {
                 addr: candidate.addr,
-                target_type: candidate.target_type,
+                target_type: r2types::render_writeback_apply_type(&candidate.target_type, ptr_bits),
                 confidence: candidate.confidence,
                 source: candidate.source.as_str().to_string(),
             })

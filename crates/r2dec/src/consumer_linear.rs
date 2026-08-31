@@ -136,6 +136,7 @@ mod tests {
 
     fn writeback_plan_with_source_shaped_artifacts() -> r2types::TypeWritebackPlan {
         r2types::TypeWritebackPlan {
+            ptr_bits: 64,
             signature: r2types::InferredSignature {
                 function_name: "sym.worker".to_string(),
                 signature: "int sym.worker(int argc, char **argv)".to_string(),

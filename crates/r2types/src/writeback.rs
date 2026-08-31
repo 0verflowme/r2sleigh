@@ -157,7 +157,13 @@ pub struct StructDeclCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalTypeLinkCandidate {
     pub addr: u64,
-    pub target_type: String,
+    /// The type this address is linked to, as a type.
+    ///
+    /// Rendered only where it leaves for radare2 or a JSON payload. It used to
+    /// be built here with `format!("struct {} *", ..)` and taken apart again
+    /// downstream with `strip_prefix`/`strip_suffix`, which is what made the
+    /// pointer's spacing something three components each had an opinion about.
+    pub target_type: CTypeLike,
     pub confidence: u8,
     pub source: WritebackSource,
 }
@@ -207,6 +213,13 @@ pub struct LocalStructArtifacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeWritebackPlan {
+    /// The target's pointer width.
+    ///
+    /// The plan carries types now, and a type only becomes a C spelling
+    /// against a target: `long` and `size_t` are the width of a pointer, and
+    /// which width that is belongs to the function being written back, not to
+    /// whichever renderer happens to run.
+    pub ptr_bits: u32,
     pub signature: InferredSignature,
     pub var_type_candidates: Vec<VarTypeCandidate>,
     pub var_rename_candidates: Vec<VarRenameCandidate>,
@@ -819,8 +832,10 @@ fn type_writeback_mutation_plan_with_policy(
         }
 
         for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
-            let apply_type = canonicalize_writeback_apply_type_name(&candidate.target_type)
-                .unwrap_or_else(|| candidate.target_type.clone());
+            let apply_type = crate::signature_infer::render_writeback_apply_type(
+                &candidate.target_type,
+                plan.ptr_bits,
+            );
             let type_materialization_key = writeback_type_materialization_key(&apply_type);
             let type_materialization_required = type_materialization_required_for_type(
                 &apply_type,
@@ -4339,6 +4354,7 @@ fn build_type_writeback_analysis_inner(
     );
 
     let plan = TypeWritebackPlan {
+        ptr_bits: input.ptr_bits,
         signature: input.inferred_signature.clone(),
         var_type_candidates,
         var_rename_candidates,
@@ -10339,13 +10355,16 @@ fn score_global_type_links(
         return Vec::new();
     }
 
-    let mut per_type_weight: BTreeMap<String, i32> = BTreeMap::new();
-    let mut decl_profiles: BTreeMap<String, BTreeMap<u64, String>> = BTreeMap::new();
+    let mut per_type_weight: BTreeMap<CTypeLike, i32> = BTreeMap::new();
+    let mut decl_profiles: BTreeMap<CTypeLike, BTreeMap<u64, String>> = BTreeMap::new();
     for decl in struct_decls {
-        let key = format!("struct {} *", decl.name);
-        if is_generic_type_string(&key) {
+        // Genericity here is a property of the struct's own name, which is what
+        // the placeholder test actually inspects once it has stripped the
+        // `struct` keyword and the star back off a rendered spelling.
+        if writeback_type_name_is_opaque_placeholder(&decl.name) {
             continue;
         }
+        let key = CTypeLike::Pointer(Box::new(CTypeLike::Struct(decl.name.clone())));
         let source_boost = if decl.source == StructDeclSource::ExternalTypeDb {
             12
         } else {
@@ -10369,25 +10388,23 @@ fn score_global_type_links(
         );
     }
     for var in var_type_candidates {
-        if var.var_type.starts_with("struct ")
-            && var.var_type.ends_with(" *")
-            && !is_generic_type_string(&var.var_type)
+        let parsed = crate::convert::parse_c_type_like(&var.var_type, ptr_bits);
+        if matches!(&parsed, CTypeLike::Pointer(inner) if matches!(inner.as_ref(), CTypeLike::Struct(name) if !writeback_type_name_is_opaque_placeholder(name)))
         {
-            *per_type_weight.entry(var.var_type.clone()).or_insert(30) +=
-                4 + (var.confidence as i32 / 12);
+            *per_type_weight.entry(parsed).or_insert(30) += 4 + (var.confidence as i32 / 12);
         }
     }
     if per_type_weight.is_empty() {
         return Vec::new();
     }
 
-    let mut per_addr_best: BTreeMap<u64, (String, i32)> = BTreeMap::new();
+    let mut per_addr_best: BTreeMap<u64, (CTypeLike, i32)> = BTreeMap::new();
     for (addr, profile) in per_addr_profiles {
         if profile.is_empty() {
             continue;
         }
         let observed_fields = profile.len();
-        let mut best: Option<(String, i32)> = None;
+        let mut best: Option<(CTypeLike, i32)> = None;
         for (ty, base_score) in &per_type_weight {
             let Some(decl_profile) = decl_profiles.get(ty) else {
                 continue;
@@ -11611,6 +11628,7 @@ mod tests {
                 None,
             ),
             plan: TypeWritebackPlan {
+                ptr_bits: 64,
                 signature: inferred_test_signature("fcn.refresh", "presentation_only"),
                 var_type_candidates: candidates,
                 var_rename_candidates: Vec::new(),
@@ -12462,6 +12480,7 @@ mod tests {
 
     fn empty_writeback_plan(function_name: &str) -> TypeWritebackPlan {
         TypeWritebackPlan {
+            ptr_bits: 64,
             signature: inferred_test_signature(function_name, "value"),
             var_type_candidates: Vec::new(),
             var_rename_candidates: Vec::new(),
@@ -13064,6 +13083,7 @@ mod tests {
         rename_confidence: u8,
     ) -> TypeWritebackPlan {
         TypeWritebackPlan {
+            ptr_bits: 64,
             signature: inferred_test_signature(function_name, "value"),
             var_type_candidates: vec![VarTypeCandidate {
                 name: "var_8h".to_string(),
@@ -13093,7 +13113,9 @@ mod tests {
             }],
             global_type_links: vec![GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct policy_item *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                    "policy_item".to_string(),
+                ))),
                 confidence,
                 source: WritebackSource::ExternalTypeDb,
             }],
@@ -13300,7 +13322,7 @@ mod tests {
         });
         plan.global_type_links.push(GlobalTypeLinkCandidate {
             addr: 0x404000,
-            target_type: "struct.Foo*".to_string(),
+            target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("Foo".to_string()))),
             confidence: 95,
             source: WritebackSource::ExternalTypeDb,
         });
@@ -13690,13 +13712,13 @@ mod tests {
         plan.global_type_links = vec![
             GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct a *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("a".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
             GlobalTypeLinkCandidate {
                 addr: 0x404008,
-                target_type: "struct b *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("b".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
@@ -13733,13 +13755,13 @@ mod tests {
         plan.global_type_links = vec![
             GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct a *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("a".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
             GlobalTypeLinkCandidate {
                 addr: 0x404008,
-                target_type: "struct b *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("b".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },

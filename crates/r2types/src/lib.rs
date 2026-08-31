@@ -107,7 +107,7 @@ pub use signature_infer::{
     compute_callconv_inference, compute_signature_confidence, format_afs_signature,
     infer_signature_from_prepared_ssa, infer_signature_return_type,
     inferred_signature_from_signature_spec, materialize_signature_type_like,
-    merge_initial_signature_type_evidence, render_signature_type,
+    merge_initial_signature_type_evidence, render_signature_type, render_writeback_apply_type,
     resolve_evidence_driven_signature_type,
 };
 pub use solver::{SolvedTypes, SolverConfig, SolverDiagnostics, TypeSolver};

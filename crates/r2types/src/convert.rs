@@ -1,6 +1,6 @@
 use crate::model::{Signedness, Type, TypeArena, TypeId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CTypeLike {
     Void,
     Bool,
@@ -236,6 +236,28 @@ fn named_integer_bits(spelling: &str, ptr_bits: u32) -> Option<(u32, Signedness)
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// radare2's own spellings, which arrive dotted and unspaced.
+    ///
+    /// These are what `canonicalize_writeback_apply_type_name` was rewriting by
+    /// hand, searching a rendered string for the first `*` and inserting a
+    /// space in front of it. Parsing reaches the same type from every spelling,
+    /// so the normalisation belongs at the point the spelling arrives rather
+    /// than at each point one is consumed.
+    #[test]
+    fn radare_dotted_spellings_reach_the_same_type() {
+        let foo = CTypeLike::Pointer(Box::new(CTypeLike::Struct("Foo".to_string())));
+        for spelling in ["struct.Foo*", "struct.Foo *", "struct Foo*", "struct Foo *"] {
+            assert_eq!(parse_c_type_like(spelling, 64), foo, "{spelling}");
+        }
+        assert_eq!(
+            parse_c_type_like("union.Bar*", 64),
+            CTypeLike::Pointer(Box::new(CTypeLike::Union("Bar".to_string())))
+        );
+        assert_eq!(
+            parse_c_type_like("type.Foo", 64),
+            CTypeLike::Typedef("Foo".to_string())
+        );
+    }
 
     /// Every type the renderer can emit, rendered and parsed back.
     ///
