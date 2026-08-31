@@ -1,6 +1,30 @@
 # Architecture plan: dispositions, bindings, and projections
 
-Execution status as of 2026-08-26 on `codex/binding-spine-rewrite`:
+Execution status as of 2026-08-31 on `codex/binding-spine-rewrite`. All four
+properties of section 1 now have a passing proof gate: `placement_audit` 54/54
+with the structured-region artifact retained and sealed, the strict-dialect raw
+compile 54/54, `shuffled_block_schedule_keeps_spans_bindings_placement_and_bytes_identical`
+passing for determinism, and `effect_obligations` and `render_refusal` 54/54 for
+the ledger. The corpus is at parity: generation, raw, diagnostic and differential
+all 54 of 54.
+
+The section 3 defect is reduced but not gone. `UseInfo` is eight fields rather
+than thirty-one, and `carrier_alias`, `var_alias`, `value_ids_by_name`,
+`unkeyed_writes` and `formatted_defs` no longer exist, so track A1, A2 and A4
+are done. A3 is not: `value_ids_by_var` and `vars_by_value_id` still store one
+relation in both directions, and `ambiguous_value_vars` and
+`ambiguous_value_ids` do the same for the ambiguity set. That is twenty-one
+uses across six mutating sites, and it is the last of the many-answerers shape
+inside `r2dec`.
+
+The measurements in the table below are from `ed7dfdc` and are stale. Current
+figures: 0 clippy diagnostics (was 184), 0 build warnings (was 57), 26
+`allow(dead_code)` (was 46), 203 `display_name()` call sites (was 684). The
+fourteen TODO/FIXME/HACK hits are mostly not debt -- eleven are radare2's own
+ESIL `TODO` keyword, which halts its evaluator; only three are real, all in
+`r2dec/src/structure.rs`.
+
+Stage commits:
 
 - stage 0, the honest 54-cell harness, is committed at `e787934`;
 - stage 1, the non-consuming binding-plan contract, is committed at `5078419`;

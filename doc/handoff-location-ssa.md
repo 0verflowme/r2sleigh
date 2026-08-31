@@ -6079,3 +6079,86 @@ actually prevents the recursion, and `r2engine/src/route.rs` decides whether a
 function gets real C or a summary on a dozen unsourced thresholds. The nearby
 `is_stack_reg_name` calls any register whose name merely *contains* `sp`, `bp` or
 `fp` a stack register.
+
+**The FFI boundary was audited and is sound.** All thirty-one `into_raw` sites
+reclaim, error paths included: the fallible steps run before `into_raw`, so a
+failure drops an owned `Box`, and the one place a raw pointer is live across a
+fallible call is covered by a `Drop` impl on `R2SleighAnalysisResultV2`. The
+allocator mismatch worth fearing -- Rust memory freed by C `free()` -- cannot
+occur, because only two symbols are exported and C never receives Rust memory:
+it copies through `sleigh_byte_view_v2_copy` into its own `malloc` and frees
+that. Handles are synthetic tokens rather than addresses, with lift and engine
+spaces disjoint by parity, so `from_raw` never runs on a pointer C supplied and
+a stale token merely misses the map. Repo-wide there is no `transmute`, no
+`get_unchecked`, no `unwrap_unchecked`, no `Vec::set_len`, and no `unsafe impl`;
+the ingress decoder for the untrusted wire buffer is entirely safe Rust under
+`unsafe_code = "deny"`. `Weak` is absent and correctly so: `SymbolId` is a copy
+index rather than a pointer, and the one recursive `Rc`, `ConstraintNode::parent`,
+has a single write in which a fresh node adopts an existing one, so every edge
+points from newer to older. That last one matters beyond leaks, because three
+functions walk the spine in unguarded `while let` loops and a cycle would hang
+the symbolic explorer rather than merely leak it.
+
+`crates/r2source/src/radare_abi138.rs` is the exception worth removing. It is
+2,923 lines holding 134 unsafe lines, the largest concentration in the tree, and
+it is the callback-based predecessor of the flat wire buffer. Nothing calls
+`capture_radare_abi138` or `RadareAbi138SnapshotInput`, but a few of its
+constants -- `RADARE_SNAPSHOT_CONTRACT_VERSION` and
+`RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION` -- still have external users, so
+deleting it means extracting those first. Doing so would cut the unsafe surface
+by roughly a third.
+
+**Two latent defects found in the API audit, neither yet fixed.** They are
+recorded here because both are traceable to a single cause and neither is
+visible in the corpus.
+
+The first is that `writeback_type_name_is_generic` and
+`writeback_apply_type_name_is_generic` disagree today. The first matches an
+exact list of spellings; the second ends with `normalized.starts_with("int")`,
+so `int64_t` is generic to one and concrete to the other. Both spacings of every
+entry are enumerated in each, which is the tell that they are parsing a
+rendering rather than reading a type. The same seam has six divergent register
+alias tables, six C-type-spelling parsers and four architecture-name
+normalizers, and two of them disagree already: `prepare.rs:302` omits `sp` from
+the `rsp` family while `writeback.rs:8704` includes it. The cause is that every
+writeback candidate carries `var_type: String` and `param_type: String` while
+`CTypeLike` and `MachineArch` exist; the fix is to make the candidates carry the
+types and render to a string only at the radare2 edge.
+
+The second is `ssa_var_key` at `r2types/src/prepare.rs:286`, which builds its
+key as `format!("{}_{}", var.name.to_ascii_lowercase(), var.version)`. That
+drops both `size` and `rename_disambiguator` -- and `rename_disambiguator`
+exists precisely to tell apart "two exact source storages that project to the
+same display name and width", which is its own doc comment. So the key collides
+on exactly the case the field was added to prevent, and `DefUseInfo` then
+encodes the resulting ambiguity at runtime as `Option<usize>` while keeping its
+typed `exact_definitions` and `exact_uses` maps private and unserialized. The
+key drives about twenty maps in `prepare.rs` and crosses the crate boundary as a
+public field on five request types.
+
+**Where the clones actually are.** The count is unremarkable in aggregate -- one
+`.clone()` per ninety-nine production lines -- but it concentrates badly in two
+places. `placement.rs:1951`, `:1954`, `:1995`, `:2035` and `:2168` deep-copy the
+whole `CFunction` AST per binding per demotion round; the trial-and-rollback
+design is right and the mechanism is what costs. And `FunctionFacts`, which
+carries three whole-program tables, is passed by value and deep-cloned five or
+six times per function, including once at `function_facts.rs:1481` purely to
+compare against a rebuild and throw away. `Arc<SsaArtifact>` one level up in
+`SourceOwnedFunctionFacts` is the pattern to copy. The redundant AST clone in
+`codegen.rs` was the one cheap case and is fixed.
+
+**Boundary hygiene, measured.** Of 916 items re-exported from `r2ssa`, `r2sym`
+and `r2types`, 505 are never named by another crate. The cause is visible in the
+visibility counts: `r2dec` uses `pub(crate)` 702 times against 197 `pub`, while
+`r2ssa` is 35 against 939, `r2types` 17 against 633 and `r2source` 0 against
+440. `r2dec` is the in-tree proof the discipline works. Separately `r2engine` is
+two files for 25,000 lines, and its `EngineSession` is a zero-sized unit struct
+carrying twenty `&self` methods across about 990 lines with no state at all.
+
+**One instance of the banned pattern survives.** `rewrite_summary_arg_labels` at
+`r2dec/src/lib.rs:1629` byte-scans already-emitted C for a literal `arg<N>`
+token and substitutes names, and `is_known_lowercase_register_version_label`
+nearby reconstructs from a rendered identifier whether it was an SSA-versioned
+register by matching a hardcoded sixty-entry register list. Both re-derive from
+text what was structured data three layers earlier. The binding plan already
+owns the naming decision, so the renderer should emit the final name once.
