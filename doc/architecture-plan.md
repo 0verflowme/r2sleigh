@@ -2045,7 +2045,47 @@ above. Three miss the strict gate on an uninitialised stack pointer and two dead
 frame slots. The gate D asks for is fifty-four of fifty-four with all four
 scores equal, and that is the track still open.
 
-### Track D's last three cells, traced to their causes
+### Track D closed to the vectorised cells
+
+Both defects the previous note described are fixed, and the corpus stands at 51
+of 54 with all four scores equal -- generation, strict, diagnostic and
+differential -- and no strict failure anywhere. What the note recorded as three
+separate causes turned out to be two, and the deeper one was neither of the
+places the traces had pointed at.
+
+The saved link register was a symptom. radare2 reports the machine role carriers
+as offsets into its own register arena, and every consumer here reads a
+canonical register offset as an offset in the Sleigh architecture's register
+space. The two numberings coincide for the stack pointer on the corpus machines
+and for nothing else, so `sp` worked and the link register was reported at
+offset zero -- a register the architecture does not have there. Every comparison
+of a carrier against a value's storage failed silently, which is why removing
+the return-address exclusion from the frame collector had been measured inert:
+that exclusion had never fired. The name now travels beside the storage and the
+lift resolves it against the architecture that was actually loaded. The plugin's
+own register profile also had to declare `=LR`, without which radare2's lookup
+walks LR, RA, PC and settles on the program counter.
+
+The two remaining strict failures were then one defect, on both architectures at
+once: `sub sp, sp, #0x70` lifts with the carry and sign computations beside it,
+nothing reads those flags, and the stack-geometry certificate counted their
+operands as readers of the stack pointer. The rule it already applied to frame
+and return-control uses -- a use inside a definition nothing observes is not a
+read -- was simply missing for the merge analysis's answer.
+
+The three cells that remain do not render at all, and all three are vectorised:
+`crc32_bitwise` and `xxhash32` at arm64 -O2 are NEON (`dup`, `cmeq`, `bic`,
+`ext`, `fmov`), and `crc32_bitwise` at x64 -O2 is SSE. The x86 one refuses later
+than the others -- its body lowers and the refusal is in declaration placement --
+but the cause is the same: the lift decomposes a 128-bit vector into named dword
+lanes, something reads the vector as a whole, so each lane write is a genuine
+insert into an object no statement has assembled. Admitting those writes as
+lanes was tried, gated on nothing in the function composing a wider value from
+the carrier, and measured to change nothing, because the wider read is really
+there. These three need vector values in the rendered C, which is a feature and
+not a defect; nothing in the current model is wrong about them.
+
+### Superseded: Track D's last three cells, traced to their causes
 
 Three cells render, compute the right answer, and miss the strict gate. Both
 were traced to a named predicate; neither fix landed, and the notes below say
