@@ -2290,9 +2290,25 @@ agree about whether it is read as itself. Imposing that in the projection, by
 requiring every value overlapping a value's storage to agree, is too strong and
 **costs all three vector cells** -- on x86 each lane overlaps the whole register,
 so one carrier-relative wide value poisons every lane in it. Overlap is not the
-grouping that matters; the storage *span* is, and that grouping is formed in the
-binding plan, a layer above the projection. So the check belongs there: when a
-binding's members disagree, the binding is carrier-relative for all of them.
+grouping that matters; the storage *span* is. Requiring agreement across a span
+was measured too, and **costs `crc32_bitwise` at arm64 -O2**, a cell that passes:
+withdrawing a member makes it carrier-relative, and its binding is then wider
+than the value its write produces -- the very error being chased.
+
+That is the useful result. All four attempts adjust *which* values are read as
+themselves, while the error is about something else. A lane write whose binding
+is wider than the value it produces renders as a bare assignment, and there is no
+assignment from a narrow value to a wide object. Whichever way the read side is
+decided, that write has to render as a field insert -- the prelude already
+provides `r2sleigh_bits_insert_*` -- and the first insert into an object no
+statement has assigned is exactly the placement refusal this began from.
+
+So the object-width model needs one coherent decision rather than another local
+rule. Two are available: an object is as wide as the widest thing done with it
+and every narrow write into it is an insert with a defined starting value; or
+objects are per lane and every wider read is an explicit composition. The corpus
+has been measured against four local answers and each moves the failure rather
+than removing it.
 
 `NEON_ushl` stays unexpanded until that is settled. It is written, it is verified
 exact against the architecture over three million vectors, and it is one measured
