@@ -2133,3 +2133,45 @@ measured and changes nothing, so that is not the x64 case, and the exclusion is
 somewhere in the closure -- either the load's use missing from
 `stack_address_uses`, or `resolve_entry_stack_root` returning nothing for that
 temp. That is one instrumented run away.
+
+### What the three vectorised cells actually need
+
+Both refusals were traced to their first point, and neither is where the printed
+message pointed.
+
+**The two arm64 -O2 cells refuse on `SSAOp::CallOther`.** The machine
+projection's operation match has no arm for it, so it falls to
+`MachineBuildError::UnsupportedOperation`, which `is_local_projection_failure`
+classifies as local. The projection then completes with those instructions
+unprojected, their constant operands are never interned as machine expressions,
+and the binding plan gives those constants `MissingLiteralProjection`. Whole-graph
+preflight surfaces the lowest-numbered refused value, and that is relabelled
+`missing_machine_projection_authorization` -- an authority that did not fail, and
+a value that is only the first casualty. The instructions are
+`ext v3.16b, v2.16b, v2.16b, 8` in `crc32_bitwise` and two `ushl v.4s` in
+`xxhash32`. The control case settles it: `crc32_init` carries the identical NEON
+lift with no `CallOther`, clears the projection stage entirely, and fails much
+later. So 128-bit registers, register geometry and sixteen-byte loads all work
+already; what is missing is a machine semantics for those two Sleigh userops --
+a lane-wise byte extract and a lane-wise variable shift -- and a C spelling for
+the result, since the type layer tops out at `__uint128_t` with no lane
+structure.
+
+**The x64 -O2 cell is two defects deep.** Its carrier resolves to the 512-bit
+ZMM register while every value in the function lives at 128-bit XMM width or
+32-bit lane width, and bits 128 to 511 are never written and never read. A lane
+write at a non-zero offset is therefore classified `Insert`, which widens the
+binding to 512 bits and lowers to a field insert reading the binding on its own
+right-hand side -- a read of an object no statement has assigned. One `pshufd`
+yields four objects of two different widths, because the lane at offset zero
+takes the `Lane` branch and its three siblings do not. Admitting `Lane` at any
+offset was measured: it moves the refusal past placement and costs no cell, but
+does not render, because the next thing in the way is the sixteen-byte
+`movdqa` load of a constant table. Its address is an inlined literal with no
+rendered occurrence, and no corpus function has ever rendered a load from a
+fixed data address, so the rendered C would also have to carry the table's bytes
+for the differential oracle to mean anything.
+
+Both remaining pieces are features with their own gates, not defects in the
+current model, and each should be planned as such rather than attempted as a
+patch: userop semantics with lane-wise rendering, and constant-data emission.
