@@ -107,10 +107,6 @@ impl ProvenProgramObservations {
     pub fn contains(&self, value: ValueId) -> bool {
         self.values.contains(&value)
     }
-
-    pub fn iter(&self) -> impl Iterator<Item = ValueId> + '_ {
-        self.values.iter().copied()
-    }
 }
 
 impl DeadPhis {

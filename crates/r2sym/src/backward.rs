@@ -1341,141 +1341,6 @@ where
     })
 }
 
-pub fn compile_derived_summary_memory_postcondition<'ctx, F>(
-    state: &SymState<'ctx>,
-    summary: &DerivedFunctionSummary<'ctx>,
-    callconv: &CallConv,
-    arg_index: usize,
-    offset: i64,
-    size: u32,
-    postcondition: F,
-) -> Option<CompiledBackwardCondition>
-where
-    F: Fn(&SymValue<'ctx>) -> Bool,
-{
-    if summary.cases.is_empty() {
-        return None;
-    }
-
-    let call =
-        callconv.collect_call_info(state, summary.arg_count_hint.max(callconv.arg_capacity()));
-    let substitutions = build_call_substitutions(
-        state,
-        &CallTransformContext {
-            summary: Rc::new(summary.clone()),
-            callconv: callconv.clone(),
-            args: call.args.clone(),
-        },
-    );
-    let base = call.args.get(arg_index)?;
-    let addr = add_signed_offset(state.context(), base, offset, call.arg_bits);
-    let mut terms = Vec::new();
-    for case in &summary.cases {
-        let Some((location, write)) = select_covering_write(
-            &case.memory_writes,
-            &[NormalizedMemoryLocation {
-                region: BackwardMemoryRegion::Argument { index: arg_index },
-                offset,
-            }],
-            size,
-        ) else {
-            continue;
-        };
-        let guard = substitute_bool(&case.guard, &substitutions);
-        let value = substitute_value(
-            state.context(),
-            &slice_write_value(state.context(), write, location.offset, size),
-            &substitutions,
-        );
-        terms.push(guard & postcondition(&value));
-    }
-    if terms.is_empty() {
-        return None;
-    }
-    let predicate = or_all(state.context(), &terms);
-    let simplified = predicate.simplify();
-    let memory_term = state
-        .memory
-        .resolve_pointer(&addr, size, state.constraints())
-        .pointers
-        .into_iter()
-        .find_map(|pointer| {
-            state.memory.region_def(pointer.region_id).map(|def| {
-                let region = BackwardMemoryRegion::Region(BackwardRegionRef {
-                    id: def.id,
-                    kind: def.kind.clone(),
-                    name: def.name.clone(),
-                });
-                let offset = i64::try_from(pointer.offset).unwrap_or(0);
-                BackwardMemoryCondition {
-                    region: region.clone(),
-                    address: SemanticMemoryAddress::exact(offset),
-                    size,
-                    evidence: if matches!(
-                        summary.completion,
-                        crate::sim::DerivedSummaryCompletion::Exact
-                    ) {
-                        SemanticEvidence::exact()
-                    } else {
-                        SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
-                            .with_coverage(SemanticEvidenceCoverage::Bounded)
-                            .with_provenance(SemanticEvidenceProvenance::Normalized)
-                    },
-                    binding: None,
-                    expr: format_backward_memory_location(&region, offset),
-                    value_expr: None,
-                    exact_value: false,
-                }
-            })
-        })
-        .unwrap_or(BackwardMemoryCondition {
-            region: BackwardMemoryRegion::Argument { index: arg_index },
-            address: SemanticMemoryAddress::exact(offset),
-            size,
-            evidence: if matches!(
-                summary.completion,
-                crate::sim::DerivedSummaryCompletion::Exact
-            ) {
-                SemanticEvidence::exact()
-            } else {
-                SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
-                    .with_coverage(SemanticEvidenceCoverage::Bounded)
-                    .with_provenance(SemanticEvidenceProvenance::Normalized)
-            },
-            binding: None,
-            expr: format_backward_memory_location(
-                &BackwardMemoryRegion::Argument { index: arg_index },
-                offset,
-            ),
-            value_expr: None,
-            exact_value: false,
-        });
-    Some(CompiledBackwardCondition {
-        summary: BackwardConditionSummary {
-            simplified: simplified.to_string(),
-            terms: terms
-                .iter()
-                .map(|term| term.simplify().to_string())
-                .collect(),
-            memory_terms: vec![memory_term],
-            backward_memory_substitutions: 1,
-            backward_memory_candidate_enumerations: 0,
-            backward_memory_residual_fallbacks: 0,
-            precision: if matches!(
-                summary.completion,
-                crate::sim::DerivedSummaryCompletion::Exact
-            ) {
-                BackwardConditionPrecision::Exact
-            } else {
-                BackwardConditionPrecision::ResidualSearchRequired
-            },
-            supported_paths: terms.len(),
-            total_paths: terms.len(),
-        },
-        predicate: simplified,
-    })
-}
-
 fn enumerate_reverse_paths(
     func: &SsaArtifact,
     target_addr: u64,
@@ -2296,19 +2161,6 @@ fn apply_delta_offsets(
         .collect()
 }
 
-fn select_covering_write<'a, 'ctx>(
-    writes: &'a [crate::sim::DerivedMemoryWrite<'ctx>],
-    locations: &[NormalizedMemoryLocation],
-    size: u32,
-) -> Option<(
-    NormalizedMemoryLocation,
-    &'a crate::sim::DerivedMemoryWrite<'ctx>,
-)> {
-    select_covering_writes(writes, locations, size)
-        .into_iter()
-        .min_by_key(|(location, write)| (write.size, write.offset, location.offset))
-}
-
 fn select_covering_writes<'a, 'ctx>(
     writes: &'a [crate::sim::DerivedMemoryWrite<'ctx>],
     locations: &[NormalizedMemoryLocation],
@@ -2464,19 +2316,6 @@ fn read_register_from_state<'ctx>(state: &SymState<'ctx>, base: &str, bits: u32)
         }
     }
     SymValue::unknown(bits)
-}
-
-fn add_signed_offset<'ctx>(
-    ctx: &'ctx Context,
-    base: &SymValue<'ctx>,
-    offset: i64,
-    bits: u32,
-) -> SymValue<'ctx> {
-    if offset >= 0 {
-        base.add(ctx, &SymValue::concrete(offset as u64, bits))
-    } else {
-        base.sub(ctx, &SymValue::concrete(offset.unsigned_abs(), bits))
-    }
 }
 
 fn find_register_key<'ctx>(state: &SymState<'ctx>, base: &str) -> Option<String> {

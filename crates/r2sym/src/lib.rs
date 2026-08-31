@@ -33,29 +33,29 @@
 //! }
 //! ```
 
-pub mod backward;
-pub mod constraints;
-pub mod control;
-pub mod executor;
-pub mod kernel;
-pub mod loops;
-pub mod memory;
+pub(crate) mod backward;
+pub(crate) mod constraints;
+pub(crate) mod control;
+pub(crate) mod executor;
+pub(crate) mod kernel;
+pub(crate) mod loops;
+pub(crate) mod memory;
 mod memory_address;
 pub mod path;
-pub mod query;
+pub(crate) mod query;
 pub mod r2api;
-pub mod replay;
-pub mod runtime;
-pub mod semantic_report;
-pub mod semantics;
+pub(crate) mod replay;
+pub(crate) mod runtime;
+pub(crate) mod semantic_report;
+pub(crate) mod semantics;
 pub mod sim;
-pub mod solver;
+pub(crate) mod solver;
 pub mod spec;
-pub mod state;
-pub mod symbol;
-pub mod tactics;
-pub mod value;
-pub mod verification;
+pub(crate) mod state;
+pub(crate) mod symbol;
+pub(crate) mod tactics;
+pub(crate) mod value;
+pub(crate) mod verification;
 
 pub use backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,

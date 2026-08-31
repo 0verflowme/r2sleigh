@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::cfg::CFG;
-use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
+use crate::control::{SsaExecutionStopReason, SsaWorkControl};
 use crate::domtree::DomTree;
 use crate::naming::RegisterNameMap;
 use crate::op::SSAOp;
@@ -161,8 +161,6 @@ pub struct RenamedFunction {
     pub blocks: HashMap<u64, Vec<SSAOp>>,
     /// Block addresses in order.
     pub block_order: Vec<u64>,
-    /// Entry block address.
-    pub entry: u64,
     /// Lifted storage provenance for SSA values.
     ///
     /// This map is populated directly from source varnodes while renaming. A
@@ -175,72 +173,14 @@ pub struct RenamedFunction {
 
 impl RenamedFunction {
     /// Create a new empty renamed function.
-    pub fn new(entry: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             blocks: HashMap::new(),
             block_order: Vec::new(),
-            entry,
             canonical_storage_by_var: BTreeMap::new(),
             ambiguous_storage_vars: BTreeSet::new(),
         }
     }
-
-    /// Get the SSA operations for a block.
-    pub fn get_block(&self, addr: u64) -> &[SSAOp] {
-        self.blocks.get(&addr).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-}
-
-/// Perform SSA renaming on a CFG.
-///
-/// This is the main entry point for the renaming algorithm.
-pub fn rename_function(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    definitions: &DefinitionSitesByIdentity,
-) -> RenamedFunction {
-    rename_function_with_names(cfg, domtree, phi_placement, definitions, None)
-}
-
-/// Perform SSA renaming on a CFG with optional register names.
-pub fn rename_function_with_names(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    definitions: &DefinitionSitesByIdentity,
-    reg_names: Option<&RegisterNameMap>,
-) -> RenamedFunction {
-    rename_function_with_names_and_call_boundaries(
-        cfg,
-        domtree,
-        phi_placement,
-        definitions,
-        reg_names,
-        None,
-    )
-}
-
-/// Perform SSA renaming on a CFG with optional register names and decompiler-safe call
-/// boundaries.
-pub fn rename_function_with_names_and_call_boundaries(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    definitions: &DefinitionSitesByIdentity,
-    reg_names: Option<&RegisterNameMap>,
-    call_boundaries: Option<&CallBoundaryConfig>,
-) -> RenamedFunction {
-    rename_function_with_names_and_call_boundaries_and_control(
-        cfg,
-        domtree,
-        phi_placement,
-        definitions,
-        reg_names,
-        call_boundaries,
-        &UncheckedSsaWorkControl,
-    )
-    .expect("unchecked SSA renaming cannot stop")
 }
 
 /// Perform SSA renaming while polling its block and operation worklists.
@@ -256,7 +196,7 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
 ) -> Result<RenamedFunction, SsaExecutionStopReason> {
     control.poll()?;
     let mut ctx = RenameContext::new();
-    let mut result = RenamedFunction::new(cfg.entry);
+    let mut result = RenamedFunction::new();
 
     // Initialize all variables
     for identity in definitions.keys() {
@@ -1441,8 +1381,7 @@ fn read_varnode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::CFG;
-    use crate::phi::{collect_defs_from_cfg, collect_defs_from_cfg_with_names};
+
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
@@ -1463,414 +1402,12 @@ mod tests {
         }
     }
 
-    fn make_ram(addr: u64, size: u32) -> Varnode {
-        Varnode {
-            space: SpaceId::Ram,
-            offset: addr,
-            size,
-            meta: None,
-        }
-    }
-
     fn make_unique(offset: u64, size: u32) -> Varnode {
         Varnode {
             space: SpaceId::Unique,
             offset,
             size,
             meta: None,
-        }
-    }
-
-    #[test]
-    fn test_rename_linear() {
-        // Linear CFG with two writes to same register
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(2, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let defs = collect_defs_from_cfg(&cfg);
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &defs);
-
-        // Check that versions are assigned correctly
-        let block_ops = result.get_block(0x1000);
-        assert_eq!(block_ops.len(), 2);
-
-        // First copy should produce reg:0 v1
-        if let SSAOp::Copy { dst, .. } = &block_ops[0] {
-            assert_eq!(dst.version, 1);
-        } else {
-            panic!("Expected Copy op");
-        }
-
-        // Second copy should produce reg:0 v2
-        if let SSAOp::Copy { dst, .. } = &block_ops[1] {
-            assert_eq!(dst.version, 2);
-        } else {
-            panic!("Expected Copy op");
-        }
-    }
-
-    #[test]
-    fn test_rename_with_phi() {
-        // Diamond CFG with phi
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x100c, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![R2ILOp::Copy {
-                    dst: make_reg(0, 8),
-                    src: make_const(2, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let defs = collect_defs_from_cfg(&cfg);
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &defs);
-
-        // Check that merge block has a phi
-        let merge_ops = result.get_block(0x100c);
-        assert!(!merge_ops.is_empty());
-
-        // First op should be a phi
-        if let SSAOp::Phi { dst, sources } = &merge_ops[0] {
-            assert_eq!(dst.name, "reg:0");
-            assert_eq!(sources.len(), 2);
-            assert_eq!(sources[0].name, "reg:0");
-            assert_eq!(sources[1].name, "reg:0");
-            assert_eq!(sources[0].version, 1);
-            assert_eq!(sources[1].version, 2);
-        } else {
-            panic!("Expected Phi op, got {:?}", merge_ops[0]);
-        }
-    }
-
-    #[test]
-    fn phi_live_in_source_retains_lifted_storage() {
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x100c, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: Vec::new(),
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let defs = collect_defs_from_cfg(&cfg);
-        let storage = CanonicalStorageId::from_varnode(&make_reg(0, 8));
-        let storage_by_identity =
-            BTreeMap::from([(RenameIdentity::new("reg:0", storage), storage)]);
-        let phi_placement =
-            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &storage_by_identity);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &defs);
-        let SSAOp::Phi { sources, .. } = &result.get_block(0x100c)[0] else {
-            panic!("expected merge phi");
-        };
-        let live_in = sources
-            .iter()
-            .find(|source| source.version == 0)
-            .expect("entry live-in source");
-        assert_eq!(result.canonical_storage_by_var.get(live_in), Some(&storage));
-    }
-
-    #[test]
-    fn call_boundary_preserves_register_map_alias_width_for_read_only_alias() {
-        let blocks = vec![R2ILBlock {
-            addr: 0x1000,
-            size: 4,
-            ops: vec![
-                R2ILOp::Call {
-                    target: make_const(0x2000, 8),
-                },
-                R2ILOp::IntEqual {
-                    dst: make_reg(0x80, 1),
-                    a: make_reg(0, 4),
-                    b: make_const(0, 4),
-                },
-                R2ILOp::Return {
-                    target: make_const(0, 8),
-                },
-            ],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let mut reg_names = RegisterNameMap::new();
-        reg_names.insert((0, 8), "RAX".to_string());
-        reg_names.insert((0, 4), "EAX".to_string());
-        let defs = collect_defs_from_cfg_with_names(&cfg, Some(&reg_names));
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs);
-        let boundary = CallBoundaryConfig {
-            defined_regs: vec![
-                CallBoundaryDef {
-                    name: "rax".to_string(),
-                    size: 8,
-                },
-                CallBoundaryDef {
-                    name: "eax".to_string(),
-                    size: 4,
-                },
-            ],
-        };
-        let result = rename_function_with_names_and_call_boundaries(
-            &cfg,
-            &domtree,
-            &phi_placement,
-            &defs,
-            Some(&reg_names),
-            Some(&boundary),
-        );
-
-        let call_defines: Vec<&SSAVar> = result
-            .get_block(0x1000)
-            .iter()
-            .filter_map(|op| match op {
-                SSAOp::CallDefine { dst } => Some(dst),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            call_defines
-                .iter()
-                .any(|dst| dst.name == "RAX" && dst.size == 8)
-        );
-        assert!(
-            call_defines
-                .iter()
-                .any(|dst| dst.name == "EAX" && dst.size == 4)
-        );
-    }
-
-    #[test]
-    fn reused_unique_widths_have_distinct_deterministic_diamond_phis() {
-        let narrow = make_unique(0x200, 4);
-        let wide = make_unique(0x200, 8);
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: narrow.clone(),
-                        src: make_const(1, 4),
-                    },
-                    R2ILOp::Copy {
-                        dst: wide.clone(),
-                        src: make_const(2, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x100c, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: narrow.clone(),
-                        src: make_const(3, 4),
-                    },
-                    R2ILOp::Copy {
-                        dst: wide.clone(),
-                        src: make_const(4, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 4),
-                        src: narrow,
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(8, 8),
-                        src: wide,
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-
-        let cfg = CFG::from_blocks(&blocks).expect("diamond CFG");
-        let domtree = DomTree::compute(&cfg);
-        let (defs, storage_by_identity) =
-            crate::phi::collect_defs_from_cfg_with_names_and_storage(&cfg, None);
-        let placement =
-            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &storage_by_identity);
-        let first = rename_function(&cfg, &domtree, &placement, &defs);
-        let second = rename_function(&cfg, &domtree, &placement, &defs);
-
-        assert_eq!(first.block_order, second.block_order);
-        assert_eq!(first.blocks, second.blocks);
-        assert_eq!(
-            first.canonical_storage_by_var,
-            second.canonical_storage_by_var
-        );
-
-        let merge = first.get_block(0x100c);
-        let phis: Vec<(&SSAVar, &Vec<SSAVar>)> = merge
-            .iter()
-            .filter_map(|op| match op {
-                SSAOp::Phi { dst, sources } => Some((dst, sources)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(phis.len(), 2, "one phi is required for each exact width");
-        assert_eq!(
-            phis.iter().map(|(dst, _)| dst.size).collect::<Vec<_>>(),
-            vec![4, 8]
-        );
-
-        let definitions: BTreeSet<SSAVar> = first
-            .blocks
-            .values()
-            .flat_map(|ops| ops.iter().filter_map(SSAOp::dst).cloned())
-            .collect();
-        for (dst, sources) in phis {
-            assert_eq!(
-                dst.version, 3,
-                "each width must own an independent version sequence"
-            );
-            assert_eq!(sources.len(), 2);
-            assert_eq!(
-                sources
-                    .iter()
-                    .map(|source| source.version)
-                    .collect::<Vec<_>>(),
-                vec![1, 2]
-            );
-            for source in sources {
-                assert_eq!(source.name, dst.name);
-                assert_eq!(source.size, dst.size);
-                assert!(
-                    source.version == 0 || definitions.contains(source),
-                    "phi source {source:?} has no incoming SSA definition"
-                );
-            }
         }
     }
 

@@ -737,12 +737,6 @@ pub fn exact_fold_evidence_from_recurrences(
     folds
 }
 
-pub fn exact_fold_evidence_from_system(
-    system: &LoopTransitionSystem,
-) -> Vec<ExactLoopFoldEvidence> {
-    exact_fold_evidence_from_recurrences(&exact_recurrence_evidence_from_system(system))
-}
-
 pub fn discover_loop_carried_state(
     block: &FunctionSSABlock,
     counter: Option<&SSAVar>,
@@ -2026,10 +2020,9 @@ mod tests {
     use z3::Context;
 
     use super::{
-        ExactLoopRecurrenceKind, LoopFoldOperation, LoopMemoryTermKind, LoopRecurrenceKind,
-        LoopRotateDirection, LoopSummaryKind, LoopVarRole, apply_exact_transition_system,
-        concrete_state_var_at_block_entry, derive_loop_transition_system,
-        discover_loop_carried_state, exact_fold_evidence_from_system,
+        LoopMemoryTermKind, LoopRecurrenceKind, LoopSummaryKind, LoopVarRole,
+        apply_exact_transition_system, concrete_state_var_at_block_entry,
+        derive_loop_transition_system, discover_loop_carried_state,
         exact_recurrence_evidence_from_system, runtime_counter_threshold_branch,
     };
     use crate::{SymState, SymValue};
@@ -2347,108 +2340,6 @@ mod tests {
     }
 
     #[test]
-    fn derives_exact_xor_table_fold_summary() {
-        let counter_phi = var("RCX", 2, 8);
-        let ptr_phi = var("RDI", 2, 8);
-        let acc_phi = var("RBX", 2, 8);
-        let block = FunctionSSABlock {
-            addr: 0x1000,
-            size: 4,
-            phis: vec![
-                PhiNode {
-                    dst: counter_phi.clone(),
-                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: ptr_phi.clone(),
-                    sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: acc_phi.clone(),
-                    sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
-                    canonical_storage: None,
-                },
-            ],
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("RCX", 1, 8),
-                    a: counter_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("RDI", 1, 8),
-                    a: ptr_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::Load {
-                    dst: var("TMP", 0, 1),
-                    space: r2il::SpaceId::Ram,
-                    addr: ptr_phi,
-                },
-                SSAOp::IntXor {
-                    dst: var("RBX", 1, 8),
-                    a: acc_phi,
-                    b: var("TMP", 0, 1),
-                },
-            ],
-        };
-        let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_prev_pc(Some(0x900));
-        state.set_register("RCX_0", SymValue::concrete(0, 64));
-        state.set_register("RDI_0", SymValue::concrete(0x5000, 64));
-        state.set_register("RBX_0", SymValue::concrete(0xaa, 64));
-        state.mem_write(
-            &SymValue::concrete(0x5000, 64),
-            &SymValue::concrete(1, 8),
-            1,
-        );
-        state.mem_write(
-            &SymValue::concrete(0x5001, 64),
-            &SymValue::concrete(2, 8),
-            1,
-        );
-        state.mem_write(
-            &SymValue::concrete(0x5002, 64),
-            &SymValue::concrete(3, 8),
-            1,
-        );
-        let branch = super::RuntimeLoopBranch {
-            counter: counter_phi,
-            threshold: 3,
-            target: 0x2000,
-        };
-
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
-        assert!(system.is_exact(), "{:?}", system.reasons);
-        let folds = exact_fold_evidence_from_system(&system);
-        assert_eq!(folds.len(), 1);
-        assert_eq!(folds[0].operation, LoopFoldOperation::Xor);
-        assert_eq!(folds[0].accumulator, "RBX_2");
-        assert_eq!(folds[0].term.kind, LoopMemoryTermKind::TableRead);
-        assert!(system.recurrences.iter().any(|recurrence| {
-            matches!(
-                &recurrence.kind,
-                LoopRecurrenceKind::XorMemoryFold(term)
-                    if term.kind == LoopMemoryTermKind::TableRead && term.base == Some(0x5000)
-            )
-        }));
-        let summary = apply_exact_transition_system(&ctx, &state, &system).expect("summary");
-        assert_eq!(summary.kind, LoopSummaryKind::Exact);
-        let summarized = summary.resulting_state.expect("state");
-        assert_eq!(
-            summarized.get_register_sized("RBX_2", 64).as_concrete(),
-            Some(0xaa)
-        );
-        assert_eq!(
-            summarized.get_register_sized("RDI_2", 64).as_concrete(),
-            Some(0x5003)
-        );
-    }
-
-    #[test]
     fn refuses_custom_space_fold_even_when_ram_exists_at_the_same_address() {
         let counter_phi = var("RCX", 2, 8);
         let ptr_phi = var("RDI", 2, 8);
@@ -2542,94 +2433,6 @@ mod tests {
     }
 
     #[test]
-    fn derives_exact_xor_symbolic_input_fold_summary() {
-        let counter_phi = var("RCX", 2, 8);
-        let ptr_phi = var("RDI", 2, 8);
-        let acc_phi = var("RBX", 2, 8);
-        let block = FunctionSSABlock {
-            addr: 0x1000,
-            size: 4,
-            phis: vec![
-                PhiNode {
-                    dst: counter_phi.clone(),
-                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: ptr_phi.clone(),
-                    sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: acc_phi.clone(),
-                    sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
-                    canonical_storage: None,
-                },
-            ],
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("RCX", 1, 8),
-                    a: counter_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("RDI", 1, 8),
-                    a: ptr_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::Load {
-                    dst: var("TMP", 0, 1),
-                    space: r2il::SpaceId::Ram,
-                    addr: ptr_phi,
-                },
-                SSAOp::IntXor {
-                    dst: var("RBX", 1, 8),
-                    a: acc_phi,
-                    b: var("TMP", 0, 1),
-                },
-            ],
-        };
-        let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_prev_pc(Some(0x900));
-        state.set_register("RCX_0", SymValue::concrete(0, 64));
-        state.set_register("RDI_0", SymValue::concrete(0x7000, 64));
-        state.set_register("RBX_0", SymValue::concrete(0, 64));
-        state.make_symbolic_memory(0x7000, 3, "argv1");
-        let branch = super::RuntimeLoopBranch {
-            counter: counter_phi,
-            threshold: 3,
-            target: 0x2000,
-        };
-
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
-        assert!(system.is_exact(), "{:?}", system.reasons);
-        let folds = exact_fold_evidence_from_system(&system);
-        assert_eq!(folds.len(), 1);
-        assert_eq!(folds[0].operation, LoopFoldOperation::Xor);
-        assert_eq!(folds[0].accumulator, "RBX_2");
-        assert_eq!(folds[0].term.kind, LoopMemoryTermKind::InputRead);
-        assert!(system.recurrences.iter().any(|recurrence| {
-            matches!(
-                &recurrence.kind,
-                LoopRecurrenceKind::XorMemoryFold(term)
-                    if term.kind == LoopMemoryTermKind::InputRead
-                        && term.base == Some(0x7000)
-                        && term.region_base == Some(0x7000)
-                        && term.region_size == Some(3)
-            )
-        }));
-        let summary = apply_exact_transition_system(&ctx, &state, &system).expect("summary");
-        assert_eq!(summary.kind, LoopSummaryKind::Exact);
-        let summarized = summary.resulting_state.expect("state");
-        assert!(summarized.get_register_sized("RBX_2", 64).is_symbolic());
-        assert_eq!(
-            summarized.get_register_sized("RDI_2", 64).as_concrete(),
-            Some(0x7003)
-        );
-    }
-
-    #[test]
     fn derives_exact_add_runtime_blob_fold_summary() {
         let counter_phi = var("RCX", 2, 8);
         let ptr_phi = var("RDI", 2, 8);
@@ -2708,132 +2511,6 @@ mod tests {
         assert_eq!(
             summarized.get_register_sized("RBX_2", 64).as_concrete(),
             Some(16)
-        );
-    }
-
-    #[test]
-    fn derives_exact_rotate_xor_table_summary() {
-        let counter_phi = var("RCX", 2, 8);
-        let ptr_phi = var("RDI", 2, 8);
-        let acc_phi = var("RBX", 2, 1);
-        let block = FunctionSSABlock {
-            addr: 0x1000,
-            size: 7,
-            phis: vec![
-                PhiNode {
-                    dst: counter_phi.clone(),
-                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: ptr_phi.clone(),
-                    sources: vec![(0x900, var("RDI", 0, 8)), (0x1008, var("RDI", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: acc_phi.clone(),
-                    sources: vec![(0x900, var("RBX", 0, 1)), (0x1008, var("RBX", 1, 1))],
-                    canonical_storage: None,
-                },
-            ],
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("RCX", 1, 8),
-                    a: counter_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("RDI", 1, 8),
-                    a: ptr_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::Load {
-                    dst: var("TMP", 0, 1),
-                    space: r2il::SpaceId::Ram,
-                    addr: ptr_phi,
-                },
-                SSAOp::IntLeft {
-                    dst: var("ROT_L", 0, 1),
-                    a: acc_phi.clone(),
-                    b: const_var(3, 1),
-                },
-                SSAOp::IntRight {
-                    dst: var("ROT_R", 0, 1),
-                    a: acc_phi,
-                    b: const_var(5, 1),
-                },
-                SSAOp::IntOr {
-                    dst: var("ROT", 0, 1),
-                    a: var("ROT_L", 0, 1),
-                    b: var("ROT_R", 0, 1),
-                },
-                SSAOp::IntXor {
-                    dst: var("RBX", 1, 1),
-                    a: var("ROT", 0, 1),
-                    b: var("TMP", 0, 1),
-                },
-            ],
-        };
-        let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_prev_pc(Some(0x900));
-        state.set_register("RCX_0", SymValue::concrete(0, 64));
-        state.set_register("RDI_0", SymValue::concrete(0x5000, 64));
-        state.set_register("RBX_0", SymValue::concrete(0x12, 8));
-        state.mem_write(
-            &SymValue::concrete(0x5000, 64),
-            &SymValue::concrete(1, 8),
-            1,
-        );
-        state.mem_write(
-            &SymValue::concrete(0x5001, 64),
-            &SymValue::concrete(2, 8),
-            1,
-        );
-        state.mem_write(
-            &SymValue::concrete(0x5002, 64),
-            &SymValue::concrete(3, 8),
-            1,
-        );
-        let branch = super::RuntimeLoopBranch {
-            counter: counter_phi,
-            threshold: 3,
-            target: 0x2000,
-        };
-
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
-        assert!(system.is_exact(), "{:?}", system.reasons);
-        assert!(system.recurrences.iter().any(|recurrence| {
-            matches!(
-                &recurrence.kind,
-                LoopRecurrenceKind::RotateMix {
-                    direction: LoopRotateDirection::Left,
-                    amount: 3,
-                    operation: LoopFoldOperation::Xor,
-                    term,
-                } if term.kind == LoopMemoryTermKind::TableRead && term.base == Some(0x5000)
-            )
-        }));
-        let recurrences = exact_recurrence_evidence_from_system(&system);
-        assert!(recurrences.iter().any(|recurrence| matches!(
-            &recurrence.kind,
-            ExactLoopRecurrenceKind::RotateMix {
-                direction: LoopRotateDirection::Left,
-                amount: 3,
-                operation: LoopFoldOperation::Xor,
-                term,
-            } if term.kind == LoopMemoryTermKind::TableRead
-        )));
-        assert!(exact_fold_evidence_from_system(&system).is_empty());
-        let summary = apply_exact_transition_system(&ctx, &state, &system).expect("summary");
-        let summarized = summary.resulting_state.expect("state");
-        assert_eq!(
-            summarized.get_register_sized("RBX_2", 8).as_concrete(),
-            Some(0x77)
-        );
-        assert_eq!(
-            summarized.get_register_sized("RDI_2", 64).as_concrete(),
-            Some(0x5003)
         );
     }
 

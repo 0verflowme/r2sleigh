@@ -28,6 +28,9 @@ pub enum CallHookResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// The shared prefix is the point: these name Windows API entry points, and
+// dropping it would leave variants like `RaiseException` that read as ours.
+#[allow(clippy::enum_variant_names)]
 pub enum CallHookTag {
     WindowsAddVectoredExceptionHandler,
     WindowsRaiseException,
