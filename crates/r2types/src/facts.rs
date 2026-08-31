@@ -917,9 +917,7 @@ pub fn signature_hint_can_replace_existing(
     let Some(hint) = hint else {
         return false;
     };
-    if crate::signature_infer::render_signature_type(existing, ptr_bits)
-        == crate::signature_infer::render_signature_type(hint, ptr_bits)
-    {
+    if crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits) {
         return false;
     }
     if type_is_generated_local_struct_pointer(existing) && pointer_hint_is_authoritative(hint) {
@@ -979,8 +977,9 @@ pub fn signature_hint_can_replace_existing(
                             signedness: _
                         }
                     )
-                ) && crate::signature_infer::render_signature_type(existing, ptr_bits)
-                    != crate::signature_infer::render_signature_type(hint, ptr_bits))
+                ) && !crate::signature_infer::signature_types_are_equivalent(
+                    existing, hint, ptr_bits,
+                ))
                 || (matches!(
                     new_inner.as_ref(),
                     CTypeLike::Typedef(_)

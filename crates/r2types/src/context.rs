@@ -1181,7 +1181,7 @@ fn register_param_candidate_score(
             score += 20;
         }
         if let (Some(left), Some(right)) = (candidate.ty.as_ref(), param.ty.as_ref())
-            && render_signature_type(left, ptr_bits) == render_signature_type(right, ptr_bits)
+            && crate::signature_infer::signature_types_are_equivalent(left, right, ptr_bits)
         {
             score += 10;
         }

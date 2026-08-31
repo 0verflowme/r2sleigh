@@ -3182,9 +3182,7 @@ fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa
 /// type that is already structured is never demoted, so a recovered type cannot
 /// overwrite a declared one.
 fn recovered_type_outranks(existing: &CTypeLike, recovered: &CTypeLike, ptr_bits: u32) -> bool {
-    if crate::signature_infer::render_signature_type(existing, ptr_bits)
-        == crate::signature_infer::render_signature_type(recovered, ptr_bits)
-    {
+    if crate::signature_infer::signature_types_are_equivalent(existing, recovered, ptr_bits) {
         return false;
     }
     if crate::facts::signature_hint_can_replace_existing(existing, Some(recovered), ptr_bits) {

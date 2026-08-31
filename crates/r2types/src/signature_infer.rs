@@ -556,6 +556,88 @@ pub fn materialize_signature_type_like(ty: CTypeLike, ptr_bits: u32) -> CTypeLik
     }
 }
 
+/// Whether two signature types are the same type for writeback purposes.
+///
+/// Both operands are already `CTypeLike`. This was written at six sites as
+/// `render_signature_type(a) == render_signature_type(b)` -- two structured
+/// values compared by the text they print to. That is only correct if the
+/// renderer is injective over the types that reach it, which nothing checked,
+/// and it silently imposed one equivalence of its own: `Signedness::Unknown`
+/// prints as signed, so a width whose signedness is not yet established
+/// compared equal to the signed type of that width and unequal to the unsigned
+/// one.
+///
+/// The equivalence is kept here rather than corrected, because removing a round
+/// trip through text should not also change which types are considered the
+/// same. It is stated instead of implied, so the next reader can see it and
+/// decide it on its merits.
+pub fn signature_types_are_equivalent(left: &CTypeLike, right: &CTypeLike, ptr_bits: u32) -> bool {
+    normalized_signature_type(left, ptr_bits) == normalized_signature_type(right, ptr_bits)
+}
+
+fn normalized_signature_type(ty: &CTypeLike, ptr_bits: u32) -> CTypeLike {
+    settle_unknown_signedness(resolve_builtin_typedefs(
+        materialize_signature_type_like(ty.clone(), ptr_bits),
+        ptr_bits,
+    ))
+}
+
+/// Fold a typedef whose name is itself a C type spelling into that type.
+///
+/// `Typedef("int32_t")` and `Int { bits: 32, signedness: Signed }` are the same
+/// type -- one arrived through radare2's type database and the other through
+/// inference -- and the comparison this replaced got that right by accident,
+/// because both print `int32_t`. Parsing the name is how to get it right on
+/// purpose.
+///
+/// The fold applies only when the parsed type spells itself the same way again.
+/// That is what separates `int32_t`, which is merely another way of writing the
+/// integer, from `size_t`, which is also sixty-four bits unsigned on this target
+/// but is not the same statement about the value: keeping it distinct is what
+/// lets a `size_t` still replace a bare `uint64_t` downstream. The round trip
+/// decides it, so there is no list of privileged names to maintain.
+fn resolve_builtin_typedefs(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
+    match ty {
+        CTypeLike::Typedef(name) => {
+            let parsed = crate::convert::parse_c_type_like(&name, ptr_bits);
+            if matches!(parsed, CTypeLike::Typedef(_))
+                || render_signature_type(&parsed, ptr_bits) != name
+            {
+                CTypeLike::Typedef(name)
+            } else {
+                parsed
+            }
+        }
+        CTypeLike::Pointer(inner) => {
+            CTypeLike::Pointer(Box::new(resolve_builtin_typedefs(*inner, ptr_bits)))
+        }
+        CTypeLike::Array(inner, len) => {
+            CTypeLike::Array(Box::new(resolve_builtin_typedefs(*inner, ptr_bits)), len)
+        }
+        other => other,
+    }
+}
+
+/// Resolve the one distinction a C spelling cannot express.
+fn settle_unknown_signedness(ty: CTypeLike) -> CTypeLike {
+    match ty {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unknown,
+        } => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        },
+        CTypeLike::Pointer(inner) => {
+            CTypeLike::Pointer(Box::new(settle_unknown_signedness(*inner)))
+        }
+        CTypeLike::Array(inner, len) => {
+            CTypeLike::Array(Box::new(settle_unknown_signedness(*inner)), len)
+        }
+        other => other,
+    }
+}
+
 pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
     match materialize_signature_type_like(ty.clone(), ptr_bits) {
         CTypeLike::Void => "void".to_string(),
@@ -1429,6 +1511,64 @@ pub fn build_inferred_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where comparing types differs from comparing the text they print to.
+    ///
+    /// The six sites this predicate replaced compared rendered strings, so any
+    /// two types that print the same were treated as one. Comparing the types
+    /// instead is only safe where the renderer is injective, and this test says
+    /// exactly where it is not, rather than leaving it to be discovered by a
+    /// wrong decompilation.
+    #[test]
+    fn comparing_types_agrees_with_comparing_their_spellings() {
+        let mut cases = vec![
+            CTypeLike::Void,
+            CTypeLike::Bool,
+            CTypeLike::Unknown,
+            CTypeLike::Float(32),
+            CTypeLike::Float(64),
+            CTypeLike::Struct("Demo".to_string()),
+            CTypeLike::Union("Demo".to_string()),
+            CTypeLike::Typedef("demo_t".to_string()),
+            // The collision worth naming: a typedef whose spelling is exactly a
+            // built-in type's spelling.
+            CTypeLike::Typedef("int32_t".to_string()),
+            CTypeLike::Typedef("size_t".to_string()),
+        ];
+        for bits in [8u32, 16, 32, 64] {
+            for signedness in [
+                Signedness::Signed,
+                Signedness::Unsigned,
+                Signedness::Unknown,
+            ] {
+                cases.push(CTypeLike::Int { bits, signedness });
+            }
+        }
+        let scalars = cases.clone();
+        for scalar in scalars {
+            cases.push(CTypeLike::Pointer(Box::new(scalar)));
+        }
+
+        let ptr_bits = 64;
+        let mut divergences = Vec::new();
+        for left in &cases {
+            for right in &cases {
+                let by_type = signature_types_are_equivalent(left, right, ptr_bits);
+                let by_spelling =
+                    render_signature_type(left, ptr_bits) == render_signature_type(right, ptr_bits);
+                if by_type != by_spelling {
+                    divergences.push(format!(
+                        "{left:?} vs {right:?}: by type {by_type}, by spelling {by_spelling}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            divergences.is_empty(),
+            "comparing types disagrees with comparing spellings:\n{}",
+            divergences.join("\n")
+        );
+    }
 
     fn x86_return_arch() -> r2il::ArchSpec {
         let mut arch = r2il::ArchSpec::new("x86-64");

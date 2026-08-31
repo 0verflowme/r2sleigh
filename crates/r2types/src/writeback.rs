@@ -1662,7 +1662,7 @@ fn merge_param_type_hint(
         hints.insert(index, hint);
         return;
     };
-    if render_signature_type(existing, ptr_bits) == render_signature_type(&hint, ptr_bits) {
+    if crate::signature_infer::signature_types_are_equivalent(existing, &hint, ptr_bits) {
         return;
     }
     let should_replace = matches!(
@@ -3610,7 +3610,7 @@ fn assumption_type_hint(
 }
 
 fn type_hint_conflicts(existing: &CTypeLike, hint: &CTypeLike, ptr_bits: u32) -> bool {
-    render_signature_type(existing, ptr_bits) != render_signature_type(hint, ptr_bits)
+    !crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits)
 }
 
 fn type_hint_requires_semantic_corroboration(assumption: &r2ssa::AnalysisAssumption) -> bool {
