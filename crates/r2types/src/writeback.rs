@@ -163,7 +163,8 @@ impl RecoveredVariable {
 pub struct StructFieldCandidate {
     pub name: String,
     pub offset: u64,
-    pub field_type: String,
+    /// The field's type, as a type.
+    pub field_type: CTypeLike,
     pub confidence: u8,
 }
 
@@ -4219,7 +4220,7 @@ fn build_type_writeback_analysis_inner(
     );
 
     let mut type_db = input.parsed_context.external_type_db.clone();
-    merge_local_structs_into_type_db(&mut type_db, &struct_decls);
+    merge_local_structs_into_type_db(&mut type_db, &struct_decls, input.ptr_bits);
     let before_slot_signature = merged_signature.clone();
     let merged_signature = merge_slot_type_overrides_into_signature(
         merged_signature,
@@ -6306,13 +6307,26 @@ fn infer_local_struct_artifacts_from_blocks(
             .map(|(offset, field_type, confidence)| StructFieldCandidate {
                 name: format!("f_{offset:x}"),
                 offset,
-                field_type: field_type.render(&struct_name),
+                field_type: crate::convert::parse_c_type_like(
+                    &field_type.render(&struct_name),
+                    ptr_bits,
+                ),
                 confidence,
             })
             .collect::<Vec<_>>();
         let normalized_fields = fields
             .iter()
-            .map(|field| (field.offset, field.field_type.clone()))
+            // The profile is still keyed by spelling; render at that boundary
+            // rather than keeping the candidate's type as text.
+            .map(|field| {
+                (
+                    field.offset,
+                    crate::signature_infer::render_writeback_apply_type(
+                        &field.field_type,
+                        ptr_bits,
+                    ),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let Some(decl) =
             build_struct_decl_with_size(&struct_name, &fields, ptr_bits, element_stride)
@@ -8224,7 +8238,7 @@ fn augment_local_struct_artifacts_with_projection(
             .map(|(offset, field_type)| StructFieldCandidate {
                 name: format!("f_{offset:x}"),
                 offset: *offset,
-                field_type: field_type.clone(),
+                field_type: crate::convert::parse_c_type_like(field_type, ptr_bits),
                 confidence: 84,
             })
             .collect::<Vec<_>>();
@@ -8289,7 +8303,7 @@ fn augment_local_struct_artifacts_with_local_field_accesses(
                 StructFieldCandidate {
                     name: format!("f_{offset:x}"),
                     offset: *offset,
-                    field_type: field_type.clone(),
+                    field_type: crate::convert::parse_c_type_like(field_type, ptr_bits),
                     confidence: 90,
                 }
             })
@@ -10175,7 +10189,7 @@ fn collect_external_struct_candidates_from_db(
             fields.push(StructFieldCandidate {
                 name: field.name.clone(),
                 offset: *offset,
-                field_type: normalize_external_type_name(&raw_ty),
+                field_type: crate::convert::parse_c_type_like(&raw_ty, ptr_bits),
                 confidence: 95,
             });
         }
@@ -10193,7 +10207,11 @@ fn collect_external_struct_candidates_from_db(
     out
 }
 
-fn merge_local_structs_into_type_db(db: &mut ExternalTypeDb, struct_decls: &[StructDeclCandidate]) {
+fn merge_local_structs_into_type_db(
+    db: &mut ExternalTypeDb,
+    struct_decls: &[StructDeclCandidate],
+    ptr_bits: u32,
+) {
     for decl in struct_decls {
         let key = decl.name.to_ascii_lowercase();
         let mut fields = BTreeMap::new();
@@ -10203,7 +10221,7 @@ fn merge_local_structs_into_type_db(db: &mut ExternalTypeDb, struct_decls: &[Str
                 ExternalField {
                     name: field.name.clone(),
                     offset: field.offset,
-                    ty: Some(field.field_type.clone()),
+                    ty: Some(render_signature_type(&field.field_type, ptr_bits)),
                 },
             );
         }
@@ -10267,7 +10285,12 @@ fn canonical_field_type_key(ty: &str, ptr_bits: u32) -> String {
 fn struct_fields_signature(fields: &[StructFieldCandidate], ptr_bits: u32) -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = fields
         .iter()
-        .map(|f| (f.offset, canonical_field_type_key(&f.field_type, ptr_bits)))
+        .map(|f| {
+            (
+                f.offset,
+                canonical_field_type_key(&render_signature_type(&f.field_type, ptr_bits), ptr_bits),
+            )
+        })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     out
@@ -10295,7 +10318,10 @@ fn local_struct_profile_score(
         .map(|field| {
             (
                 field.offset,
-                canonical_field_type_key(&field.field_type, ptr_bits),
+                canonical_field_type_key(
+                    &render_signature_type(&field.field_type, ptr_bits),
+                    ptr_bits,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -10479,7 +10505,7 @@ fn score_global_type_links(
                 .map(|field| {
                     (
                         field.offset,
-                        normalize_external_type_name(&field.field_type).to_ascii_lowercase(),
+                        render_signature_type(&field.field_type, ptr_bits).to_ascii_lowercase(),
                     )
                 })
                 .collect(),
@@ -10908,7 +10934,7 @@ fn build_struct_decl_with_size(
             cursor = field.offset;
         }
 
-        let field_type = normalize_external_type_name(&field.field_type);
+        let field_type = render_signature_type(&field.field_type, ptr_bits);
         lines.push(format!("    {} {};", field_type, field.name));
         cursor = cursor.saturating_add(estimate_c_type_size_bytes(&field_type, ptr_bits));
     }
@@ -14221,13 +14247,13 @@ mod tests {
                 StructFieldCandidate {
                     name: "f_8".to_string(),
                     offset: 8,
-                    field_type: "int32_t".to_string(),
+                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
                     confidence: 95,
                 },
                 StructFieldCandidate {
                     name: "f_34".to_string(),
                     offset: 0x34,
-                    field_type: "int32_t".to_string(),
+                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
                     confidence: 95,
                 },
             ],
@@ -17126,13 +17152,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 90,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "struct node *".to_string(),
+                        field_type: crate::convert::parse_c_type_like("struct node *", 64),
                         confidence: 90,
                     },
                 ],
@@ -17246,13 +17272,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17402,13 +17428,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17546,13 +17572,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_c".to_string(),
                         offset: 12,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17715,13 +17741,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19439,13 +19465,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19524,13 +19550,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: "int32_t".to_string(),
+                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19613,7 +19639,7 @@ mod tests {
                 fields: vec![StructFieldCandidate {
                     name: "f_0".to_string(),
                     offset: 0,
-                    field_type: "int32_t".to_string(),
+                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
                     confidence: 95,
                 }],
             }],
@@ -20341,9 +20367,10 @@ mod tests {
         assert_eq!(profile.get(&0x20), Some(struct_pointer));
         assert!(
             artifacts.struct_decls.iter().any(|decl| {
-                decl.fields
-                    .iter()
-                    .any(|field| field.offset == 0x20 && field.field_type == *struct_pointer)
+                decl.fields.iter().any(|field| {
+                    field.offset == 0x20
+                        && field.field_type == crate::convert::parse_c_type_like(struct_pointer, 64)
+                })
             }),
             "diagnostics={diagnostics:?}; artifacts={artifacts:?}"
         );

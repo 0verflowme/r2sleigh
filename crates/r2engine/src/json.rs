@@ -258,13 +258,14 @@ fn writeback_evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<Strin
 
 fn struct_fields_json(
     fields: &[r2types::StructFieldCandidate],
+    ptr_bits: u32,
 ) -> Vec<EngineStructFieldCandidateJson> {
     fields
         .iter()
         .map(|field| EngineStructFieldCandidateJson {
             name: field.name.clone(),
             offset: field.offset,
-            field_type: field.field_type.clone(),
+            field_type: r2types::render_writeback_apply_type(&field.field_type, ptr_bits),
             confidence: field.confidence,
         })
         .collect()
@@ -354,7 +355,7 @@ pub fn type_writeback_json_core(
                 decl: decl.decl,
                 confidence: decl.confidence,
                 source: decl.source.as_str().to_string(),
-                fields: struct_fields_json(&decl.fields),
+                fields: struct_fields_json(&decl.fields, ptr_bits),
             })
             .collect(),
         global_type_links: payload
