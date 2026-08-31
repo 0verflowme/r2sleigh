@@ -2303,6 +2303,14 @@ decided, that write has to render as a field insert -- the prelude already
 provides `r2sleigh_bits_insert_*` -- and the first insert into an object no
 statement has assigned is exactly the placement refusal this began from.
 
+A fifth attempt went at the carrier itself, on the reading that the width comes
+from a specification nesting -- x86 vector registers inside a 512-bit `ZMM`,
+AArch64 ones inside a 32-byte SVE `Z` -- that these programs never address.
+Narrowing the carrier to the narrowest declared register covering what the
+function actually touches is **unsound**: four cells stop compiling and two
+compute the wrong answer. The carrier is not merely a width; the projection's
+arithmetic is stated against it, and moving it moves what every slice means.
+
 So the object-width model needs one coherent decision rather than another local
 rule. Two are available: an object is as wide as the widest thing done with it
 and every narrow write into it is an insert with a defined starting value; or
