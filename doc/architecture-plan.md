@@ -2262,6 +2262,14 @@ a table the rendered program does not have.
   carrier-wide value. Both changes are therefore reverted, since neither alone
   changes any rendered output.
 
+  A fourth attempt: suppressing the re-basing of a read onto the register
+  carrier when the value's own definition was a lane write -- on the ground that
+  a lane write preserves nothing, so there is no carrier content for a read to
+  be composed out of. That is coherent, and it **cost a cell**, so the re-basing
+  carries something else as well. Four approaches at this layer have now been
+  measured and rejected; the next attempt should not be a fifth projection
+  tweak.
+
   What remains is that all four lanes of these vectors are always written
   together and consumed only by an explicit `Piece`. The rendering that follows
   from that is a single composed assignment of the whole object, not four writes
