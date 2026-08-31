@@ -150,14 +150,25 @@ impl<'a> FoldingContext<'a> {
             other => CExpr::unary(UnaryOp::Not, other),
         }
     }
+    /// Whether an expression is the constant zero.
+    ///
+    /// A constant reaches the AST as a literal and nothing else: `lowering`
+    /// builds `IntLit`/`UIntLit` from `MachineExprKind::Constant`, and the one
+    /// site that mints a `Var` spelling sanitizes it through
+    /// `c_identifier_for_presentation`, which prefixes a leading digit. So a
+    /// variable is never the number it happens to be spelled like.
+    ///
+    /// This used to also accept a variable spelled `"0"` or `"elf_header"`,
+    /// which was compensation for a folder that turned a constant into a
+    /// radare2 flag name -- `elf_header` is the flag at address 0 in a base-0
+    /// ELF. That folder is gone. What the check would still match is a genuine
+    /// parameter the binary happens to name `elf_header`, and reading `x <
+    /// elf_header` as `x < 0` is a wrong answer about an unrelated value.
     pub(super) fn is_zero_expr(&self, expr: &CExpr) -> bool {
         match expr {
             CExpr::Paren(inner) => self.is_zero_expr(inner),
             CExpr::Cast { expr: inner, .. } => self.is_zero_expr(inner),
             CExpr::IntLit(0) | CExpr::UIntLit(0) => true,
-            CExpr::Var(name) => {
-                &*self.spelling(*name) == "0" || &*self.spelling(*name) == "elf_header"
-            }
             _ => false,
         }
     }
