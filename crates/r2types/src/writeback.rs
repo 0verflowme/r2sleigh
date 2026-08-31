@@ -137,6 +137,27 @@ pub struct RecoveredVariable {
     pub reg: Option<String>,
 }
 
+impl RecoveredVariable {
+    /// The recovered type, parsed once with the canonical parser.
+    ///
+    /// The spelling is radare2's, so it stays a `String` on the wire -- this is
+    /// what radare2 told us, not something we decided. What should not happen
+    /// is each consumer taking the spelling apart its own way, which is how one
+    /// of them came to test for a pointer with `contains('*')`.
+    pub fn recovered_type(&self, ptr_bits: u32) -> CTypeLike {
+        crate::convert::parse_c_type_like(&self.var_type, ptr_bits)
+    }
+
+    /// Whether the recovered spelling is `void *`, however it was spaced.
+    ///
+    /// No target width is needed: `parse_c_type_like` consults `ptr_bits` only
+    /// for the integer names whose width is a property of the target, and the
+    /// shape of a pointer is not one of them.
+    pub fn recovered_type_is_void_pointer(&self) -> bool {
+        self.recovered_type(64).is_void_pointer()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructFieldCandidate {
     pub name: String,
@@ -9364,7 +9385,7 @@ fn build_var_type_candidates(
         }
 
         let mut source = WritebackSource::LocalInferred;
-        let mut confidence = if var.var_type.contains('*') {
+        let mut confidence = if var.recovered_type(ctx.ptr_bits).is_pointer() {
             92
         } else if var.isarg {
             88

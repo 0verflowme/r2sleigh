@@ -44,7 +44,7 @@ pub use context::{
     is_generic_arg_name, merge_signature_with_register_params, normalize_function_basename,
     parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
-pub use convert::{CTypeLike, render_c_type_like, to_c_type_like};
+pub use convert::{CTypeLike, parse_c_type_like, render_c_type_like, to_c_type_like};
 pub use evidence::{EvidenceNode, EvidenceTypes, SourceEvidenceTypeOracle, solve_evidence_types};
 pub use external::{
     ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,

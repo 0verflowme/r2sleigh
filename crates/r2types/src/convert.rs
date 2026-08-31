@@ -27,6 +27,18 @@ pub enum CTypeLike {
     Unknown,
 }
 
+impl CTypeLike {
+    /// Whether this is a pointer to anything.
+    pub fn is_pointer(&self) -> bool {
+        matches!(self, CTypeLike::Pointer(_))
+    }
+
+    /// Whether this is `void *`.
+    pub fn is_void_pointer(&self) -> bool {
+        matches!(self, CTypeLike::Pointer(inner) if matches!(**inner, CTypeLike::Void))
+    }
+}
+
 pub fn to_c_type_like(arena: &TypeArena, ty: TypeId) -> CTypeLike {
     match arena.get(ty) {
         Type::Top | Type::Bottom => CTypeLike::Unknown,

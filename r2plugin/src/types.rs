@@ -271,10 +271,14 @@ pub(crate) fn add_stack_var(
     let is_frame_base = frame_bases.contains(&base_reg);
     let slot_key = (is_frame_base, offset);
     if let Some(existing_idx) = seen_slots.get(&slot_key).copied() {
+        // A second hint for a slot that is already typed demotes it to the
+        // opaque pointer, because the two disagree and neither is proven. The
+        // comparison is on the types rather than on the spellings, so radare2
+        // writing `void*` reaches the same conclusion as `void *`.
         if let Some(override_ty) = type_override
-            && override_ty == "void *"
+            && r2types::parse_c_type_like(&override_ty, 64).is_void_pointer()
             && let Some(existing) = vars.get_mut(existing_idx)
-            && existing.var_type != "void *"
+            && !existing.recovered_type_is_void_pointer()
         {
             existing.var_type = override_ty;
         }
