@@ -59,10 +59,10 @@ impl RecordedType {
                 width_bits,
                 signedness,
             } => match signedness {
-                r2ssa::MachineSignedness::Signed => CType::Int(*width_bits),
-                r2ssa::MachineSignedness::Unsigned => CType::UInt(*width_bits),
+                r2ssa::MachineSignedness::Signed => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Signed },
+                r2ssa::MachineSignedness::Unsigned => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Unsigned },
             },
-            r2ssa::MachineType::Address { width_bits, .. } => CType::UInt(*width_bits),
+            r2ssa::MachineType::Address { width_bits, .. } => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Unsigned },
         })
     }
 
@@ -565,7 +565,15 @@ impl<'a> FoldingContext<'a> {
                         let expr = self.certified_expr_for_prepared_var(src, depth + 1, visited)?;
                         let source_already_matches_return = depth == 0
                             && dst.size > src.size
-                            && self.inputs.function_return_type.and_then(CType::bits)
+                            // 64 is what `CType::bits` assumed for a pointer
+                            // before the two type models were folded together.
+                            // The fold context carries no target width, so the
+                            // assumption is kept here rather than silently
+                            // changed; it only matters for a pointer return.
+                            && self
+                                .inputs
+                                .function_return_type
+                                .and_then(|ty| ty.bits(64))
                                 == Some(src.size.saturating_mul(8));
                         Some(if source_already_matches_return {
                             expr
@@ -1695,24 +1703,24 @@ impl<'a> FoldingContext<'a> {
                 .and_then(|signature| signature.params.get(slot))
                 .and_then(|parameter| parameter.ty.as_ref())
         {
-            candidates.push(crate::variable::type_like_to_ctype(ty));
+            candidates.push(ty.clone());
         }
         if let Some(r2types::CertifiedEntity::LoopCarrier { ty: Some(ty), .. }) =
             render.loop_carrier_for_value(value)
         {
-            candidates.push(crate::variable::type_like_to_ctype(ty));
+            candidates.push(ty.clone());
         }
         if let Some(memory) = self
             .certified_render_context()
             .and_then(|proof| proof.exact_memory_read_for_value(value))
             && let Some(ty) = render.memory_value_type(memory.access)
         {
-            candidates.push(crate::variable::type_like_to_ctype(ty));
+            candidates.push(ty.clone());
         }
         if render.return_effects().any(|effect| effect.value == value)
             && let Some(ty) = signature.and_then(|signature| signature.ret_type.as_ref())
         {
-            candidates.push(crate::variable::type_like_to_ctype(ty));
+            candidates.push(ty.clone());
         }
         let ty = candidates.first()?.clone();
         if candidates.iter().any(|candidate| *candidate != ty) {
@@ -1874,7 +1882,7 @@ impl<'a> FoldingContext<'a> {
                 ..
             } => self
                 .known_signature_for_site(*block_addr, *op_idx)
-                .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
+                .map(|sig| sig.return_type.clone()),
             CExpr::Call { site: None, .. } => None,
             CExpr::Cast { ty, .. } => Some(ty.clone()),
             CExpr::Paren(inner) => self.expr_type_hint(inner),
@@ -1891,7 +1899,7 @@ impl<'a> FoldingContext<'a> {
         match expr.unobserved() {
             CExpr::Call { .. } => self
                 .known_signature_for_site(source_call.0, source_call.1)
-                .map(|sig| crate::variable::type_like_to_ctype(&sig.return_type)),
+                .map(|sig| sig.return_type.clone()),
             CExpr::Cast { ty, .. } => Some(ty.clone()),
             CExpr::Paren(inner) => self.expr_type_hint_for_source_call(source_call, inner),
             _ => self.expr_type_hint(expr),
@@ -1932,8 +1940,8 @@ impl<'a> FoldingContext<'a> {
 
     fn int_meta(&self, ty: &CType) -> Option<(bool, u32)> {
         match ty {
-            CType::Int(bits) => Some((true, *bits)),
-            CType::UInt(bits) => Some((false, *bits)),
+            CType::Int { bits, signedness: r2types::Signedness::Signed } => Some((true, *bits)),
+            CType::Int { bits, signedness: r2types::Signedness::Unsigned } => Some((false, *bits)),
             CType::Bool => Some((false, 1)),
             CType::Typedef(name) => self.typedef_int_meta(name),
             _ => None,
@@ -1999,8 +2007,8 @@ impl<'a> FoldingContext<'a> {
             (target, source),
             (
                 CType::Pointer(_),
-                CType::Int(_) | CType::UInt(_) | CType::Bool | CType::Pointer(_)
-            ) | (CType::Int(_) | CType::UInt(_), CType::Pointer(_))
+                CType::Int { bits: _, signedness: r2types::Signedness::Signed } | CType::Int { bits: _, signedness: r2types::Signedness::Unsigned } | CType::Bool | CType::Pointer(_)
+            ) | (CType::Int { bits: _, signedness: r2types::Signedness::Signed } | CType::Int { bits: _, signedness: r2types::Signedness::Unsigned }, CType::Pointer(_))
         )
     }
 
@@ -2646,7 +2654,7 @@ impl<'a> FoldingContext<'a> {
                         name: "__builtin_popcountll".to_string(),
                         kind: crate::symbol::ExternalKind::Intrinsic,
                     },
-                    vec![CExpr::cast(CType::UInt(64), input(0, src)?)],
+                    vec![CExpr::cast(CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned }, input(0, src)?)],
                 );
                 let rhs = CExpr::cast(uint_type_from_size(dst.size), rhs);
                 self.assign_stmt(lhs, rhs)
@@ -2981,9 +2989,7 @@ impl<'a> FoldingContext<'a> {
                 let returned = self
                     .known_signature_for_site(source_call.0, source_call.1)
                     .map(|signature| {
-                        RecordedType::from_callee_signature(crate::variable::type_like_to_ctype(
-                            &signature.return_type,
-                        ))
+                        RecordedType::from_callee_signature(signature.return_type.clone())
                     });
                 let rhs = self.assignment_rhs_from_source_type(dst, returned, call);
                 self.assign_stmt(lhs, rhs)
@@ -3126,7 +3132,7 @@ impl<'a> FoldingContext<'a> {
             op,
             BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
         ) {
-            Some(RecordedType::from_operation(CType::Int(32)))
+            Some(RecordedType::from_operation(CType::Int { bits: 32, signedness: r2types::Signedness::Signed }))
         } else {
             // No stated operand type means the operation did not require one,
             // not that the expression has no type. Where both operands are
@@ -3159,9 +3165,9 @@ impl<'a> FoldingContext<'a> {
                         right_signed
                     };
                     let converted = if signed {
-                        CType::Int(bits)
+                        CType::Int { bits, signedness: r2types::Signedness::Signed }
                     } else {
-                        CType::UInt(bits)
+                        CType::Int { bits, signedness: r2types::Signedness::Unsigned }
                     };
                     Some(RecordedType::from_operation(converted))
                 })

@@ -68,9 +68,7 @@ use r2ssa::SSAFunction;
 #[cfg(test)]
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
-use r2types::{
-    CTypeLike, DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts,
-};
+use r2types::{DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts};
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
 pub use region::{Region, RegionAnalyzer};
@@ -87,59 +85,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-fn ctype_to_type_like(ty: &CType) -> CTypeLike {
-    match ty {
-        CType::Void => CTypeLike::Void,
-        CType::Bool => CTypeLike::Bool,
-        CType::Int(bits) => CTypeLike::Int {
-            bits: *bits,
-            signedness: r2types::Signedness::Signed,
-        },
-        CType::UInt(bits) => CTypeLike::Int {
-            bits: *bits,
-            signedness: r2types::Signedness::Unsigned,
-        },
-        CType::BitVector(bits) => CTypeLike::BitVector(*bits),
-        CType::Float(bits) => CTypeLike::Float(*bits),
-        CType::Pointer(inner) => CTypeLike::Pointer(Box::new(ctype_to_type_like(inner))),
-        CType::Array(inner, len) => CTypeLike::Array(Box::new(ctype_to_type_like(inner)), *len),
-        CType::Struct(name) => CTypeLike::Struct(name.clone()),
-        CType::Union(name) => CTypeLike::Union(name.clone()),
-        CType::Enum(name) => CTypeLike::Enum(name.clone()),
-        CType::Typedef(name) => CTypeLike::Typedef(name.clone()),
-        CType::Function { ret, params } => CTypeLike::Function {
-            ret: Box::new(ctype_to_type_like(ret)),
-            params: params.iter().map(ctype_to_type_like).collect(),
-        },
-        CType::Unknown => CTypeLike::Unknown,
-    }
-}
-
-fn type_like_to_ctype(ty: &CTypeLike) -> CType {
-    match ty {
-        CTypeLike::Void => CType::Void,
-        CTypeLike::Bool => CType::Bool,
-        CTypeLike::BitVector(bits) => CType::BitVector(*bits),
-        CTypeLike::Int { bits, signedness } => match signedness {
-            r2types::Signedness::Unsigned => CType::UInt(*bits),
-            _ => CType::Int(*bits),
-        },
-        CTypeLike::Float(bits) => CType::Float(*bits),
-        CTypeLike::Pointer(inner) => CType::Pointer(Box::new(type_like_to_ctype(inner))),
-        CTypeLike::Array(inner, len) => CType::Array(Box::new(type_like_to_ctype(inner)), *len),
-        CTypeLike::Struct(name) => CType::Struct(name.clone()),
-        CTypeLike::Union(name) => CType::Union(name.clone()),
-        CTypeLike::Enum(name) => CType::Enum(name.clone()),
-        CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
-        CTypeLike::Function { ret, params } => CType::Function {
-            ret: Box::new(type_like_to_ctype(ret)),
-            params: params.iter().map(type_like_to_ctype).collect(),
-        },
-        CTypeLike::Unknown => CType::Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -1567,7 +1512,7 @@ fn summary_non_void_return_type(
         .type_facts()
         .render_authorized_signature()
         .and_then(|sig| sig.ret_type.as_ref())
-        .map(type_like_to_ctype)
+        .cloned()
         .filter(|ty| !matches!(ty, CType::Void | CType::Unknown))
 }
 
@@ -4509,8 +4454,7 @@ impl Decompiler {
         };
         let inferred_ret_type =
             evidence_return_type(prepared, input.source_owned_facts().evidence_types());
-        let signature_ret_type =
-            render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
+        let signature_ret_type = render_signature.and_then(|sig| sig.ret_type.clone());
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
@@ -4673,7 +4617,7 @@ impl Decompiler {
                 .cloned()
                 .collect(),
             ret_type: render_signature
-                .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+                .and_then(|sig| sig.ret_type.clone())
                 .unwrap_or_else(|| inferred_ret_type.clone()),
             params,
             // Program locals are introduced only by the final placement pass
@@ -4792,7 +4736,7 @@ fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::Evidenc
         let Some(ty) = evidence.value_type(certificate.value) else {
             return CType::Unknown;
         };
-        let ty = type_like_to_ctype(ty);
+        let ty = ty.clone();
         match &candidate {
             None => candidate = Some(ty),
             Some(existing) if existing == &ty => {}
@@ -5466,8 +5410,14 @@ fn spelled_integer_shape(spelling: &str) -> Option<(bool, u32)> {
 
 fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
     let (is_signed, bits) = match ty {
-        CType::Int(bits) => (true, *bits),
-        CType::UInt(bits) => (false, *bits),
+        CType::Int {
+            bits,
+            signedness: r2types::Signedness::Signed,
+        } => (true, *bits),
+        CType::Int {
+            bits,
+            signedness: r2types::Signedness::Unsigned,
+        } => (false, *bits),
         CType::Bool => (false, 1),
         CType::Typedef(name) => match spelled_integer_shape(name) {
             Some(shape) => shape,
@@ -5862,48 +5812,6 @@ mod tests {
     /// -- with nothing to catch it. Before the two are folded into one model,
     /// this records exactly which types do not survive the trip, so the fold is
     /// closing a measured gap rather than an assumed one.
-    #[test]
-    fn ctype_round_trips_through_the_shared_type_model() {
-        let mut cases = vec![
-            CType::Void,
-            CType::Bool,
-            CType::Float(32),
-            CType::Float(64),
-            CType::Struct("Demo".to_string()),
-            CType::Union("Demo".to_string()),
-            CType::Enum("Demo".to_string()),
-            CType::Typedef("demo_t".to_string()),
-            CType::Unknown,
-        ];
-        for bits in [8u32, 16, 32, 64, 128] {
-            cases.push(CType::Int(bits));
-            cases.push(CType::UInt(bits));
-        }
-        cases.push(CType::BitVector(192));
-        cases.push(CType::BitVector(24));
-        cases.push(CType::BitVector(48));
-        cases.push(CType::Function {
-            ret: Box::new(CType::Void),
-            params: vec![CType::Int(32)],
-        });
-        let scalars = cases.clone();
-        for scalar in scalars {
-            cases.push(CType::Pointer(Box::new(scalar)));
-        }
-
-        let lossy: Vec<String> = cases
-            .iter()
-            .filter_map(|case| {
-                let back = type_like_to_ctype(&ctype_to_type_like(case));
-                (back != *case).then(|| format!("{case:?} -> {back:?}"))
-            })
-            .collect();
-        assert!(
-            lossy.is_empty(),
-            "types lost between the two models:\n{}",
-            lossy.join("\n")
-        );
-    }
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
@@ -6185,12 +6093,12 @@ mod tests {
         params: Vec<(&str, Option<CType>)>,
     ) -> FunctionSignatureSpec {
         FunctionSignatureSpec {
-            ret_type: ret_type.as_ref().map(super::ctype_to_type_like),
+            ret_type: ret_type.as_ref().cloned(),
             params: params
                 .into_iter()
                 .map(|(name, ty)| FunctionParamSpec {
                     name: name.to_string(),
-                    ty: ty.as_ref().map(super::ctype_to_type_like),
+                    ty: ty.as_ref().cloned(),
                 })
                 .collect(),
         }
@@ -6274,16 +6182,29 @@ mod tests {
     #[test]
     fn redundant_return_carrier_cast_yields_to_declared_c_type() {
         let symbols = test_table();
-        let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
+        let mut func = CFunction::new(
+            "carrier",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![CStmt::if_stmt(
             CExpr::IntLit(1),
             CStmt::Return(Some(CExpr::cast(
-                CType::Int(64),
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Signed,
+                },
                 CExpr::var(crate::symbol::declare(&symbols, "result")),
             ))),
             None,
         )]);
         func.locals.push(ast::CLocal {
-            ty: CType::Int(32),
+            ty: CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
             name: crate::symbol::declare(&symbols, "result"),
             stack_offset: None,
         });
@@ -6301,7 +6222,14 @@ mod tests {
     #[test]
     fn declared_assignment_type_normalizes_only_root_integer_literals() {
         let symbols = test_table();
-        let mut func = CFunction::new("typed_assignments", CType::Int(32)).with_body(vec![
+        let mut func = CFunction::new(
+            "typed_assignments",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![
             CStmt::Expr(CExpr::binary(
                 BinaryOp::Assign,
                 CExpr::var(crate::symbol::declare(&symbols, "signed_value")),
@@ -6320,12 +6248,18 @@ mod tests {
         ]);
         func.locals = vec![
             ast::CLocal {
-                ty: CType::Int(32),
+                ty: CType::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                },
                 name: crate::symbol::declare(&symbols, "signed_value"),
                 stack_offset: Some(-4),
             },
             ast::CLocal {
-                ty: CType::UInt(32),
+                ty: CType::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Unsigned,
+                },
                 name: crate::symbol::declare(&symbols, "unsigned_value"),
                 stack_offset: Some(-8),
             },
@@ -6369,8 +6303,14 @@ mod tests {
         let strings = BTreeMap::from([(0x1004, "text".to_string())]);
 
         fold_constant_arithmetic_in_expr(&mut expr, &strings);
-        let mut function = CFunction::new("folded", CType::Pointer(Box::new(CType::Int(8))))
-            .with_body(vec![CStmt::Return(Some(expr))]);
+        let mut function = CFunction::new(
+            "folded",
+            CType::Pointer(Box::new(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            })),
+        )
+        .with_body(vec![CStmt::Return(Some(expr))]);
         let reachable =
             crate::ast::strip_render_observations(&mut function, observations.expected_count())
                 .expect("constant folding preserves a valid marker domain");
@@ -6399,7 +6339,14 @@ mod tests {
             ])
         );
 
-        let mut function = CFunction::new("commented", CType::Int(32)).with_body(vec![commented]);
+        let mut function = CFunction::new(
+            "commented",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![commented]);
         let reachable =
             crate::ast::strip_render_observations(&mut function, observations.expected_count())
                 .expect("comment insertion preserves a valid marker domain");
@@ -6419,8 +6366,14 @@ mod tests {
             ]))
             .expect("block observation");
         let commented = Decompiler::prepend_comment(block, "summary".to_string());
-        let mut function =
-            CFunction::new("commented_block", CType::Int(32)).with_body(vec![commented]);
+        let mut function = CFunction::new(
+            "commented_block",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![commented]);
 
         let reachable =
             crate::ast::strip_render_observations(&mut function, observations.expected_count())
@@ -6454,7 +6407,14 @@ mod tests {
             .expect("block observation");
         let decompiler = Decompiler::new(DecompilerConfig::x86_64());
         let body = decompiler.stmt_to_vec(block);
-        let mut function = CFunction::new("split", CType::Int(32)).with_body(body);
+        let mut function = CFunction::new(
+            "split",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(body);
 
         let reachable =
             crate::ast::strip_render_observations(&mut function, observations.expected_count())
@@ -7091,8 +7051,17 @@ mod tests {
             );
             let spans = prepared.storage_spans().clone();
             let signature = signature_spec(
-                Some(CType::UInt(64)),
-                vec![("condition", Some(CType::UInt(64)))],
+                Some(CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
+                vec![(
+                    "condition",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                )],
             );
             let parsed_context = r2types::ParsedExternalContext {
                 current_signature: Some(signature.clone()),
@@ -7695,11 +7664,32 @@ mod tests {
             },
         };
         let signature = signature_spec(
-            Some(CType::Int(32)),
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
             vec![
-                ("code", Some(CType::Pointer(Box::new(CType::UInt(8))))),
-                ("len", Some(CType::Int(32))),
-                ("arg3", Some(CType::Int(64))),
+                (
+                    "code",
+                    Some(CType::Pointer(Box::new(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }))),
+                ),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "arg3",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -7780,7 +7770,16 @@ mod tests {
                 ),
             ],
         );
-        let signature = signature_spec(Some(CType::Void), vec![("status", Some(CType::Int(32)))]);
+        let signature = signature_spec(
+            Some(CType::Void),
+            vec![(
+                "status",
+                Some(CType::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            )],
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -7863,7 +7862,13 @@ mod tests {
             vec![
                 ("dst", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("src", Some(CType::Pointer(Box::new(CType::Void)))),
-                ("len", Some(CType::Int(64))),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -7973,7 +7978,13 @@ mod tests {
     fn semantic_worker_summary_handles_structured_worker_comment_only() {
         let semantic_artifact =
             large_cfg_worker_report(r2sym::RefinementStage::Compiled, Vec::new(), Vec::new());
-        let signature = signature_spec(Some(CType::Int(32)), Vec::new());
+        let signature = signature_spec(
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            Vec::new(),
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -8194,12 +8205,12 @@ mod tests {
                 register_params: vec![
                     ExternalRegisterParamSpec {
                         name: "arg1".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rdx".to_string(),
                     },
                     ExternalRegisterParamSpec {
                         name: "arg2".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "r8".to_string(),
                     },
                 ],
@@ -8267,7 +8278,7 @@ mod tests {
                 merged_signature: Some(signature_spec(Some(CType::Bool), Vec::new())),
                 register_params: vec![ExternalRegisterParamSpec {
                     name: "arg1".to_string(),
-                    ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                    ty: Some(CType::Typedef("int64_t".to_string())),
                     reg: "rdi".to_string(),
                 }],
                 ..FunctionTypeFacts::default()
@@ -8335,12 +8346,12 @@ mod tests {
                 register_params: vec![
                     ExternalRegisterParamSpec {
                         name: "arg1".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rdi".to_string(),
                     },
                     ExternalRegisterParamSpec {
                         name: "arg2".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rsi".to_string(),
                     },
                 ],
@@ -8463,11 +8474,32 @@ mod tests {
                 });
         }
         let signature = signature_spec(
-            Some(CType::Int(32)),
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
             vec![
-                ("src_fd", Some(CType::Int(32))),
-                ("dest_fd", Some(CType::Int(32))),
-                ("len", Some(CType::Int(64))),
+                (
+                    "src_fd",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "dest_fd",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
                 ("sp", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("stream", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("fields", Some(CType::Pointer(Box::new(CType::Void)))),
@@ -8545,13 +8577,19 @@ mod tests {
                 (
                     "argv",
                     Some(CType::Pointer(Box::new(CType::Pointer(Box::new(
-                        CType::Int(8),
+                        CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
                     ))))),
                 ),
                 (
                     "envp",
                     Some(CType::Pointer(Box::new(CType::Pointer(Box::new(
-                        CType::Int(8),
+                        CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
                     ))))),
                 ),
             ],
@@ -8783,8 +8821,17 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::Int(32)),
-                    vec![("str", Some(CType::Pointer(Box::new(CType::Int(8)))))],
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                    vec![(
+                        "str",
+                        Some(CType::Pointer(Box::new(CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        }))),
+                    )],
                 )),
                 ..FunctionTypeFacts::default()
             },
@@ -8942,7 +8989,16 @@ mod tests {
                     r2sym::SemanticEvidenceReason::SummaryBudget,
                 ),
             });
-        let signature = signature_spec(Some(CType::Void), vec![("size", Some(CType::UInt(64)))]);
+        let signature = signature_spec(
+            Some(CType::Void),
+            vec![(
+                "size",
+                Some(CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
+            )],
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -9116,10 +9172,28 @@ mod tests {
         let signature = signature_spec(
             Some(CType::Typedef("size_t".to_string())),
             vec![
-                ("buf", Some(CType::Pointer(Box::new(CType::UInt(8))))),
+                (
+                    "buf",
+                    Some(CType::Pointer(Box::new(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }))),
+                ),
                 ("n", Some(CType::Typedef("size_t".to_string()))),
-                ("a", Some(CType::UInt(8))),
-                ("b", Some(CType::UInt(8))),
+                (
+                    "a",
+                    Some(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                ),
+                (
+                    "b",
+                    Some(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -9933,8 +10007,17 @@ mod tests {
                 .with_coverage(r2sym::SemanticEvidenceCoverage::Bounded),
         }));
         let signature = signature_spec(
-            Some(CType::Int(32)),
-            vec![("table", Some(CType::Pointer(Box::new(CType::Int(8)))))],
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            vec![(
+                "table",
+                Some(CType::Pointer(Box::new(CType::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                }))),
+            )],
         );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
@@ -10078,7 +10161,13 @@ mod tests {
             });
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
-                merged_signature: Some(signature_spec(Some(CType::ptr(CType::Int(8))), Vec::new())),
+                merged_signature: Some(signature_spec(
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                    Vec::new(),
+                )),
                 ..FunctionTypeFacts::default()
             },
             None,
@@ -10086,7 +10175,10 @@ mod tests {
         let mut func = CFunction {
             externs: Vec::new(),
             name: "dbg.gettext_quote".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
@@ -10129,8 +10221,17 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::ptr(CType::Int(8))),
-                    vec![("buf", Some(CType::ptr(CType::Int(8))))],
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                    vec![(
+                        "buf",
+                        Some(CType::ptr(CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        })),
+                    )],
                 )),
                 ..FunctionTypeFacts::default()
             },
@@ -10139,7 +10240,10 @@ mod tests {
         let mut func = CFunction {
             externs: Vec::new(),
             name: "dbg.return_arg_summary".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
@@ -10182,7 +10286,10 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::ptr(CType::Int(8))),
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
                     vec![("n", Some(CType::Typedef("size_t".to_string())))],
                 )),
                 ..FunctionTypeFacts::default()
@@ -10196,7 +10303,10 @@ mod tests {
         let mut func = CFunction {
             externs: Vec::new(),
             name: "dbg.alloc_wrapper2".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),

@@ -193,7 +193,7 @@ fn vm_summary_signature_comment(func_name: &str, function_facts: &FunctionFacts)
     let ret = signature
         .ret_type
         .as_ref()
-        .map(crate::type_like_to_ctype)
+        .cloned()
         .filter(|ty| !matches!(ty, CType::Unknown))?;
     let mut params = Vec::new();
     for (index, param) in signature.params.iter().enumerate() {
@@ -206,7 +206,7 @@ fn vm_summary_signature_comment(func_name: &str, function_facts: &FunctionFacts)
         {
             continue;
         }
-        let Some(ty) = param.ty.as_ref().map(crate::type_like_to_ctype) else {
+        let Some(ty) = param.ty.as_ref().cloned() else {
             continue;
         };
         if matches!(ty, CType::Unknown | CType::Void) {

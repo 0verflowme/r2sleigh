@@ -42,7 +42,10 @@ fn bitvector_helper(name: String, args: Vec<CExpr>) -> CExpr {
 
 fn checked_uint_type(width_bits: u32) -> Result<CType, MachineUseProjectionError> {
     c_integer_width_is_spellable(width_bits)
-        .then_some(CType::UInt(width_bits))
+        .then_some(CType::Int {
+            bits: width_bits,
+            signedness: r2types::Signedness::Unsigned,
+        })
         .ok_or(MachineUseProjectionError::UnsupportedIntegerWidth(
             width_bits,
         ))
@@ -50,7 +53,10 @@ fn checked_uint_type(width_bits: u32) -> Result<CType, MachineUseProjectionError
 
 fn checked_int_type(width_bits: u32) -> Result<CType, MachineUseProjectionError> {
     c_integer_width_is_spellable(width_bits)
-        .then_some(CType::Int(width_bits))
+        .then_some(CType::Int {
+            bits: width_bits,
+            signedness: r2types::Signedness::Signed,
+        })
         .ok_or(MachineUseProjectionError::UnsupportedIntegerWidth(
             width_bits,
         ))
@@ -134,7 +140,10 @@ pub(super) fn project_machine_use(
 
 fn checked_write_uint_type(width_bits: u32) -> Result<CType, MachineWriteProjectionError> {
     c_integer_width_is_spellable(width_bits)
-        .then_some(CType::UInt(width_bits))
+        .then_some(CType::Int {
+            bits: width_bits,
+            signedness: r2types::Signedness::Unsigned,
+        })
         .ok_or(MachineWriteProjectionError::UnsupportedIntegerWidth(
             width_bits,
         ))
@@ -278,7 +287,10 @@ mod tests {
         let mut symbols = SymbolTable::new();
         CExpr::Var(symbols.reserve_binding(
             "carrier".to_string(),
-            CType::UInt(64),
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            },
             SymbolRole::Carrier,
         ))
     }
@@ -308,9 +320,9 @@ mod tests {
         assert!(matches!(
             rhs,
             CExpr::Cast {
-                ty: CType::UInt(64),
+                ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
                 expr
-            } if matches!(*expr, CExpr::Cast { ty: CType::UInt(32), .. })
+            } if matches!(*expr, CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
     }
 
@@ -328,7 +340,11 @@ mod tests {
         )
         .expect("inserted write");
         let CExpr::Cast {
-            ty: CType::UInt(64),
+            ty:
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
             expr: combined,
         } = rhs
         else {
@@ -391,6 +407,12 @@ mod tests {
             CType::machine_bits(256).to_string(),
             "struct r2sleigh_bits_256"
         );
-        assert_eq!(CType::machine_bits(128), CType::UInt(128));
+        assert_eq!(
+            CType::machine_bits(128),
+            CType::Int {
+                bits: 128,
+                signedness: r2types::Signedness::Unsigned
+            }
+        );
     }
 }

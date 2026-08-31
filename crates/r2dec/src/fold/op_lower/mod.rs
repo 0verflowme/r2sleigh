@@ -395,11 +395,26 @@ fn linear_coeff_expr(term: CExpr, coeff: i64) -> Option<CExpr> {
 fn type_from_size(size: u32) -> CType {
     match size {
         0 => CType::Unknown,
-        1 => CType::Int(8),
-        2 => CType::Int(16),
-        4 => CType::Int(32),
-        8 => CType::Int(64),
-        16 => CType::Int(128),
+        1 => CType::Int {
+            bits: 8,
+            signedness: r2types::Signedness::Signed,
+        },
+        2 => CType::Int {
+            bits: 16,
+            signedness: r2types::Signedness::Signed,
+        },
+        4 => CType::Int {
+            bits: 32,
+            signedness: r2types::Signedness::Signed,
+        },
+        8 => CType::Int {
+            bits: 64,
+            signedness: r2types::Signedness::Signed,
+        },
+        16 => CType::Int {
+            bits: 128,
+            signedness: r2types::Signedness::Signed,
+        },
         _ => CType::BitVector(size.saturating_mul(8)),
     }
 }
@@ -407,11 +422,26 @@ fn type_from_size(size: u32) -> CType {
 fn uint_type_from_size(size: u32) -> CType {
     match size {
         0 => CType::Unknown,
-        1 => CType::UInt(8),
-        2 => CType::UInt(16),
-        4 => CType::UInt(32),
-        8 => CType::UInt(64),
-        16 => CType::UInt(128),
+        1 => CType::Int {
+            bits: 8,
+            signedness: r2types::Signedness::Unsigned,
+        },
+        2 => CType::Int {
+            bits: 16,
+            signedness: r2types::Signedness::Unsigned,
+        },
+        4 => CType::Int {
+            bits: 32,
+            signedness: r2types::Signedness::Unsigned,
+        },
+        8 => CType::Int {
+            bits: 64,
+            signedness: r2types::Signedness::Unsigned,
+        },
+        16 => CType::Int {
+            bits: 128,
+            signedness: r2types::Signedness::Unsigned,
+        },
         _ => CType::BitVector(size.saturating_mul(8)),
     }
 }

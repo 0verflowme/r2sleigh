@@ -680,7 +680,10 @@ fn declaration_width_uses_exact_machine_carriers_not_register_view_widths() {
     let carrier_binding = carrier_binding.expect("at least one observed AH value has a binding");
     for forged_width in [32, 128] {
         let mut forged = plan.clone();
-        forged.bindings[carrier_binding.index()].declaration_type = CType::UInt(forged_width);
+        forged.bindings[carrier_binding.index()].declaration_type = CType::Int {
+            bits: forged_width,
+            signedness: r2types::Signedness::Unsigned,
+        };
         assert_eq!(
             forged.validate_seal(&source_owned),
             Err(BindingPlanBuildError::Seal(
@@ -1092,7 +1095,10 @@ fn certified_stack_objects_get_bindings_without_invented_value_membership() {
                 bound_stack_objects += 1;
                 assert_eq!(
                     plan.binding(binding).map(Binding::declaration_type),
-                    Some(&CType::UInt(size * 8))
+                    Some(&CType::Int {
+                        bits: size * 8,
+                        signedness: r2types::Signedness::Unsigned
+                    })
                 );
                 assert!(matches!(
                     plan.binding(binding)

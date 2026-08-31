@@ -130,7 +130,10 @@ fn seal_parameter_width(
 
 fn binding_declaration_width(ty: &CType) -> Option<u32> {
     match ty {
-        CType::UInt(bits) if *bits <= 128 => Some(*bits),
+        CType::Int {
+            bits,
+            signedness: r2types::Signedness::Unsigned,
+        } if *bits <= 128 => Some(*bits),
         CType::BitVector(bits) if *bits > 128 => Some(*bits),
         _ => None,
     }

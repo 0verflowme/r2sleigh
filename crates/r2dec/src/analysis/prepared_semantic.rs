@@ -1297,7 +1297,10 @@ fn prepared_load_access_expr_from_visible_addr(
             return expr;
         }
         CExpr::cast(
-            crate::ast::CType::ptr(crate::ast::CType::UInt(elem_bytes.saturating_mul(8))),
+            crate::ast::CType::ptr(crate::ast::CType::Int {
+                bits: elem_bytes.saturating_mul(8),
+                signedness: r2types::Signedness::Unsigned,
+            }),
             expr,
         )
     }

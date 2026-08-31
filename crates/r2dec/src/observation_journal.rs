@@ -3474,7 +3474,13 @@ mod tests {
             .cloned()
             .expect("exact source return-value certificate");
         let plan = Rc::new(BindingPlan::build_shadow(&source).expect("return binding plan"));
-        let mut function = CFunction::new("certified_read", CType::Int(64));
+        let mut function = CFunction::new(
+            "certified_read",
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
+        );
         let names = Rc::new(
             BindingNameResolution::build(&source, Rc::clone(&plan), Rc::clone(&function.symbols))
                 .expect("sealed return names"),
@@ -3882,7 +3888,13 @@ mod tests {
             Some(ValueDisposition::Bound { binding }) if *binding == output_binding
         )));
 
-        let function = CFunction::new("coalesced_phi", CType::Int(64));
+        let function = CFunction::new(
+            "coalesced_phi",
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
+        );
         let normalized = source.source().function().clone();
         let origins = NormalizationOrigins::for_unchanged(&normalized, source.source());
         let names = test_binding_names(&source, plan, Rc::clone(&function.symbols));
@@ -4125,11 +4137,14 @@ mod tests {
     #[test]
     fn every_private_journal_error_has_a_stable_public_seal_cause() {
         let function = CFunction::new("seal_cause", CType::Void);
-        let symbol =
-            function
-                .symbols
-                .borrow_mut()
-                .declare("unowned", CType::Int(32), SymbolRole::Carrier);
+        let symbol = function.symbols.borrow_mut().declare(
+            "unowned",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
         let site = UseSite {
             inst: InstId(17),
             input_idx: 3,

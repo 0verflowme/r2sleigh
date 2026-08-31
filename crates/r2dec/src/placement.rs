@@ -3712,10 +3712,14 @@ mod tests {
     #[test]
     fn inline_replaces_only_the_exact_marked_assignment() {
         let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
-        let symbol =
-            symbols
-                .borrow_mut()
-                .declare("value", crate::ast::CType::UInt(32), SymbolRole::Carrier);
+        let symbol = symbols.borrow_mut().declare(
+            "value",
+            crate::ast::CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Unsigned,
+            },
+            SymbolRole::Carrier,
+        );
         let marker = observation(7);
         let assignment = CStmt::observed(
             marker,
@@ -3728,7 +3732,10 @@ mod tests {
                 &mut statements,
                 marker,
                 symbol,
-                &crate::ast::CType::UInt(32),
+                &crate::ast::CType::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Unsigned
+                },
             ),
             1
         );
@@ -3919,7 +3926,10 @@ mod tests {
         let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
         let symbol = symbols.borrow_mut().declare(
             "stack_m16",
-            crate::ast::CType::UInt(32),
+            crate::ast::CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Unsigned,
+            },
             SymbolRole::StackLocal(-16),
         );
         let expression = CExpr::assign(

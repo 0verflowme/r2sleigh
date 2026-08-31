@@ -36,8 +36,8 @@ mod tests {
     impl From<FunctionType> for r2types::FunctionType {
         fn from(value: FunctionType) -> Self {
             Self {
-                return_type: crate::ctype_to_type_like(&value.return_type),
-                params: value.params.iter().map(crate::ctype_to_type_like).collect(),
+                return_type: value.return_type.clone(),
+                params: value.params.to_vec(),
                 variadic: value.variadic,
             }
         }
@@ -990,9 +990,9 @@ mod tests {
         assert!(matches!(
             copy_rhs.unobserved(),
             CExpr::Cast {
-                ty: CType::UInt(64),
+                ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
                 expr,
-            } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::UInt(32), .. })
+            } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
 
         assert_eq!(*ctx.observation_error.borrow(), None);
@@ -1819,7 +1819,7 @@ mod tests {
             source_call,
             "sym.local.nonvoid",
             Some(FunctionType {
-                return_type: CType::Int(32),
+                return_type: CType::Int { bits: 32, signedness: r2types::Signedness::Signed },
                 params: Vec::new(),
                 variadic: false,
             }),
@@ -1875,7 +1875,7 @@ mod tests {
         ctx.set_known_function_signatures(HashMap::from([(
             "sym.local.poison".to_string(),
             FunctionType {
-                return_type: CType::Int(32),
+                return_type: CType::Int { bits: 32, signedness: r2types::Signedness::Signed },
                 params: Vec::new(),
                 variadic: false,
             },
@@ -1886,7 +1886,7 @@ mod tests {
             "sym.imp.malloc",
             Some(FunctionType {
                 return_type: CType::void_ptr(),
-                params: vec![CType::UInt(64)],
+                params: vec![CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned }],
                 variadic: false,
             }),
         );
@@ -1910,15 +1910,15 @@ mod tests {
         let ctx = make_x86_64_ctx();
 
         assert_eq!(
-            ctx.expr_type_hint(&CExpr::cast(CType::Int(16), ctx.name_ref("value"))),
-            Some(CType::Int(16))
+            ctx.expr_type_hint(&CExpr::cast(CType::Int { bits: 16, signedness: r2types::Signedness::Signed }, ctx.name_ref("value"))),
+            Some(CType::Int { bits: 16, signedness: r2types::Signedness::Signed })
         );
         assert_eq!(
             ctx.expr_type_hint(&CExpr::Paren(Box::new(CExpr::cast(
-                CType::Int(16),
+                CType::Int { bits: 16, signedness: r2types::Signedness::Signed },
                 ctx.name_ref("value"),
             )))),
-            Some(CType::Int(16))
+            Some(CType::Int { bits: 16, signedness: r2types::Signedness::Signed })
         );
     }
 
@@ -2022,7 +2022,7 @@ mod tests {
             .observe_expr(CExpr::binary(BinaryOp::Add, value, zero))
             .expect("result observation");
         let simplified = ctx.simplify_identities(source);
-        let mut function = CFunction::new("identity", CType::Int(32))
+        let mut function = CFunction::new("identity", CType::Int { bits: 32, signedness: r2types::Signedness::Signed })
             .with_body(vec![CStmt::Return(Some(simplified))]);
 
         let reachable =
@@ -2059,7 +2059,7 @@ mod tests {
         );
         let (result_id, source) = owner.observe_expr(source).expect("result observation");
         let simplified = ctx.simplify_identities(source);
-        let mut function = CFunction::new("linear_identity", CType::Int(32))
+        let mut function = CFunction::new("linear_identity", CType::Int { bits: 32, signedness: r2types::Signedness::Signed })
             .with_body(vec![CStmt::Return(Some(simplified))]);
 
         let reachable =
@@ -2126,9 +2126,9 @@ mod tests {
     #[test]
     fn assignment_cast_policy_is_observation_transparent() {
         let ctx = FoldingContext::new(64);
-        let target = CType::Int(32);
+        let target = CType::Int { bits: 32, signedness: r2types::Signedness::Signed };
         let source =
-            RecordedType::for_test(CType::UInt(64));
+            RecordedType::for_test(CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned });
         let cast = CExpr::cast(target.clone(), ctx.name_ref("value"));
         let plain = ctx.cast_expr_if_needed(cast.clone(), target.clone(), Some(&source));
         let mut owner = crate::ast::RenderObservationOwner::new();
@@ -2146,7 +2146,7 @@ mod tests {
     #[test]
     fn typed_literal_rewrite_is_observation_transparent() {
         let ctx = FoldingContext::new(64);
-        let target = CType::Int(8);
+        let target = CType::Int { bits: 8, signedness: r2types::Signedness::Signed };
         let literal = CExpr::UIntLit(255);
         let plain = ctx.rewrite_typed_assignment_literal_expr(literal.clone(), &target);
         let mut owner = crate::ast::RenderObservationOwner::new();
@@ -3216,7 +3216,7 @@ mod tests {
         assert!(matches!(address_expr, CExpr::Observed { .. }));
         assert_eq!(*address_expr.unobserved(), CExpr::Var(address_symbol));
         let access = ctx
-            .render_certified_load_access_expr(dst, addr, CType::UInt(64))
+            .render_certified_load_access_expr(dst, addr, CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned })
             .expect("exact memory and field facts must render");
         assert_eq!(access.access(), memory.access);
         let expr = access.expr();

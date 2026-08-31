@@ -282,7 +282,10 @@ mod tests {
         CFunction {
             externs: Vec::new(),
             name: "f".to_string(),
-            ret_type: CType::Int(32),
+            ret_type: CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
             params: Vec::<CParam>::new(),
             locals: Vec::<CLocal>::new(),
             body,

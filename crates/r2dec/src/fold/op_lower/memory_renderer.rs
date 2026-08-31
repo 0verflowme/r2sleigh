@@ -145,7 +145,7 @@ impl<'a> FoldingContext<'a> {
                         ..
                     }) if *entity_slot == slot
                         && matches!(
-                            crate::type_like_to_ctype(ty),
+                            ty.clone(),
                             CType::Pointer(_) | CType::Array(_, _)
                         )
                 )
@@ -162,12 +162,9 @@ impl<'a> FoldingContext<'a> {
                 matches!(
                     names.require_value(*phi),
                     Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) if symbol == *name
-                ) && ty.as_ref().is_some_and(|ty| {
-                    matches!(
-                        crate::type_like_to_ctype(ty),
-                        CType::Pointer(_) | CType::Array(_, _)
-                    )
-                })
+                ) && ty
+                    .as_ref()
+                    .is_some_and(|ty| matches!(ty.clone(), CType::Pointer(_) | CType::Array(_, _)))
             })
         })
     }
@@ -422,7 +419,13 @@ impl<'a> FoldingContext<'a> {
             index,
             offset,
         } = self.certified_linear_address_components(address)?;
-        let mut result = CExpr::cast(CType::ptr(CType::UInt(8)), base);
+        let mut result = CExpr::cast(
+            CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Unsigned,
+            }),
+            base,
+        );
         if let Some(CertifiedLinearIndex { expr, stride }) = index
             && stride != 0
         {
@@ -458,7 +461,10 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn integerize_certified_address_expr(expr: &CExpr, pointer_bits: u32) -> Option<CExpr> {
-        let integer = CType::UInt(pointer_bits);
+        let integer = CType::Int {
+            bits: pointer_bits,
+            signedness: r2types::Signedness::Unsigned,
+        };
         Some(match expr {
             CExpr::Observed { id, expr } => CExpr::Observed {
                 id: *id,
@@ -577,7 +583,15 @@ impl<'a> FoldingContext<'a> {
             return expr;
         };
         let elem_bytes = match elem_ty {
-            CType::Int(bits) | CType::UInt(bits) | CType::Float(bits) => bits / 8,
+            CType::Int {
+                bits,
+                signedness: r2types::Signedness::Signed,
+            }
+            | CType::Int {
+                bits,
+                signedness: r2types::Signedness::Unsigned,
+            }
+            | CType::Float(bits) => bits / 8,
             _ => 0,
         };
         let already_typed = matches!(
@@ -599,7 +613,13 @@ impl<'a> FoldingContext<'a> {
                 CType::ptr(elem_ty.clone()),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::cast(CType::ptr(CType::UInt(8)), *base),
+                    CExpr::cast(
+                        CType::ptr(CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Unsigned,
+                        }),
+                        *base,
+                    ),
                     *index,
                 ),
             ))),

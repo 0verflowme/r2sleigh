@@ -4,179 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A C type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CType {
-    /// Void type.
-    Void,
-    /// Boolean type.
-    Bool,
-    /// Signed integer with bit width.
-    Int(u32),
-    /// Unsigned integer with bit width.
-    UInt(u32),
-    /// Exact machine bitvector wider than C's native integer domain.
-    ///
-    /// The external C prelude owns the concrete limb representation. Keeping
-    /// this distinct from `UInt` prevents ordinary C arithmetic and casts from
-    /// being emitted for a value the language cannot represent as a scalar.
-    BitVector(u32),
-    /// Floating point with bit width.
-    Float(u32),
-    /// Pointer to another type.
-    Pointer(Box<CType>),
-    /// Array of elements.
-    Array(Box<CType>, Option<usize>),
-    /// Function type.
-    Function { ret: Box<CType>, params: Vec<CType> },
-    /// Struct type.
-    Struct(String),
-    /// Union type.
-    Union(String),
-    /// Enum type.
-    Enum(String),
-    /// Typedef alias.
-    Typedef(String),
-    /// Unknown type (will be rendered as a comment).
-    Unknown,
-}
-
-impl CType {
-    /// Exact unsigned machine storage type.
-    ///
-    /// C has scalar integer spellings through 128 bits in the supported
-    /// compiler contract. Wider carriers use the limb-backed external prelude
-    /// instead of inventing names such as `uint256_t`.
-    pub const fn machine_bits(bits: u32) -> Self {
-        match bits {
-            8 | 16 | 32 | 64 | 128 => Self::UInt(bits),
-            _ => Self::BitVector(bits),
-        }
-    }
-
-    /// Create an 8-bit signed integer type.
-    pub fn i8() -> Self {
-        Self::Int(8)
-    }
-
-    /// Create a 16-bit signed integer type.
-    pub fn i16() -> Self {
-        Self::Int(16)
-    }
-
-    /// Create a 32-bit signed integer type.
-    pub fn i32() -> Self {
-        Self::Int(32)
-    }
-
-    /// Create a 64-bit signed integer type.
-    pub fn i64() -> Self {
-        Self::Int(64)
-    }
-
-    /// Create an 8-bit unsigned integer type.
-    pub fn u8() -> Self {
-        Self::UInt(8)
-    }
-
-    /// Create a 16-bit unsigned integer type.
-    pub fn u16() -> Self {
-        Self::UInt(16)
-    }
-
-    /// Create a 32-bit unsigned integer type.
-    pub fn u32() -> Self {
-        Self::UInt(32)
-    }
-
-    /// Create a 64-bit unsigned integer type.
-    pub fn u64() -> Self {
-        Self::UInt(64)
-    }
-
-    /// Create a pointer type.
-    pub fn ptr(inner: CType) -> Self {
-        Self::Pointer(Box::new(inner))
-    }
-
-    /// Create a void pointer type.
-    pub fn void_ptr() -> Self {
-        Self::ptr(Self::Void)
-    }
-
-    /// Get the size in bits (if known).
-    pub fn bits(&self) -> Option<u32> {
-        match self {
-            Self::Bool => Some(1),
-            Self::Int(bits) | Self::UInt(bits) | Self::BitVector(bits) | Self::Float(bits) => {
-                Some(*bits)
-            }
-            Self::Pointer(_) => Some(64), // Assume 64-bit pointers
-            _ => None,
-        }
-    }
-
-    /// Check if this is a signed type.
-    pub fn is_signed(&self) -> bool {
-        matches!(self, Self::Int(_))
-    }
-
-    /// Check if this is an integer type.
-    pub fn is_integer(&self) -> bool {
-        matches!(self, Self::Int(_) | Self::UInt(_) | Self::Bool)
-    }
-
-    /// Check if this is a pointer type.
-    pub fn is_pointer(&self) -> bool {
-        matches!(self, Self::Pointer(_))
-    }
-}
-
-impl std::fmt::Display for CType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Void => write!(f, "void"),
-            Self::Bool => write!(f, "bool"),
-            Self::Int(8) => write!(f, "int8_t"),
-            Self::Int(16) => write!(f, "int16_t"),
-            Self::Int(32) => write!(f, "int32_t"),
-            Self::Int(64) => write!(f, "int64_t"),
-            Self::Int(128) => write!(f, "__int128_t"),
-            Self::Int(bits) => write!(f, "int{}_t", bits),
-            Self::UInt(8) => write!(f, "uint8_t"),
-            Self::UInt(16) => write!(f, "uint16_t"),
-            Self::UInt(32) => write!(f, "uint32_t"),
-            Self::UInt(64) => write!(f, "uint64_t"),
-            // A 128-bit read is real on targets with vector registers -- arm64
-            // crc32 loads its table sixteen bytes at a time -- but `uint128_t`
-            // is not a C type. `__uint128_t` is the spelling compilers give it.
-            Self::UInt(128) => write!(f, "__uint128_t"),
-            Self::UInt(bits) => write!(f, "uint{}_t", bits),
-            Self::BitVector(bits) => write!(f, "struct r2sleigh_bits_{}", bits),
-            Self::Float(32) => write!(f, "float"),
-            Self::Float(64) => write!(f, "double"),
-            Self::Float(bits) => write!(f, "float{}", bits),
-            Self::Pointer(inner) => write!(f, "{}*", inner),
-            Self::Array(inner, Some(size)) => write!(f, "{}[{}]", inner, size),
-            Self::Array(inner, None) => write!(f, "{}[]", inner),
-            Self::Function { ret, params } => {
-                write!(f, "{}(*)(", ret)?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", p)?;
-                }
-                write!(f, ")")
-            }
-            Self::Struct(name) => write!(f, "struct {}", name),
-            Self::Union(name) => write!(f, "union {}", name),
-            Self::Enum(name) => write!(f, "enum {}", name),
-            Self::Typedef(name) => write!(f, "{}", name),
-            Self::Unknown => write!(f, "/* unknown */"),
-        }
-    }
-}
+/// The C type model.
+///
+/// This was a second type enum with its own renderer, and the two had already
+/// disagreed once -- about how to spell a 128-bit integer -- with nothing to
+/// catch it. It is now the shared model, so there is one set of variants and
+/// one spelling for each of them.
+pub use r2types::CTypeLike as CType;
 
 /// A C expression.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2283,14 +2117,18 @@ mod tests {
 
     #[test]
     fn stripping_reports_only_reachable_observations_and_restores_the_ast() {
-        let mut plain =
-            CFunction::new("observed", CType::Int(32)).with_body(vec![CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::IntLit(1),
-                    CExpr::IntLit(2),
-                )),
-            ])]);
+        let mut plain = CFunction::new(
+            "observed",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![CStmt::Block(vec![CStmt::Expr(CExpr::binary(
+            BinaryOp::Add,
+            CExpr::IntLit(1),
+            CExpr::IntLit(2),
+        ))])]);
         let expected = plain.clone();
         let mut owner = RenderObservationOwner::new();
         let (nested_expr_id, nested_expr) = owner

@@ -1,6 +1,6 @@
 use crate::model::{Signedness, Type, TypeArena, TypeId};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum CTypeLike {
     Void,
     Bool,
@@ -34,7 +34,119 @@ pub enum CTypeLike {
     Unknown,
 }
 
+impl std::fmt::Display for CTypeLike {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&render_c_type_like(self))
+    }
+}
+
 impl CTypeLike {
+    /// A signed integer of the given width.
+    pub const fn int(bits: u32) -> Self {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        }
+    }
+
+    /// An unsigned integer of the given width.
+    pub const fn uint(bits: u32) -> Self {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unsigned,
+        }
+    }
+
+    /// A signed 8-bit integer.
+    pub const fn i8() -> Self {
+        Self::int(8)
+    }
+
+    /// A signed 16-bit integer.
+    pub const fn i16() -> Self {
+        Self::int(16)
+    }
+
+    /// A signed 32-bit integer.
+    pub const fn i32() -> Self {
+        Self::int(32)
+    }
+
+    /// A signed 64-bit integer.
+    pub const fn i64() -> Self {
+        Self::int(64)
+    }
+
+    /// A unsigned 8-bit integer.
+    pub const fn u8() -> Self {
+        Self::uint(8)
+    }
+
+    /// A unsigned 16-bit integer.
+    pub const fn u16() -> Self {
+        Self::uint(16)
+    }
+
+    /// A unsigned 32-bit integer.
+    pub const fn u32() -> Self {
+        Self::uint(32)
+    }
+
+    /// A unsigned 64-bit integer.
+    pub const fn u64() -> Self {
+        Self::uint(64)
+    }
+
+    /// Exact unsigned machine storage of the given width.
+    ///
+    /// C has scalar integer spellings through 128 bits in the supported
+    /// compiler contract. Wider or unaligned carriers use the limb-backed
+    /// external prelude instead of inventing names such as `uint256_t`.
+    pub const fn machine_bits(bits: u32) -> Self {
+        match bits {
+            8 | 16 | 32 | 64 | 128 => Self::uint(bits),
+            _ => CTypeLike::BitVector(bits),
+        }
+    }
+
+    /// A pointer to the given type.
+    pub fn ptr(inner: CTypeLike) -> Self {
+        CTypeLike::Pointer(Box::new(inner))
+    }
+
+    /// A pointer to void.
+    pub fn void_ptr() -> Self {
+        Self::ptr(CTypeLike::Void)
+    }
+
+    /// The width in bits, where the type has one.
+    pub fn bits(&self, ptr_bits: u32) -> Option<u32> {
+        match self {
+            CTypeLike::Bool => Some(1),
+            CTypeLike::Int { bits, .. } | CTypeLike::BitVector(bits) | CTypeLike::Float(bits) => {
+                Some(*bits)
+            }
+            CTypeLike::Pointer(_) => Some(ptr_bits),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a signed integer.
+    pub fn is_signed(&self) -> bool {
+        matches!(
+            self,
+            CTypeLike::Int {
+                signedness: Signedness::Signed,
+                ..
+            }
+        )
+    }
+
+    /// Whether this is an integer, boolean included.
+    pub fn is_integer(&self) -> bool {
+        matches!(self, CTypeLike::Int { .. } | CTypeLike::Bool)
+    }
+
     /// Whether this is a pointer to anything.
     pub fn is_pointer(&self) -> bool {
         matches!(self, CTypeLike::Pointer(_))

@@ -355,7 +355,14 @@ mod tests {
     #[test]
     fn declaring_is_what_produces_a_reference() {
         let mut symbols = table();
-        let id = symbols.declare("total", CType::Int(32), SymbolRole::Carrier);
+        let id = symbols.declare(
+            "total",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         assert_eq!(symbols.name(id), "total");
         assert_eq!(symbols.by_name("total"), Some(id));
@@ -366,8 +373,22 @@ mod tests {
     #[test]
     fn two_declarations_never_share_one_identifier() {
         let mut symbols = table();
-        let first = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
-        let second = symbols.declare("h", CType::Int(64), SymbolRole::Carrier);
+        let first = symbols.declare(
+            "h",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
+        let second = symbols.declare(
+            "h",
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         assert_ne!(first, second);
         assert_eq!(symbols.name(first), "h");
@@ -377,8 +398,22 @@ mod tests {
     #[test]
     fn presentation_lookup_does_not_merge_distinct_declarations() {
         let mut symbols = table();
-        let first = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
-        let second = symbols.declare("h", CType::Int(32), SymbolRole::Carrier);
+        let first = symbols.declare(
+            "h",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
+        let second = symbols.declare(
+            "h",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         assert_ne!(first, second);
         assert_eq!(symbols.by_name("h"), Some(first));
@@ -388,7 +423,14 @@ mod tests {
     #[test]
     fn renaming_moves_the_spelling_and_leaves_the_reference_alone() {
         let mut symbols = table();
-        let id = symbols.declare("x0_2", CType::Int(64), SymbolRole::Carrier);
+        let id = symbols.declare(
+            "x0_2",
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         symbols.rename(id, "hash");
 
@@ -400,8 +442,22 @@ mod tests {
     #[test]
     fn renaming_onto_a_taken_spelling_does_not_merge_two_symbols() {
         let mut symbols = table();
-        let taken = symbols.declare("hash", CType::Int(32), SymbolRole::Carrier);
-        let other = symbols.declare("x0_2", CType::Int(64), SymbolRole::Carrier);
+        let taken = symbols.declare(
+            "hash",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
+        let other = symbols.declare(
+            "x0_2",
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         symbols.rename(other, "hash");
 
@@ -440,7 +496,14 @@ mod reuse_tests {
     fn a_declared_name_is_not_reissued_by_reuse() {
         // declare() is what mints a distinct variable; reuse must respect it.
         let mut symbols = SymbolTable::new();
-        let declared = symbols.declare("total", CType::Int(32), SymbolRole::Carrier);
+        let declared = symbols.declare(
+            "total",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+            SymbolRole::Carrier,
+        );
 
         assert_eq!(symbols.declare_or_reuse("total"), declared);
         assert_eq!(symbols.len(), 1);

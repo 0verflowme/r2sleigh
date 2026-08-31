@@ -99,11 +99,11 @@ impl<'a> FoldingContext<'a> {
             ret_type: self
                 .certified_call_result_value((block_addr, op_idx))
                 .and_then(|value| self.machine_value_width_bits(value))
-                .map_or(CType::Void, CType::UInt),
+                .map_or(CType::Void, CType::uint),
             params: args
                 .values
                 .iter()
-                .map(|value| self.machine_value_width_bits(*value).map(CType::UInt))
+                .map(|value| self.machine_value_width_bits(*value).map(CType::uint))
                 .collect::<Option<Vec<_>>>(),
         };
         self.callee_declarations

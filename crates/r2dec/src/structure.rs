@@ -5326,8 +5326,14 @@ mod tests {
         owner: &RenderObservationOwner,
         stmt: CStmt,
     ) -> (CStmt, crate::ast::ReachableObservations) {
-        let mut function =
-            CFunction::new("observed_structure", CType::Int(32)).with_body(vec![stmt]);
+        let mut function = CFunction::new(
+            "observed_structure",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![stmt]);
         let reachable = strip_render_observations(&mut function, owner.expected_count())
             .expect("structure rewrite must retain each observation at most once");
         let stmt = function.body.pop().unwrap_or(CStmt::Empty);
