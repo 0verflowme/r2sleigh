@@ -1831,11 +1831,29 @@ impl Disassembler {
         let instr_size = pcode.origin.size as u32;
         let mut block = R2ILBlock::new(addr, instr_size);
 
+        let mut ops = Vec::with_capacity(pcode.instructions.len());
         for pcode_instr in pcode.instructions {
             if let Some(op) = self.translate_pcode_op(&pcode_instr)? {
-                for expanded in self.expand_user_operation(op) {
-                    block.push(expanded);
-                }
+                ops.push(op);
+            }
+        }
+
+        // Where an expansion's own temporaries may live: above every temporary
+        // this instruction already uses. Sleigh scopes the unique space to the
+        // instruction, so that is the whole extent an expansion has to stay
+        // clear of, and taking it from the instruction itself means there is no
+        // offset to guess and nothing to collide with.
+        let temp_base = ops
+            .iter()
+            .flat_map(|op| op.output().into_iter().chain(op.inputs()))
+            .filter(|varnode| varnode.space == SpaceId::Unique)
+            .filter_map(|varnode| varnode.offset.checked_add(u64::from(varnode.size)))
+            .max()
+            .unwrap_or(0);
+
+        for op in ops {
+            for expanded in self.expand_user_operation(op, temp_base) {
+                block.push(expanded);
             }
         }
 
@@ -1854,12 +1872,6 @@ impl Disassembler {
     }
 
     /// Translate a single P-code instruction to an r2il operation.
-    /// Reserved unique offsets for the temporaries a user-operation expansion
-    /// needs. Sleigh's own uniques come from a much lower range, and re-using
-    /// the same slots across instructions is what Sleigh itself does: each
-    /// write is a new definition.
-    const USER_OP_TEMP_BASE: u64 = 0x7000_0000;
-
     /// The name the architecture gives the user-defined operation at `index`.
     fn user_op_name(&self, index: u32) -> Option<&str> {
         self.genuine_authority
@@ -1879,7 +1891,7 @@ impl Disassembler {
     /// expanding it here is what keeps the rest of the pipeline free of any
     /// vector-specific machinery. An operation this does not model is returned
     /// untouched and still refuses, which is the honest answer.
-    fn expand_user_operation(&self, op: R2ILOp) -> Vec<R2ILOp> {
+    fn expand_user_operation(&self, op: R2ILOp, temp_base: u64) -> Vec<R2ILOp> {
         let R2ILOp::CallOther {
             userop,
             output,
@@ -1889,7 +1901,7 @@ impl Disassembler {
             return vec![op];
         };
         let expanded = match self.user_op_name(*userop) {
-            Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs),
+            Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs, temp_base),
             _ => None,
         };
         expanded.unwrap_or_else(|| vec![op])
@@ -1904,7 +1916,11 @@ impl Disassembler {
     ///
     /// Only the byte-granular form is expanded, which is the only form the
     /// specification uses; anything else is left to refuse.
-    fn expand_neon_ext(output: Option<&Varnode>, inputs: &[Varnode]) -> Option<Vec<R2ILOp>> {
+    fn expand_neon_ext(
+        output: Option<&Varnode>,
+        inputs: &[Varnode],
+        temp_base: u64,
+    ) -> Option<Vec<R2ILOp>> {
         let [rn, rm, index, element_size] = inputs else {
             return None;
         };
@@ -1929,8 +1945,8 @@ impl Disassembler {
         if taken >= width_bytes {
             return None;
         }
-        let low = Varnode::unique(Self::USER_OP_TEMP_BASE, output.size);
-        let high = Varnode::unique(Self::USER_OP_TEMP_BASE + width_bytes, output.size);
+        let low = Varnode::unique(temp_base, output.size);
+        let high = Varnode::unique(temp_base.checked_add(width_bytes)?, output.size);
         let down = Varnode::constant(taken * 8, output.size);
         let up = Varnode::constant((width_bytes - taken) * 8, output.size);
         Some(vec![
