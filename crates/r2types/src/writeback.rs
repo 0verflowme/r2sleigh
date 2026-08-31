@@ -10903,7 +10903,20 @@ pub fn writeback_apply_type_name_is_opaque_placeholder(type_name: &str) -> bool 
     normalize_writeback_apply_compare_string(type_name).contains("type_0x")
 }
 
-pub fn writeback_apply_type_name_is_generic(type_name: &str) -> bool {
+/// Whether a spelling is a plain scalar or an opaque placeholder.
+///
+/// This is *not* the same question as `writeback_type_name_is_generic`, and the
+/// two disagree on every fixed-width integer. That is deliberate, and the names
+/// hid it: this one is asked at apply time, where the guard is "do not let a
+/// plain scalar displace a type that already has structure". A `uint32_t` is
+/// informative -- it is a width -- and so it is not *generic*; but it is still
+/// weaker than `struct real_type *`, and writing it over one would lose the
+/// aggregate. `writeback_type_name_is_generic` asks the narrower question of
+/// whether a spelling says anything at all, and gates whether a hint may
+/// replace a recovered signature type.
+///
+/// A test pins the difference so that neither drifts into the other again.
+pub fn writeback_apply_type_name_is_plain_scalar_or_opaque(type_name: &str) -> bool {
     if type_name.is_empty() {
         return true;
     }
@@ -11080,8 +11093,8 @@ pub fn type_writeback_var_type_apply_decision(
         return TypeWritebackApplyDecision::SkipMissingMaterialization;
     }
     if let Some(existing_type) = existing_type.filter(|ty| !ty.trim().is_empty())
-        && !writeback_apply_type_name_is_generic(existing_type)
-        && writeback_apply_type_name_is_generic(candidate_type)
+        && !writeback_apply_type_name_is_plain_scalar_or_opaque(existing_type)
+        && writeback_apply_type_name_is_plain_scalar_or_opaque(candidate_type)
     {
         return TypeWritebackApplyDecision::SkipConcreteExisting;
     }
@@ -11102,7 +11115,7 @@ pub fn type_writeback_global_type_link_apply_decision(
     }
     if let Some(existing_type) = existing_type.filter(|ty| !ty.trim().is_empty())
         && !writeback_apply_types_equivalent(existing_type, candidate_type)
-        && !writeback_apply_type_name_is_generic(existing_type)
+        && !writeback_apply_type_name_is_plain_scalar_or_opaque(existing_type)
     {
         return TypeWritebackApplyDecision::SkipConcreteExisting;
     }
@@ -11157,7 +11170,7 @@ pub fn canonicalize_writeback_apply_type_name(type_name: &str) -> Option<String>
 }
 
 pub fn writeback_type_materialization_key(type_name: &str) -> Option<String> {
-    if writeback_apply_type_name_is_generic(type_name) {
+    if writeback_apply_type_name_is_plain_scalar_or_opaque(type_name) {
         return None;
     }
     let canonical = canonicalize_writeback_apply_type_name(type_name)?;
@@ -11398,6 +11411,61 @@ fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two type-strength questions, and where they deliberately differ.
+    ///
+    /// They were named `..._is_generic` and `..._apply_type_name_is_generic`,
+    /// which reads as one question asked twice; they are two questions, and
+    /// merging them lets a `uint32_t` overwrite a `struct real_type *`. This
+    /// pins the boundary so neither drifts into the other.
+    #[test]
+    fn the_two_type_strength_questions_differ_only_on_bare_widths() {
+        // Says nothing at all, on both counts.
+        for name in ["void *", "void*", "char *", "int", ""] {
+            assert!(
+                super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+        // A width is information, so it is not generic -- but it is still a
+        // plain scalar, and must not displace an aggregate at apply time. The
+        // literal spelling `unknown` sits here too, which is worth noticing:
+        // the narrower predicate does not treat it as generic, because its
+        // placeholder test looks for `anon_` and `type_0x` rather than for a
+        // type that says in words that it is not known.
+        for name in [
+            "int64_t",
+            "uint32_t",
+            "int8_t",
+            "int32_t",
+            "uintptr_t",
+            "unknown",
+        ] {
+            assert!(
+                !super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+        // Structure is informative on both counts.
+        for name in ["struct real_type *", "struct Foo *"] {
+            assert!(
+                !super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                !super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+    }
 
     #[test]
     fn abi_register_params_cover_aarch64_as_well_as_sysv64() {
@@ -12712,7 +12780,7 @@ mod tests {
             "struct type_0x1234 *",
         ] {
             assert!(
-                writeback_apply_type_name_is_generic(generic),
+                writeback_apply_type_name_is_plain_scalar_or_opaque(generic),
                 "{generic:?} should remain a weak apply-time type"
             );
         }
@@ -12723,7 +12791,9 @@ mod tests {
         assert!(!writeback_apply_type_name_is_opaque_placeholder(
             "struct real_type *"
         ));
-        assert!(!writeback_apply_type_name_is_generic("struct real_type *"));
+        assert!(!writeback_apply_type_name_is_plain_scalar_or_opaque(
+            "struct real_type *"
+        ));
     }
 
     #[test]

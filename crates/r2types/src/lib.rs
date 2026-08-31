@@ -136,10 +136,10 @@ pub use writeback::{
     signature_writeback_size_eligible, type_writeback_global_type_link_apply_decision,
     type_writeback_stack_arg_name_conflict_delete_required,
     type_writeback_var_rename_apply_decision, type_writeback_var_type_apply_decision,
-    writeback_apply_type_name_is_generic, writeback_apply_type_name_is_opaque_placeholder,
-    writeback_type_materialization_key, writeback_type_materialization_required,
-    writeback_type_name_is_generic, writeback_type_name_is_opaque_placeholder,
-    writeback_var_name_is_generated,
+    writeback_apply_type_name_is_opaque_placeholder,
+    writeback_apply_type_name_is_plain_scalar_or_opaque, writeback_type_materialization_key,
+    writeback_type_materialization_required, writeback_type_name_is_generic,
+    writeback_type_name_is_opaque_placeholder, writeback_var_name_is_generated,
 };
 
 #[cfg(test)]
