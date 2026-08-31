@@ -819,7 +819,10 @@ fn indexed_param_home_name<'a>(
 
 pub(crate) fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
-        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function { .. } => None,
+        CTypeLike::Void
+        | CTypeLike::Unknown
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Function { .. } => None,
         CTypeLike::Bool => Some(1),
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))

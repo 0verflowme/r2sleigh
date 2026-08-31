@@ -1259,7 +1259,7 @@ impl TypeInference {
             CTypeLike::Union(name) | CTypeLike::Enum(name) => {
                 (arena.unknown_alias(name.clone()), None)
             }
-            CTypeLike::Function { .. } => (arena.top(), None),
+            CTypeLike::Function { .. } | CTypeLike::BitVector(_) => (arena.top(), None),
             CTypeLike::Unknown => (arena.top(), None),
         }
     }

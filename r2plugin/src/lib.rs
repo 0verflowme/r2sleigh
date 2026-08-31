@@ -3155,7 +3155,9 @@ fn estimate_parsed_c_type_size_bytes(ty: &r2types::CTypeLike, ptr_bits: u32) -> 
     match ty {
         r2types::CTypeLike::Void => Some(0),
         r2types::CTypeLike::Bool => Some(1),
-        r2types::CTypeLike::Int { bits, .. } | r2types::CTypeLike::Float(bits) => {
+        r2types::CTypeLike::Int { bits, .. }
+        | r2types::CTypeLike::Float(bits)
+        | r2types::CTypeLike::BitVector(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))
         }
         r2types::CTypeLike::Pointer(_) | r2types::CTypeLike::Function { .. } => {

@@ -9,6 +9,13 @@ pub enum CTypeLike {
         signedness: Signedness,
     },
     Float(u32),
+    /// An exact machine bitvector wider than, or not expressible in, C's native
+    /// integer domain.
+    ///
+    /// Distinct from `Int` on purpose: the external C prelude owns the limb
+    /// representation, and keeping it apart is what stops ordinary C arithmetic
+    /// and casts being emitted for a value the language has no scalar for.
+    BitVector(u32),
     Pointer(Box<CTypeLike>),
     Array(Box<CTypeLike>, Option<usize>),
     Struct(String),
@@ -135,6 +142,7 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
         CTypeLike::Float(32) => "float".to_string(),
         CTypeLike::Float(64) => "double".to_string(),
         CTypeLike::Float(bits) => format!("float{bits}"),
+        CTypeLike::BitVector(bits) => format!("struct r2sleigh_bits_{bits}"),
         CTypeLike::Pointer(inner) => format!("{}*", render_c_type_like(inner)),
         CTypeLike::Array(inner, Some(size)) => format!("{}[{}]", render_c_type_like(inner), size),
         CTypeLike::Array(inner, None) => format!("{}[]", render_c_type_like(inner)),
@@ -194,6 +202,12 @@ fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
             len.parse::<usize>().ok()
         };
         return CTypeLike::Array(Box::new(parse_normalized(&spelling[..open], ptr_bits)), len);
+    }
+    if let Some(bits) = spelling
+        .strip_prefix("struct r2sleigh_bits_")
+        .and_then(|bits| bits.parse::<u32>().ok())
+    {
+        return CTypeLike::BitVector(bits);
     }
     for (keyword, build) in [
         ("struct ", CTypeLike::Struct as fn(String) -> CTypeLike),

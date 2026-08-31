@@ -1428,7 +1428,10 @@ fn external_member_type(member: &ExternalBaseTypeMemberJson, ptr_bits: u32) -> S
 
 fn type_like_size_bits(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
-        CTypeLike::Void | CTypeLike::Function { .. } | CTypeLike::Unknown => None,
+        CTypeLike::Void
+        | CTypeLike::Function { .. }
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Unknown => None,
         CTypeLike::Bool => Some(1),
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => Some(u64::from(*bits)),
         CTypeLike::Pointer(_) => Some(u64::from(ptr_bits)),

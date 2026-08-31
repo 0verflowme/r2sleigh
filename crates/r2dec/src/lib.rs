@@ -102,10 +102,7 @@ fn ctype_to_type_like(ty: &CType) -> CTypeLike {
             bits: *bits,
             signedness: r2types::Signedness::Unsigned,
         },
-        CType::BitVector(bits) => CTypeLike::Int {
-            bits: *bits,
-            signedness: r2types::Signedness::Unsigned,
-        },
+        CType::BitVector(bits) => CTypeLike::BitVector(*bits),
         CType::Float(bits) => CTypeLike::Float(*bits),
         CType::Pointer(inner) => CTypeLike::Pointer(Box::new(ctype_to_type_like(inner))),
         CType::Array(inner, len) => CTypeLike::Array(Box::new(ctype_to_type_like(inner)), *len),
@@ -125,8 +122,8 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
     match ty {
         CTypeLike::Void => CType::Void,
         CTypeLike::Bool => CType::Bool,
+        CTypeLike::BitVector(bits) => CType::BitVector(*bits),
         CTypeLike::Int { bits, signedness } => match signedness {
-            r2types::Signedness::Unsigned if *bits > 128 => CType::BitVector(*bits),
             r2types::Signedness::Unsigned => CType::UInt(*bits),
             _ => CType::Int(*bits),
         },
@@ -5883,6 +5880,8 @@ mod tests {
             cases.push(CType::UInt(bits));
         }
         cases.push(CType::BitVector(192));
+        cases.push(CType::BitVector(24));
+        cases.push(CType::BitVector(48));
         cases.push(CType::Function {
             ret: Box::new(CType::Void),
             params: vec![CType::Int(32)],
