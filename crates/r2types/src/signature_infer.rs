@@ -566,12 +566,18 @@ pub fn materialize_signature_type_like(ty: CTypeLike, ptr_bits: u32) -> CTypeLik
 /// inserting a space in front of it -- which made three components normalize
 /// the same star three different ways. Rendering from the type instead means
 /// the spelling is decided once, by the code that knows which sink it is for.
-pub fn render_writeback_apply_type(ty: &CTypeLike, ptr_bits: u32) -> String {
+pub fn render_writeback_apply_type(ty: &CTypeLike, _ptr_bits: u32) -> String {
     match ty {
         CTypeLike::Pointer(inner) => {
-            format!("{} *", render_writeback_apply_type(inner, ptr_bits))
+            format!("{} *", render_writeback_apply_type(inner, _ptr_bits))
         }
-        other => render_signature_type(other, ptr_bits),
+        // `render_c_type_like`, not `render_signature_type`: the latter
+        // materializes first, which turns a pointer to an unmaterialized
+        // aggregate into `void *`. That is the right answer for a rendered
+        // signature and the wrong one here, because radare2 needs the name it
+        // was given so the writeback can require the type be materialized and
+        // fail closed when it is not.
+        other => crate::convert::render_c_type_like(other),
     }
 }
 

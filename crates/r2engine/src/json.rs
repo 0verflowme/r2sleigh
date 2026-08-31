@@ -304,7 +304,7 @@ pub fn type_writeback_json_core(
                 name: candidate.name,
                 kind: candidate.kind,
                 delta: candidate.delta,
-                var_type: candidate.var_type,
+                var_type: r2types::render_writeback_apply_type(&candidate.var_type, ptr_bits),
                 isarg: candidate.isarg,
                 reg: candidate.reg,
                 size: candidate.size,

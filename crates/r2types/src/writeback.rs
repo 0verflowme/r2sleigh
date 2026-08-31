@@ -195,7 +195,10 @@ pub struct VarTypeCandidate {
     pub name: String,
     pub kind: String,
     pub delta: i64,
-    pub var_type: String,
+    /// The type this variable is being given, as a type.
+    ///
+    /// Rendered only where it leaves for radare2 or a JSON payload.
+    pub var_type: CTypeLike,
     pub isarg: bool,
     pub reg: Option<String>,
     pub size: u32,
@@ -764,8 +767,10 @@ fn type_writeback_mutation_plan_with_policy(
         };
 
         for candidate in &plan.var_type_candidates {
-            let apply_type = canonicalize_writeback_apply_type_name(&candidate.var_type)
-                .unwrap_or_else(|| candidate.var_type.clone());
+            let apply_type = crate::signature_infer::render_writeback_apply_type(
+                &candidate.var_type,
+                plan.ptr_bits,
+            );
             let type_materialization_key = writeback_type_materialization_key(&apply_type);
             let type_materialization_required = type_materialization_required_for_type(
                 &apply_type,
@@ -1168,9 +1173,9 @@ impl TypeWritebackAnalysis {
             else {
                 return false;
             };
-            let var_type = render_signature_type(ty, ptr_bits);
-            let size = estimate_c_type_size_bytes(&var_type, ptr_bits) as u32;
-            candidate.var_type = var_type;
+            let size =
+                estimate_c_type_size_bytes(&render_signature_type(ty, ptr_bits), ptr_bits) as u32;
+            candidate.var_type = ty.clone();
             candidate.size = size;
             candidate.source = WritebackSource::CalleeSignature;
             if !candidate
@@ -4334,7 +4339,6 @@ fn build_type_writeback_analysis_inner(
         &mut input.parsed_context.stack_slots,
         input.recovered_vars,
         &var_type_candidates,
-        input.ptr_bits,
     );
     let var_rename_candidates = build_var_rename_candidates(
         input.recovered_vars,
@@ -9230,9 +9234,9 @@ fn build_visible_bindings(
         .collect::<HashMap<_, _>>();
     let mut type_map = BTreeMap::<RecoveredVarKey, CTypeLike>::new();
     for candidate in var_type_candidates {
-        let Some(ty) = parse_type_like_spec(&candidate.var_type, ptr_bits) else {
-            continue;
-        };
+        // The candidate carries a type now, so there is nothing left to parse
+        // and nothing to skip for being unparseable.
+        let ty = candidate.var_type.clone();
         let key = RecoveredVarKey::for_type_candidate(candidate);
         type_map
             .entry(key)
@@ -9360,7 +9364,6 @@ fn apply_canonical_stack_width_types(
     stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     vars: &[RecoveredVariable],
     candidates: &[VarTypeCandidate],
-    ptr_bits: u32,
 ) {
     let candidates = candidates
         .iter()
@@ -9381,9 +9384,7 @@ fn apply_canonical_stack_width_types(
         let Some(candidate) = candidates.get(&RecoveredVarKey::for_recovered_var(var)) else {
             continue;
         };
-        let Some(candidate_ty) = parse_type_like_spec(&candidate.var_type, ptr_bits) else {
-            continue;
-        };
+        let candidate_ty = candidate.var_type.clone();
         let CTypeLike::Int {
             bits: candidate_bits,
             ..
@@ -9544,7 +9545,7 @@ fn build_var_type_candidates(
             name: var.name.clone(),
             kind: var.kind.clone(),
             delta: var.delta,
-            var_type: chosen_type.clone(),
+            var_type: crate::convert::parse_c_type_like(&chosen_type, ctx.ptr_bits),
             isarg: var.isarg,
             reg: var.reg.clone(),
             size: estimate_c_type_size_bytes(&chosen_type, ctx.ptr_bits) as u32,
@@ -10485,7 +10486,7 @@ fn score_global_type_links(
         );
     }
     for var in var_type_candidates {
-        let parsed = crate::convert::parse_c_type_like(&var.var_type, ptr_bits);
+        let parsed = var.var_type.clone();
         if matches!(&parsed, CTypeLike::Pointer(inner) if matches!(inner.as_ref(), CTypeLike::Struct(name) if !writeback_type_name_is_opaque_placeholder(name)))
         {
             *per_type_weight.entry(parsed).or_insert(30) += 4 + (var.confidence as i32 / 12);
@@ -11830,7 +11831,7 @@ mod tests {
             name: name.to_string(),
             kind: "r".to_string(),
             delta: 0,
-            var_type: "int64_t".to_string(),
+            var_type: crate::convert::parse_c_type_like("int64_t", 64),
             isarg: true,
             reg: register.map(str::to_string),
             size: 8,
@@ -11855,7 +11856,10 @@ mod tests {
 
         assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
         let candidate = &analysis.plan().var_type_candidates[0];
-        assert_eq!(candidate.var_type, "int8_t");
+        assert_eq!(
+            candidate.var_type,
+            crate::convert::parse_c_type_like("int8_t", 64)
+        );
         assert_eq!(candidate.size, 1);
         assert_eq!(candidate.source, WritebackSource::CalleeSignature);
         assert!(
@@ -12405,7 +12409,10 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(candidate.var_type, "int32_t");
+        assert_eq!(
+            candidate.var_type,
+            crate::convert::parse_c_type_like("int32_t", 64)
+        );
         assert_eq!(candidate.source, WritebackSource::DataflowRanked);
         assert!(
             candidate
@@ -12523,7 +12530,10 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(candidate.var_type, "uint8_t");
+        assert_eq!(
+            candidate.var_type,
+            crate::convert::parse_c_type_like("uint8_t", 64)
+        );
         assert!(
             candidate
                 .evidence
@@ -13277,7 +13287,7 @@ mod tests {
                 name: "var_8h".to_string(),
                 kind: "b".to_string(),
                 delta: -8,
-                var_type: "int32_t".to_string(),
+                var_type: crate::convert::parse_c_type_like("int32_t", 64),
                 isarg: false,
                 reg: None,
                 size: 4,
@@ -13441,7 +13451,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: crate::convert::parse_c_type_like("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13500,7 +13510,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "struct type.Foo*".to_string(),
+            var_type: crate::convert::parse_c_type_like("struct type.Foo*", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -13518,7 +13528,7 @@ mod tests {
             name: "var_ch".to_string(),
             kind: "b".to_string(),
             delta: -12,
-            var_type: "int32_t".to_string(),
+            var_type: crate::convert::parse_c_type_like("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13530,7 +13540,7 @@ mod tests {
             name: "var_10h".to_string(),
             kind: "b".to_string(),
             delta: -16,
-            var_type: "struct type_0x123 *".to_string(),
+            var_type: crate::convert::parse_c_type_like("struct type_0x123 *", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -14060,7 +14070,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: crate::convert::parse_c_type_like("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -14146,7 +14156,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: crate::convert::parse_c_type_like("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -15597,7 +15607,10 @@ mod tests {
         });
 
         assert_eq!(analysis.signature.params[0].param_type, "int32_t");
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            crate::convert::parse_c_type_like("int32_t", 64)
+        );
         let merged = analysis
             .type_facts
             .merged_signature
@@ -16056,7 +16069,10 @@ mod tests {
             interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            crate::convert::parse_c_type_like("int32_t", 64)
+        );
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
         assert!(
             analysis
@@ -16928,7 +16944,10 @@ mod tests {
         });
 
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            crate::convert::parse_c_type_like("void *", 64)
+        );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
             WritebackSource::LocalInferred
@@ -16994,7 +17013,10 @@ mod tests {
         });
 
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            crate::convert::parse_c_type_like("void *", 64)
+        );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
             WritebackSource::LocalInferred
@@ -17052,7 +17074,10 @@ mod tests {
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            crate::convert::parse_c_type_like("int32_t", 64)
+        );
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
         assert!(
             analysis.type_facts.stack_slots.contains_key(&StackSlotKey {

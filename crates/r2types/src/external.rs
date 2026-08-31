@@ -113,11 +113,23 @@ fn normalize_primitive_alias(base: &str) -> Option<&'static str> {
 }
 
 pub fn normalize_external_type_name(ty: &str) -> String {
-    let mut normalized = ty.trim().to_string();
-    if normalized.is_empty() || is_opaque_placeholder_type_name(&normalized) {
+    let spelled = normalize_type_spelling(ty);
+    if spelled.trim().is_empty() || is_opaque_placeholder_type_name(&spelled) {
         return "void *".to_string();
     }
+    spelled
+}
 
+/// Strip the spellings radare2 decorates a type name with.
+///
+/// Qualifiers, its `type.` and `struct.` prefixes, and the like. This is
+/// separate from `normalize_external_type_name` because that one also decides
+/// that an opaque placeholder *is* `void *`, which is a judgement about what to
+/// do with an unknown type rather than a fact about how it is spelled. Parsing
+/// must not make that judgement: a `struct type_0x123 *` has to survive as
+/// itself so the writeback can require its materialization and fail closed.
+pub fn normalize_type_spelling(ty: &str) -> String {
+    let mut normalized = ty.trim().to_string();
     for qualifier in ["const", "volatile", "restrict", "register"] {
         normalized = normalized
             .split_whitespace()
@@ -184,7 +196,7 @@ pub fn normalize_external_type_name(ty: &str) -> String {
     }
 
     normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() || is_opaque_placeholder_type_name(&normalized) {
+    if normalized.is_empty() {
         return "void *".to_string();
     }
     format!("{normalized}{ptr_suffix}")

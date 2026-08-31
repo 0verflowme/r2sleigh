@@ -292,7 +292,7 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
 /// `long` and `size_t` is a property of the target, and guessing it is how two
 /// of the previous parsers came to disagree.
 pub fn parse_c_type_like(spelling: &str, ptr_bits: u32) -> CTypeLike {
-    let normalized = crate::external::normalize_external_type_name(spelling);
+    let normalized = crate::external::normalize_type_spelling(spelling);
     parse_normalized(normalized.trim(), ptr_bits)
 }
 
