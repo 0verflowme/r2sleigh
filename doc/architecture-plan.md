@@ -2254,9 +2254,9 @@ exactly this reasoning for write *projections*, in
 extension that clears the rest of its carrier. The same fact has to reach the SSA
 definition, not only the projection, or a full-width read cannot see it.
 
-Until that lands, `NEON_ushl` stays unexpanded and the cell stays refused. A
-refusal is worth more than a silent wrong answer, and this one has already shown
-it can pass the ledger.
+**Landed.** A merge source is now composed from the parts that define it, so the
+deadness proof is no longer false. See the closing entry at the end of this
+track.
 
 
 ### What is left of the last cell
@@ -2370,10 +2370,9 @@ objects are per lane and every wider read is an explicit composition. The corpus
 has been measured against four local answers and each moves the failure rather
 than removing it.
 
-`NEON_ushl` stays unexpanded until that is settled. It is written, it is verified
-exact against the architecture over three million vectors, and it is one measured
-change away from landing -- but a cell that does not compile is worth no more
-than one that refuses.
+**Settled, and not by any of the six local rules.** See the closing entry at the
+end of this track: the width question was the wrong frame, and what actually
+remained was an offset described twice.
 
 ## Track E -- the two capabilities Track D's last three cells need
 
@@ -2555,3 +2554,42 @@ a table the rendered program does not have.
   into a carrier-wide object that must then be read to preserve what they did
   not touch. Gate: `crc32_bitwise` at x64 -O2 renders, compiles under the strict
   flags, and passes the differential oracle.
+
+
+## Track D closed: fifty-four of fifty-four
+
+The gate is met. Generation, strict compilation, diagnostic compilation and the
+differential oracle all read fifty-four, with 2222 tests and no clippy warning.
+
+Three changes closed it, and the first is the one the six earlier attempts kept
+circling without seeing.
+
+**An extracting operation's operand is read whole.** Where the extraction sits is
+the operation's own semantics and the operation renders it. Describing it again
+as a property of the read applied the offset twice, and a lane that shifts twice
+is zero. It stayed hidden because a register operand read as itself already has
+its slice replaced with a whole read, so only values composed inside the function
+-- which carry no canonical storage and keep the recorded slice -- ever showed
+it. The record and the mirror it is validated against have to move together:
+changing the mirror alone makes every extraction fail validation, and that, not
+any semantic dependence, is why the earlier attempt fell to three cells.
+
+**A computed value is read at the width it holds; an entered value keeps machine
+width.** The second is an ABI fact rather than a use fact -- narrowing an
+incoming argument to whatever the body reads makes a function disagree with the
+declaration its caller writes, and the two renderings then do not compile
+together. For a computed value there is no such contract, and re-basing it onto
+its register only forced objects as wide as whatever the specification nests that
+register in, which for the vector registers is a carrier no program here
+addresses.
+
+**`NEON_ushl` expanded element by element**, each element shifted by the signed
+low byte of the corresponding element of the second operand, in the direction of
+its sign, and to zero once the distance reaches the element's width.
+
+What the six failed attempts were worth: every one of them adjusted *which*
+values are read as themselves, and the defect was that an offset was stated
+twice. The measurements are kept above because they are what ruled that framing
+out, and because two of them produced output that was wrong rather than refused
+-- caught by the differential oracle and not by any audit the renderer performs
+on itself.
