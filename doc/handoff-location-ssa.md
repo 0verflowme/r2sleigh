@@ -6197,3 +6197,31 @@ its name appears in a list of about two hundred coreutils spellings. Deleting
 the list outright was rejected because it is not a uniform refusal: at
 `facts.rs:1280` and `writeback.rs:3278` it degrades output silently rather than
 declining, and at `writeback.rs:9833` the polarity inverts.
+
+**The derived replacement for `semantic_typedef_is_authoritative`, worked out and
+not landed.** The predicate should be: a type name is authoritative when
+something can actually resolve it -- when the C language resolves it, which
+`parse_c_type_like` already answers, or when the external type database holds a
+real layout for it, which `external_named_aggregate_has_real_layout` already
+answers, or when the database holds a typedef entry that eventually names one.
+That is three lines over facts the tree already has, and unlike a list of about
+two hundred coreutils and gnulib spellings it says the same thing about a
+coreutils typedef and about anybody else's.
+
+It was written and then reverted, because wiring it in is the actual work and
+the tree does not keep a change that alters nothing. The three consumers --
+`facts::pointer_hint_is_authoritative` and the two `*_can_replace_*` predicates
+-- have no type database in scope, and threading one to them reaches about
+twenty-three call sites across `facts.rs`, `function_facts.rs` and
+`writeback.rs`, each of which then needs it from its own callers. An attempt at
+that threading spread further than it should have and was reverted whole.
+
+The reason it spreads is worth stating, because it points at the better shape.
+These predicates ask "is this typedef resolvable" at the moment of *use*, which
+is why every one of them needs the database. A typedef should instead be
+resolved against the database once, where a spelling becomes a `CTypeLike` --
+`parse_c_type_like` is already that seam, and already folds the builtin
+spellings. Then an unresolved `CTypeLike::Typedef` means exactly "nothing could
+resolve this name", the predicates become a pattern match with no database
+argument at all, and the list has nowhere left to live. That is the change to
+make, and it subsumes the threading rather than adding to it.
