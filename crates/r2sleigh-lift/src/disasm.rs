@@ -217,6 +217,76 @@ fn register_storages_are_disjoint(first: CanonicalStorageId, second: CanonicalSt
         })
 }
 
+/// Where the lifted architecture puts the register the source named.
+///
+/// Spelling differs between the two: radare2 writes x86 register names in lower
+/// case where the Sleigh specification writes them in upper case, and that is a
+/// difference in spelling, not in register. Case is therefore folded, and
+/// nothing else is: a name the architecture does not define resolves to
+/// nothing, because placing an unrecognised carrier by guesswork is how a
+/// carrier ends up at another register's offset.
+fn arch_register_storage(arch: &r2il::ArchSpec, name: &str) -> Option<CanonicalStorageId> {
+    let register = arch
+        .get_register(name)
+        .or_else(|| arch.get_register(&name.to_ascii_uppercase()))
+        .or_else(|| arch.get_register(&name.to_ascii_lowercase()))?;
+    Some(CanonicalStorageId {
+        space: r2source::CanonicalStorageSpace::Register,
+        offset: register.offset,
+        size: register.size,
+    })
+}
+
+/// Restate a capture's role carriers in the lifted architecture's numbering.
+///
+/// The capture states each carrier as a name plus an offset into its own
+/// register arena. Only the name crosses over, so each carrier is looked up
+/// again here and a carrier the architecture cannot place is dropped. Dropping
+/// costs the certificates that need that carrier; keeping the capture's offset
+/// would instead assert that some unrelated register is the return address,
+/// which every consumer downstream would then believe.
+fn arch_resolved_source(
+    source: OwnedFunctionSnapshot,
+    arch: &r2il::ArchSpec,
+) -> Result<OwnedFunctionSnapshot> {
+    let resolve = |name: Option<&str>| name.and_then(|name| arch_register_storage(arch, name));
+    let interface = match source.function_interface() {
+        Some(interface) => {
+            let names = interface.role_register_names();
+            Some(
+                interface
+                    .clone()
+                    .with_arch_resolved_role_carriers(
+                        resolve(names.return_address()),
+                        resolve(names.stack_pointer()),
+                        resolve(names.frame_pointer()),
+                    )
+                    .map_err(|error| {
+                        LiftError::Unsupported(format!(
+                            "captured interface carriers do not resolve against the lifted \
+                             architecture: {error:?}"
+                        ))
+                    })?,
+            )
+        }
+        None => None,
+    };
+    let role_names = source.machine_roles().role_register_names();
+    let roles = source
+        .machine_roles()
+        .with_arch_resolved_carriers(
+            resolve(role_names.return_address()),
+            resolve(role_names.stack_pointer()),
+        )
+        .map_err(|error| {
+            LiftError::Unsupported(format!(
+                "captured machine carriers do not resolve against the lifted architecture: \
+                 {error:?}"
+            ))
+        })?;
+    Ok(source.with_arch_resolved_role_carriers(interface, roles))
+}
+
 fn captured_frame_pointer_storage_matches_arch(
     interface: &SourceFunctionInterface,
     arch: &r2il::ArchSpec,
@@ -1324,6 +1394,9 @@ impl Disassembler {
                     "trusted lift lost its exact architecture authority".to_string(),
                 )
             })?;
+        // The capture's carriers are restated in this architecture's numbering
+        // before anything reads them, including the agreement check below.
+        let source = arch_resolved_source(source, trusted_arch)?;
         // Lifting is a function of the machine tuple and the image bytes; the
         // function interface is evidence about the ABI and is never read below.
         // An absent interface is therefore a fact about the source, not a lift

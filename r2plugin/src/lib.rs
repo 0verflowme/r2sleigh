@@ -326,6 +326,27 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
     if let Some(n) = bp.as_deref() {
         profile.push_str(&format!("=BP\t{}\n", n));
     }
+    // The link register, where the architecture has one. Without this alias
+    // radare2's return-address lookup walks LR, RA, PC and settles on the
+    // program counter, so every consumer is told the return address lives in
+    // `pc`. On arm64 that named a register the prologue never saves, and the
+    // saved `x30` was left looking like an ordinary local: stored once, read by
+    // nothing, and declared from a value nothing wrote. An architecture with no
+    // link register names none of these and keeps no alias, which is the
+    // truthful answer for x86.
+    let lr = if is_arm64 {
+        first_existing(&["x30", "lr"])
+    } else {
+        // Only spellings that mean the link register wherever they appear.
+        // `r14` is ARM's, but x86-64 has a general register of that name, and
+        // claiming it as the return address made radare2 report R14 as the
+        // return-address carrier for every x86-64 function -- which refused all
+        // twenty-seven of them.
+        first_existing(&["lr", "ra", "$ra"])
+    };
+    if let Some(n) = lr.as_deref() {
+        profile.push_str(&format!("=LR\t{}\n", n));
+    }
     for (idx, reg) in a_roles.iter().enumerate() {
         if let Some(n) = reg.as_deref() {
             profile.push_str(&format!("=A{}\t{}\n", idx, n));

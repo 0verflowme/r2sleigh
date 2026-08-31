@@ -2158,10 +2158,16 @@ impl<'a> FoldingContext<'a> {
                             .certificates()
                             .stack_frame_round_trip_by_inst
                             .contains_key(&inst)
-                            || prepared
-                                .certificates()
-                                .machine_return_control_by_inst
-                                .contains_key(&inst)
+                            // Every instruction a return-control certificate
+                            // answers for, not only the ones it claims
+                            // exclusively: the prologue's save of the return
+                            // address is shared with the frame's own setup and
+                            // with every other return, so it is deliberately
+                            // claimed by none of them, and asking only about
+                            // exclusive claims left it to be rendered as a
+                            // store to a slot the plan had already elided.
+                            || crate::binding_plan::certified_return_control_insts(prepared)
+                                .contains(&inst)
                             || prepared
                                 .certificates()
                                 .stack_geometry

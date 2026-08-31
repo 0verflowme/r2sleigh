@@ -1698,15 +1698,44 @@ impl LegacyObservationJournal {
             }
         }
         for site in crate::binding_plan::certified_return_control_sites(source.source()) {
+            // A merge the analysis already answered for keeps its answer. The
+            // link register reaches a return through phis that merge it with
+            // itself, and once the certificate covers the register those phi
+            // operands are named twice -- as an unobserved merge and as return
+            // control. Both say the same thing, and calling that a conflict
+            // refused every function whose return address survives a branch.
+            if elided_uses.get(&site) == Some(&r2ssa::ledger::ElisionReason::UnobservedMerge) {
+                continue;
+            }
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::ReturnControl) {
                 Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
+        // Instructions the certificate took over from the prologue are shared
+        // with whatever else describes them: one `stp x29, x30` is the frame's
+        // setup and the return address's save at once, and one save serves
+        // every return. Where such an instruction is already accounted for,
+        // that account stands; both say it renders nothing, and treating the
+        // second one as a contradiction refused the whole function.
+        let shared = crate::binding_plan::certified_return_control_absorbed_insts(source.source());
         for inst in crate::binding_plan::certified_return_control_insts(source.source()) {
             let Some(definition) = graph.inst(inst) else {
                 return Err(LegacyObservationJournalError::InvalidWrite(inst));
             };
+            if shared.contains(&inst) {
+                if definition.output.is_some() {
+                    elided_writes
+                        .entry(inst)
+                        .or_insert(r2ssa::ledger::ElisionReason::ReturnControl);
+                }
+                for input_idx in 0..definition.inputs.len() {
+                    elided_uses
+                        .entry(UseSite { inst, input_idx })
+                        .or_insert(r2ssa::ledger::ElisionReason::ReturnControl);
+                }
+                continue;
+            }
             if definition.output.is_some() {
                 match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::ReturnControl) {
                     Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}

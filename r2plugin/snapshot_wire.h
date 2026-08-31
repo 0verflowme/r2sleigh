@@ -16,7 +16,7 @@
 #include <stdint.h>
 
 #define R2SLEIGH_SNAPSHOT_WIRE_MAGIC 0x52325357u
-#define R2SLEIGH_SNAPSHOT_WIRE_FORMAT_VERSION 4u
+#define R2SLEIGH_SNAPSHOT_WIRE_FORMAT_VERSION 5u
 #define R2SLEIGH_SNAPSHOT_WIRE_HEADER_BYTES 24u
 
 /* Reference written for an absent optional string. */

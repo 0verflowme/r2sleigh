@@ -502,6 +502,30 @@ static void walk_optional_storage(R2SleighWireWriter *writer, bool present,
 	}
 }
 
+/* A role carrier is written with the register's name beside its storage.
+ * radare2 reports the offset into its own register arena, which has nothing to
+ * do with the offset the Sleigh architecture gives the same register, so the
+ * name is what the consumer resolves; the offset alone would name a different
+ * register or none at all. An empty name is written when radare2 cannot spell
+ * the register, and the consumer treats that as no carrier rather than as a
+ * carrier at a wrong offset. */
+static void walk_named_optional_storage(R2SleighWireWriter *writer, bool present,
+		const RAnalSnapshotRegisterStorageView *storage,
+		const RAnalFunctionSnapshot *snapshot,
+		RAnalSnapshotInterfaceStorageKind kind) {
+	r2sleigh_wire_bool (writer, present);
+	if (!present) {
+		return;
+	}
+	walk_storage (writer, storage);
+	char name[WALK_NAME_MAX];
+	if (!r_anal_function_snapshot_interface_storage_name (snapshot, kind, name,
+			sizeof (name))) {
+		name[0] = '\0';
+	}
+	r2sleigh_wire_string (writer, name);
+}
+
 static bool walk_carrier(R2SleighWireWriter *writer,
 		const RAnalSnapshotCarrierProjection *carrier) {
 	switch (carrier->kind) {
@@ -817,14 +841,17 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) != 0;
 	const bool has_stack_pointer = (top->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) != 0;
-	walk_optional_storage (writer, has_return_address, &view->return_address_storage);
-	walk_optional_storage (writer, has_stack_pointer, &view->stack_pointer_storage);
+	walk_named_optional_storage (writer, has_return_address, &view->return_address_storage,
+		snapshot, R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN_ADDRESS);
+	walk_named_optional_storage (writer, has_stack_pointer, &view->stack_pointer_storage,
+		snapshot, R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER);
 
 	RAnalSnapshotRegisterStorageView frame = {0};
 	const bool has_frame = (top->capabilities
 			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) != 0
 		&& r_anal_function_snapshot_interface_frame_pointer_storage (snapshot, &frame);
-	walk_optional_storage (writer, has_frame, &frame);
+	walk_named_optional_storage (writer, has_frame, &frame, snapshot,
+		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_FRAME_POINTER);
 
 	if (top->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
 		RAnalSnapshotReturnMechanismView mechanism = {0};
@@ -911,10 +938,12 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	 * functions that have no interface and most need them. */
 	RAnalFunctionInterfaceSnapshotView carriers = {0};
 	const bool carriers_read = r_anal_function_snapshot_interface_view (source, &carriers);
-	walk_optional_storage (writer, carriers_read && has_return_address,
-		&carriers.return_address_storage);
-	walk_optional_storage (writer, carriers_read && has_stack_pointer,
-		&carriers.stack_pointer_storage);
+	walk_named_optional_storage (writer, carriers_read && has_return_address,
+		&carriers.return_address_storage, source,
+		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN_ADDRESS);
+	walk_named_optional_storage (writer, carriers_read && has_stack_pointer,
+		&carriers.stack_pointer_storage, source,
+		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER);
 	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
 		RAnalSnapshotStackAllocationContractView contract = {0};
 		if (!r_anal_function_snapshot_interface_stack_allocation_contract (source,

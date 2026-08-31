@@ -780,6 +780,7 @@ impl BindingPlan {
                     .certificates()
                     .stack_frame_round_trips
                     .contains_key(object)
+                    || super::certified_return_control_stack_objects(source).contains(object)
                 {
                     stack_objects.insert(
                         *object,

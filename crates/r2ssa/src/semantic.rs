@@ -1136,6 +1136,22 @@ pub struct MachineReturnControlCertificate {
     pub insts: BTreeSet<InstId>,
     pub values: BTreeSet<ValueId>,
     pub uses: BTreeSet<UseSite>,
+    /// The instructions this certificate took over from the prologue: the
+    /// save of the return address and the copies feeding it.
+    ///
+    /// They are recorded apart from the rest because they are shared. One
+    /// `stp x29, x30` both sets up the frame and saves the return address, so
+    /// the frame's certificate and this one describe the same instruction from
+    /// two sides; and one save serves every return the function has. Both
+    /// accounts say it renders nothing, so neither has to be the only one.
+    pub absorbed_insts: BTreeSet<InstId>,
+    /// The slot the return address was saved in, when this certificate answers
+    /// for the save as well as the reload. A slot that holds only the return
+    /// address between the prologue and the return is not an object the
+    /// function has; it is where the machine kept its control while the
+    /// function ran, and the certificate that accounts for the reload accounts
+    /// for the save with it.
+    pub stack_object: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4192,6 +4208,7 @@ fn collect_machine_return_control_certificates(
     graph: &SsaGraph,
     objects: &ObjectModel,
     structured: &StructuredDataflowFacts,
+    unobserved: &crate::deadphi::DeadPhis,
 ) -> (
     BTreeMap<InstId, MachineReturnControlCertificate>,
     BTreeMap<InstId, InstId>,
@@ -4215,6 +4232,14 @@ fn collect_machine_return_control_certificates(
         let mut values = BTreeSet::from([return_address.value]);
         let mut current = return_address.value;
         let mut complete = true;
+        let mut claimed_stack_object = None;
+        // The prologue saves the return address once however many returns the
+        // function has, so every return's certificate describes that one save.
+        // These instructions are therefore exempt from the rule that no two
+        // certificates may claim an instruction: that rule exists to stop two
+        // certificates giving different accounts of one instruction, and here
+        // they give the same account.
+        let mut absorbed = BTreeSet::new();
         loop {
             let Some(inst) = graph.def_inst(current) else {
                 break;
@@ -4277,6 +4302,50 @@ fn collect_machine_return_control_certificates(
                         || !insts.insert(inst)
                     {
                         complete = false;
+                        break;
+                    }
+                    // The slot this reload came from holds the return address
+                    // and nothing else. Its one write is the prologue's save,
+                    // and the value it saves is the return address the function
+                    // was entered with. Save and reload are one fact about
+                    // control, so the certificate that answers for the reload
+                    // answers for the save too; leaving the save to another
+                    // collector is what renders it as a store to a variable no
+                    // one reads, assigned from an entry value nothing wrote.
+                    let object_accesses = structured
+                        .memory_accesses
+                        .values()
+                        .filter(|other| other.object == access.object)
+                        .collect::<Vec<_>>();
+                    let writes = object_accesses
+                        .iter()
+                        .filter(|other| other.is_write)
+                        .collect::<Vec<_>>();
+                    let reads = object_accesses
+                        .iter()
+                        .filter(|other| !other.is_write)
+                        .collect::<Vec<_>>();
+                    if let ([store], [only_read]) = (writes.as_slice(), reads.as_slice())
+                        && only_read.id == access.id
+                        && store.provenance_complete
+                        && store.space == SpaceId::Ram
+                        && store.width == return_address.storage.size
+                        && let Some(stored) = store.value
+                        && let Some((storage, entry, save_insts, save_values)) =
+                            exact_copy_chain_to_entry_storage(
+                                graph,
+                                stored,
+                                return_address.storage.size,
+                            )
+                        && storage == return_address.storage
+                        && insts.insert(store.id.inst)
+                    {
+                        absorbed.insert(store.id.inst);
+                        absorbed.extend(save_insts.iter().copied());
+                        insts.extend(save_insts);
+                        values.extend(save_values);
+                        values.insert(entry);
+                        claimed_stack_object = Some(access.object);
                     }
                     break;
                 }
@@ -4292,13 +4361,22 @@ fn collect_machine_return_control_certificates(
         };
         if !complete
             || insts.is_empty()
+            // A use the merge analysis has already answered for is not a
+            // reader. The link register reaches a return through phis that
+            // merge it with itself; those merges render nothing, and counting
+            // them as escapes refused the certificate on every path but the
+            // first, which is how a saved return address kept its declaration
+            // in a function with more than one return.
             || values.iter().any(|value| {
-                graph
-                    .use_sites(*value)
-                    .iter()
-                    .any(|site| *site != return_use && !insts.contains(&site.inst))
+                graph.use_sites(*value).iter().any(|site| {
+                    *site != return_use
+                        && !insts.contains(&site.inst)
+                        && !unobserved.unobserved_uses().contains(site)
+                })
             })
-            || insts.iter().any(|inst| by_inst.contains_key(inst))
+            || insts
+                .iter()
+                .any(|inst| !absorbed.contains(inst) && by_inst.contains_key(inst))
         {
             continue;
         }
@@ -4320,8 +4398,14 @@ fn collect_machine_return_control_certificates(
             insts,
             values,
             uses,
+            absorbed_insts: absorbed,
+            stack_object: claimed_stack_object,
         };
-        for inst in &certificate.insts {
+        for inst in certificate
+            .insts
+            .iter()
+            .filter(|inst| !certificate.absorbed_insts.contains(inst))
+        {
             by_inst.insert(*inst, *at);
         }
         certificates.insert(*at, certificate);
@@ -4755,7 +4839,9 @@ fn collect_prepared_function_certificates(
             unobserved,
         );
     let (machine_return_controls, machine_return_control_by_inst) =
-        collect_machine_return_control_certificates(boundaries, graph, objects, structured);
+        collect_machine_return_control_certificates(
+            boundaries, graph, objects, structured, unobserved,
+        );
     let stack_geometry = collect_stack_geometry_certificate(
         boundaries,
         function,

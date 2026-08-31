@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 4;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 5;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -349,9 +349,9 @@ use crate::contracts::{
     SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
     SourceCallPreservedCarriers, SourceCallResult, SourceCarrierKind, SourceCarrierProjection,
     SourceConventionSlots, SourceFunctionInterface, SourceFunctionReturn, SourceLogicalValue,
-    SourceMachineRoles, SourceReturnMechanism, SourceStackAllocationContract, SourceStackGrowth,
-    SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeKind,
-    StackAddressBase,
+    SourceMachineRoles, SourceRegisterName, SourceReturnMechanism, SourceRoleRegisterNames,
+    SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
+    SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
 };
 use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
@@ -585,6 +585,36 @@ pub fn read_optional_storage(
     }
 }
 
+/// A role carrier, written with the register spelling that survives the trip.
+///
+/// The offset beside it is stated in the producer's own register numbering,
+/// which is not the numbering the lifted architecture uses for the same
+/// register. The name is what the consumer resolves; the offset is carried only
+/// so an older consumer keeps reading what it always read.
+fn write_named_optional_storage(
+    writer: &mut SnapshotWireWriter,
+    storage: Option<CanonicalStorageId>,
+    name: Option<SourceRegisterName>,
+    format_version: u32,
+) -> Result<(), SnapshotWireError> {
+    write_optional_storage(writer, storage);
+    if storage.is_some() && format_version >= 5 {
+        writer.string(name.as_ref().map_or("", SourceRegisterName::as_str))?;
+    }
+    Ok(())
+}
+
+fn read_named_optional_storage(
+    reader: &mut SnapshotWireReader<'_>,
+) -> Result<(Option<CanonicalStorageId>, Option<SourceRegisterName>), SnapshotWireError> {
+    let storage = read_optional_storage(reader)?;
+    if storage.is_some() && reader.format_version() >= 5 {
+        let name = SourceRegisterName::new(reader.string()?);
+        return Ok((storage, name));
+    }
+    Ok((storage, None))
+}
+
 pub fn write_presentation(
     writer: &mut SnapshotWireWriter,
     presentation: &FunctionPresentation,
@@ -784,17 +814,31 @@ pub fn read_captured_fields(
     })
 }
 
-pub fn write_machine_roles(writer: &mut SnapshotWireWriter, roles: &SourceMachineRoles) {
-    write_machine_roles_for_format(writer, roles, SNAPSHOT_WIRE_FORMAT_VERSION);
+pub fn write_machine_roles(
+    writer: &mut SnapshotWireWriter,
+    roles: &SourceMachineRoles,
+) -> Result<(), SnapshotWireError> {
+    write_machine_roles_for_format(writer, roles, SNAPSHOT_WIRE_FORMAT_VERSION)
 }
 
 fn write_machine_roles_for_format(
     writer: &mut SnapshotWireWriter,
     roles: &SourceMachineRoles,
     format_version: u32,
-) {
-    write_optional_storage(writer, roles.return_address_storage());
-    write_optional_storage(writer, roles.stack_pointer_storage());
+) -> Result<(), SnapshotWireError> {
+    let names = roles.role_register_names();
+    write_named_optional_storage(
+        writer,
+        roles.return_address_storage(),
+        names.return_address().and_then(SourceRegisterName::new),
+        format_version,
+    )?;
+    write_named_optional_storage(
+        writer,
+        roles.stack_pointer_storage(),
+        names.stack_pointer().and_then(SourceRegisterName::new),
+        format_version,
+    )?;
     if format_version >= 3 {
         match roles.stack_allocation_contract() {
             Some(contract) => {
@@ -818,6 +862,7 @@ fn write_machine_roles_for_format(
             None => writer.bool(false),
         }
     }
+    Ok(())
 }
 
 pub fn read_machine_roles(
@@ -830,8 +875,8 @@ fn read_machine_roles_with_legacy_contract(
     reader: &mut SnapshotWireReader<'_>,
     legacy_contract: Option<SourceStackAllocationContract>,
 ) -> Result<SourceMachineRoles, SnapshotWireError> {
-    let return_address_storage = read_optional_storage(reader)?;
-    let stack_pointer_storage = read_optional_storage(reader)?;
+    let (return_address_storage, return_address_name) = read_named_optional_storage(reader)?;
+    let (stack_pointer_storage, stack_pointer_name) = read_named_optional_storage(reader)?;
     let contract = if reader.format_version() >= 3 {
         if reader.bool()? {
             Some(read_stack_allocation(reader)?)
@@ -867,7 +912,11 @@ fn read_machine_roles_with_legacy_contract(
     if let Some(carriers) = carriers {
         roles = roles.with_call_preserved_carriers(carriers);
     }
-    Ok(roles)
+    Ok(roles.with_role_register_names(SourceRoleRegisterNames::new(
+        return_address_name.as_ref().map(SourceRegisterName::as_str),
+        stack_pointer_name.as_ref().map(SourceRegisterName::as_str),
+        None,
+    )))
 }
 
 pub fn write_convention_slots(
@@ -1666,9 +1715,27 @@ fn write_interface_for_format(
 
     writer.bool(interface.stack_pointer_preserved_across_calls());
     writer.bool(interface.frame_pointer_preserved_across_calls());
-    write_optional_storage(writer, interface.return_address_storage());
-    write_optional_storage(writer, interface.stack_pointer_storage());
-    write_optional_storage(writer, interface.frame_pointer_storage());
+    let role_names = interface.role_register_names();
+    write_named_optional_storage(
+        writer,
+        interface.return_address_storage(),
+        role_names
+            .return_address()
+            .and_then(SourceRegisterName::new),
+        format_version,
+    )?;
+    write_named_optional_storage(
+        writer,
+        interface.stack_pointer_storage(),
+        role_names.stack_pointer().and_then(SourceRegisterName::new),
+        format_version,
+    )?;
+    write_named_optional_storage(
+        writer,
+        interface.frame_pointer_storage(),
+        role_names.frame_pointer().and_then(SourceRegisterName::new),
+        format_version,
+    )?;
     match interface.return_mechanism() {
         Some(mechanism) => {
             writer.bool(true);
@@ -1757,9 +1824,9 @@ fn read_interface_record(
 
     let stack_pointer_preserved = reader.bool()?;
     let frame_pointer_preserved = reader.bool()?;
-    let return_address_storage = read_optional_storage(reader)?;
-    let stack_pointer_storage = read_optional_storage(reader)?;
-    let frame_pointer_storage = read_optional_storage(reader)?;
+    let (return_address_storage, return_address_name) = read_named_optional_storage(reader)?;
+    let (stack_pointer_storage, stack_pointer_name) = read_named_optional_storage(reader)?;
+    let (frame_pointer_storage, frame_pointer_name) = read_named_optional_storage(reader)?;
     let return_mechanism = if reader.bool()? {
         Some(read_return_mechanism(reader)?)
     } else {
@@ -1825,6 +1892,11 @@ fn read_interface_record(
 
     interface =
         interface.with_preserved_call_carriers(stack_pointer_preserved, frame_pointer_preserved);
+    interface = interface.with_role_register_names(SourceRoleRegisterNames::new(
+        return_address_name.as_ref().map(SourceRegisterName::as_str),
+        stack_pointer_name.as_ref().map(SourceRegisterName::as_str),
+        frame_pointer_name.as_ref().map(SourceRegisterName::as_str),
+    ));
     if let Some(storage) = return_address_storage {
         interface = interface
             .with_return_address_storage(storage)
@@ -1906,7 +1978,7 @@ pub fn encode_snapshot_set(
         }
         None => writer.bool(false),
     }
-    write_machine_roles(&mut writer, snapshot.machine_roles());
+    write_machine_roles(&mut writer, snapshot.machine_roles())?;
     write_convention_slots(&mut writer, snapshot.convention_slots())?;
     write_captured_fields(&mut writer, snapshot.captured_fields());
     write_diagnostic_identity(&mut writer, snapshot.diagnostic_identity());
@@ -2466,7 +2538,7 @@ mod tests {
         };
         let roles = SourceMachineRoles::new(Some(sp), Some(sp)).expect("roles");
         let mut writer = SnapshotWireWriter::new();
-        write_machine_roles(&mut writer, &roles);
+        write_machine_roles(&mut writer, &roles).expect("machine roles encode");
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         assert_eq!(read_machine_roles(&mut reader).expect("read"), roles);
@@ -2991,7 +3063,7 @@ mod tests {
 
         let mut writer = SnapshotWireWriter::new();
         write_interface(&mut writer, &interface).expect("write");
-        write_machine_roles(&mut writer, &roles);
+        write_machine_roles(&mut writer, &roles).expect("machine roles encode");
         let buffer = writer.finish().expect("finish");
         let mut reader = SnapshotWireReader::new(&buffer).expect("header");
         let decoded = read_interface(&mut reader).expect("read");
@@ -3161,7 +3233,8 @@ mod tests {
         writer.bool(true);
         write_interface_for_format(&mut writer, interface, format_version, Some(contract))
             .expect("legacy interface");
-        write_machine_roles_for_format(&mut writer, snapshot.machine_roles(), format_version);
+        write_machine_roles_for_format(&mut writer, snapshot.machine_roles(), format_version)
+            .expect("machine roles encode");
         write_convention_slots_for_format(&mut writer, snapshot.convention_slots(), format_version)
             .expect("legacy convention slots");
         let mut captured = snapshot.captured_fields();

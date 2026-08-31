@@ -202,16 +202,62 @@ pub(super) fn certified_return_control_sites(source: &r2ssa::SsaArtifact) -> BTr
     sites
 }
 
-/// Definitions whose whole result is a return address on its way to the return.
+/// The instructions a return-control certificate answers for.
 ///
-/// The copy that moves a link register into the program counter defines a
-/// value the structured form never emits, so its write is accounted here
-/// rather than being left for a rendering that will not happen.
+/// Two kinds. The copy that moves a link register into the program counter
+/// defines a value the structured form never emits, so its write is accounted
+/// here rather than being left for a rendering that will not happen. And the
+/// store that saved the return address in the first place, where the
+/// certificate absorbed it: that write has no reader once the reload is
+/// elided, and leaving it out of this set is what rendered it as an assignment
+/// to a variable no one reads.
 pub(super) fn certified_return_control_insts(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
     let graph = source.graph();
-    certified_return_control_values(source)
+    let mut insts = certified_return_control_values(source)
         .into_iter()
         .filter_map(|value| graph.def_inst(value))
+        .collect::<BTreeSet<_>>();
+    insts.extend(
+        source
+            .certificates()
+            .machine_return_controls
+            .values()
+            .flat_map(|certificate| certificate.insts.iter().copied()),
+    );
+    insts
+}
+
+/// The instructions a return-control certificate took over from the prologue.
+///
+/// A save is shared -- with the frame certificate, when one `stp` does both
+/// jobs, and with every other return in the function. So where an account of
+/// these instructions already exists, this certificate agrees with it rather
+/// than contradicting it, and the journal keeps the one that was there.
+pub(super) fn certified_return_control_absorbed_insts(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<InstId> {
+    source
+        .certificates()
+        .machine_return_controls
+        .values()
+        .flat_map(|certificate| certificate.absorbed_insts.iter().copied())
+        .collect()
+}
+
+/// The stack slots a return-control certificate claims.
+///
+/// A slot whose only write is the prologue's save of the return address and
+/// whose only read is the reload the certificate already answers for is not a
+/// local. Both binding derivations ask this the same way, so it is answered
+/// once.
+pub(super) fn certified_return_control_stack_objects(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<r2ssa::ObjectId> {
+    source
+        .certificates()
+        .machine_return_controls
+        .values()
+        .filter_map(|certificate| certificate.stack_object)
         .collect()
 }
 

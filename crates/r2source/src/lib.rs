@@ -603,7 +603,7 @@ impl std::fmt::Display for SnapshotValidationError {
 
 impl std::error::Error for SnapshotValidationError {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SnapshotState {
     machine: MachineProfile,
     function: FunctionIdentity,
@@ -765,6 +765,32 @@ impl OwnedFunctionSnapshot {
             captured_fields,
             diagnostics,
         })))
+    }
+
+    /// Restate the machine role carriers in the numbering of the architecture
+    /// that was actually lifted.
+    ///
+    /// A capture reports its carriers as offsets into the producer's own
+    /// register arena. That arena is not the architecture's register space --
+    /// on arm64 the producer calls the link register offset zero where the
+    /// architecture calls it 16624 -- so a carrier is a spelling plus a number
+    /// that means nothing here until the spelling is looked up. Until this
+    /// runs, every comparison of a carrier against a value's storage fails
+    /// quietly and every certificate that depends on one is declined for a
+    /// reason that looks like the function's fault.
+    ///
+    /// This is the single point of translation; it is applied once, by the
+    /// lift, before anything reads a carrier.
+    #[must_use]
+    pub fn with_arch_resolved_role_carriers(
+        &self,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+    ) -> Self {
+        let mut state = (*self.0).clone();
+        state.function_interface = function_interface;
+        state.machine_roles = machine_roles;
+        Self(Arc::new(state))
     }
 
     pub fn machine(&self) -> &MachineProfile {

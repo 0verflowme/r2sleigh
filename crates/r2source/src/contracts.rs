@@ -857,6 +857,105 @@ impl SourceStackSlotSpec {
     }
 }
 
+/// The register names a source spells for the machine role carriers.
+///
+/// A name is the only part of a source-reported carrier that means the same
+/// thing to the architecture that gets lifted. Everything else about the
+/// carrier -- its offset above all -- is stated in the source's own register
+/// numbering and has to be re-derived from the name before it can be compared
+/// with anything the lift produced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRoleRegisterNames {
+    return_address: Option<SourceRegisterName>,
+    stack_pointer: Option<SourceRegisterName>,
+    frame_pointer: Option<SourceRegisterName>,
+}
+
+/// One register spelling, stored inline.
+///
+/// Register names are short by construction, and holding one inline keeps the
+/// carriers a machine states about itself copyable, which is what every
+/// consumer of them already assumes. A name too long for the buffer is refused
+/// rather than truncated: a truncated spelling would resolve to a different
+/// register, which is the exact failure this type exists to prevent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SourceRegisterName {
+    bytes: [u8; SOURCE_REGISTER_NAME_MAX],
+    len: u8,
+}
+
+/// Longest register spelling a source may state.
+pub const SOURCE_REGISTER_NAME_MAX: usize = 32;
+
+impl SourceRegisterName {
+    /// Take a spelling, refusing one that is empty, over-long, or not plain
+    /// ASCII -- a register name outside that set is not one this transport can
+    /// compare, and guessing at it would place the wrong register.
+    pub fn new(name: &str) -> Option<Self> {
+        if name.is_empty() || name.len() > SOURCE_REGISTER_NAME_MAX || !name.is_ascii() {
+            return None;
+        }
+        let mut bytes = [0u8; SOURCE_REGISTER_NAME_MAX];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        Some(Self {
+            bytes,
+            len: name.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // The only constructor accepts ASCII, so the prefix is always UTF-8.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+}
+
+impl PartialEq for SourceRegisterName {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SourceRegisterName {}
+
+impl SourceRoleRegisterNames {
+    /// A capture that spelled no carrier at all.
+    pub const fn none() -> Self {
+        Self {
+            return_address: None,
+            stack_pointer: None,
+            frame_pointer: None,
+        }
+    }
+
+    /// Record what the source called each carrier. An empty spelling is no
+    /// name: a carrier the source could not name is one the consumer must do
+    /// without, never one it may place by its offset.
+    pub fn new(
+        return_address: Option<&str>,
+        stack_pointer: Option<&str>,
+        frame_pointer: Option<&str>,
+    ) -> Self {
+        let spelled = |name: Option<&str>| name.and_then(SourceRegisterName::new);
+        Self {
+            return_address: spelled(return_address),
+            stack_pointer: spelled(stack_pointer),
+            frame_pointer: spelled(frame_pointer),
+        }
+    }
+
+    pub fn return_address(&self) -> Option<&str> {
+        self.return_address.as_ref().map(SourceRegisterName::as_str)
+    }
+
+    pub fn stack_pointer(&self) -> Option<&str> {
+        self.stack_pointer.as_ref().map(SourceRegisterName::as_str)
+    }
+
+    pub fn frame_pointer(&self) -> Option<&str> {
+        self.frame_pointer.as_ref().map(SourceRegisterName::as_str)
+    }
+}
+
 /// Coherent, revision-bound function interface injected by the source owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceFunctionInterface {
@@ -869,6 +968,17 @@ pub struct SourceFunctionInterface {
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
     frame_pointer_storage: Option<CanonicalStorageId>,
+    /// How the source spells each role carrier's register.
+    ///
+    /// The source numbers registers in its own arena, which says nothing about
+    /// where the lifted architecture puts the same register: on arm64 the
+    /// source calls the link register offset zero and the architecture calls it
+    /// 16624. A storage taken from the source therefore names a different
+    /// register, or none, until it is resolved through the architecture's own
+    /// table -- and a comparison against a value's storage silently never
+    /// matched. The name is what survives that translation, so it is what the
+    /// capture carries.
+    role_register_names: SourceRoleRegisterNames,
     return_mechanism: Option<SourceReturnMechanism>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
@@ -1144,6 +1254,7 @@ impl SourceFunctionInterface {
             return_address_storage: None,
             stack_pointer_storage: None,
             frame_pointer_storage: None,
+            role_register_names: SourceRoleRegisterNames::none(),
             return_mechanism: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
@@ -1300,6 +1411,48 @@ impl SourceFunctionInterface {
 
     pub const fn return_address_storage(&self) -> Option<CanonicalStorageId> {
         self.return_address_storage
+    }
+
+    /// Record how the source spelled each role carrier.
+    pub const fn with_role_register_names(mut self, names: SourceRoleRegisterNames) -> Self {
+        self.role_register_names = names;
+        self
+    }
+
+    pub const fn role_register_names(&self) -> SourceRoleRegisterNames {
+        self.role_register_names
+    }
+
+    /// Replace the role carriers with the storages the lifted architecture
+    /// gives for the names the source spelled.
+    ///
+    /// This is the one place a source-numbered carrier becomes an
+    /// architecture-numbered one, and it runs before anything compares a
+    /// carrier with a value. A carrier the architecture cannot place is
+    /// dropped rather than kept at its source offset: an absent carrier costs
+    /// the certificates that need it, while a carrier at an offset belonging
+    /// to some other register is a false statement about the machine.
+    pub fn with_arch_resolved_role_carriers(
+        mut self,
+        return_address: Option<CanonicalStorageId>,
+        stack_pointer: Option<CanonicalStorageId>,
+        frame_pointer: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        if return_address.is_some_and(|storage| !self.return_address_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage);
+        }
+        if stack_pointer.is_some_and(|storage| !self.stack_pointer_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
+        }
+        self.return_address_storage = return_address;
+        self.stack_pointer_storage = stack_pointer;
+        // The frame pointer is validated against the carriers just installed,
+        // since its rule is that it overlaps neither of them.
+        if frame_pointer.is_some_and(|storage| !self.frame_pointer_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidFramePointerStorage);
+        }
+        self.frame_pointer_storage = frame_pointer;
+        Ok(self)
     }
 
     /// Bind the source-owned full-width stack-pointer carrier. This identity
@@ -2445,6 +2598,10 @@ mod tests {
 pub struct SourceMachineRoles {
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
+    /// How the source spells these two carriers, for the same reason the
+    /// interface records it: the offsets beside them are in the source's
+    /// register numbering and mean nothing to the lifted architecture.
+    role_register_names: SourceRoleRegisterNames,
     stack_allocation_contract: Option<SourceStackAllocationContract>,
     call_preserved_carriers: Option<SourceCallPreservedCarriers>,
 }
@@ -2577,9 +2734,45 @@ impl SourceMachineRoles {
         Ok(Self {
             return_address_storage,
             stack_pointer_storage,
+            role_register_names: SourceRoleRegisterNames::none(),
             stack_allocation_contract: None,
             call_preserved_carriers: None,
         })
+    }
+
+    /// Record how the source spelled these carriers.
+    #[must_use]
+    pub const fn with_role_register_names(mut self, names: SourceRoleRegisterNames) -> Self {
+        self.role_register_names = names;
+        self
+    }
+
+    pub const fn role_register_names(&self) -> SourceRoleRegisterNames {
+        self.role_register_names
+    }
+
+    /// Replace the carriers with the storages the lifted architecture gives
+    /// for the names the source spelled, dropping one the architecture cannot
+    /// place. This mirrors the interface's resolution and exists for the same
+    /// reason: these offsets arrive in the source's numbering.
+    pub fn with_arch_resolved_carriers(
+        mut self,
+        return_address: Option<CanonicalStorageId>,
+        stack_pointer: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceMachineRolesError> {
+        if return_address.is_some_and(|storage| !valid_register_storage(storage))
+            || stack_pointer.is_some_and(|storage| !valid_register_storage(storage))
+        {
+            return Err(SourceMachineRolesError::InvalidRegisterStorage);
+        }
+        // The allocation contract is a statement about the stack pointer, so
+        // it cannot outlive a stack pointer the architecture would not place.
+        if stack_pointer.is_none() {
+            self.stack_allocation_contract = None;
+        }
+        self.return_address_storage = return_address;
+        self.stack_pointer_storage = stack_pointer;
+        Ok(self)
     }
 
     /// Bind what a call leaves the frame carriers holding. Like the allocation
