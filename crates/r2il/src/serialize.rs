@@ -509,6 +509,17 @@ pub struct ArchSpec {
     /// the architectures somebody thought of.
     #[serde(default)]
     pub return_registers: Vec<RegisterDef>,
+
+    /// The names of the language's user-defined p-code operations, indexed by
+    /// the identifier a `CallOther` carries.
+    ///
+    /// A `CallOther` states only that index, and the index is assigned by the
+    /// compiled specification and moves with it, so nothing can say which
+    /// operation an instruction invoked without this list. An empty table means
+    /// the architecture source did not provide one, and every `CallOther` then
+    /// stays unidentified rather than being guessed at.
+    #[serde(default)]
+    pub user_ops: Vec<String>,
 }
 
 impl ArchSpec {
@@ -525,6 +536,7 @@ impl ArchSpec {
             registers: Vec::new(),
             register_projections: Vec::new(),
             return_registers: Vec::new(),
+            user_ops: Vec::new(),
         }
     }
 

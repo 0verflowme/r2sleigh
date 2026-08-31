@@ -311,6 +311,36 @@ mod tests {
         assert!(spec.get_register("RIP").is_some());
     }
 
+    /// The specification's own user-operation table reaches the architecture.
+    ///
+    /// A `CallOther` states only an index, and the index is assigned by the
+    /// compiled specification, so this table is the only thing that can say
+    /// which operation an instruction invoked. `NEON_ext` and `NEON_ushl` are
+    /// the two the corpus needs; asserting a name resolves back through its own
+    /// index is the property a consumer depends on.
+    #[test]
+    fn aarch64_user_operation_names_reach_the_arch_spec() {
+        let spec = build_arch_spec(
+            sleigh_config::processor_aarch64::SLA_AARCH64,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("aarch64 sleigh specification");
+
+        assert!(
+            !spec.user_ops.is_empty(),
+            "AARCH64 declares user-defined operations"
+        );
+        for name in ["NEON_ext", "NEON_ushl"] {
+            let index = spec
+                .user_ops
+                .iter()
+                .position(|declared| declared == name)
+                .unwrap_or_else(|| panic!("AARCH64 declares {name}"));
+            assert_eq!(spec.user_ops[index], name);
+        }
+    }
+
     #[test]
     fn test_arm_spec() {
         let spec = create_arm_spec();

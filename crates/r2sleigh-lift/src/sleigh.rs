@@ -344,6 +344,9 @@ pub(crate) fn extract_architecture(
         });
     }
     ctx.arch.register_projections = derive_register_projections(register_geometry);
+    // The language's user-defined operations, in the order it declares them.
+    // A CALLOTHER names one by index, and the index means nothing without this.
+    ctx.arch.user_ops = sleigh.user_op_names();
 
     let arch = validate_extracted_register_geometry(ctx.finish())?;
 

@@ -44,3 +44,20 @@ strip = true
 inherits = "release"
 lto = true
 codegen-units = 1
+
+# Consuming two upstream changes that are raised and under review, so that the
+# work that depends on them is not blocked behind someone else's merge queue:
+#
+#   mnemonikr/libsla-sys#8  exposes the language's user-defined p-code operation
+#                           names, which `SleighBase` already keeps and nothing
+#                           reached.
+#   mnemonikr/libsla#18     the safe passthrough over it.
+#
+# A `CALLOTHER` carries only the index of the operation it invokes, and that
+# index is assigned by the compiled specification and moves with it, so nothing
+# here can identify an operation without those names. Both branches are the
+# exact diffs on those pull requests. Drop this block for the released crates
+# once they land.
+[patch.crates-io]
+libsla = { git = "https://github.com/0verflowme/libsla.git", branch = "user-op-names" }
+libsla-sys = { git = "https://github.com/0verflowme/libsla-sys.git", branch = "expose-user-op-names" }

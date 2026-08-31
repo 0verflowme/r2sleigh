@@ -642,8 +642,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libsla"
 version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "478334afca2c29ba021109a115610eb8555bb388f32140d298dcb12585e5b147"
+source = "git+https://github.com/0verflowme/libsla.git?branch=user-op-names#7b28c9327351458fdeb798656154883a32f37efd"
 dependencies = [
  "libsla-sys",
  "thiserror 2.0.17",
@@ -652,8 +651,7 @@ dependencies = [
 [[package]]
 name = "libsla-sys"
 version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f2662124969c0a607944ebff7402f50371751ea2329a9ce21e5ef9c6c7caf47"
+source = "git+https://github.com/0verflowme/libsla-sys.git?branch=expose-user-op-names#a0aa34df668ce1442f0a4762b05115add3deaf50"
 dependencies = [
  "cxx",
  "cxx-build",
