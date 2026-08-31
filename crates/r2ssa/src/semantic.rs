@@ -4413,15 +4413,30 @@ fn collect_machine_return_control_certificates(
     (certificates, by_inst)
 }
 
+/// What the geometry collector needs from the answers already given.
+///
+/// The stack pointer's own arithmetic is the last thing certified, because
+/// whether a use of it counts as a reader depends on what the frame, the
+/// return control, and the merge analysis have already accounted for.
+struct StackGeometryContext<'a> {
+    frame_round_trips: &'a BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
+    return_controls: &'a BTreeMap<InstId, MachineReturnControlCertificate>,
+    unobserved: &'a crate::deadphi::DeadPhis,
+}
+
 fn collect_stack_geometry_certificate(
     boundaries: &SourceBoundaryFacts,
     function: &SSAFunction,
     graph: &SsaGraph,
     objects: &ObjectModel,
     structured: &StructuredDataflowFacts,
-    frame_round_trips: &BTreeMap<ObjectId, StackFrameRoundTripCertificate>,
-    return_controls: &BTreeMap<InstId, MachineReturnControlCertificate>,
+    answered: &StackGeometryContext<'_>,
 ) -> StackGeometryCertificate {
+    let StackGeometryContext {
+        frame_round_trips,
+        return_controls,
+        unobserved,
+    } = answered;
     let Some(prep) = function.decompile_prep_facts() else {
         return StackGeometryCertificate::default();
     };
@@ -4430,10 +4445,34 @@ fn collect_stack_geometry_certificate(
             .value(value)
             .and_then(|value| resolve_entry_stack_root(Some(prep), &value.var))
     };
+    // A constant that arrived through a copy is still a constant. `add x29,
+    // sp, #0x60` lifts to a copy of the immediate into a temporary and an add
+    // of that temporary, so requiring the operand's own varnode to carry the
+    // bits refused the one instruction that establishes the frame base, and
+    // with it the whole stack-pointer chain: the prologue's decrement then
+    // rendered as `SP_0 = SP_0 - 112`, reading an entry stack pointer no
+    // statement had written. The walk is bounded because it is a chain, not a
+    // search.
     let is_constant = |value: ValueId| {
-        graph
-            .value(value)
-            .is_some_and(|value| value.var.constant_bits().is_some())
+        let mut current = value;
+        for _ in 0..8 {
+            let Some(resolved) = graph.value(current) else {
+                return false;
+            };
+            if resolved.var.constant_bits().is_some() {
+                return true;
+            }
+            let Some(definition) = graph.def_inst(current).and_then(|inst| graph.inst(inst)) else {
+                return false;
+            };
+            match &definition.payload {
+                InstPayload::Op(SSAOp::Copy { .. }) if definition.inputs.len() == 1 => {
+                    current = definition.inputs[0];
+                }
+                _ => return false,
+            }
+        }
+        false
     };
 
     let mut geometry_outputs = BTreeMap::<InstId, ValueId>::new();
@@ -4570,6 +4609,14 @@ fn collect_stack_geometry_certificate(
                     !frame_uses.contains(site)
                         && !return_control_uses.contains(site)
                         && !stack_address_uses.contains(site)
+                        // A use inside a definition nothing observes is not a
+                        // reader. `sub sp, sp, #0x70` lifts with the carry and
+                        // sign computations beside it, and nothing reads those
+                        // flags; counting them dropped the stack pointer from
+                        // its own geometry, and the prologue then rendered as
+                        // `SP_0 = SP_0 - 112` over an entry value no statement
+                        // had written.
+                        && !unobserved.unobserved_uses().contains(site)
                         && !geometry_outputs
                             .get(&site.inst)
                             .is_some_and(|output| values.contains(output))
@@ -4848,8 +4895,11 @@ fn collect_prepared_function_certificates(
         graph,
         objects,
         structured,
-        &stack_frame_round_trips,
-        &machine_return_controls,
+        &StackGeometryContext {
+            frame_round_trips: &stack_frame_round_trips,
+            return_controls: &machine_return_controls,
+            unobserved,
+        },
     );
     let stack_slots = objects
         .objects
