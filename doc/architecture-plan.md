@@ -2175,3 +2175,60 @@ for the differential oracle to mean anything.
 Both remaining pieces are features with their own gates, not defects in the
 current model, and each should be planned as such rather than attempted as a
 patch: userop semantics with lane-wise rendering, and constant-data emission.
+
+## Track E -- the two capabilities Track D's last three cells need
+
+Track D's gate was written as fifty-four of fifty-four with the four scores
+equal. Fifty-one of those cells are there. The other three are not blocked by
+anything Track D describes: each needs a capability the model does not have, and
+a gate that requires unplanned capabilities is a defect in the plan rather than
+a debt in the code. They are specified here so the work is scoped, and Track D's
+gate should be read as every cell the stated scope covers until this track
+lands.
+
+### E1 -- Sleigh userop identity and semantics
+
+`SSAOp::CallOther` carries `userop: u32` and nothing else. The index comes from
+the Sleigh specification's userop table, and that table is not read anywhere:
+the lift discards it, so no consumer can say which operation an index names.
+Matching on the bare integer would be exactly the unsourced inference Track B
+exists to make unrepresentable, so the name has to travel first.
+
+- **E1.1** Read the userop table from the loaded specification and carry the
+  names through `build_arch_spec` into `ArchSpec`, the way register names are
+  carried. Gate: the name for a known index is retrievable from the artifact,
+  and an index the specification does not define resolves to nothing.
+- **E1.2** Carry the resolved name on the lifted operation, so `CallOther`
+  states which userop it is rather than which slot it occupies. Gate: the
+  wire and the SSA operation both round-trip the name.
+- **E1.3** Give the machine projection arms keyed by name, beginning with the
+  two the corpus needs: `ext`, a lane-wise byte extract across a pair of
+  128-bit values, and `ushl`, a lane-wise variable shift. An unnamed or
+  unimplemented userop must keep refusing, and the refusal must name the
+  instruction rather than the lowest-numbered constant that failed with it --
+  the current message reports an authority that did not fail.
+- **E1.4** Render the results. The type layer tops out at `__uint128_t` with no
+  lane structure, so a lane-wise operation has to be spelled as masked shifts
+  over that scalar. Gate: `crc32_bitwise` and `xxhash32` at arm64 -O2 render and
+  pass the differential oracle.
+
+### E2 -- Constant data emission
+
+`crc32_bitwise` at x64 -O2 loads a sixteen-byte constant table with `movdqa`.
+The address is a literal with no rendered occurrence, and no corpus function has
+ever rendered a load from a fixed data address. Rendering one means the emitted C
+carries the table's bytes; without that the differential oracle compares against
+a table the rendered program does not have.
+
+- **E2.1** Account a certified access address that renders through an object
+  name, so the literal is elided with a stated reason instead of left
+  unaccounted. Gate: the obligation ledger balances for a function with such a
+  load.
+- **E2.2** Emit the referenced constant bytes as a declared object in the
+  rendered C, with its own certificate over the source bytes. Gate: the rendered
+  program reproduces the table byte for byte.
+- **E2.3** The lane-width defect this cell also has: its carrier resolves to the
+  512-bit ZMM while nothing in the function exceeds 128 bits. Admitting lanes at
+  a non-zero offset is measured to cost no cell, and belongs with E2.2 rather
+  than alone, since alone it changes no rendered output. Gate: `crc32_bitwise` at
+  x64 -O2 renders and passes the differential oracle.
