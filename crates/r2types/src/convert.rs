@@ -4,7 +4,10 @@ use crate::model::{Signedness, Type, TypeArena, TypeId};
 pub enum CTypeLike {
     Void,
     Bool,
-    Int { bits: u32, signedness: Signedness },
+    Int {
+        bits: u32,
+        signedness: Signedness,
+    },
     Float(u32),
     Pointer(Box<CTypeLike>),
     Array(Box<CTypeLike>, Option<usize>),
@@ -12,7 +15,15 @@ pub enum CTypeLike {
     Union(String),
     Enum(String),
     Typedef(String),
-    Function,
+    /// A function type, with the signature it was recovered with.
+    ///
+    /// This carried no signature until the two type models were folded
+    /// together: `r2dec`'s `CType::Function` had a return type and parameters,
+    /// and every trip through here erased them.
+    Function {
+        ret: Box<CTypeLike>,
+        params: Vec<CTypeLike>,
+    },
     Unknown,
 }
 
@@ -32,7 +43,13 @@ pub fn to_c_type_like(arena: &TypeArena, ty: TypeId) -> CTypeLike {
         Type::Struct(shape) => {
             CTypeLike::Struct(shape.name.clone().unwrap_or_else(|| "anon".to_string()))
         }
-        Type::Function { .. } => CTypeLike::Function,
+        Type::Function { params, ret, .. } => CTypeLike::Function {
+            ret: Box::new(to_c_type_like(arena, *ret)),
+            params: params
+                .iter()
+                .map(|param| to_c_type_like(arena, *param))
+                .collect(),
+        },
         Type::UnknownAlias(name) if name == "void" => CTypeLike::Void,
         Type::UnknownAlias(name) if name.starts_with("struct ") => {
             CTypeLike::Struct(name.trim_start_matches("struct ").to_string())
@@ -113,7 +130,18 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
         CTypeLike::Union(name) => format!("union {name}"),
         CTypeLike::Enum(name) => format!("enum {name}"),
         CTypeLike::Typedef(name) => name.clone(),
-        CTypeLike::Function => "void (*)()".to_string(),
+        CTypeLike::Function { ret, params } => {
+            let params = if params.is_empty() {
+                String::new()
+            } else {
+                params
+                    .iter()
+                    .map(render_c_type_like)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("{}(*)({params})", render_c_type_like(ret))
+        }
         CTypeLike::Unknown => "/* unknown */".to_string(),
     }
 }
@@ -165,7 +193,12 @@ fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
         }
     }
     if spelling.contains("(*)") {
-        return CTypeLike::Function;
+        // A spelling reached here only says it is a function pointer; the
+        // signature it was written with is not recovered from the text.
+        return CTypeLike::Function {
+            ret: Box::new(CTypeLike::Unknown),
+            params: Vec::new(),
+        };
     }
 
     let collapsed = spelling.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -277,7 +310,10 @@ mod tests {
             CTypeLike::Enum("Demo".to_string()),
             CTypeLike::Typedef("demo_t".to_string()),
             CTypeLike::Unknown,
-            CTypeLike::Function,
+            CTypeLike::Function {
+                ret: Box::new(CTypeLike::Unknown),
+                params: Vec::new(),
+            },
         ];
         for bits in [8u32, 16, 32, 64, 128] {
             for signedness in [Signedness::Signed, Signedness::Unsigned] {

@@ -113,7 +113,11 @@ fn ctype_to_type_like(ty: &CType) -> CTypeLike {
         CType::Union(name) => CTypeLike::Union(name.clone()),
         CType::Enum(name) => CTypeLike::Enum(name.clone()),
         CType::Typedef(name) => CTypeLike::Typedef(name.clone()),
-        CType::Function { .. } | CType::Unknown => CTypeLike::Unknown,
+        CType::Function { ret, params } => CTypeLike::Function {
+            ret: Box::new(ctype_to_type_like(ret)),
+            params: params.iter().map(ctype_to_type_like).collect(),
+        },
+        CType::Unknown => CTypeLike::Unknown,
     }
 }
 
@@ -133,7 +137,11 @@ fn type_like_to_ctype(ty: &CTypeLike) -> CType {
         CTypeLike::Union(name) => CType::Union(name.clone()),
         CTypeLike::Enum(name) => CType::Enum(name.clone()),
         CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
-        CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
+        CTypeLike::Function { ret, params } => CType::Function {
+            ret: Box::new(type_like_to_ctype(ret)),
+            params: params.iter().map(type_like_to_ctype).collect(),
+        },
+        CTypeLike::Unknown => CType::Unknown,
     }
 }
 
@@ -5849,6 +5857,54 @@ fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the two type models lose when a type crosses between them.
+    ///
+    /// `r2dec` and `r2types` each have a type enum and a renderer, and the two
+    /// renderers already disagreed once -- about how to spell a 128-bit integer
+    /// -- with nothing to catch it. Before the two are folded into one model,
+    /// this records exactly which types do not survive the trip, so the fold is
+    /// closing a measured gap rather than an assumed one.
+    #[test]
+    fn ctype_round_trips_through_the_shared_type_model() {
+        let mut cases = vec![
+            CType::Void,
+            CType::Bool,
+            CType::Float(32),
+            CType::Float(64),
+            CType::Struct("Demo".to_string()),
+            CType::Union("Demo".to_string()),
+            CType::Enum("Demo".to_string()),
+            CType::Typedef("demo_t".to_string()),
+            CType::Unknown,
+        ];
+        for bits in [8u32, 16, 32, 64, 128] {
+            cases.push(CType::Int(bits));
+            cases.push(CType::UInt(bits));
+        }
+        cases.push(CType::BitVector(192));
+        cases.push(CType::Function {
+            ret: Box::new(CType::Void),
+            params: vec![CType::Int(32)],
+        });
+        let scalars = cases.clone();
+        for scalar in scalars {
+            cases.push(CType::Pointer(Box::new(scalar)));
+        }
+
+        let lossy: Vec<String> = cases
+            .iter()
+            .filter_map(|case| {
+                let back = type_like_to_ctype(&ctype_to_type_like(case));
+                (back != *case).then(|| format!("{case:?} -> {back:?}"))
+            })
+            .collect();
+        assert!(
+            lossy.is_empty(),
+            "types lost between the two models:\n{}",
+            lossy.join("\n")
+        );
+    }
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,

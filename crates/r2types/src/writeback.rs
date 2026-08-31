@@ -7348,7 +7348,7 @@ fn scalar_element_stride(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         | CTypeLike::Struct(_)
         | CTypeLike::Union(_)
         | CTypeLike::Enum(_)
-        | CTypeLike::Function => None,
+        | CTypeLike::Function { .. } => None,
         CTypeLike::Pointer(_) => Some((ptr_bits / 8).max(1) as u64),
     }
 }
@@ -8059,7 +8059,7 @@ fn collect_aggregate_type_names(ty: &CTypeLike, out: &mut Vec<String>) {
         | CTypeLike::Bool
         | CTypeLike::Int { .. }
         | CTypeLike::Float(_)
-        | CTypeLike::Function => {}
+        | CTypeLike::Function { .. } => {}
     }
 }
 
@@ -9056,7 +9056,7 @@ fn visible_binding_type_specificity(ty: &CTypeLike) -> u8 {
     match ty {
         CTypeLike::Unknown => 0,
         CTypeLike::Void => 1,
-        CTypeLike::Function => 2,
+        CTypeLike::Function { .. } => 2,
         CTypeLike::Bool | CTypeLike::Int { .. } | CTypeLike::Float(_) => 4,
         CTypeLike::Typedef(_) | CTypeLike::Enum(_) => 5,
         CTypeLike::Struct(_) | CTypeLike::Union(_) => 6,
@@ -10751,7 +10751,7 @@ fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
 
 fn estimate_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
-        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
+        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function { .. } => None,
         CTypeLike::Bool => Some(1),
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))

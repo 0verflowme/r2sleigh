@@ -130,7 +130,7 @@ fn intern_render_type(arena: &mut TypeArena, ty: &CTypeLike) -> TypeId {
             arena.struct_named_or_existing(name.clone())
         }
         CTypeLike::Union(name) | CTypeLike::Enum(name) => arena.unknown_alias(name.clone()),
-        CTypeLike::Function | CTypeLike::Unknown => arena.top(),
+        CTypeLike::Function { .. } | CTypeLike::Unknown => arena.top(),
     }
 }
 
@@ -702,7 +702,7 @@ impl<'a> EvidenceBuilder<'a> {
         match ty {
             // `void` as a value type says nothing; as a pointee it is the top of
             // the pointee lattice, which is what `Top` already means.
-            CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
+            CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function { .. } => None,
             CTypeLike::Bool => Some(self.arena.bool_ty()),
             CTypeLike::Int { bits, signedness } => Some(self.arena.int(*bits, *signedness)),
             CTypeLike::Float(bits) => Some(self.arena.float(*bits)),

@@ -713,7 +713,7 @@ pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
         CTypeLike::Union(name) => format!("union {name}"),
         CTypeLike::Enum(name) => format!("enum {name}"),
         CTypeLike::Typedef(name) => name,
-        CTypeLike::Function => "void (*)()".to_string(),
+        CTypeLike::Function { .. } => "void (*)()".to_string(),
         CTypeLike::Unknown => "int64_t".to_string(),
     }
 }

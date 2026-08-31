@@ -1259,7 +1259,7 @@ impl TypeInference {
             CTypeLike::Union(name) | CTypeLike::Enum(name) => {
                 (arena.unknown_alias(name.clone()), None)
             }
-            CTypeLike::Function => (arena.top(), None),
+            CTypeLike::Function { .. } => (arena.top(), None),
             CTypeLike::Unknown => (arena.top(), None),
         }
     }
@@ -1271,7 +1271,7 @@ impl TypeInference {
         fallback_size: u32,
     ) -> CTypeLike {
         match to_c_type_like(arena, ty_id) {
-            CTypeLike::Function => CTypeLike::Unknown,
+            CTypeLike::Function { .. } => CTypeLike::Unknown,
             CTypeLike::Unknown => self.type_from_size(fallback_size),
             other => other,
         }
