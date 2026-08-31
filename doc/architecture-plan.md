@@ -2294,8 +2294,25 @@ a table the rendered program does not have.
   layer has separated the two cases in five tries. The next attempt should come
   from the renderer, not the projection.
 
-  What remains is that all four lanes of these vectors are always written
-  together and consumed only by an explicit `Piece`. The rendering that follows
+  A sixth attempt got the furthest and is the most important result here. Three
+  changes together -- admitting lanes at any offset, not re-basing a lane value
+  no read reaches outside of (stated once and consulted by both the derivation
+  and its validator, so they cannot drift), and marking the address operand of a
+  certified access as the read it is -- **render the cell**. Fifty-two of
+  fifty-four generate, every audit passes on all fifty-two, `pearson` keeps
+  working, and the 512-bit declarations are gone.
+
+  It computes the wrong answer. The differential oracle catches it: `crc32` of a
+  one-byte input comes back `8bb1d29a` where the oracle says `ad68e236`. So the
+  carrier re-basing is not bookkeeping that can be skipped for a value whose
+  reads all name its own width -- something in the composition genuinely depends
+  on it, and dropping it silently changes what the program computes. This is the
+  same failure mode as the linearized switch arms: it compiles, it looks right,
+  and it is wrong, which is worse than the refusal it replaced.
+
+  So the object width is not the thing to attack at all. What remains is that
+  all four lanes of these vectors are always written together and consumed only
+  by an explicit `Piece`. The rendering that follows
   from that is a single composed assignment of the whole object, not four writes
   into a carrier-wide object that must then be read to preserve what they did
   not touch. Gate: `crc32_bitwise` at x64 -O2 renders, compiles under the strict
