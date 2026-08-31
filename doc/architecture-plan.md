@@ -2176,6 +2176,47 @@ Both remaining pieces are features with their own gates, not defects in the
 current model, and each should be planned as such rather than attempted as a
 patch: userop semantics with lane-wise rendering, and constant-data emission.
 
+
+### The arm64 -O2 NEON cell, traced to a wrongly exempted interference
+
+`NEON_ext` expanded at the lift into two shifts and an or makes `crc32_bitwise`
+at arm64 -O2 render, and the expansion is right: a numeric model following the
+instructions and one following the rendered C agree on the whole vector block --
+`dup`, `and`, `cmeq`, `bic`, `ext`, `eor` and `fmov` all reproduce the reference
+fold. What the cell returns is `ffffffff` for every non-empty input, and the
+cause is none of that.
+
+The lift routes both `w10` and `w11` through one p-code temporary. In SSA that is
+correct and unambiguous -- `tmp:20380` versions two through eight, each defined
+exactly once -- and `eor w10, w10, w11` reads versions six and seven at the same
+instruction. The binding plan then put four of those versions in one C object, so
+that statement became the exclusive-or of a value with itself, which is zero for
+every input on every iteration.
+
+The rule that should decline this is `values_read_together`, and it declines only
+pairs at *different* machine locations. The exemption was written on the reading
+that a carrier coalescing two runs of one register is ordinary. Two runs are
+ordinary; two runs a single instruction reads at once are not, whatever they are
+stored in, because both hold their content at that instruction.
+
+Removing the exemption fixes this cell and **costs eight others**, which fail
+their strict compile rather than rendering anything wrong. Declining a coalescing
+gives the values their own objects, and the narrower types those get trip
+`-Wconversion` in code that previously shared one wide object. So the
+interference rule is right and the typing of separated objects is the weakness
+behind it; the two have to be fixed together, and the second is its own piece of
+work rather than an adjustment to the first.
+
+Two further defects in the same rendering, both real and neither answerable for
+the wrong value: the `dup` byte projection applies its lane offset twice around a
+truncation, so twelve of sixteen bytes render as zero -- the same double-offset
+shape already fixed for the x86 128-bit lanes, here at eight-bit lanes of a
+thirty-two-bit value, which the fix's condition does not reach; and the
+sixteen-bit `Piece` composition renders as `(uint16_t)a << 8 | (uint16_t)b`,
+whose promotion to `int` trips `-Wimplicit-int-conversion` at twenty-eight sites.
+Both are value-preserving here, which is why the cell's wrong answer survives
+fixing either.
+
 ## Track E -- the two capabilities Track D's last three cells need
 
 Track D's gate was written as fifty-four of fifty-four with the four scores
