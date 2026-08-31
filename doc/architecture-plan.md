@@ -2311,6 +2311,35 @@ function actually touches is **unsound**: four cells stop compiling and two
 compute the wrong answer. The carrier is not merely a width; the projection's
 arithmetic is stated against it, and moving it moves what every slice means.
 
+### Option B measured: sound, and blocked by one other thing
+
+The second of the two decisions below was then tried whole rather than as a
+local rule: never re-base a read onto its register carrier, so an object is the
+value and every wider read is the explicit composition the alias repair already
+builds. With today's merge composition in place this no longer costs `pearson`,
+which is what it cost before that fix existed.
+
+The result is worth stating precisely. **Forty-nine cells pass and four fail,
+and none of the four is wrong** -- every failure is a compile error, and the
+differential oracle reports no incorrect answer anywhere. So the semantics of
+per-lane objects hold; what does not hold is a typing agreement, and not the one
+expected. The four failures are all the same shape:
+
+    error: conflicting types for 'sym__rotl32'
+      uint64_t sym__rotl32(uint64_t, uint64_t);        // at the call site
+      uint64_t sym__rotl32(uint32_t EDI_0, uint8_t ... // the definition
+
+Without re-basing, a callee's parameters take the width the callee actually
+reads -- `uint32_t` and `uint8_t`, which is `rotl32`'s true signature -- while
+the declaration the caller emits for it still states the register widths. The
+two views of one function disagree, and that disagreement was previously hidden
+because both were widened to the carrier.
+
+So option B is the right direction and has one named blocker: a call site must
+declare a callee with the types that callee's own rendering recovered. That is a
+coherence requirement between two renderings of the same function, which is a
+different piece of work from the object-width question and a well-formed one.
+
 So the object-width model needs one coherent decision rather than another local
 rule. Two are available: an object is as wide as the widest thing done with it
 and every narrow write into it is an insert with a defined starting value; or
