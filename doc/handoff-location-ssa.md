@@ -5942,3 +5942,53 @@ chooses it held in one place.
 
 The corpus is 35 of 54 throughout -- this moves `xxhash32` from one undeclared
 name to another rather than to a rendering that compiles.
+## Open items carried forward, after Track D closed at fifty-four of fifty-four
+
+Recorded here rather than left in a conversation, so the next session starts from
+them. None of these blocks the corpus; every one of them is a thread that was
+opened deliberately and not finished.
+
+**The dependency patch is on a fork, and the corpus depends on it.**
+`Cargo.toml` carries a `[patch.crates-io]` pointing `libsla` and `libsla-sys` at
+branches of two pull requests -- mnemonikr/libsla#18 and mnemonikr/libsla-sys#8 --
+which expose the language's user-defined operation names. A `CallOther` states
+only an index, and the index is assigned by the compiled specification, so
+without those names the two NEON cells cannot be identified and refuse. Both
+pull requests are open and unreviewed. Until they land and release, this branch
+does not build against published crates. The options are to wait, to ask, or to
+vendor the two crates under our own control; the last is cheap for `libsla` at
+around 1400 lines, and does not remove the dependency on Ghidra's C++ underneath.
+
+**Nothing has been pushed.** The branch is 1092 commits ahead of master. Whether
+that lands whole or in stages is unresolved.
+
+**The radare2 sub-register widening was dropped and still deserves a PR.**
+radareorg/radare2#26621 was narrowed to a case-folding fix and then closed
+entirely, because the maintainer showed the real defect was ours: upper case is
+`RReg`'s alias namespace, and this plugin was publishing the Sleigh
+specification's own spelling. Fixed here. What was dropped along the way is a
+genuine improvement: resolving *any* sub-register to its parent, not only a
+32-bit one, so 8- and 16-bit argument spills are recovered. It is not landable as
+it stood -- on a function that already carries a DWARF prototype it recovers the
+same parameters a second time, and `dbg.palya` rendered with four parameters for
+a two-parameter function -- so it needs a guard against double-counting against
+debug info. That guard is the whole remaining work.
+
+**Two radare2 defects are noted and unraised.** A fully recovered signature is
+discarded for name-linked, non-DWARF functions at `libr/anal/function.c:3949`.
+And `SNAPSHOT_MAX_CALLEE_SNAPSHOTS 4` truncates callee bodies, so a caller past
+the fourth callee learns nothing about it. Each is its own upstream contribution.
+
+**Undefined behaviour in emitted C, found and not chased.** UBSan on the
+vectorised renderings reports two things. The `NEON_ushl` expansion evaluates
+both the left and the right shift before selecting between them, so the discarded
+branch shifts by a negative count. And several `__uint128_t` loads are misaligned.
+Both currently render correct values on this target and neither affects the
+corpus, which is exactly why they are easy to forget.
+
+**What fifty-four of fifty-four does and does not say.** The verifier rewrites
+the C it checks: `map_image_data` cuts the image's bytes into a blob and rewrites
+absolute addresses into it, which is how any function reading a constant table
+passes. So the score does not say those cells emit self-contained, independently
+compilable C. The diagnostic column likewise compiles with warnings off after a
+repair pass. The corpus remains a canary and not a specification.
