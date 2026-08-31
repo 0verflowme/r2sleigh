@@ -311,6 +311,41 @@ mod tests {
         assert!(spec.get_register("RIP").is_some());
     }
 
+    /// The processor specification's own program-counter role reaches the
+    /// architecture, in the specification's own spelling.
+    ///
+    /// AArch64 writes it `pc` and x86-64 writes it `RIP`, which is exactly why
+    /// it is read rather than guessed: a list of spellings has to know both, and
+    /// every architecture nobody thought of gets no answer or a wrong one.
+    #[test]
+    fn processor_specifications_name_their_own_program_counter() {
+        for (sla, pspec, arch, expected) in [
+            (
+                sleigh_config::processor_aarch64::SLA_AARCH64,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+                "pc",
+            ),
+            (
+                sleigh_config::processor_x86::SLA_X86_64,
+                sleigh_config::processor_x86::PSPEC_X86_64,
+                "x86-64",
+                "RIP",
+            ),
+        ] {
+            let spec = build_arch_spec(sla, pspec, arch).expect("sleigh specification");
+            assert_eq!(
+                spec.program_counter.as_deref(),
+                Some(expected),
+                "{arch} states its program counter"
+            );
+            assert!(
+                spec.get_register(expected).is_some(),
+                "the named register must exist in {arch}"
+            );
+        }
+    }
+
     /// The specification's own user-operation table reaches the architecture.
     ///
     /// A `CallOther` states only an index, and the index is assigned by the

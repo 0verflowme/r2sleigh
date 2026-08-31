@@ -510,6 +510,21 @@ pub struct ArchSpec {
     #[serde(default)]
     pub return_registers: Vec<RegisterDef>,
 
+    /// The register the processor specification names as the program counter.
+    ///
+    /// Which register holds a machine role is a fact the specification states --
+    /// `<programcounter register="pc"/>` -- and reading it is the difference
+    /// between knowing the answer and guessing it from a list of spellings that
+    /// happens to match the architectures somebody thought of. That guessing has
+    /// misfired here before: `r14` is ARM's link register and x86-64's sixth
+    /// general register, and `s8` is MIPS's frame pointer and AArch64's 32-bit
+    /// SIMD register.
+    ///
+    /// Empty when the specification does not say, and then nothing downstream
+    /// may claim to know.
+    #[serde(default)]
+    pub program_counter: Option<String>,
+
     /// The names of the language's user-defined p-code operations, indexed by
     /// the identifier a `CallOther` carries.
     ///
@@ -536,6 +551,7 @@ impl ArchSpec {
             registers: Vec::new(),
             register_projections: Vec::new(),
             return_registers: Vec::new(),
+            program_counter: None,
             user_ops: Vec::new(),
         }
     }

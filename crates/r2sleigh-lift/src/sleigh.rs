@@ -424,7 +424,25 @@ pub fn build_arch_spec(
         .build(sla_data)
         .map_err(|e| LiftError::Parse(format!("Failed to load SLA data: {}", e)))?;
 
-    extract_arch_spec(&sleigh, arch_name)
+    let mut arch = extract_arch_spec(&sleigh, arch_name)?;
+    arch.program_counter = processor_spec_program_counter(pspec_data);
+    Ok(arch)
+}
+
+/// The register the processor specification names as the program counter.
+///
+/// Read from the specification text rather than inferred from a register's
+/// spelling, because the specification is where the fact lives. The element is
+/// `<programcounter register="NAME"/>` and appears at most once; anything else
+/// is treated as the specification not saying, which is the honest answer.
+fn processor_spec_program_counter(pspec_data: &str) -> Option<String> {
+    let element = pspec_data.split("<programcounter").nth(1)?;
+    let element = element.split('>').next()?;
+    let attribute = element.split("register").nth(1)?;
+    let mut quoted = attribute.split('"');
+    quoted.next()?;
+    let name = quoted.next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Metadata about a parsed Sleigh specification.

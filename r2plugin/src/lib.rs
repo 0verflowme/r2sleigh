@@ -266,15 +266,27 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
 
     let is_x86 = matches!(arch_name.as_str(), "x86" | "x86-64");
     let address_bits = arch.addr_size.checked_mul(8);
+    // The program counter is stated by the processor specification --
+    // `<programcounter register="pc"/>` -- so it is read, not guessed. Every
+    // specification this plugin ships declares it, and one that does not gets no
+    // `=PC` rather than a register picked because its name looked right.
+    //
+    // The spelling is the specification's own, and the profile names registers
+    // in lower case, so the two are reconciled here.
+    let declared_pc = arch
+        .program_counter
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .and_then(|name| reg_meta.get(&name).map(|(_, _, spelling)| spelling.clone()));
     let (pc, sp, bp) = if is_x86 {
         (
-            address_bits.and_then(|bits| first_existing_at_width(&["rip", "eip", "ip"], bits)),
+            declared_pc,
             address_bits.and_then(|bits| first_existing_at_width(&["rsp", "esp", "sp"], bits)),
             address_bits.and_then(|bits| first_existing_at_width(&["rbp", "ebp", "bp"], bits)),
         )
     } else {
         (
-            first_existing(&["pc", "$pc", "rip", "eip", "ip"]),
+            declared_pc,
             first_existing(&["sp", "$sp", "rsp", "esp"]),
             // `x29` before `s8`: `s8` is MIPS's frame pointer and AArch64's
             // 32-bit SIMD register, and taking the collision made radare2
