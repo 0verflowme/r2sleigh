@@ -6252,3 +6252,29 @@ is asked before anything is removed. Making it cheaper means implementing
 rollback instead of trial-on-a-copy, which is an optimisation with a correctness
 property to preserve rather than a defect to fix. It is the right next
 performance target and it is not a small change.
+
+**`slot_type_overrides` is the one field left as a `String`, and the attempt
+that failed says why.** Converting it to `CTypeLike` is only about ten
+production sites, and all of them convert cleanly. What does not survive is
+`local_external_struct_reconciliation_prefers_external_names`: after the change
+the reconciliation stops replacing a locally inferred `sla_struct_deadbeef` with
+the external `node` it structurally matches, so a binary with real type
+information gets the worse name. That is a regression in output quality, not a
+test encoding an old behaviour, so the change was reverted whole.
+
+Two things were learned on the way and are worth keeping, because both are
+traps for the next attempt. `render_signature_type` materializes before it
+renders, so using it to build a structural key turns every pointer to a
+locally-inferred `sla_struct_*` into `void *` and makes all of them look
+identical to each other -- `render_c_type_like` is the renderer for any
+comparison key. And the slot field profile and the slot type override are
+compared against one another as spellings, so whichever renderer is chosen has
+to be the same one on both sides; they disagree about the space before a star.
+
+The remaining cause is not yet found. The suspicion is
+`local_structs_from_external_type_db`, which used to build its field types with
+`normalize_external_type_name` -- collapsing an opaque placeholder to `void *` --
+and now parses them faithfully, so an external struct's signature may no longer
+match a local one that still carries the collapsed form. Confirming that means
+printing both signatures on either side of `structurally_compatible` for that
+test, which is where the next attempt should start.
