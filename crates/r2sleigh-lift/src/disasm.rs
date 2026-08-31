@@ -1902,6 +1902,7 @@ impl Disassembler {
         };
         let expanded = match self.user_op_name(*userop) {
             Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs, temp_base),
+            Some("NEON_ushl") => Self::expand_neon_ushl(output.as_ref(), inputs, temp_base),
             _ => None,
         };
         expanded.unwrap_or_else(|| vec![op])
@@ -1966,6 +1967,166 @@ impl Disassembler {
                 b: high,
             },
         ])
+    }
+
+    /// `NEON_ushl(rn, rm, element_size)` -- AArch64 `USHL`.
+    ///
+    /// Each element of the result is the corresponding element of `rn` shifted
+    /// by the signed low byte of the corresponding element of `rm`: left when
+    /// that byte is positive, right when it is negative, and zero when the
+    /// distance reaches the element's width, which is what the architecture
+    /// says and not what a C shift would do.
+    ///
+    /// Written out per element and recomposed, because the element is where the
+    /// operation is defined; nothing downstream needs to know it came from a
+    /// vector.
+    fn expand_neon_ushl(
+        output: Option<&Varnode>,
+        inputs: &[Varnode],
+        temp_base: u64,
+    ) -> Option<Vec<R2ILOp>> {
+        let [rn, rm, element_size] = inputs else {
+            return None;
+        };
+        let output = output?;
+        if element_size.space != SpaceId::Const {
+            return None;
+        }
+        let lane_bytes = u32::try_from(element_size.offset).ok()?;
+        if lane_bytes == 0
+            || output.size != rn.size
+            || output.size != rm.size
+            || output.size % lane_bytes != 0
+        {
+            return None;
+        }
+        let lanes = output.size / lane_bytes;
+        if lanes < 2 || !lanes.is_power_of_two() {
+            return None;
+        }
+        let lane_bits = u64::from(lane_bytes).checked_mul(8)?;
+
+        let mut ops = Vec::new();
+        let mut next = temp_base;
+        let temp = |size: u32, next: &mut u64| {
+            let node = Varnode::unique(*next, size);
+            *next += u64::from(size).max(1);
+            node
+        };
+
+        let mut lane_values = Vec::with_capacity(lanes as usize);
+        for lane in 0..lanes {
+            let byte_offset = lane * lane_bytes;
+            let value = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: value.clone(),
+                src: rn.clone(),
+                offset: byte_offset,
+            });
+            let distance_lane = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: distance_lane.clone(),
+                src: rm.clone(),
+                offset: byte_offset,
+            });
+            // The distance is the element's low byte, read as signed.
+            let distance_byte = temp(1, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: distance_byte.clone(),
+                src: distance_lane,
+                offset: 0,
+            });
+            let distance = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntSExt {
+                dst: distance.clone(),
+                src: distance_byte,
+            });
+
+            let zero = Varnode::constant(0, lane_bytes);
+            let negative = temp(1, &mut next);
+            ops.push(R2ILOp::IntSLess {
+                dst: negative.clone(),
+                a: distance.clone(),
+                b: zero.clone(),
+            });
+            let magnitude = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntSub {
+                dst: magnitude.clone(),
+                a: zero.clone(),
+                b: distance.clone(),
+            });
+
+            let left = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntLeft {
+                dst: left.clone(),
+                a: value.clone(),
+                b: distance.clone(),
+            });
+            let right = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntRight {
+                dst: right.clone(),
+                a: value,
+                b: magnitude.clone(),
+            });
+            let shifted = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: shifted.clone(),
+                cond: negative.clone(),
+                if_true: right,
+                if_false: left,
+            });
+
+            // A distance at or beyond the element's width leaves zero, in both
+            // directions. A C shift would be undefined there, so it is decided
+            // here rather than left to the rendering.
+            let distance_magnitude = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: distance_magnitude.clone(),
+                cond: negative,
+                if_true: magnitude,
+                if_false: distance,
+            });
+            let within = temp(1, &mut next);
+            ops.push(R2ILOp::IntLess {
+                dst: within.clone(),
+                a: distance_magnitude,
+                b: Varnode::constant(lane_bits, lane_bytes),
+            });
+            let result = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: result.clone(),
+                cond: within,
+                if_true: shifted,
+                if_false: zero,
+            });
+            lane_values.push(result);
+        }
+
+        // Recompose, halving the count each round until one value is left.
+        let mut width = lane_bytes;
+        while lane_values.len() > 1 {
+            let mut joined = Vec::with_capacity(lane_values.len() / 2);
+            for pair in lane_values.chunks(2) {
+                let [low, high] = pair else {
+                    return None;
+                };
+                let wider = temp(width * 2, &mut next);
+                ops.push(R2ILOp::Piece {
+                    dst: wider.clone(),
+                    hi: high.clone(),
+                    lo: low.clone(),
+                });
+                joined.push(wider);
+            }
+            lane_values = joined;
+            width *= 2;
+        }
+        let composed = lane_values.pop()?;
+        ops.push(R2ILOp::Copy {
+            dst: output.clone(),
+            src: composed,
+        });
+        Some(ops)
     }
 
     fn translate_pcode_op(&self, instr: &PcodeInstruction) -> Result<Option<R2ILOp>> {

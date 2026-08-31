@@ -263,8 +263,14 @@ fn genuine_x86_eax_read_is_relative_to_rax() {
     }));
 }
 
+/// A subpiece reads its operand whole, and the carrier is still the source's.
+///
+/// The extraction is the operation's own semantics and the operation renders it,
+/// so the read underneath carries no offset -- stating it in both places applied
+/// it twice and made every vector lane above the first read as zero. What the
+/// source still owns is the carrier width, which is what this checks.
 #[test]
-fn genuine_x86_xmm_subpieces_retain_the_source_owned_512_bit_carrier() {
+fn genuine_x86_xmm_subpieces_read_their_operand_whole_of_the_owned_carrier() {
     let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
         .expect("trusted embedded profile");
     let lifted = disassembler
@@ -287,56 +293,11 @@ fn genuine_x86_xmm_subpieces_retain_the_source_owned_512_bit_carrier() {
     let projection = MachineProjection::from_artifact(&artifact).expect("machine projection");
 
     let slices = exact_uses_from_storage(&artifact, &projection, xmm2);
-    assert!(slices.iter().any(|slice| {
-        slice.width_bits() == 32
-            && slice.carrier_width_bits() == 512
-            && slice.conversion().is_none()
-    }));
-}
-
-fn assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
-    instructions: &[u8],
-    expected_userop: u32,
-) {
-    let (artifact, projection, _) =
-        genuine_projection_allowing_residuals(TrustedSleighProfile::Aarch64Le, instructions);
-    let graph = artifact.graph();
-    let callother = graph
-        .insts
-        .iter()
-        .find(|inst| {
-            matches!(
-                &inst.payload,
-                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { userop, .. })
-                    if *userop == expected_userop
-            )
-        })
-        .unwrap_or_else(|| panic!("genuine lift is missing CallOther({expected_userop})"));
-    let output = callother.output.expect("vector userop result");
-    assert!(matches!(
-        projection
-            .failure_for_output(output)
-            .map(r2ssa::MachineProjectionFailure::error),
-        Some(r2ssa::MachineBuildError::UnsupportedOperation { inst, op })
-            if *inst == callother.id
-                && matches!(&**op, r2ssa::SSAOp::CallOther { userop, .. }
-                    if *userop == expected_userop)
-    ));
-    let uses = graph
-        .uses_of
-        .get(output.0 as usize)
-        .expect("dense uses for userop output");
+    assert!(!slices.is_empty(), "the subpiece must record a use of XMM2");
     assert!(
-        !uses.is_empty(),
-        "test block must consume the userop result"
+        slices.iter().all(|slice| slice.bit_offset() == 0),
+        "an extracting operation reads its operand whole: {slices:?}"
     );
-    assert!(uses.iter().all(|site| {
-        matches!(
-            projection.use_disposition(*site),
-            Some(MachineUseDisposition::Exact(slice))
-                if slice.carrier_width_bits() == 256 && slice.conversion().is_none()
-        )
-    }));
 }
 
 /// `NEON_ext` is no longer opaque: the lift gives it its semantics.
@@ -385,13 +346,62 @@ fn genuine_aarch64_neon_ext_is_expanded_into_exact_operations() {
     }
 }
 
+/// `NEON_ushl` is no longer opaque: the lift gives it its semantics.
+///
+/// `USHL` shifts each element of its first operand by the signed low byte of
+/// the corresponding element of its second -- left when positive, logical right
+/// when negative, and to zero once the distance reaches the element's width.
+/// That is expressible element by element, so it is expanded here rather than
+/// left as a `CallOther` carrying no semantics at all, which refuses the whole
+/// function.
 #[test]
-fn genuine_aarch64_neon_ushl_is_opaque_but_its_result_uses_keep_exact_geometry() {
-    assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
+fn genuine_aarch64_neon_ushl_is_expanded_into_exact_operations() {
+    let (artifact, projection, _) = genuine_projection_allowing_residuals(
+        TrustedSleighProfile::Aarch64Le,
         &[
             0x01, 0x44, 0xa1, 0x6e, // ushl v1.4s, v0.4s, v1.4s
             0x00, 0x1c, 0xa1, 0x4e, // orr v0.16b, v0.16b, v1.16b
         ],
-        294,
     );
+    let graph = artifact.graph();
+    assert!(
+        !graph.insts.iter().any(|inst| matches!(
+            &inst.payload,
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { userop, .. }) if *userop == 294
+        )),
+        "the lift must give NEON_ushl its semantics rather than leave it opaque"
+    );
+    // The distance is read as a signed byte and both directions are present.
+    let signed = graph.insts.iter().any(|inst| {
+        matches!(
+            &inst.payload,
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::IntSExt { .. })
+        )
+    });
+    let selects = graph
+        .insts
+        .iter()
+        .filter(|inst| {
+            matches!(
+                &inst.payload,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::Select { .. })
+            )
+        })
+        .count();
+    assert!(
+        signed,
+        "the shift distance is the element's signed low byte"
+    );
+    assert!(
+        selects >= 8,
+        "each element chooses a direction and saturates to zero"
+    );
+    for inst in &graph.insts {
+        if let Some(output) = inst.output {
+            assert!(
+                projection.failure_for_output(output).is_none(),
+                "an expanded operation must project exactly"
+            );
+        }
+    }
 }

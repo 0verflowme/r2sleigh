@@ -1319,6 +1319,7 @@ impl MachineProjection {
                                 .and_then(|children| children.get(input_idx))
                                 .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
                             source,
+                            matches!(inst.payload, InstPayload::Op(SSAOp::Subpiece { .. })),
                         )
                         .ok_or(MachineBuildError::UseDispositionMismatch(site))?,
                     ),
@@ -1666,6 +1667,21 @@ fn canonical_machine_use_disposition(
     if read_as_themselves.contains(&input) {
         return Ok(MachineUseDisposition::Exact(whole_machine_use(source)));
     }
+    // A value this function computed is read at the width it holds; a value it
+    // was entered with is read at the width the machine handed it over in.
+    //
+    // The second is an ABI fact rather than a use fact, and the distinction
+    // matters at a call: narrowing an incoming argument to whatever the body
+    // happens to read makes this function's idea of its own parameters disagree
+    // with the declaration a caller writes for it, and the two renderings then
+    // do not compile together. For a computed value there is no such contract --
+    // the object is the value -- and re-basing it onto the register it sits in
+    // only forces objects as wide as whatever the specification nests that
+    // register in, which for the vector registers is a carrier no program here
+    // ever addresses.
+    if artifact.graph().def_inst(input).is_some() {
+        return Ok(MachineUseDisposition::Exact(whole_machine_use(source)));
+    }
     let slice = match compose_machine_use_slice(slice, geometry.bit_offset, geometry.carrier_bits) {
         Ok(slice) => slice,
         Err(reason) => return Ok(MachineUseDisposition::Refused(reason)),
@@ -1740,6 +1756,12 @@ fn validate_canonical_machine_use_disposition(
     // same point in the sequence: after the geometry is known to be exact, so
     // that a refused geometry is still reported as a refusal by both.
     if read_as_themselves.contains(&input) {
+        return (actual == MachineUseDisposition::Exact(whole_machine_use(source)))
+            .then_some(())
+            .ok_or_else(mismatch);
+    }
+    // Mirrors the derivation: a computed value is read as itself.
+    if artifact.graph().def_inst(input).is_some() {
         return (actual == MachineUseDisposition::Exact(whole_machine_use(source)))
             .then_some(())
             .ok_or_else(mismatch);
@@ -2210,6 +2232,7 @@ fn machine_use_slice_for_input(
     root: &MachineExpr,
     child_id: MachineExprId,
     source: MachineValueBinding,
+    root_is_extracting_operation: bool,
 ) -> Option<MachineUseSlice> {
     let child = arena.get(child_id)?;
     if operand_leaf_binding(arena, child_id)? != source {
@@ -2233,6 +2256,20 @@ fn machine_use_slice_for_input(
     if let MachineExprKind::Extract { input, lsb_bits } = &root.kind {
         if *input != child_id {
             return None;
+        }
+        // An extraction the *operation* performs reads its operand whole: the
+        // operation renders the offset, and describing it again as a property
+        // of the read applies it twice. An extraction that is merely how a
+        // narrower read of a wider register is expressed has no such operation
+        // behind it, so the read keeps the offset -- otherwise a sub-register
+        // read would lose its position entirely.
+        //
+        // This is the mirror of the record in the `Subpiece` arm, and the two
+        // have to move together: this is what the recorded slice is validated
+        // against, so changing one alone makes every extraction fail validation
+        // and takes the whole projection down.
+        if root_is_extracting_operation {
+            return Some(whole_machine_use(source));
         }
         return Some(MachineUseSlice {
             bit_offset: *lsb_bits,
@@ -3613,13 +3650,21 @@ impl MachineBuilder {
                         lsb_bits,
                     });
                 }
+                // The operand is read whole. Where the extraction sits is this
+                // operation's own semantics, and the operation renders it;
+                // describing it a second time as a property of the read applies
+                // the offset twice, and a lane read that shifts twice is zero.
+                // It went unseen because a register operand read as itself has
+                // its slice replaced with a whole read anyway, so only values
+                // composed inside the function -- which have no canonical
+                // storage and keep the recorded slice -- ever showed it.
                 self.record_use(
                     graph,
                     inst,
                     0,
                     MachineUseSlice {
-                        bit_offset: lsb_bits,
-                        width_bits: output.width_bits,
+                        bit_offset: 0,
+                        width_bits: source_bits,
                         carrier_width_bits: source_bits,
                         conversion: None,
                     },
@@ -5998,11 +6043,15 @@ mod tests {
                 conversion: None,
             }
         );
+        // The narrow read normalises into an extracting operation, and an
+        // extracting operation reads its operand whole -- it renders the offset
+        // itself, so the read no longer carries it. Describing the offset in
+        // both places applied it twice.
         assert_eq!(
             exact_use(&projection, &artifact, 1, 0),
             MachineUseSlice {
-                bit_offset: 8,
-                width_bits: 8,
+                bit_offset: 0,
+                width_bits: 32,
                 carrier_width_bits: 64,
                 conversion: None,
             }
@@ -6021,7 +6070,10 @@ mod tests {
         else {
             panic!("high-byte use must be exact");
         };
-        high_slice.bit_offset = 0;
+        // A wrong offset, not the right one: the extracting operation now reads
+        // its operand whole, so zero is what this slice correctly holds and
+        // setting it to zero would corrupt nothing.
+        high_slice.bit_offset = 8;
         assert_eq!(
             corrupted.validate_against(&artifact),
             Err(MachineBuildError::UseDispositionMismatch(UseSite {
@@ -6517,11 +6569,13 @@ mod tests {
                 conversion: None,
             }
         );
+        // Whole, as this test's name says: the subpiece operation renders the
+        // extraction, so its operand is read entire.
         assert_eq!(
             exact_use(&projection, &artifact, 1, 0),
             MachineUseSlice {
-                bit_offset: 32,
-                width_bits: 32,
+                bit_offset: 0,
+                width_bits: 64,
                 carrier_width_bits: 64,
                 conversion: None,
             }
