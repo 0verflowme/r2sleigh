@@ -8,14 +8,19 @@ passing for determinism, and `effect_obligations` and `render_refusal` 54/54 for
 the ledger. The corpus is at parity: generation, raw, diagnostic and differential
 all 54 of 54.
 
-The section 3 defect is reduced but not gone. `UseInfo` is eight fields rather
-than thirty-one, and `carrier_alias`, `var_alias`, `value_ids_by_name`,
-`unkeyed_writes` and `formatted_defs` no longer exist, so track A1, A2 and A4
-are done. A3 is not: `value_ids_by_var` and `vars_by_value_id` still store one
-relation in both directions, and `ambiguous_value_vars` and
-`ambiguous_value_ids` do the same for the ambiguity set. That is twenty-one
-uses across six mutating sites, and it is the last of the many-answerers shape
-inside `r2dec`.
+The section 3 defect is removed. `UseInfo` is five fields rather than
+thirty-one; `carrier_alias`, `var_alias`, `value_ids_by_name`, `unkeyed_writes`
+and `formatted_defs` no longer exist, which is A1, A2 and A4. A3 closed last:
+`value_ids_by_var`, `vars_by_value_id`, `ambiguous_value_vars` and
+`ambiguous_value_ids` were four `pub(crate)` fields holding one relation, each
+independently writable, so a caller could read one direction and be
+contradicted by the other. They are now a single private `ExactValueIdentities`
+whose only mutator is `bind`, reached only through `UseInfo::bind_value_id`.
+Both directions and the poison sets are still stored, because the accessors are
+asked questions both ways and the asymptotics rule in section 9 says a lookup is
+not a scan -- but they can no longer be written apart, and a test asserts the
+directions agree. No field of `UseInfo` is now written by more than one pass,
+which is A3's gate.
 
 The measurements in the table below are from `ed7dfdc` and are stale. Current
 figures: 0 clippy diagnostics (was 184), 0 build warnings (was 57), 26
