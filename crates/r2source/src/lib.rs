@@ -15,11 +15,27 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 mod contracts;
-mod radare_abi138;
+/// Schema version of the function snapshot radare2 hands over.
+///
+/// Bumped whenever the wire layout in `snapshot_wire` changes, and asserted at
+/// the FFI boundary so a plugin and a radare2 built against different versions
+/// refuse rather than misread each other.
+///
+/// This is the one thing that outlived `radare_abi138`, the callback-based
+/// predecessor of the flat wire buffer. That module was 2,923 lines holding the
+/// largest concentration of `unsafe` in the tree, and nothing had called into
+/// it since the migration.
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 14;
+
+/// Version of the snapshot transport contract itself.
+pub const RADARE_SNAPSHOT_CONTRACT_VERSION: u32 = 1;
+
+/// Version of the accessor layout within a snapshot.
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
+
 pub mod snapshot_wire;
 
 pub use contracts::*;
-pub use radare_abi138::*;
 
 /// Endianness captured from the active analyzer configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
