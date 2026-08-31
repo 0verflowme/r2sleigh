@@ -111,10 +111,20 @@ impl EmissionReadyFunction {
 
 /// Run all AST rewrites required solely by textual C emission.
 pub(crate) fn prepare_function_for_emission(func: &CFunction) -> EmissionReadyFunction {
+    // Not `..func.clone()`: struct-update evaluates the whole clone first,
+    // including `body`, and then throws that cloned tree away because `body` is
+    // overridden -- two full AST traversals where one is needed, six times per
+    // function.
     EmissionReadyFunction {
         function: CFunction {
             body: prepare_stmt_sequence_for_emission(&func.body),
-            ..func.clone()
+            symbols: std::rc::Rc::clone(&func.symbols),
+            name: func.name.clone(),
+            ret_type: func.ret_type.clone(),
+            params: func.params.clone(),
+            locals: func.locals.clone(),
+            params_known: func.params_known,
+            externs: func.externs.clone(),
         },
     }
 }
