@@ -2335,6 +2335,29 @@ the declaration the caller emits for it still states the register widths. The
 two views of one function disagree, and that disagreement was previously hidden
 because both were widened to the carrier.
 
+**Option B, narrowed and measured again.** A callee's parameters have their width
+fixed by the ABI and not by what its body reads, so the rule is: a value the
+function *computed* is read at its own width, a value it was *entered with* keeps
+machine width. That removes the prototype conflicts entirely -- fifty-three of
+fifty-four with all four scores equal, no cell lost -- and with `NEON_ushl`
+applied on top, **all fifty-four cells generate and compile under the strict
+flags**. The object-width question is answered.
+
+One cell then computes the wrong digest, and tracing it named a defect that is
+older than any of this. A lane's bit offset is applied **twice** whenever the
+value read was composed inside the function: once by the operand's own
+projection, and once by the extracting operation, which already carries that
+offset. Thirty-one sites in one function, each evaluating to a hard zero, and
+they are unchanged whichever way the read side is decided -- reads of values the
+function *loaded* apply the offset once and are correct, which is the
+discriminator. Removing the duplicate at those thirty-one sites and nothing else
+restores every expected digest, verified against all twenty-two harness cases.
+
+So the operand slice handed to an extracting operation should be the whole value,
+with the extraction left to the operation that is already doing it. That is a
+third layer again -- `machine_use_slice_for_input` -- and re-basing was masking
+it rather than causing it.
+
 So option B is the right direction and has one named blocker: a call site must
 declare a callee with the types that callee's own rendering recovered. That is a
 coherence requirement between two renderings of the same function, which is a
