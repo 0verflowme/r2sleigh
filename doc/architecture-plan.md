@@ -2237,11 +2237,34 @@ a table the rendered program does not have.
   name, so the literal is elided with a stated reason instead of left
   unaccounted. Gate: the obligation ledger balances for a function with such a
   load.
-- **E2.2** Emit the referenced constant bytes as a declared object in the
-  rendered C, with its own certificate over the source bytes. Gate: the rendered
-  program reproduces the table byte for byte.
-- **E2.3** The lane-width defect this cell also has: its carrier resolves to the
-  512-bit ZMM while nothing in the function exceeds 128 bits. Admitting lanes at
-  a non-zero offset is measured to cost no cell, and belongs with E2.2 rather
-  than alone, since alone it changes no rendered output. Gate: `crc32_bitwise` at
-  x64 -O2 renders and passes the differential oracle.
+- **E2.2** ~~Emit the referenced constant bytes as a declared object.~~ Not
+  needed: the verifier already does this. `map_image_data` finds certified image
+  literals in the rendered C, cuts the bytes out of the binary, and emits them as
+  `corpus_blob_N`, rewriting the absolute address into that blob -- `pearson`'s
+  table is the case it was written for. The decompiler only has to spell the
+  address.
+- **E2.3** The object width. This is the whole of what is left, and it is not
+  the lane projection. Three things were implemented and measured:
+
+  E2.1 works. The address of a certified access is built by the memory renderer
+  itself rather than through the operand-observation path, so the read is never
+  marked; that does not matter while the address is a computation whose parts
+  are observed on their way in, and it does matter when the address is a bare
+  literal. Marking it, together with admitting lanes at a non-zero offset,
+  **renders the cell** -- fifty-two of fifty-four, with no cell lost.
+
+  It does not compile. Every binding comes out `struct r2sleigh_bits_512`,
+  including 32-bit lanes, because the binding width takes the *carrier* width
+  from each use projection and the x86 specification nests the vector registers
+  inside `ZMM`. Bounding the width by how far a read actually reaches instead of
+  by the carrier was tried and **cost four cells**: the carrier width is
+  load-bearing on the use side, since a projection extracts from a
+  carrier-wide value. Both changes are therefore reverted, since neither alone
+  changes any rendered output.
+
+  What remains is that all four lanes of these vectors are always written
+  together and consumed only by an explicit `Piece`. The rendering that follows
+  from that is a single composed assignment of the whole object, not four writes
+  into a carrier-wide object that must then be read to preserve what they did
+  not touch. Gate: `crc32_bitwise` at x64 -O2 renders, compiles under the strict
+  flags, and passes the differential oracle.
