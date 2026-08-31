@@ -339,15 +339,50 @@ fn assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
     }));
 }
 
+/// `NEON_ext` is no longer opaque: the lift gives it its semantics.
+///
+/// `EXT` takes the vector's width of bytes from the concatenation of its second
+/// operand above its first, starting at a byte index, which is exactly a shift
+/// down, a shift up and an or. Expanding it there is what lets the projection
+/// and everything after it stay free of vector-specific machinery -- and what
+/// lets `crc32_bitwise` at arm64 -O2 render at all, since a `CallOther` carries
+/// no semantics and refuses the whole function.
 #[test]
-fn genuine_aarch64_neon_ext_is_opaque_but_its_result_uses_keep_exact_geometry() {
-    assert_aarch64_opaque_vector_userop_feeds_exact_wide_uses(
+fn genuine_aarch64_neon_ext_is_expanded_into_exact_operations() {
+    let (artifact, projection, _) = genuine_projection_allowing_residuals(
+        TrustedSleighProfile::Aarch64Le,
         &[
             0x43, 0x40, 0x02, 0x6e, // ext v3.16b, v2.16b, v2.16b, 8
             0x42, 0x1c, 0x23, 0x2e, // eor v2.8b, v2.8b, v3.8b
         ],
-        150,
     );
+    let graph = artifact.graph();
+    assert!(
+        !graph.insts.iter().any(|inst| matches!(
+            &inst.payload,
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { userop, .. }) if *userop == 150
+        )),
+        "the lift must give NEON_ext its semantics rather than leave it opaque"
+    );
+    // The expansion is a 64-bit rotate for this index, so both shifts are there
+    // and neither is refused by the projection.
+    for (shifted, amount) in [(false, 64_u64), (true, 64)] {
+        let inst = graph
+            .insts
+            .iter()
+            .find(|inst| match &inst.payload {
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::IntLeft { .. }) if shifted => true,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::IntRight { .. }) if !shifted => true,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("the expansion must shift by {amount}"));
+        assert!(
+            projection
+                .failure_for_output(inst.output.expect("shift result"))
+                .is_none(),
+            "an expanded operation must project exactly"
+        );
+    }
 }
 
 #[test]

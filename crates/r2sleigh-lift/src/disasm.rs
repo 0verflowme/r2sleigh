@@ -1833,7 +1833,9 @@ impl Disassembler {
 
         for pcode_instr in pcode.instructions {
             if let Some(op) = self.translate_pcode_op(&pcode_instr)? {
-                block.push(op);
+                for expanded in self.expand_user_operation(op) {
+                    block.push(expanded);
+                }
             }
         }
 
@@ -1852,6 +1854,104 @@ impl Disassembler {
     }
 
     /// Translate a single P-code instruction to an r2il operation.
+    /// Reserved unique offsets for the temporaries a user-operation expansion
+    /// needs. Sleigh's own uniques come from a much lower range, and re-using
+    /// the same slots across instructions is what Sleigh itself does: each
+    /// write is a new definition.
+    const USER_OP_TEMP_BASE: u64 = 0x7000_0000;
+
+    /// The name the architecture gives the user-defined operation at `index`.
+    fn user_op_name(&self, index: u32) -> Option<&str> {
+        self.genuine_authority
+            .as_ref()?
+            .arch_spec()
+            .user_ops
+            .get(index as usize)
+            .map(String::as_str)
+    }
+
+    /// Give a user-defined operation its semantics, where the architecture
+    /// names one this lift models.
+    ///
+    /// A `CallOther` carries no semantics at all, so everything downstream can
+    /// only refuse the instruction and, with it, the function. Where the
+    /// operation's meaning is exactly expressible in the ordinary vocabulary,
+    /// expanding it here is what keeps the rest of the pipeline free of any
+    /// vector-specific machinery. An operation this does not model is returned
+    /// untouched and still refuses, which is the honest answer.
+    fn expand_user_operation(&self, op: R2ILOp) -> Vec<R2ILOp> {
+        let R2ILOp::CallOther {
+            userop,
+            output,
+            inputs,
+        } = &op
+        else {
+            return vec![op];
+        };
+        let expanded = match self.user_op_name(*userop) {
+            Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs),
+            _ => None,
+        };
+        expanded.unwrap_or_else(|| vec![op])
+    }
+
+    /// `NEON_ext(rn, rm, index, element_size)` -- AArch64 `EXT`.
+    ///
+    /// The result is the vector's width of bytes taken from the concatenation
+    /// of `rm` above `rn`, starting at byte `index`. As a whole-register value
+    /// that is `rn` shifted down by `index` bytes with `rm` shifted up into the
+    /// space it vacated.
+    ///
+    /// Only the byte-granular form is expanded, which is the only form the
+    /// specification uses; anything else is left to refuse.
+    fn expand_neon_ext(output: Option<&Varnode>, inputs: &[Varnode]) -> Option<Vec<R2ILOp>> {
+        let [rn, rm, index, element_size] = inputs else {
+            return None;
+        };
+        let output = output?;
+        if index.space != SpaceId::Const
+            || element_size.space != SpaceId::Const
+            || element_size.offset != 1
+        {
+            return None;
+        }
+        let width_bytes = u64::from(output.size);
+        if output.size != rn.size || output.size != rm.size || width_bytes == 0 {
+            return None;
+        }
+        let taken = index.offset;
+        if taken == 0 {
+            return Some(vec![R2ILOp::Copy {
+                dst: output.clone(),
+                src: rn.clone(),
+            }]);
+        }
+        if taken >= width_bytes {
+            return None;
+        }
+        let low = Varnode::unique(Self::USER_OP_TEMP_BASE, output.size);
+        let high = Varnode::unique(Self::USER_OP_TEMP_BASE + width_bytes, output.size);
+        let down = Varnode::constant(taken * 8, output.size);
+        let up = Varnode::constant((width_bytes - taken) * 8, output.size);
+        Some(vec![
+            R2ILOp::IntRight {
+                dst: low.clone(),
+                a: rn.clone(),
+                b: down,
+            },
+            R2ILOp::IntLeft {
+                dst: high.clone(),
+                a: rm.clone(),
+                b: up,
+            },
+            R2ILOp::IntOr {
+                dst: output.clone(),
+                a: low,
+                b: high,
+            },
+        ])
+    }
+
     fn translate_pcode_op(&self, instr: &PcodeInstruction) -> Result<Option<R2ILOp>> {
         self.validate_pcode_spaces(instr)?;
         let source = DisasmInstructionWrapper {

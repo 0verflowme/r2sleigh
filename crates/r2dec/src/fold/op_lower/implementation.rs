@@ -2691,6 +2691,17 @@ impl<'a> FoldingContext<'a> {
                     CExpr::binary(BinaryOp::Shl, hi_cast, CExpr::IntLit(shift_bits as i64))
                 };
                 let rhs = CExpr::binary(BinaryOp::BitOr, shifted, lo_cast);
+                // A composition narrower than `int` is computed in `int`,
+                // because that is what C promotes the shift and the or to, and
+                // assigning the result back narrows it. The value always fits --
+                // the operands are exactly the destination's bytes -- but the
+                // strict dialect this renders for treats the implicit narrowing
+                // as an error, so the conversion is written down.
+                let rhs = if dst.size.saturating_mul(8) < 32 {
+                    CExpr::cast(dst_ty, rhs)
+                } else {
+                    rhs
+                };
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Subpiece { dst, src, offset } => {

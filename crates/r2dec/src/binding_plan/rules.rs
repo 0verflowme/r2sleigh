@@ -80,10 +80,25 @@ pub(super) fn component_eligible_values(
 /// then said `R8_1 ^= R8_1`, which is zero, and the function returned zero for
 /// every non-empty input while compiling perfectly cleanly.
 ///
-/// Only across storage locations. A carrier coalescing two runs of the same
-/// register is the ordinary case and stays allowed; what has to be declined is
-/// folding one machine location into another while both are needed, which is
-/// what a copy into a carried register looks like.
+/// Across storage locations always, and within one location when neither value
+/// is carried.
+///
+/// Folding one machine location into another while both are needed is the
+/// obvious interference. Two runs of the *same* location are the ordinary case
+/// a carrier coalesces, and declining those breaks the carrier: seven corpus
+/// functions rendered the wrong answer when this declined them all, because the
+/// assignment that carries a loop round its back edge disappeared.
+///
+/// But two runs of one location that a single instruction reads at once, and
+/// that are both computed here rather than carried in, are not that case. Both
+/// hold their content at that instruction. `crc32_bitwise` at arm64 -O2 is the
+/// case: the lift routes `w10` and `w11` through one p-code temporary, and
+/// `eor w10, w10, w11` reads two versions of it. Coalescing them made that
+/// statement the exclusive-or of a value with itself, which is zero for every
+/// input.
+///
+/// A value defined by a merge is carried by definition, so a pair with one of
+/// those in it stays exempt; a pair of ordinary definitions does not.
 pub(super) fn values_read_together(graph: &SsaGraph) -> BTreeSet<(ValueId, ValueId)> {
     let location_of = |value: ValueId| {
         graph
@@ -91,8 +106,20 @@ pub(super) fn values_read_together(graph: &SsaGraph) -> BTreeSet<(ValueId, Value
             .and_then(|value| value.canonical_storage)
             .map(r2ssa::CanonicalStorageId::location)
     };
+    let is_merged = |value: ValueId| {
+        graph
+            .def_inst(value)
+            .and_then(|inst| graph.inst(inst))
+            .is_none_or(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+    };
     let mut read_together = BTreeSet::new();
     for inst in &graph.insts {
+        // A merge does not read its operands together. Each one reaches it on
+        // its own edge, and only one of them is live at a time, which is the
+        // whole reason a merge can be coalesced into one object at all.
+        if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
+            continue;
+        }
         for (position, left) in inst.inputs.iter().enumerate() {
             for right in inst.inputs.iter().skip(position + 1) {
                 if left == right {
@@ -103,7 +130,7 @@ pub(super) fn values_read_together(graph: &SsaGraph) -> BTreeSet<(ValueId, Value
                 else {
                     continue;
                 };
-                if left_location != right_location {
+                if left_location != right_location || (!is_merged(*left) && !is_merged(*right)) {
                     read_together.insert((*left.min(right), *left.max(right)));
                 }
             }

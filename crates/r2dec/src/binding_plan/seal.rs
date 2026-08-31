@@ -170,13 +170,17 @@ pub(super) fn seal_binding_components(
             .ok_or(BindingPlanBuildError::MissingStorageSpan { value: value.id })?;
         values_by_span.entry(span).or_default().insert(value.id);
     }
+    let read_together = super::rules::values_read_together(graph);
+
     for (span, members) in values_by_span {
-        if members.len() > 1 {
+        // The same question the construction pass asks of a span: sharing a
+        // machine location is not on its own a licence to share a C object, and
+        // one instruction reading two members makes it impossible whichever
+        // derivation proposed the merge.
+        if members.len() > 1 && !super::rules::set_interferes(&read_together, &members) {
             members_by_source.insert(BindingCertificateSource::StorageSpan(span), members);
         }
     }
-
-    let read_together = super::rules::values_read_together(graph);
 
     if let Some(render) = source_owned.report().render() {
         for entity in render.certified_entities.values() {

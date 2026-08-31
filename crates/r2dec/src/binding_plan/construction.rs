@@ -248,16 +248,6 @@ pub(super) fn binding_components(
             .ok_or(BindingPlanBuildError::MissingStorageSpan { value: value.id })?;
         values_by_span.entry(span).or_default().insert(value.id);
     }
-    for (span, values) in values_by_span {
-        if values.len() > 1 {
-            let first = values.first().copied().expect("multi-member span");
-            for value in values.iter().copied().skip(1) {
-                union(&mut parent, &mut rank, first, value);
-            }
-            certificate_sets.push((BindingCertificateSource::StorageSpan(span), values));
-        }
-    }
-
     let read_together = super::rules::values_read_together(source.graph());
     // Whether merging every one of these values into one object would put two
     // values that some instruction reads together into that object.
@@ -274,6 +264,26 @@ pub(super) fn binding_components(
         }
         super::rules::set_interferes(&read_together, &members)
     };
+
+    for (span, values) in values_by_span {
+        if values.len() > 1 {
+            // A storage span says these values share a machine location. That
+            // is not on its own a licence to share a C object, and this asked
+            // nothing before unioning: the certificate path below has always
+            // asked, and one instruction reading two members is exactly as
+            // impossible whichever derivation proposed the merge. `crc32_bitwise`
+            // at arm64 -O2 is the case -- one p-code temporary carries both
+            // `w10` and `w11`, and `eor w10, w10, w11` reads two of its versions.
+            if merge_would_interfere(&mut parent, &values) {
+                continue;
+            }
+            let first = values.first().copied().expect("multi-member span");
+            for value in values.iter().copied().skip(1) {
+                union(&mut parent, &mut rank, first, value);
+            }
+            certificate_sets.push((BindingCertificateSource::StorageSpan(span), values));
+        }
+    }
 
     if let Some(render) = source_owned.report().render() {
         for entity in render.certified_entities.values() {
