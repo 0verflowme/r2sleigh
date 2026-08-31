@@ -2731,7 +2731,7 @@ impl SSAFunction {
             phi_index: usize,
             source_index: usize,
             replacement: SSAVar,
-            projection: Option<(u64, SSAOp)>,
+            projection: Option<(u64, Vec<SSAOp>)>,
         }
 
         let mut rewrites = Vec::new();
@@ -2755,12 +2755,42 @@ impl SSAFunction {
                         offset: member.offset,
                         width: source.size,
                     };
-                    let Some(root) = block_out_states
-                        .get(pred_addr)
-                        .and_then(|state| family_root_slice_for_range(state, requested))
-                    else {
-                        // An unavailable range stays unresolved. Adjacent or
-                        // partial fragments must never be assembled implicitly.
+                    let Some(state) = block_out_states.get(pred_addr) else {
+                        continue;
+                    };
+                    let Some(root) = family_root_slice_for_range(state, requested) else {
+                        // No single definition covers the range. Where several
+                        // cover it exactly, they are assembled the same way an
+                        // ordinary read of the same range is assembled -- by an
+                        // explicit `Piece` written into the predecessor -- and
+                        // where they do not, the range stays unresolved.
+                        //
+                        // A merge source is a read, and leaving it alone was not
+                        // neutral: it left the merge taking whichever whole-width
+                        // definition came before, which is a stale value once the
+                        // predecessor has redefined the register through its
+                        // parts. `fmov w11, s0` is exactly that -- the low half
+                        // and a zeroed upper half -- and the merge went on
+                        // carrying the register's previous contents.
+                        let mut materialized = Vec::new();
+                        if let Some(composed) = piece_family_tiles(
+                            state,
+                            requested,
+                            source,
+                            *pred_addr,
+                            phi_index,
+                            source_index,
+                            &mut materialized,
+                        ) && composed != *source
+                        {
+                            rewrites.push(PhiSourceRewrite {
+                                block_addr,
+                                phi_index,
+                                source_index,
+                                replacement: composed,
+                                projection: Some((*pred_addr, materialized)),
+                            });
+                        }
                         continue;
                     };
                     if let Some(direct) = direct_family_root_value(&root, source.size) {
@@ -2790,11 +2820,11 @@ impl SSAFunction {
                         replacement: projected.clone(),
                         projection: Some((
                             *pred_addr,
-                            SSAOp::Subpiece {
+                            vec![SSAOp::Subpiece {
                                 dst: projected,
                                 src: root.value,
                                 offset: root.offset,
-                            },
+                            }],
                         )),
                     });
                 }
@@ -2821,7 +2851,9 @@ impl SSAFunction {
                             )
                         })
                         .map_or(pred.ops.len(), |_| pred.ops.len().saturating_sub(1));
-                    pred.ops.insert(insert_at, projection);
+                    for (offset, op) in projection.into_iter().enumerate() {
+                        pred.ops.insert(insert_at + offset, op);
+                    }
                     true
                 }
                 None => true,

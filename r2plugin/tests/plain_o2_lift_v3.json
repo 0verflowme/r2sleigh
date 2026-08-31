@@ -32,7 +32,7 @@
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
       "r2il_fnv1a64": "d9fac0a75ea4fd0e",
-      "ssa_fnv1a64": "e4795fa51fa50e83",
+      "ssa_fnv1a64": "64af8e0fc6e30997",
       "required_native_opcodes": [
         "movdqu",
         "paddd",
@@ -164,28 +164,28 @@
         },
         {
           "address": 4294968956,
-          "fnv1a64": "efb8871b43ec0f2e",
-          "op_count": 154,
+          "fnv1a64": "d6be921dd42992cc",
+          "op_count": 160,
           "phi_count": 0,
           "size": 30
         },
         {
           "address": 4294968986,
-          "fnv1a64": "f17a20e686133c29",
-          "op_count": 3,
+          "fnv1a64": "b0d9fa6c61b3b983",
+          "op_count": 9,
           "phi_count": 0,
           "size": 6
         },
         {
           "address": 4294968992,
-          "fnv1a64": "409f66c810a524bb",
+          "fnv1a64": "82fadb9b1a679521",
           "op_count": 58,
           "phi_count": 105,
           "size": 11
         },
         {
           "address": 4294969003,
-          "fnv1a64": "546fc40aa35533ff",
+          "fnv1a64": "8551f2b135cf42dd",
           "op_count": 7,
           "phi_count": 105,
           "size": 2
