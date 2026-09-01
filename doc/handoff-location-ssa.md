@@ -6768,3 +6768,103 @@ The next step is to ask the existing rules rather than to invent a third: a
 value whose definition and use straddle a carrier must not be inlined, and
 `set_outlives_a_redefinition` already knows how to phrase that question for a
 set of values. Ask it for the single value here.
+
+**Folding lands: fifty-one of fifty-four, none wrong, and two thirds of the
+statements gone.** The three cells that computed the wrong answer were not the
+carrier hazard the section above expected. They were two renderings of one
+value disagreeing about signedness: `fold::op_lower` renders `IntSLess(x, 0)`
+with `(int32_t)` casts from the operation, while the materialiser re-derived
+the same value from the machine arena, whose `interpretation` field says how a
+value is later *read* rather than how the operation computes it. The casts
+vanished and a comparison that was sometimes true became one that never is.
+
+The fix was the smaller of the two the previous session named: the fold now
+moves the expression the operation lowering already produces, by lowering the
+defining operation in expression mode at its own site. Nothing is derived
+twice, so nothing can disagree. It also gives the operands their ordinary
+observations at the definition's site, which is what authorises reads that end
+up nested inside another statement.
+
+One thing had to change for that to work at all. Expression mode delegates to
+statement lowering, which spells a left-hand side before it builds the
+right-hand side, and an inlined value has no left-hand side -- the plan
+withheld its symbol precisely because it is written nowhere. Every ordinary
+arithmetic operation therefore refused. `FoldingContext::inlined_definition`
+now suppresses the left-hand side and collapses the assignment to its
+expression, so statement form and expression form come out of one body and
+cannot drift.
+
+Four separate defects surfaced on the way, each fixed at its origin rather than
+near the symptom:
+
+`CTypeLike::Bool` rendered as `bool`, which is a macro from `<stdbool.h>`, and
+the emitted translation unit includes no headers of its own. Thirty-four cells
+failed to compile the moment a predicate reached a cast. It is `_Bool` now.
+
+The snapshot's data-symbol walk in the radare2 fork skipped every flag spelled
+`sym.`, discarding the objects it exists to report: a compiler-emitted lookup
+table carries a `sym.` flag exactly as an imported function does. The reference
+decides now -- a data or indirect-code reference whose target is not a function
+entry -- so `pearson`'s table renders as `&_pearson_tab` instead of a bare
+address the recompiled program dereferences and dies on. That is
+`radare2@ef38a98bb9` on `anal/subregister-argument-spills`.
+
+An inlined *literal* returned straight to its caller from `planned_value_expr`,
+skipping every cell it and its defining instruction owe.
+
+`carry_outer_expr_observations` carries only a source expression's leading
+markers. That is right when the replacement keeps the source's subtrees and
+wrong when it discards them: folding a cast chain down to one literal, or an
+address into `&name`, deletes the nodes the inner markers sat on.
+`carry_all_expr_observations` collects every marker in the collapsed subtree,
+because the replacement renders everything the source rendered.
+
+**What is still open.** Three cells refuse -- `murmur3_32` at x86-64 and arm64
+`-O0`, `xxhash32` at x86-64 `-O0` -- and six functions regress in whole-binary
+coverage, 239 of 313 against a baseline of 245. All nine are one cause, traced
+but not fixed.
+
+The trace, so it does not have to be repeated. Both refused obligations in
+`murmur3_32` are `LiveValueProducer` on a `Copy` whose output the plan inlines.
+The marker for each *is* allocated -- `allocate_effect_targets` runs, and an
+instrumented seal shows the id present in `targets` and absent from the final
+AST -- so the fold and its accounting are working. What is missing is the
+statement. `murmur3_32` renders through the unstructured fallback in
+`consumer_structured::primary_body_for_semantic_route`, whose residual comment
+reads `rendered control-domain occurrences do not exactly cover block
+0x100000a61`; that path calls `rollback_tentative_structure` and re-renders
+through `linearize_function_body`, and the emitted body contains no `push rbp`
+store at all. The value was folded into a statement that this rendering does
+not emit, so its occurrence has nowhere to live.
+
+Things already ruled out by bisection, each with an env-gated switch that was
+removed afterwards: none of the five `cleanup_recurse` rewrites, none of
+`simplify_identities_in_function`, `reconstruct_flag_conditions_in_function`,
+`normalize_redundant_return_carrier_casts`,
+`normalize_declared_assignment_literals`,
+`normalize_comparison_operand_order`, or `fold_constant_arithmetic_in_function`
+drops these markers. `fold_block` reports eighteen statements built for the
+entry block and only about ten survive, so the loss is between `fold_block` and
+the sealed body, on the linearized path.
+
+`rules::inlinable_values` already declines to fold into an instruction a
+certificate elides, via `certified_elided_read_instructions`. That predicate is
+the right shape and the wrong reach: the frame store here is not covered by
+`stack_frame_round_trips`, `machine_return_controls` or `stack_geometry` in this
+function. The complete question is whether the *use instruction will be
+emitted*, and the honest place to answer it is the same set the observation
+journal builds when it seeds `elided_uses` -- which is computed from the
+certificates plus `plan.use_disposition`, both available to
+`inlinable_values`. Extracting that seed into `binding_plan::rules`, so the
+journal and the plan read one statement of the rule instead of two, is the next
+step. Do not answer it at the ledger: an obligation nobody rendered is not a
+detector to be silenced.
+
+Two measurements worth keeping. Folding is where nearly all the statement
+reduction lives, and copies are where nearly all of folding lives: the nine
+x86-64 `-O0` corpus functions render in 1014 statements unfolded, 1002 with
+copies excluded from folding, and 367 with folding complete. Excluding copies
+is therefore not an option -- it buys a green gate for one percent of the
+benefit. And test fixtures throughout the tree were built from single-use
+values, which fold away entirely; each one that needed something bound gained a
+second reader, which is a fixture correction rather than a concession.
