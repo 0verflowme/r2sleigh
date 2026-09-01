@@ -425,11 +425,27 @@ fn removing_statement_would_lose_an_effect(
             Some(r2ssa::InstPayload::Op(r2ssa::SSAOp::CallDefine { .. }))
         )
     {
-        instructions.extend(
-            op_index
-                .checked_sub(1)
-                .and_then(|previous| source.graph().inst_id_for_op_site(block_addr, previous)),
-        );
+        // A call is followed by one `CallDefine` per register the convention
+        // lets it clobber -- ten of them on amd64 -- so the one naming the
+        // result is not necessarily the operation directly after the call.
+        // Walking back over the run of them finds the call that owns them all.
+        let mut previous = op_index;
+        while let Some(earlier) = previous.checked_sub(1) {
+            previous = earlier;
+            let Some(inst_id) = source.graph().inst_id_for_op_site(block_addr, earlier) else {
+                break;
+            };
+            match source.graph().inst(inst_id).map(|i| &i.payload) {
+                Some(r2ssa::InstPayload::Op(r2ssa::SSAOp::CallDefine { .. })) => continue,
+                Some(r2ssa::InstPayload::Op(
+                    r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. },
+                )) => {
+                    instructions.push(inst_id);
+                    break;
+                }
+                _ => break,
+            }
+        }
     }
     instructions
         .into_iter()
