@@ -6516,7 +6516,23 @@ have to answer the ledger question the duplicated-tail work already answered
 once: one rendered expression discharging several source obligations is a fold,
 not a loss, and the accounting has to say so.
 
-**Component 5 is a binding-plan policy, not a rendering pass.** Folding
+**Component 5 needs a machine-expression materialiser, and that is the whole of
+it.** The paragraph below was written before the policy was tried, and it is
+wrong about where the work is. Extending the inline disposition to computed
+values was implemented and reverted: the plan accepted it, the corpus stayed
+green, and nothing changed in the output, because
+`fold/op_lower/lowering.rs` materialises a planned inline *only* when the
+machine expression is a `Constant` and answers `InvalidPlannedInline` for every
+other kind. Five values in one `-O0` function qualified under the rule and none
+of them could be rendered.
+
+So the missing piece is a materialiser from `MachineExprKind` -- arithmetic,
+comparison, casts, shifts, selects, concatenations, extracts -- to a C
+expression. That is a second renderer beside the operation lowering, and it is
+why `Inline` has only ever meant a literal. Build it first; the policy change
+below is then a few lines and is already written once in this document.
+
+**The policy, once the materialiser exists.** Folding
 `ZF_1 = (a - b) == 0; if (!ZF_1)` into `if (a != b)` looks like an expression
 rewrite, and `reconstruct_flag_conditions_in_function` already tries it, but the
 reason it cannot succeed is upstream: `binding_plan::construction` gives
