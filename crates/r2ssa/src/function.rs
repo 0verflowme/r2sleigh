@@ -1285,6 +1285,12 @@ impl TrustedSsaArtifact {
         for (addr, text) in source.image().string_literals() {
             display_names.insert_string(*addr, text.clone());
         }
+        // The names radare2 has for the data this function points at. Display
+        // facts, like the strings above: they say what an address is called,
+        // never what is stored there.
+        for (addr, name) in source.image().data_symbols() {
+            display_names.insert_symbol(*addr, name.clone());
+        }
         display_names.set_parameters(
             source
                 .presentation()

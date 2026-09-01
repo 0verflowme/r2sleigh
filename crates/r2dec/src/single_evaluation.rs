@@ -281,6 +281,7 @@ mod tests {
     ) -> CFunction {
         CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "f".to_string(),
             ret_type: CType::Int {
                 bits: 32,

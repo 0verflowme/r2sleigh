@@ -1571,6 +1571,17 @@ def map_image_data(
     for occurrence in certified:
         by_address.setdefault(occurrence["address"], []).append(occurrence)
 
+    # A named object the decompiler recovered carries the address it stands for
+    # on its declaration. The name is what a reader wants; the address is what
+    # this has to resolve, and defining the object from the same captured bytes
+    # keeps the program runnable without turning the name back into a number.
+    named_objects: dict[str, int] = {}
+    for name, address in re.findall(
+        r"#define (\w+)__r2sleigh_addr 0x([0-9a-f]+)ULL", source
+    ):
+        named_objects[name] = int(address, 16)
+        by_address.setdefault(int(address, 16), [])
+
     blobs: list[str] = []
     records: list[dict[str, Any]] = []
     replacements: dict[int, str] = {}
@@ -1607,6 +1618,9 @@ def map_image_data(
         initializer = ",".join(str(byte) for byte in data)
         blobs.append(f"static unsigned char {blob_name}[{len(data)}] = {{{initializer}}};")
         replacements[address] = f"((uintptr_t){blob_name})"
+        for object_name, object_address in named_objects.items():
+            if object_address == address:
+                blobs.append(f"#define {object_name} (*(char (*)[]){blob_name})")
         occurrences = by_address[address]
         records.append(
             {
@@ -1631,6 +1645,13 @@ def map_image_data(
             + replacements[occurrence["address"]]
             + mapped[occurrence["end"] :]
         )
+    # The declaration goes once the object is defined from the capture; leaving
+    # it beside the definition makes the compiler expand the definition inside
+    # the declaration. Done after the offset rewrites above, which index into
+    # the text as the decompiler emitted it.
+    if named_objects:
+        mapped = re.sub(r"#define \w+__r2sleigh_addr 0x[0-9a-f]+ULL\n", "", mapped)
+        mapped = re.sub(r"[ \t]*extern char \w+\[\];[ \t]*\n", "", mapped)
     return mapped, blobs, records
 
 

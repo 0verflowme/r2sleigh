@@ -314,6 +314,14 @@ pub struct OwnedFunctionImage {
     /// Display data: it tells a renderer what to print where a constant points
     /// at text, and carries no claim about behaviour.
     string_literals: Box<[(u64, String)]>,
+    /// Names radare2 already has for the data this function points at, with the
+    /// address each names.
+    ///
+    /// Display data, exactly like the string literals above: it tells a renderer
+    /// what to call an address, and carries no claim about what is stored there.
+    /// A rendering that uses one is depending on radare2's analysis rather than
+    /// on the machine, which is why the proof line records that it did.
+    data_symbols: Box<[(u64, String)]>,
     /// Tables of function pointers the function indexes, with the addresses
     /// each table holds.
     ///
@@ -357,6 +365,10 @@ impl SourceCodePointerTable {
 impl OwnedFunctionImage {
     pub const fn entry_address(&self) -> u64 {
         self.entry_address
+    }
+
+    pub fn data_symbols(&self) -> &[(u64, String)] {
+        &self.data_symbols
     }
 
     pub fn string_literals(&self) -> &[(u64, String)] {
@@ -906,6 +918,7 @@ mod tests {
             },
             OwnedFunctionImage {
                 string_literals: Box::new([]),
+                data_symbols: Box::new([]),
                 code_pointer_tables: Box::new([]),
                 entry_address: 0x1000,
                 blocks: vec![OwnedFunctionBlock {

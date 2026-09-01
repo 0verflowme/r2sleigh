@@ -200,6 +200,22 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 		r2sleigh_wire_u64 (writer, literal.addr);
 		r2sleigh_wire_string (writer, text);
 	}
+	if (view->num_data_symbols > UINT32_MAX) {
+		return false;
+	}
+	r2sleigh_wire_u32 (writer, (uint32_t)view->num_data_symbols);
+	for (size_t i = 0; i < view->num_data_symbols; i++) {
+		RAnalSnapshotDataSymbolView symbol = {0};
+		if (!r_anal_function_snapshot_data_symbol_view (snapshot, i, &symbol)) {
+			return false;
+		}
+		char name[WALK_NAME_MAX];
+		if (!r_anal_function_snapshot_data_symbol_name (snapshot, i, name, sizeof (name))) {
+			return false;
+		}
+		r2sleigh_wire_u64 (writer, symbol.addr);
+		r2sleigh_wire_string (writer, name);
+	}
 	if (view->num_code_pointer_tables > UINT32_MAX) {
 		return false;
 	}

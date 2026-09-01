@@ -4849,6 +4849,7 @@ impl Decompiler {
         let mut c_function = CFunction {
             symbols: std::rc::Rc::clone(&symbol_table),
             name: crate::ast::c_identifier(&func_name),
+            extern_objects: Vec::new(),
             externs: fold_ctx
                 .callee_declarations
                 .borrow()
@@ -4873,8 +4874,14 @@ impl Decompiler {
             self.context.function_facts.semantic_report(),
         );
 
-        let strings = self.context.function_facts.display_names().strings();
-        fold_constant_arithmetic_in_function(&mut c_function, strings);
+        let display = self.context.function_facts.display_names();
+        let strings = display.strings();
+        let data_symbols = display.symbols();
+        let used_objects: std::cell::RefCell<std::collections::BTreeSet<(String, u64)>> =
+            std::cell::RefCell::new(std::collections::BTreeSet::new());
+        fold_constant_arithmetic_in_function(&mut c_function, strings, data_symbols, &used_objects);
+        c_function.extern_objects = used_objects.into_inner().into_iter().collect();
+
         if let Err(error) =
             single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names)
         {
@@ -5340,20 +5347,29 @@ fn reconstruct_flag_conditions_in_function(func: &mut CFunction, fold_ctx: &Fold
 fn fold_constant_arithmetic_in_function(
     func: &mut CFunction,
     strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
 ) {
     for stmt in &mut func.body {
-        fold_constant_arithmetic_in_stmt(stmt, strings);
+        fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
     }
 }
 
 fn fold_constant_arithmetic_in_stmt(
     stmt: &mut CStmt,
     strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
 ) {
-    let fold_expr = |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings);
+    let fold_expr =
+        |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
-        CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(stmt, strings),
+        CStmt::StructuredRegion { stmt, .. } => {
+            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used)
+        }
+        CStmt::Observed { stmt, .. } => {
+            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used)
+        }
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5373,7 +5389,7 @@ fn fold_constant_arithmetic_in_stmt(
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                fold_constant_arithmetic_in_stmt(stmt, strings);
+                fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
             }
         }
         CStmt::If {
@@ -5382,14 +5398,14 @@ fn fold_constant_arithmetic_in_stmt(
             else_body,
         } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(then_body, strings);
+            fold_constant_arithmetic_in_stmt(then_body, strings, symbols, used);
             if let Some(else_body) = else_body {
-                fold_constant_arithmetic_in_stmt(else_body, strings);
+                fold_constant_arithmetic_in_stmt(else_body, strings, symbols, used);
             }
         }
         CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(body, strings);
+            fold_constant_arithmetic_in_stmt(body, strings, symbols, used);
         }
         CStmt::For {
             init,
@@ -5398,7 +5414,7 @@ fn fold_constant_arithmetic_in_stmt(
             body,
         } => {
             if let Some(init) = init {
-                fold_constant_arithmetic_in_stmt(init, strings);
+                fold_constant_arithmetic_in_stmt(init, strings, symbols, used);
             }
             if let Some(cond) = cond {
                 fold_expr(cond);
@@ -5406,7 +5422,7 @@ fn fold_constant_arithmetic_in_stmt(
             if let Some(update) = update {
                 fold_expr(update);
             }
-            fold_constant_arithmetic_in_stmt(body, strings);
+            fold_constant_arithmetic_in_stmt(body, strings, symbols, used);
         }
         CStmt::Switch {
             expr,
@@ -5416,12 +5432,12 @@ fn fold_constant_arithmetic_in_stmt(
             fold_expr(expr);
             for case in cases {
                 for stmt in &mut case.body {
-                    fold_constant_arithmetic_in_stmt(stmt, strings);
+                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    fold_constant_arithmetic_in_stmt(stmt, strings);
+                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
                 }
             }
         }
@@ -5442,9 +5458,11 @@ fn literal_value(expr: &CExpr) -> Option<u64> {
 fn fold_constant_arithmetic_in_expr(
     expr: &mut CExpr,
     strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
 ) {
     if let CExpr::Observed { expr, .. } = expr {
-        fold_constant_arithmetic_in_expr(expr, strings);
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
         return;
     }
     let mut replacement = None;
@@ -5454,10 +5472,12 @@ fn fold_constant_arithmetic_in_expr(
         | CExpr::Sizeof(operand)
         | CExpr::AddrOf(operand)
         | CExpr::Deref(operand)
-        | CExpr::Paren(operand) => fold_constant_arithmetic_in_expr(operand, strings),
+        | CExpr::Paren(operand) => {
+            fold_constant_arithmetic_in_expr(operand, strings, symbols, used)
+        }
         CExpr::Binary { op, left, right } => {
-            fold_constant_arithmetic_in_expr(left, strings);
-            fold_constant_arithmetic_in_expr(right, strings);
+            fold_constant_arithmetic_in_expr(left, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(right, strings, symbols, used);
             if let (Some(lhs), Some(rhs)) = (literal_value(left), literal_value(right)) {
                 // Wrapping, because the program's arithmetic wraps; a fold that
                 // disagreed with the machine would be worse than no fold.
@@ -5476,26 +5496,26 @@ fn fold_constant_arithmetic_in_expr(
             then_expr,
             else_expr,
         } => {
-            fold_constant_arithmetic_in_expr(cond, strings);
-            fold_constant_arithmetic_in_expr(then_expr, strings);
-            fold_constant_arithmetic_in_expr(else_expr, strings);
+            fold_constant_arithmetic_in_expr(cond, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(then_expr, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(else_expr, strings, symbols, used);
         }
         CExpr::Call { func, args, .. } => {
-            fold_constant_arithmetic_in_expr(func, strings);
+            fold_constant_arithmetic_in_expr(func, strings, symbols, used);
             for arg in args {
-                fold_constant_arithmetic_in_expr(arg, strings);
+                fold_constant_arithmetic_in_expr(arg, strings, symbols, used);
             }
         }
         CExpr::Subscript { base, index } => {
-            fold_constant_arithmetic_in_expr(base, strings);
-            fold_constant_arithmetic_in_expr(index, strings);
+            fold_constant_arithmetic_in_expr(base, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(index, strings, symbols, used);
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            fold_constant_arithmetic_in_expr(base, strings)
+            fold_constant_arithmetic_in_expr(base, strings, symbols, used)
         }
         CExpr::Comma(items) => {
             for item in items {
-                fold_constant_arithmetic_in_expr(item, strings);
+                fold_constant_arithmetic_in_expr(item, strings, symbols, used);
             }
         }
         _ => {}
@@ -5510,6 +5530,63 @@ fn fold_constant_arithmetic_in_expr(
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
         *expr = crate::ast::carry_outer_expr_observations(&source, CExpr::StringLit(text.clone()));
+        return;
+    }
+    // And so can the object table, for an address radare2 has a name for.
+    //
+    // The address is taken rather than the object's value: `lea` puts the
+    // address of the object in the register, so `&progName` is what the
+    // constant is. Rendering the number instead loses a name the analysis
+    // already had and that a reader cannot recover from it.
+    if let Some(value) = literal_value(expr)
+        && let Some(name) = symbols.get(&value)
+    {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_outer_expr_observations(
+            &source,
+            CExpr::addr_of(CExpr::External {
+                name: {
+                    let rendered = c_identifier_for_data_symbol(name);
+                    used.borrow_mut().insert((rendered.clone(), value));
+                    rendered
+                },
+                kind: crate::symbol::ExternalKind::Global,
+            }),
+        );
+    }
+}
+
+/// The C name for a radare2 data flag.
+///
+/// The fact is kept as radare2 stated it -- `obj.progName`, `reloc.stderr` --
+/// because that is what the analysis said and what the proof line answers for.
+/// What C can take is the name without the flag space that qualifies it, and
+/// with anything left that is not an identifier character replaced, so the
+/// rendered program declares `progName` rather than a dotted spelling no
+/// compiler accepts.
+fn c_identifier_for_data_symbol(flag: &str) -> String {
+    const SPACES: [&str; 6] = ["obj.", "reloc.", "segment.", "section.", "str.", "sym."];
+    let mut name = flag;
+    loop {
+        let Some(stripped) = SPACES.iter().find_map(|space| name.strip_prefix(space)) else {
+            break;
+        };
+        name = stripped;
+    }
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("g_{cleaned}")
+    } else {
+        cleaned
     }
 }
 
@@ -6541,7 +6618,9 @@ mod tests {
             .expect("root observation");
         let strings = BTreeMap::from([(0x1004, "text".to_string())]);
 
-        fold_constant_arithmetic_in_expr(&mut expr, &strings);
+        let no_symbols = BTreeMap::new();
+        let unused_objects = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        fold_constant_arithmetic_in_expr(&mut expr, &strings, &no_symbols, &unused_objects);
         let mut function = CFunction::new(
             "folded",
             CType::Pointer(Box::new(CType::Int {
@@ -10420,6 +10499,7 @@ mod tests {
         );
         let mut func = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.gettext_quote".to_string(),
             ret_type: CType::ptr(CType::Int {
                 bits: 8,
@@ -10485,6 +10565,7 @@ mod tests {
         );
         let mut func = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.return_arg_summary".to_string(),
             ret_type: CType::ptr(CType::Int {
                 bits: 8,
@@ -10548,6 +10629,7 @@ mod tests {
         ))];
         let mut func = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.alloc_wrapper2".to_string(),
             ret_type: CType::ptr(CType::Int {
                 bits: 8,

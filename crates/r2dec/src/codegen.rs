@@ -125,6 +125,7 @@ pub(crate) fn prepare_function_for_emission(func: &CFunction) -> EmissionReadyFu
             locals: func.locals.clone(),
             params_known: func.params_known,
             externs: func.externs.clone(),
+            extern_objects: func.extern_objects.clone(),
         },
     }
 }
@@ -209,7 +210,25 @@ impl CodeGenerator {
             }
             self.output.push_str(");\n");
         }
-        if !func.externs.is_empty() {
+        // The address the name stands for travels with the declaration.
+        // A reader wants the name; a tool that has to resolve the object --
+        // the corpus verifier maps image addresses into a captured blob --
+        // needs the number the name replaced, and the name alone hides it.
+        for (name, address) in &func.extern_objects {
+            // The address the name stands for travels with the declaration, as
+            // a define rather than a comment. A reader wants the name; a tool
+            // that has to resolve the object -- the corpus verifier maps image
+            // addresses into a captured blob -- needs the number the name
+            // replaced, and a comment does not survive every rewrite the
+            // verifier applies before it looks.
+            self.output
+                .push_str(&format!("#define {name}__r2sleigh_addr 0x{address:x}ULL\n"));
+            self.emit_indent();
+            self.output.push_str("extern char ");
+            self.output.push_str(name);
+            self.output.push_str("[];\n");
+        }
+        if !func.externs.is_empty() || !func.extern_objects.is_empty() {
             self.output.push('\n');
         }
 
@@ -1092,6 +1111,7 @@ mod tests {
         let symbols = test_table();
         let func = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "add".to_string(),
             ret_type: CType::i32(),
             params: vec![
@@ -1125,6 +1145,7 @@ mod tests {
         let value = crate::symbol::declare(&symbols, "value");
         let plain = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "observed".to_string(),
             ret_type: CType::i32(),
             params: vec![],
@@ -1411,6 +1432,7 @@ mod tests {
         let x = crate::symbol::declare(&symbols, "x");
         let func = CFunction {
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "test".to_string(),
             ret_type: CType::Void,
             params: vec![],

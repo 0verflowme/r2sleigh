@@ -978,6 +978,13 @@ pub struct CFunction {
     /// calls another is not readable, compilable or checkable without one.
     /// These are emitted above the definition.
     pub externs: Vec<CExternDecl>,
+    /// Named data objects the body refers to, declared so the rendering stays a
+    /// self-contained translation unit.
+    ///
+    /// The type is deliberately not claimed: the body only ever takes the
+    /// object's address, so an incomplete array of bytes declares exactly what
+    /// is known -- that a named object lives there -- and nothing more.
+    pub extern_objects: Vec<(String, u64)>,
 }
 
 /// A machine symbol spelled as a C identifier.
@@ -1049,6 +1056,7 @@ impl CFunction {
             name: name.into(),
             ret_type,
             externs: Vec::new(),
+            extern_objects: Vec::new(),
             params: Vec::new(),
             locals: Vec::new(),
             body: Vec::new(),
