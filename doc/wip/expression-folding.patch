@@ -54,7 +54,7 @@ index 4f1b43c..160f097 100644
      Refused(ValueRefusal),
  }
 diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
-index e2e96db..cca83e2 100644
+index e2e96db..2b105b4 100644
 --- a/crates/r2dec/src/binding_plan/rules.rs
 +++ b/crates/r2dec/src/binding_plan/rules.rs
 @@ -39,6 +39,7 @@ pub(super) fn component_eligible_values(
@@ -73,7 +73,7 @@ index e2e96db..cca83e2 100644
          })
          .collect())
  }
-@@ -210,3 +212,101 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
+@@ -210,3 +212,110 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
      }
      false
  }
@@ -123,6 +123,15 @@ index e2e96db..cca83e2 100644
 +            continue;
 +        }
 +        let Some(use_inst) = graph.inst(use_site.inst) else { continue };
++        // A merge reads its operands on edges, not at a position in a block, so
++        // comparing ordinals against one says nothing and moving a computation
++        // into a merge operand moves it across the edge that operand arrives
++        // on. `crc32_bitwise` and `pearson` are the cases: their loop carriers
++        // are merges, and folding into them computed the wrong answer while
++        // every other check passed.
++        if matches!(use_inst.payload, r2ssa::InstPayload::Phi { .. }) {
++            continue;
++        }
 +        if def_inst.block != use_inst.block || def_inst.ordinal >= use_inst.ordinal { continue }
 +        // Every location the *rendered* expression reads, not only the ones the
 +        // defining instruction lists. A machine expression is a tree over the
@@ -344,7 +353,7 @@ index edd7b04..cfd99a4 100644
              Ok(marked) => marked,
              Err(error) => {
 diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
-index 45c95ae..205061e 100644
+index 45c95ae..e5d0342 100644
 --- a/crates/r2dec/src/fold/op_lower/lowering.rs
 +++ b/crates/r2dec/src/fold/op_lower/lowering.rs
 @@ -264,12 +264,24 @@ impl<'a> FoldingContext<'a> {
@@ -432,7 +441,57 @@ index 45c95ae..205061e 100644
              }
              Kind::Copy { input } => child(*input)?,
              Kind::Arithmetic {
-@@ -391,7 +452,25 @@ impl<'a> FoldingContext<'a> {
+@@ -328,18 +389,37 @@ impl<'a> FoldingContext<'a> {
+                 value: shifted,
+                 count,
+                 ..
+-            } => CExpr::binary(
+-                match kind {
+-                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+-                    // Both right shifts render as `>>`; which one it is follows
+-                    // from the signedness of the operand's type, which the
+-                    // declaration carries.
+-                    r2ssa::MachineShiftKind::LogicalRight
+-                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+-                },
+-                child(*shifted)?,
+-                child(*count)?,
+-            ),
++            } => {
++                // An arithmetic right shift is `>>` on a signed operand and
++                // nothing else, so the operand is cast rather than the operator
++                // changed -- the same mistake as the comparison above, and the
++                // same fix.
++                let value_expr = child(*shifted)?;
++                let value_expr = if matches!(kind, r2ssa::MachineShiftKind::ArithmeticRight) {
++                    let bits = names
++                        .inline_expr(*shifted)
++                        .map(|expr| expr.ty().width_bits())
++                        .unwrap_or(32);
++                    CExpr::cast(
++                        CType::Int {
++                            bits,
++                            signedness: r2types::Signedness::Signed,
++                        },
++                        value_expr,
++                    )
++                } else {
++                    value_expr
++                };
++                CExpr::binary(
++                    match kind {
++                        r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
++                        r2ssa::MachineShiftKind::LogicalRight
++                        | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
++                    },
++                    value_expr,
++                    child(*count)?,
++                )
++            }
+             Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(*input)?),
+             Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(*input)?),
+             Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(*input)?),
+@@ -391,7 +471,25 @@ impl<'a> FoldingContext<'a> {
                          },
                      );
                  }

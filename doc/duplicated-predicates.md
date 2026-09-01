@@ -87,3 +87,22 @@ hand-written list per architecture family. The ROADMAP carries this as debt
 against the compiler specification, which states it; it is listed here because
 a hand-written list is an answerer, and when the specification-derived answer
 lands there will be two.
+
+**How a value is rendered.** Found while folding, and it is the reason the last
+three corpus cells compute the wrong answer. `fold::op_lower` renders a value
+from its SSA operation, so `SSAOp::IntSLess` becomes
+`(int32_t)x < (int32_t)0`. `materialize_machine_expr` renders the same value
+from the machine arena, where the node is a `Compare` carrying its own
+`interpretation` -- and for that value the arena says unsigned, so the casts
+disappear and a comparison that was true becomes one that never is.
+
+Two renderings of one value that disagree is this document's subject, and the
+resolution is the same as everywhere else in it: one of them answers, or they
+share the rule. The arena's `interpretation` is not the SSA operation's
+signedness and was never meant to stand in for it, so the materialiser either
+takes its signedness from the defining operation, or the fold is expressed by
+asking the operation lowering to render the value and moving *that* expression,
+rather than by building a second renderer over the arena.
+
+The second is the smaller change and the more honest one: a fold should move the
+expression the renderer would have produced, not a re-derivation of it.
