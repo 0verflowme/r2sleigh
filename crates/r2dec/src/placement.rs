@@ -408,15 +408,64 @@ fn removing_statement_would_lose_an_effect(
     if site.is_some_and(|site| answered.contains(&site)) {
         return false;
     }
-    source
-        .obligations()
-        .obligations_for_inst(inst)
+    // A `CallDefine` is judged by the call it names.
+    //
+    // The call operation itself deliberately renders nothing when a
+    // `CallDefine` names its result, so that the function is not called twice;
+    // the assignment is the call's only statement. Its obligations, though, sit
+    // on the call operation rather than on the `CallDefine`, so asking only
+    // about the `CallDefine` found nothing observable and the assignment was
+    // removed as a dead store -- taking the call with it. That is how
+    // `fprintf(stderr, "...")`, whose result nobody reads, disappeared from
+    // every function in a `-O0` binary while the proof line read `0 refused`.
+    let mut instructions = vec![inst];
+    if let Some((block_addr, op_index)) = site
+        && matches!(
+            source.graph().inst(inst).map(|i| &i.payload),
+            Some(r2ssa::InstPayload::Op(r2ssa::SSAOp::CallDefine { .. }))
+        )
+    {
+        instructions.extend(
+            op_index
+                .checked_sub(1)
+                .and_then(|previous| source.graph().inst_id_for_op_site(block_addr, previous)),
+        );
+    }
+    instructions
+        .into_iter()
+        .flat_map(|inst| source.obligations().obligations_for_inst(inst))
         .any(|obligation| {
-            // Only a write into memory. The others in this family are either
-            // answered when the statement goes -- a trap belongs to the
-            // operation the removal takes with it -- or cannot arise on a
-            // statement that only writes an object nothing reads.
-            matches!(obligation.id.kind, Kind::ObservableMemoryWrite)
+            // Everything whose absence the reader would never learn about.
+            //
+            // This asked only about a write into memory, on the reasoning that
+            // nothing else in the family could arise on a statement that writes
+            // an object nothing reads. A call can: `RAX_4 = fprintf(...)` writes
+            // a result no one uses *and* calls fprintf. The statement was
+            // removed as a dead store and the call went with it, silently --
+            // fourteen of the twenty-six calls in one `-O0` binary, in every
+            // function rendered, under proof lines reading `0 refused`.
+            //
+            // A trap, a fence and an atomic are the same argument: the effect
+            // belongs to the operation, not to the value it happens to leave
+            // behind, so removing the statement removes the effect.
+            //
+            // A trap is deliberately not here yet, though the argument is the
+            // same. A division carries one, and protecting its statement keeps
+            // an assignment whose result nothing reads, which `-Werror` rejects
+            // as an unused variable. Keeping the effect without the variable
+            // needs a rendering form this does not have -- the operation as a
+            // bare expression statement -- so the trap keeps its old treatment
+            // until that exists rather than trading one wrong answer for a cell
+            // that will not compile.
+            matches!(
+                obligation.id.kind,
+                Kind::ObservableMemoryWrite
+                    | Kind::Call
+                    | Kind::CallResult
+                    | Kind::Atomicity
+                    | Kind::MemoryOrdering
+                    | Kind::VolatileOrUnknownEffect
+            )
         })
 }
 

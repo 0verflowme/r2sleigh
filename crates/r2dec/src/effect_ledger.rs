@@ -23,6 +23,40 @@ fn rendered_site(id: SemanticObligationId) -> Option<(u64, usize)> {
     }
 }
 
+/// The zero-occurrence disposition, with an eye on the ones that must not be
+/// elided.
+///
+/// A call is an observable effect. Eliding one drops it from the rendering with
+/// no trace, which is how fourteen of twenty-six calls in a `-O0` binary went
+/// missing under a proof line reading `0 refused`. Every elision of a call or
+/// of one of its arguments says so under `R2DEC_TRACE_REFUSAL`, so the reason
+/// that took it is named rather than hunted.
+fn traced_zero_occurrence_outcome(
+    prepared: &SsaArtifact,
+    origins: &NormalizationOrigins,
+    effects: &SurvivingEffectObservations,
+    id: SemanticObligationId,
+) -> Outcome {
+    let outcome = upstream_zero_occurrence_outcome(prepared, origins, effects, id);
+    if matches!(
+        id.kind,
+        SemanticObligationKind::Call
+            | SemanticObligationKind::CallArgument
+            | SemanticObligationKind::CallResult
+    ) && let Outcome::Elided(reason) = outcome
+    {
+        r2il::refusal_evidence!(
+            "call-elided",
+            "a call effect was elided rather than rendered: kind={:?} reason={reason:?} \
+             block={:#x} site={:?}",
+            id.kind,
+            id.instruction.block_addr,
+            id.instruction.site
+        );
+    }
+    outcome
+}
+
 /// Exact upstream disposition for a source effect that has no final occurrence.
 ///
 /// These are not renderer guesses. Unsupported native effects are inventory
@@ -267,7 +301,7 @@ pub(crate) fn build_obligation_ledger(
             .occurrence_count(id)
             .expect("effect observation domain is opened from this source inventory");
         let outcome = match count {
-            0 => Some(upstream_zero_occurrence_outcome(
+            0 => Some(traced_zero_occurrence_outcome(
                 prepared, origins, effects, id,
             )),
             1 => rendered_site(id)
