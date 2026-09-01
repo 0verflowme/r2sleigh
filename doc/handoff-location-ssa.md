@@ -6619,3 +6619,34 @@ The materialiser handles ten expression kinds today. A width change, a flag, a
 memory read, a merge and a trapping division are deliberately outside it, and
 the set is stated in one place so the plan can be made to mark exactly what the
 renderer can take.
+
+**Where the rewriting layer belongs, decided by measurement.** Folding was built
+on the emitted C tree, and it worked: `gate_one` at x86-64 `-O0` went from
+seventeen statements to seven, every `tmp_*` chain gone, the flag folded into
+its `if`, and the effect ledger reporting nothing refused. Then the differential
+oracle reported twenty-one of fifty-four corpus cells computing the wrong
+answer.
+
+The cause is the layer, not the bugs. In SSA a value is written once and the
+version says so. In the emitted C the same value is a named local that is
+written again, so moving an expression down past a write to something it reads
+returns the new value instead of the old. Adding a span analysis -- what the
+value reads, whether it touches memory, whether anything between assigns to it,
+whether a call intervenes, whether a control edge is crossed -- took the wrong
+answers from twenty-one to six, and six is still six. That progression is the
+diagnosis: it is SSA's guarantees being rebuilt by inspection, and each addition
+recovers a little more of what SSA knew for free.
+
+So the one rewriting layer the user asked for belongs on the SSA side, where
+"written once" and "nothing redefined in between" are structural rather than
+inferred. `rules::inlinable_values` already computes exactly that correctly, and
+the attempt that used it failed only on the journal's contract -- which the user
+has since settled: a folded obligation's occurrence *moves with the expression*
+rather than being elided, and the journal is to accept an occurrence found at a
+site other than the statement that originally carried it.
+
+That makes the remaining work specific. Take the SSA-side rule, the
+materialiser that is already committed, and the seal category that accepts a
+computed inline; then change the journal so a moved marker discharges its
+obligation where it now sits. The AST experiment is not the thing to finish --
+it is the evidence for not finishing it.
