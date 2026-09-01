@@ -6515,3 +6515,28 @@ is the other. Both are protected by the corpus differential oracle, and both
 have to answer the ledger question the duplicated-tail work already answered
 once: one rendered expression discharging several source obligations is a fold,
 not a loss, and the accounting has to say so.
+
+**Component 5 is a binding-plan policy, not a rendering pass.** Folding
+`ZF_1 = (a - b) == 0; if (!ZF_1)` into `if (a != b)` looks like an expression
+rewrite, and `reconstruct_flag_conditions_in_function` already tries it, but the
+reason it cannot succeed is upstream: `binding_plan::construction` gives
+`ValueDisposition::Inline` only to values with `constant_bits()`. Every computed
+value is `Bound`, so it gets a local, so a flag or a temporary is a statement
+before it is ever an expression. That is why 93 per cent of rendered functions
+carry `tmp_*` chains and 58 per cent expose CPU flags as C.
+
+The change is to extend the inline disposition to a computed value that has
+exactly one use, whose defining operation is pure -- no memory access, no call,
+no trap -- and whose use cannot be reordered past a redefinition of anything it
+reads. The last part is the question `rules::set_outlives_a_redefinition`
+already asks for coalescing, and the answer belongs beside it: the rule goes in
+`binding_plan/rules.rs` so construction and seal both call it, which is the
+arrangement that exists precisely so a policy like this cannot drift between the
+two derivations.
+
+Two consequences to plan for. The obligation ledger counts one rendered
+occurrence per source effect, and an inlined value folds two statements into
+one, so the accounting has to accept a fold the way it now accepts a duplicated
+tail -- the machinery for saying "this is one execution, not a loss" is already
+there. And placement stops declaring a local that no longer exists, which is the
+path that is already exercised whenever a value is `Inline` today.
