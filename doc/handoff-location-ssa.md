@@ -6278,3 +6278,38 @@ and now parses them faithfully, so an external struct's signature may no longer
 match a local one that still carries the collapsed form. Confirming that means
 printing both signatures on either side of `structurally_compatible` for that
 test, which is where the next attempt should start.
+
+**What rendering a trap user-operation needs, mapped and not built.** Twelve of
+the sixteen refusing real functions on `/bin/ls` now stop at one place:
+`fold/op_lower/implementation.rs:2339` refuses `SSAOp::CallOther` outright. The
+two user-operations this binary uses are `SoftwareBreakpoint` and
+`UndefinedInstructionException`, both traps, and `sym.func.100003844` is the
+clearest case -- an arm64e signature check that ends `brk 0xc471` on the failing
+edge.
+
+The pieces exist and do not yet meet.
+
+`op_to_stmt_impl` is the right place to emit the statement, and
+`observed_input` beside it is how each operand gets accounted to the observation
+journal. `FoldContext::callee_declarations` already produces the `externs` on
+`CFunction`, so a declared `void __r2sleigh_brk(uint32_t)` can be emitted and the
+result still compiles standalone, which is what the corpus requires.
+
+What is missing is the user-operation's *name*. `SSAOp::CallOther` carries only
+`userop: u32`, and the index is arch-dependent, so matching on it would be
+exactly the kind of magic constant this project refuses. The name lives in
+`ArchSpec::user_ops`, which reaches `TrustedSsaArtifact` as a private field and
+stops there -- `SsaArtifact`, which is what `r2dec` is handed, does not carry it.
+Carrying the user-operation names onto the artifact is the first step and is
+bounded.
+
+Two further obligations have to be satisfied, and each is a proof the tree
+checks rather than a detail. The trap writes `pc`, which is Sleigh's way of
+saying control leaves for an exception handler, so that write needs a
+disposition -- most likely the block simply has no successor and the value is
+unobserved, but that has to be shown rather than assumed. And a call has
+effects, so the effect ledger has to account for the statement.
+
+This was mapped and deliberately not started: it is a three-layer change, and
+the two multi-layer conversions attempted late in the same session both had to
+be reverted whole. It is worth doing next, from a clean start, in that order.
