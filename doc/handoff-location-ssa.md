@@ -6428,3 +6428,28 @@ renderer has no form for it, so it refuses. Rendering one is
 
 This is the largest single cause in the deterministic gate and the next thing
 to take.
+
+**Rendering a composed return value: mapped, and larger than it looks.**
+Eighteen of the corpus gate's refusals stop at one line, and the evidence names
+the shape exactly -- `at_mismatch=false incomplete=false compositions=1
+values=0`. The boundary is complete; the returned value is assembled from a
+full-width base and ordered contained-slice writes over it. `gate_one` at
+x86-64 `-O1` is the case: `xor eax, eax` then `sete al`.
+
+The facts are all built. `SourceReturnRegisterCompositionFact` carries the base
+definition and the overlays in order, `validate` checks them against the graph,
+and `obligation.rs` already seeds the `ReturnValue` obligation with every value
+in the composition. Rendering one is `(base & !mask) | (overlay << shift)` per
+overlay, with the shift taken from `offset_bytes` on a little-endian target and
+refused otherwise, because `offset_bytes` is a physical register-space offset
+and its meaning as a shift depends on the specification's layout.
+
+What makes it big is a single-value assumption downstream.
+`ReturnValueCertificate` has one `value` field, `collect_return_value_certificates`
+skips any boundary with compositions outright, and that one value is threaded
+through the render plan's `ReturnValueRenderFact`, the binding plan, placement's
+`certificate.value == value`, and the observation journal's
+`symbol_for_value(certificate.value)`. Rendering a composition means making that
+field hold an ordered set in five places, which is the shape of change this
+document already records being reverted whole when attempted late in a session.
+Take it first, from a clean start, in that order.

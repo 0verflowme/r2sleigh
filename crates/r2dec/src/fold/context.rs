@@ -547,13 +547,36 @@ impl<'a> FoldingContext<'a> {
                     op_index: op_idx,
                 })
         });
-        let return_certified = source_site
-            .and_then(|(block_addr, op_idx)| {
-                self.inputs
-                    .render_facts()?
-                    .return_for_op(block_addr, op_idx)
-            })
-            .is_some_and(|fact| Some(fact.value) == value);
+        // A return is certified when the plan says which value it carries, and
+        // also when the source says it carries none.
+        //
+        // Only the first was asked, so a function returning nothing could not
+        // discharge its own `Return` obligation: no return-value fact exists for
+        // a void boundary, and none ever will. The obligation was scored
+        // unaccounted and the function refused for the one statement it had
+        // certainly rendered. A complete boundary with no values and no
+        // compositions is the source's own statement that the return carries
+        // nothing, which is exactly what `return;` renders.
+        let void_return = value.is_none()
+            && prepared
+                .facts()
+                .boundaries
+                .returns
+                .get(&source_inst)
+                .is_some_and(|boundary| {
+                    boundary.at == source_inst
+                        && boundary.complete
+                        && boundary.values.is_empty()
+                        && boundary.register_compositions.is_empty()
+                });
+        let return_certified = void_return
+            || source_site
+                .and_then(|(block_addr, op_idx)| {
+                    self.inputs
+                        .render_facts()?
+                        .return_for_op(block_addr, op_idx)
+                })
+                .is_some_and(|fact| Some(fact.value) == value);
         let rendered_call = call_fact.filter(|fact| {
             !matches!(
                 fact.disposition,
