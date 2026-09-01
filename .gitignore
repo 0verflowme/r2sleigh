@@ -52,3 +52,6 @@ r2plugin/arch_sleigh.o
 r2plugin/r_anal_sleigh_arch.o
 r2plugin/snapshot_wire.o
 r2plugin/snapshot_walk.o
+
+# Whole-binary coverage sweep artifacts (binaries, dumps, measured report)
+tests/coverage/artifacts/
