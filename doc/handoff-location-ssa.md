@@ -6746,3 +6746,25 @@ here -- which turns a fold into a hard generation failure rather than a decline
 to fold. The rule that marks a value inlinable should require those dispositions
 to be renderable, so the plan and the renderer agree before the tree is built,
 which is the same discipline that fixed the seal.
+
+**Folding now reaches forty-seven of fifty-four, and the three that are wrong
+are the ones this project has been wrong about before.** Marking a constant leaf
+of a moved expression -- it is rendered by the materialiser rather than as an
+operand of a statement, so nothing else marks it -- took the blocked cells from
+thirty-nine to five. Forty-seven compile, forty-six agree with the oracle, and
+three do not: `crc32_bitwise` on both architectures and `pearson` at x86-64.
+
+Those three are loop carriers, and they are the same functions
+`rules::values_read_together` and `rules::set_outlives_a_redefinition` were
+written for. The inlining rule's safety check is a weaker relative of both: it
+asks that nothing between the definition and the use writes a location the
+expression reads, which is exact within one pass through a block and says
+nothing about a value that is carried around a back edge. Extending the read set
+to every leaf of the rendered expression, rather than the defining
+instruction's own inputs, did not change the three -- so the hazard is the
+carrier, not the leaves.
+
+The next step is to ask the existing rules rather than to invent a third: a
+value whose definition and use straddle a carrier must not be inlined, and
+`set_outlives_a_redefinition` already knows how to phrase that question for a
+set of values. Ask it for the single value here.

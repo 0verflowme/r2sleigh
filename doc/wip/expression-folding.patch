@@ -54,7 +54,7 @@ index 4f1b43c..160f097 100644
      Refused(ValueRefusal),
  }
 diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
-index e2e96db..a9e32cf 100644
+index e2e96db..cca83e2 100644
 --- a/crates/r2dec/src/binding_plan/rules.rs
 +++ b/crates/r2dec/src/binding_plan/rules.rs
 @@ -39,6 +39,7 @@ pub(super) fn component_eligible_values(
@@ -73,7 +73,7 @@ index e2e96db..a9e32cf 100644
          })
          .collect())
  }
-@@ -210,3 +212,46 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
+@@ -210,3 +212,101 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
      }
      false
  }
@@ -95,14 +95,69 @@ index e2e96db..a9e32cf 100644
 +            .and_then(|root| projection.expr(*root))
 +            .is_some_and(|expr| expression_renders_inline(expr.kind()));
 +        if !renderable { continue }
-+        let Some(def_inst) = graph.def_inst(value.id).and_then(|i| graph.inst(i)) else { continue };
++        let Some(definition) = graph.def_inst(value.id) else { continue };
++        // The renderer will ask the plan for a write observation on the
++        // definition and a use observation on each of its operands, and either
++        // can answer refused for something never meant to be rendered here.
++        // Asking now is the difference between declining to fold and failing to
++        // generate: plan and renderer agree before the tree exists.
++        if !matches!(
++            projection.write_disposition(definition),
++            Some(r2ssa::MachineWriteDisposition::Exact(_))
++        ) {
++            continue;
++        }
++        let Some(def_inst) = graph.inst(definition) else { continue };
++        if !(0..def_inst.inputs.len()).all(|input_idx| {
++            matches!(
++                projection.use_disposition(r2ssa::UseSite {
++                    inst: definition,
++                    input_idx,
++                }),
++                Some(
++                    r2ssa::MachineUseDisposition::Exact(_)
++                        | r2ssa::MachineUseDisposition::MemoryAddress(_)
++                )
++            )
++        }) {
++            continue;
++        }
 +        let Some(use_inst) = graph.inst(use_site.inst) else { continue };
 +        if def_inst.block != use_inst.block || def_inst.ordinal >= use_inst.ordinal { continue }
-+        let read_locations = def_inst.inputs.iter()
-+            .filter_map(|i| graph.value(*i))
-+            .filter_map(|v| v.canonical_storage)
-+            .map(r2ssa::CanonicalStorageId::location)
-+            .collect::<BTreeSet<_>>();
++        // Every location the *rendered* expression reads, not only the ones the
++        // defining instruction lists. A machine expression is a tree over the
++        // arena, so moving it moves every leaf in it, and a leaf can name a
++        // location the instruction itself never mentions. Checking only the
++        // instruction's inputs let three corpus cells compute the wrong answer.
++        let mut read_locations = BTreeSet::new();
++        let mut pending = vec![*expr_by_value.get(&value.id).expect("checked above")];
++        let mut seen = BTreeSet::new();
++        while let Some(node) = pending.pop() {
++            if !seen.insert(node) {
++                continue;
++            }
++            let Some(expr) = projection.expr(node) else {
++                continue;
++            };
++            if let r2ssa::MachineExprKind::Source { binding, storage } = expr.kind() {
++                if let Some(storage) = storage {
++                    read_locations.insert(storage.location());
++                } else if let Some(storage) =
++                    graph.value(binding.value()).and_then(|v| v.canonical_storage)
++                {
++                    read_locations.insert(storage.location());
++                }
++            }
++            pending.extend(expr.kind().children());
++        }
++        read_locations.extend(
++            def_inst
++                .inputs
++                .iter()
++                .filter_map(|i| graph.value(*i))
++                .filter_map(|v| v.canonical_storage)
++                .map(r2ssa::CanonicalStorageId::location),
++        );
 +        let rewritten = graph.insts.iter().any(|inst| {
 +            inst.block == def_inst.block && inst.ordinal > def_inst.ordinal
 +                && inst.ordinal < use_inst.ordinal
@@ -289,10 +344,37 @@ index edd7b04..cfd99a4 100644
              Ok(marked) => marked,
              Err(error) => {
 diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
-index 45c95ae..4b6fa80 100644
+index 45c95ae..205061e 100644
 --- a/crates/r2dec/src/fold/op_lower/lowering.rs
 +++ b/crates/r2dec/src/fold/op_lower/lowering.rs
-@@ -277,7 +277,56 @@ impl<'a> FoldingContext<'a> {
+@@ -264,12 +264,24 @@ impl<'a> FoldingContext<'a> {
+         let child =
+             |id: r2ssa::MachineExprId| self.materialize_machine_expr(names, value, id, depth + 1);
+         Ok(match machine_expr.kind() {
+-            Kind::Constant { value: literal, .. } => {
++            Kind::Constant {
++                binding,
++                value: literal,
++            } => {
+                 let bits = literal.bits();
+-                if bits > i64::MAX as u64 {
++                let rendered = if bits > i64::MAX as u64 {
+                     CExpr::UIntLit(bits)
+                 } else {
+                     CExpr::IntLit(bits as i64)
++                };
++                // Every value owes a cell, and a constant reached as a leaf of
++                // a moved expression is rendered here rather than as an operand
++                // of an emitted statement, so this is where it is marked.
++                let constant = binding.value();
++                if constant == value {
++                    rendered
++                } else {
++                    self.observe_inlined_value_expr(constant, rendered)
+                 }
+             }
+             Kind::Source { binding, .. } => {
+@@ -277,7 +289,56 @@ impl<'a> FoldingContext<'a> {
                  if source == value {
                      return Err(invalid());
                  }
@@ -350,17 +432,19 @@ index 45c95ae..4b6fa80 100644
              }
              Kind::Copy { input } => child(*input)?,
              Kind::Arithmetic {
-@@ -391,7 +440,23 @@ impl<'a> FoldingContext<'a> {
+@@ -391,7 +452,25 @@ impl<'a> FoldingContext<'a> {
                          },
                      );
                  }
 -                self.materialize_machine_expr(names, value, expr, 0)
 +                let rendered = self.materialize_machine_expr(names, value, expr, 0)?;
++                // A constant has no defining instruction and owes no write or
++                // operand cells, but it still owes its own.
 +                let Some(definition) = self
 +                    .prepared_ssa()
 +                    .and_then(|prepared| prepared.graph().def_inst(value))
 +                else {
-+                    return Ok(rendered);
++                    return Ok(self.observe_inlined_value_expr(value, rendered));
 +                };
 +                let marked = self.observe_inlined_definition_expr(value, definition, rendered);
 +                // The effects the definition answered for move with it. Nothing
@@ -731,3 +815,17 @@ index 776de09..d64e6bf 100644
      UpstreamValueElision {
          value: ValueId,
      },
+diff --git a/crates/r2ssa/src/machine.rs b/crates/r2ssa/src/machine.rs
+index 3241fad..c87446a 100644
+--- a/crates/r2ssa/src/machine.rs
++++ b/crates/r2ssa/src/machine.rs
+@@ -818,7 +818,8 @@ pub enum MachineExprKind {
+ }
+ 
+ impl MachineExprKind {
+-    fn children(&self) -> Vec<MachineExprId> {
++    /// The expressions this one is built from.
++    pub fn children(&self) -> Vec<MachineExprId> {
+         match self {
+             Self::Source { .. } | Self::Constant { .. } => Vec::new(),
+             Self::MemoryRead { address, .. } => vec![*address],
