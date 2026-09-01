@@ -2396,40 +2396,48 @@ addresses into it, and the diagnostic column compiles with warnings off after a
 repair pass. So the score does not say those cells emit self-contained,
 independently compilable C. The corpus is a canary, not a specification.
 
-**Real-world coverage: about two functions in three, once the count is honest.**
-The earlier figure here said one in ten and was wrong, because it counted every
-entry radare2 lists as a function. On `/bin/ls`, 90 of the 136 are sixteen-byte
-import thunks in `__TEXT.__auth_stubs` -- `adrp`/`add`/`ldr`/`braa` and nothing
-else. Of the 46 real functions, 30 render.
+**Real-world coverage: twenty-two of forty-eight real functions.** The earlier
+figure here said one in ten and was wrong, because it counted every entry
+radare2 lists as a function. On `/bin/ls`, 88 of the 136 are sixteen-byte import
+thunks in `__TEXT.__auth_stubs` -- `adrp`/`add`/`ldr`/`braa` and nothing else.
+Of the 48 real functions, 22 render.
 
 Measured by grouping the refusals by their typed cause rather than their
 message:
 
 | count | population | refusal |
 |-------|------------|---------|
-| 85 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
-| 6 | import stubs | unrepresentable control flow |
-| 1 | import stub | missing machine projection: op lowering |
-| 7 | real functions | missing machine projection: op lowering |
-| 5 | real functions | observation journal: `RenderedValueRequired` |
-| 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 88 | import thunks | indirect branch out of the function |
+| 7 | real functions | effect obligations refused |
+| 4 | real functions | placement: `unobserved_binding_write` |
+| 3 | real functions | missing machine projection: op lowering |
+| 3 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 2 | real functions | placement: `preserved_carrier_read_before_assignment` |
+| 2 | real functions | semantic fallback: worker slice in compiled mode |
+| 1 | real function | placement: `read_before_assignment` |
+| 1 | real function | observation journal: `RenderedValueRequired` |
 | 1 | real function | observation journal: `ConflictingUse` |
+| 1 | real function | unrepresentable control flow |
 | 1 | real function (`main`) | unrepresentable operation |
 
-**An indirect branch through `pc` is now the dominant cause by a wide margin.**
-It accounts for the 85 import thunks and, after the trap work below, five real
-functions as well -- ninety of the hundred and six refusals in the binary. A
-`braa`, a tail branch into a stub, and a jump table all arrive as
-`SSAOp::BranchInd` reading a `pc` nothing defines, and no part of the renderer
-has a shape for it. It is the next thing to take.
+**The eighty-eight import thunks are one cause and low value.** Every one is
+`braa x16, x17` after loading `x16` from `__auth_got`, which Sleigh writes as
+`AuthIA(x16, x17); pc = x16; goto [pc]`. The branch leaves the function through a
+value the machine cannot evaluate, and the renderer has no shape for that. The
+honest C form is a tail call, but claiming it requires proving the target is not
+one of this function's own blocks -- an unresolved jump table arrives in exactly
+the same shape -- and radare2's resolution is advisory, not machine evidence.
+The output would also be a thunk calling the symbol radare2 has already named
+the thunk after, which is why this is recorded as the largest count and not as
+the highest leverage.
 
-The trap user-operations are done. `SoftwareBreakpoint` and
-`UndefinedInstructionException` were the only two `/bin/ls` uses, both writing
-`pc` because that is how Sleigh says control leaves for an exception handler.
-The pipeline already had `R2ILOp::Breakpoint` and `SSAOp::Breakpoint`, seeded as
-`Kind::Trap` by the obligation ledger and emitted by nothing; the lift now
-expands into it and `r2dec` renders `__builtin_trap()`. Six functions moved off
-that cause and onto the `BranchInd` one.
+The trap user-operations are done, and so is the branch they left behind.
+`SoftwareBreakpoint` and `UndefinedInstructionException` were the only two
+`/bin/ls` uses, both writing `pc` because that is how Sleigh says control leaves
+for an exception handler. `R2ILOp::Breakpoint` produces nothing, so the branch
+Sleigh writes after the trap was reading a `pc` no operation defined; a trap now
+ends the instruction it traps in and the block it ends, and `__builtin_trap()`
+answers the trap obligation it takes.
 
 **Performance is not a constraint.** Radare2's own analysis dominates
 end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
@@ -2449,12 +2457,11 @@ Roadmap to Completion
 
 In order, highest leverage first.
 
-1. **Render an indirect branch through `pc`.** Ninety of the hundred and six
-   refusals in `/bin/ls` are `SSAOp::BranchInd` reading a `pc` nothing defines:
-   every import thunk, and five real functions that tail-branch into one. A tail
-   call, a stub jump and a jump table all arrive this way and none of them has a
-   rendered shape. The trap user-operations that used to head this list are
-   done.
+1. **Close out the real-function refusals.** Twenty-six of the forty-eight real
+   functions in `/bin/ls` still refuse, and no single cause accounts for more
+   than seven. The largest is the effect ledger, then declaration placement's
+   `unobserved_binding_write`. Each is a small number of functions, which is
+   what the list looks like once the thunks are counted separately.
 
 2. **Retire the register-role tables.** The program counter is read from the
    processor specification now. mnemonikr/sleigh-config#8 exposes the compiler

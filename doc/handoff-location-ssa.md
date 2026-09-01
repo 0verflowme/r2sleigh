@@ -6313,3 +6313,39 @@ effects, so the effect ledger has to account for the statement.
 This was mapped and deliberately not started: it is a three-layer change, and
 the two multi-layer conversions attempted late in the same session both had to
 be reverted whole. It is worth doing next, from a clean start, in that order.
+
+**Where the /bin/ls refusals actually are, after the trap and duplication
+work.** The headline count is 114, and 88 of those are the sixteen-byte import
+thunks in `__TEXT.__auth_stubs`. Of the 48 real functions, 22 render. The
+ROADMAP's coverage table carries the per-cause breakdown; what matters for the
+next session is that no single remaining real-function cause accounts for more
+than seven functions, so the work from here is a series of small, separately
+traceable fixes rather than one large one.
+
+**The import thunks are one cause, and the reason they are not taken is
+recorded rather than forgotten.** Each is `braa x16, x17` after loading `x16`
+from `__auth_got`. Sleigh writes that as `AuthIA(x16, x17); pc = x16;
+goto [pc]`, so `pc` is properly defined -- the refusal is not an undefined read
+but `ExactUseRequiresRenderedOccurrence`: nothing in the renderer has a shape
+for a branch through a value, so the value the branch reads is never rendered.
+The honest C is a tail call. Claiming it needs a proof that the target is not
+one of this function's own blocks, because an unresolved jump table arrives in
+exactly the same shape, and radare2's own resolution is advisory. Two candidate
+proofs were considered and neither taken: a single-block function has nowhere
+inside itself to jump to, which is exact for these thunks but not a general
+rule; and the `__auth_got` slot carries a relocation naming the imported symbol,
+which is real evidence but yields a thunk that calls the symbol radare2 has
+already named the thunk after. The value of rendering them is low either way,
+which is why the count is large and the priority is not.
+
+**Diagnostics that paid for themselves and are worth reaching for again.** Two
+temporary probes found both defects fixed in this stretch faster than reading
+would have. Printing every `PcodeOp::BranchIndirect` the lift produced, with the
+instruction address, showed that Sleigh emits 97 of them on `/bin/ls` and that
+84 are `braa`, 9 are `brk` and one is a jump table -- which is what separated
+the trap cause from the tail-call cause. Note that `crates/r2sleigh-lift/src/
+pcode.rs` is *not* the live translation path; `translate_pcode_op` in
+`disasm.rs` is, and a probe placed in the former never fires. Printing the three
+components of an incomplete return boundary showed all four of its functions
+failing on `values=0` against `slots=1`, which led straight to the liveout walk
+reading past a call.
