@@ -6453,3 +6453,65 @@ through the render plan's `ReturnValueRenderFact`, the binding plan, placement's
 field hold an ordered set in five places, which is the shape of change this
 document already records being reverted whole when attempted late in a session.
 Take it first, from a clean start, in that order.
+
+Implementing the five components: where each one hooks in
+---------------------------------------------------------
+
+Written after the dropped-call defect was fixed, with the hook points found
+rather than guessed. The decisions these obey are recorded in
+`doc/decbench-plan.md` and were taken by the user directly: radare2's analysis
+is load-bearing provided the proof line marks what came from it, a type may be
+asserted from use evidence with a conflict refusing that value alone, an
+unknown-signature call takes its arity from the convention's live argument
+registers, and aggregate recovery goes all the way in the first pass.
+
+**Component 1, the call-boundary model -- done for the dropped calls.** All 26
+calls in `bzip2recover` at `-O0` now render, format strings included. What
+remains of this component is the arity rule for a callee no prototype describes:
+`prepared_call_max_arity` returns `None` for a variadic callee and
+`canonical_call_authoritative_args` then takes every argument the facts supply,
+which is right; a callee with *no* signature reaches the same path with no facts
+at all. The live-argument-register rule belongs there.
+
+**Component 2, the data reader -- half done.** String literals already work end
+to end and render inline: `OwnedFunctionImage::string_literals` is filled from
+radare2's snapshot API in `snapshot_walk.c`, crosses the wire in
+`snapshot_wire.c`/`snapshot_wire.rs`, and reaches the renderer through
+`DisplayNames::insert_string`. Named globals do not, so `progName` still renders
+as `0x6000` and `stderr` as `*(uint64_t*)0x5020`.
+
+The channel to build is a mirror of the string one, and every piece of it
+already exists except the payload:
+
+* a data-symbol view on radare2's function snapshot, beside
+  `r_anal_function_snapshot_string_literal_view` -- this is in our radare2 fork
+  and is Sleigh-specific plumbing rather than a correctness fix, so it does not
+  need its own upstream pull request;
+* `walk_symbols` in `snapshot_walk.c`, beside the string-literal loop;
+* a `data_symbols: Box<[(u64, String)]>` field on `OwnedFunctionImage`, with the
+  wire's version bumped;
+* `DisplayNames::insert_symbol`, which already exists and is never called;
+* in the renderer, a constant that names a known data address renders as that
+  symbol rather than as its address.
+
+Provenance is the new part: the proof line has to say the name came from
+radare2. Nothing in the tree marks a fact's origin yet, so this component builds
+that machinery and the three after it use it.
+
+**Components 3 and 4, types and stack locals.** `recover_interface` mints the
+interface and is where signedness, pointer-ness and width belong; `r2types` is
+where a value's type is carried. The evidence rules are the ones the user
+settled: a value used as a load address is a pointer, a signed comparison proves
+signedness, an access width proves the width, a strided access off one base
+proves an array, and consistent offset access off one base proves a struct. A
+conflict refuses that value's type and leaves today's default, per value rather
+than per function. `stack_m16` becoming a named typed local is the same work
+seen from the frame's side, and DecBench weighs it directly -- the ground truth
+for `bzip2recover` has 39 stack variables and we align none.
+
+**Component 5, expression folding.** `ZF_1 = (a - b) == 0; if (!ZF_1)` folding to
+`if (a != b)` is the flag case, and the unoptimised spill-and-reload round trip
+is the other. Both are protected by the corpus differential oracle, and both
+have to answer the ledger question the duplicated-tail work already answered
+once: one rendered expression discharging several source obligations is a fold,
+not a loss, and the accounting has to say so.
