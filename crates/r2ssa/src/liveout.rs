@@ -93,6 +93,7 @@ impl FunctionLiveOut {
         from: u64,
     ) -> bool {
         let mut found = false;
+        let mut clobbered_any = false;
         let mut seen = BTreeSet::new();
         let mut pending = std::collections::VecDeque::from([from]);
         while let Some(addr) = pending.pop_front() {
@@ -103,6 +104,9 @@ impl FunctionLiveOut {
                 continue;
             };
             let mut defined_here = false;
+            // Whether a call on this path leaves the return register holding a
+            // value this function never defines.
+            let mut clobbered = false;
             // The last write to the *location* wins, and one write need not be
             // the whole value. `xor eax, eax` followed by `sete al` leaves the
             // returned `RAX` composed of a full-width zero and a one-byte
@@ -111,6 +115,23 @@ impl FunctionLiveOut {
             // nothing. Walking back until the location is covered names every
             // definition the caller actually reads.
             for op in block.ops.iter().rev() {
+                // A call owns the result register. The convention names the
+                // same register for a callee's result and for this function's,
+                // so any call reached walking backwards has overwritten what
+                // came before it, and a definition earlier in the block is not
+                // what the caller reads. Walking past one named the last thing
+                // put in the register before the call -- for a function whose
+                // final act is `warnx(fmt, ...)`, the format string -- as the
+                // value returned. The operation that names a call's result
+                // writes the register itself and is seen first, so a callee
+                // that does return a value still resolves here.
+                if matches!(
+                    op,
+                    crate::op::SSAOp::Call { .. } | crate::op::SSAOp::CallInd { .. }
+                ) {
+                    clobbered = true;
+                    break;
+                }
                 let Some(dst) = op.dst() else {
                     continue;
                 };
@@ -152,6 +173,13 @@ impl FunctionLiveOut {
                     found |= self.values.insert(value);
                 }
             }
+            if clobbered {
+                // The path answers with the callee's value, which is not one of
+                // this function's. Its predecessors cannot answer either: they
+                // run before the call.
+                clobbered_any = true;
+                continue;
+            }
             if defined_here {
                 continue;
             }
@@ -159,7 +187,7 @@ impl FunctionLiveOut {
                 pending.push_back(predecessor);
             }
         }
-        found
+        found && !clobbered_any
     }
 
     /// Whether the caller reads this value once the function returns.
@@ -232,6 +260,41 @@ mod tests {
             ..R2ILBlock::default()
         };
         SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa")
+    }
+
+    #[test]
+    fn a_value_put_in_the_return_register_before_a_call_does_not_leave_the_function() {
+        // `rax = 7; call rcx; ret` -- the callee owns `rax` when it returns, so
+        // the seven is not what this function hands back, and nothing in the
+        // function names what does.
+        let block = R2ILBlock {
+            addr: 0x1000,
+            size: 4,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: reg(0, 8),
+                    src: Varnode::constant(7, 8),
+                },
+                R2ILOp::CallInd { target: reg(8, 8) },
+                R2ILOp::Return {
+                    target: reg(0x288, 8),
+                },
+            ],
+            ..R2ILBlock::default()
+        };
+        let func = SSAFunction::from_blocks_with_arch(&[block], Some(&x86_64_arch())).expect("ssa");
+        let graph = SsaGraph::from_function(&func);
+        let live = FunctionLiveOut::compute(
+            &func,
+            &graph,
+            &[CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: 0,
+                size: 8,
+            }],
+        );
+        assert!(live.is_empty(), "{live:?}");
+        assert_eq!(live.unresolved_blocks().collect::<Vec<_>>(), vec![0x1000]);
     }
 
     #[test]
