@@ -6349,3 +6349,37 @@ pcode.rs` is *not* the live translation path; `translate_pcode_op` in
 components of an incomplete return boundary showed all four of its functions
 failing on `values=0` against `slots=1`, which led straight to the liveout walk
 reading past a call.
+
+**Three real-function refusals traced but not fixed.** Each is a separate
+defect with a diagnosis good enough to act on directly.
+
+*A call argument the function only passes through can never be discharged.*
+Four functions on `/bin/ls` -- `fcn_100003110` is the smallest, thirty-two bytes
+that call one function and return one -- refuse with a `CallArgument` obligation
+scored `BlockNotRendered`. The cause is a seam. `obligation.rs` seeds a
+`CallArgument` obligation for a `SourceCallArgumentValue::PreservedEntry`
+argument with an empty input list, and says why: the function never defines the
+carrier, so no SSA value is named for it, but the call reads it either way. The
+occurrence classifier in `fold/context.rs` requires `!obligation.inputs.
+is_empty()` and that every input appear in the rendered call's `proof_values`, so
+an obligation with no inputs cannot be satisfied by any rendering. The
+certificate carries no argument either, so the call renders as
+`sym_func_1000038c0()` with the argument dropped. The honest C passes the
+function's own parameter, which means the parameter has to exist: interface
+recovery derives parameters from entry *reads*, and a carrier that is only
+passed on is never read. Fixing this properly spans `recover_interface` (a slot
+a call passes through as `PreservedEntry` is a parameter), the call-argument
+rendering (which is keyed by `ValueId` and has none here), and the classifier.
+
+*A stack write with no stack observation.* `fcn_1000040d8` and `fcn_100004080`
+refuse in placement with `unobserved_binding_write` on a binding named
+`stack_m40` that owns no values. The audit finds the symbol written in the tree
+with no `StackAccess` observation active on that statement -- the observations
+present are one `Write` naming a different binding and several `Other`. The next
+step is to find where the assignment to a stack object is emitted without
+recording its `StackAccess` target.
+
+*A conflicting value behind the placement refusal.* Suppressing the
+`unobserved_binding_write` refusal on `fcn_1000040d8` does not render it; the
+seal then refuses with `ConflictingValue`, so there is a second finding behind
+the first and both belong to the same investigation.
