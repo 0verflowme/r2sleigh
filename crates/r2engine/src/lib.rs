@@ -4097,7 +4097,7 @@ impl EngineSession {
             );
             return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
-                reason,
+                &reason,
                 input_quality,
                 metrics,
                 diagnostics,
@@ -4697,34 +4697,54 @@ fn placement_refusal_reason(audit: PlacementAudit) -> Option<String> {
     }
 }
 
-fn render_refusal_reason(refusal: DecompileRenderRefusal) -> &'static str {
+/// The name of an enum variant, taken from its `Debug` form.
+///
+/// The refusal causes are typed and precise; what reached the reader was the
+/// name of the *outer* variant alone, so sixty distinct journal failures all
+/// printed as "observation journal" and could not be counted apart. The payload
+/// already knows which one it is.
+fn refusal_variant_name(debug: &str) -> String {
+    debug
+        .split(['(', '{', ' '])
+        .next()
+        .unwrap_or(debug)
+        .to_string()
+}
+
+fn render_refusal_reason(refusal: DecompileRenderRefusal) -> String {
     match refusal {
         DecompileRenderRefusal::MissingMachineProjectionAuthorization => {
-            "native rendering refused: missing machine projection authorization"
+            "native rendering refused: missing machine projection authorization".to_string()
         }
         DecompileRenderRefusal::MissingProgramVariableAuthorization => {
-            "native rendering refused: missing program-variable authorization"
+            "native rendering refused: missing program-variable authorization".to_string()
         }
-        DecompileRenderRefusal::ObservationJournal(_) => {
-            "native rendering refused: observation journal"
+        DecompileRenderRefusal::ObservationJournal(failure) => {
+            format!(
+                "native rendering refused: observation journal: {}",
+                refusal_variant_name(&format!("{failure:?}"))
+            )
         }
-        DecompileRenderRefusal::DeclarationPlacement(_) => {
-            "native rendering refused: declaration placement"
+        DecompileRenderRefusal::DeclarationPlacement(refusal) => {
+            format!(
+                "native rendering refused: declaration placement: {}",
+                refusal_variant_name(&format!("{refusal:?}"))
+            )
         }
         DecompileRenderRefusal::RefusedBindingDisposition { .. } => {
-            "native rendering refused: refused binding disposition"
+            "native rendering refused: refused binding disposition".to_string()
         }
         DecompileRenderRefusal::NormalizationOriginUnavailable => {
-            "native rendering refused: normalization origin unavailable"
+            "native rendering refused: normalization origin unavailable".to_string()
         }
         DecompileRenderRefusal::UnrepresentableControlFlow => {
-            "native rendering refused: unrepresentable control flow"
+            "native rendering refused: unrepresentable control flow".to_string()
         }
         DecompileRenderRefusal::IncompleteEffectInventory => {
-            "native rendering refused: incomplete effect inventory"
+            "native rendering refused: incomplete effect inventory".to_string()
         }
         DecompileRenderRefusal::UnrepresentableOperation => {
-            "native rendering refused: unrepresentable operation"
+            "native rendering refused: unrepresentable operation".to_string()
         }
     }
 }
@@ -8293,7 +8313,7 @@ mod tests {
                 .diagnostics
                 .refusal
                 .as_deref()
-                .is_some_and(|value| value.contains(&reason))
+                .is_some_and(|value| value.contains(reason.as_str()))
         );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(effect_obligation_refusal_reason(EffectObligationAudit::NOT_RUN).is_none());
@@ -8380,7 +8400,7 @@ mod tests {
         );
         let response = refused_decompile_response_with_metrics_and_audits(
             "sym.render_refusal",
-            reason,
+            &reason,
             None,
             metrics,
             EngineDiagnostics::default(),
@@ -8397,13 +8417,16 @@ mod tests {
             response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
             EnginePhaseStatus::Refused
         );
-        assert_eq!(response.diagnostics.route_reason.as_deref(), Some(reason));
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
         assert!(
             response
                 .diagnostics
                 .refusal
                 .as_deref()
-                .is_some_and(|value| value.contains(reason))
+                .is_some_and(|value| value.contains(reason.as_str()))
         );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(!response.output.contains("() {"));

@@ -2396,27 +2396,38 @@ addresses into it, and the diagnostic column compiles with warnings off after a
 repair pass. So the score does not say those cells emit self-contained,
 independently compilable C. The corpus is a canary, not a specification.
 
-**Real-world coverage: about one function in ten.** On `/bin/ls`, 122 of 136
-functions fall back to the legacy path. Every one of those is an honest refusal
-rather than wrong output, which is the design working -- but the certifying
-approach is currently paying for its guarantees with a great deal of silence,
-and that gap, not the corpus, is the honest measure of where the project stands.
+**Real-world coverage: about two functions in three, once the count is honest.**
+The earlier figure here said one in ten and was wrong, because it counted every
+entry radare2 lists as a function. On `/bin/ls`, 90 of the 136 are sixteen-byte
+import thunks in `__TEXT.__auth_stubs` -- `adrp`/`add`/`ldr`/`braa` and nothing
+else. Of the 46 real functions, 30 render.
 
-Why they refuse, measured:
+Measured by grouping the refusals by their typed cause rather than their
+message:
 
-| count | refusal |
-|-------|---------|
-| 86 | observation journal |
-| 13 | missing machine projection authorization |
-| 6 | unrepresentable control flow |
-| 5 | unprovable execution order |
-| 5 | effect obligations refused |
-| 4 | declaration placement, various |
+| count | population | refusal |
+|-------|------------|---------|
+| 83 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 6 | import stubs | unrepresentable control flow |
+| 1 | import stubs | missing machine projection authorization |
+| 12 | real functions | missing machine projection authorization |
+| 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 1 | real function | observation journal: `ConflictingUse` |
+| 1 | real function (`main`) | unrepresentable operation |
 
-Eighty-six of a hundred and twenty-two share one cause. On the corpus, refusals
-that looked like many defects repeatedly collapsed into one or two once traced,
-so the first question is how few distinct causes those eighty-six are. That is
-the single highest-leverage measurement available right now.
+The eighty-six collapsed, as the corpus said they would, and further than
+expected: 85 of 86 are one variant, and 84 of those are one operation --
+`SSAOp::BranchInd` through `pc`, the indirect branch every one of those stubs
+ends in. The use has an exact disposition and the renderer emits no node for it,
+so the seal refuses. That is one defect standing in front of 83 thunks, not
+eighty-six defects.
+
+It is also not the thing to fix first. The stubs are `sym.imp.*` entries whose
+whole body is a jump into the binding table; rendering them yields nothing a
+reader wants. The real blocker is the next row down: **12 of the 16 refusing
+real functions fail on missing machine projection authorization**, and that is
+where the remaining coverage is. `main` alone refuses on an unrepresentable
+operation.
 
 **Performance is not a constraint.** Radare2's own analysis dominates
 end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
@@ -2436,10 +2447,11 @@ Roadmap to Completion
 
 In order, highest leverage first.
 
-1. **Take the eighty-six.** Group the observation-journal refusals on `/bin/ls`
-   by their underlying cause rather than their message. The corpus taught that
-   these collapse; until that grouping exists, every other coverage estimate is
-   guesswork.
+1. **Take the twelve.** Group the `missing machine projection authorization`
+   refusals across the 16 refusing real functions on `/bin/ls` -- twelve of them
+   share that cause, and it is now the largest blocker on anything a reader
+   would want to read. The eighty-six that used to head this list have been
+   taken: they were 83 import thunks and one defect, recorded above.
 
 2. **Retire the register-role tables.** The program counter is read from the
    processor specification now. mnemonikr/sleigh-config#8 exposes the compiler
