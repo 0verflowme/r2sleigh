@@ -6679,3 +6679,36 @@ own structure rather than through the SSA instruction.
 
 Nothing from any of this is in the tree. The materialiser is committed and
 inert; everything else was reverted, and every gate is green.
+
+**Expression folding: eleven blockers cleared, the patch kept, the count still
+open.** The work is saved as `doc/wip/expression-folding.patch` rather than
+described, because describing it has twice proved less useful than the diff.
+Apply it to resume; every gate is green without it.
+
+What it contains, in the order the blockers fell. The shared rule marks values
+with one use, a movable definition and nothing rewritten in between. Component
+eligibility excludes them, so a binding component no longer overwrites the
+disposition. The seal derives the same rule itself and accepts a computed inline
+beside a literal one, which needed an `InlineExpression` category carried through
+the shadow report. The materialiser renders ten expression kinds and recurses
+into the plan at a `Source` leaf.
+
+Then the part that is genuinely new, and is the decided model made concrete. A
+read inside a moved expression has no use to authorise it, because the use
+belongs to a statement that is no longer emitted. Three attempts to reuse the
+existing machinery failed for instructive reasons: the normalized-input path
+marks by projection index and the leaves of a machine expression do not stand
+one-to-one against SSA inputs; the certified-value-read path requires a boundary
+read and this is not one; and the emitting block cannot be read from ambient
+state because the materialiser is reached from callers that carry none -- it
+comes from the value's own definition, which the inlining rule guarantees sits
+in the same block. What works is a new observation target, `InlinedValueRead`,
+carrying the value, its binding, its symbol and the block, mapped to a placement
+target that authorises a read of that binding. With it, declaration placement
+passes, which had been the wall since the first attempt.
+
+What remains is the seal and the journal. One function refuses with
+`RenderedValueRequired` from the journal rather than the plan, and another with
+`Seal(CertificateMembership)`, so there is more than one failure left rather
+than a single last step. That is the honest state: the wall is behind, the
+number of remaining layers is not known.
