@@ -3048,6 +3048,7 @@ pub enum MachineProjectionRefusalOrigin {
     RenderedIdentityMissingUseDisposition,
     RenderedIdentityMissingWriteDisposition,
     RenderedIdentityMissingLiteralProjection,
+    RenderedIdentityUnmodelledUserOperation,
     RenderedIdentityIncoherentUseProjection,
     RenderedIdentityIncoherentWriteProjection,
     BindingPlanBuild,
@@ -3205,6 +3206,12 @@ fn rendered_identity_refusal_category(
             ..
         } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
             Origin::RenderedIdentityMissingLiteralProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::UnmodelledUserOperation { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityUnmodelledUserOperation,
         ),
         RenderedIdentityRefusal::Value {
             reason: ValueRefusal::IncoherentUseProjection { .. },

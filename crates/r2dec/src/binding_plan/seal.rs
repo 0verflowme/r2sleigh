@@ -519,8 +519,27 @@ pub(crate) fn build_upstream_shadow_oracle(
                                 .collect::<String>()),
                     );
                 }
-                UpstreamValueDisposition::Refused(ValueRefusal::MissingLiteralProjection {
-                    value: graph_value.id,
+                // Classified exactly as `construction` classifies it: the two
+                // derivations are compared, so a reason computed on one side
+                // only is a disagreement rather than a better message.
+                let unmodelled_userop = graph
+                    .use_sites(graph_value.id)
+                    .iter()
+                    .filter_map(|site| graph.inst(site.inst))
+                    .find_map(|inst| match &inst.payload {
+                        r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther { userop, .. }) => {
+                            Some(*userop)
+                        }
+                        _ => None,
+                    });
+                UpstreamValueDisposition::Refused(match unmodelled_userop {
+                    Some(userop) => ValueRefusal::UnmodelledUserOperation {
+                        value: graph_value.id,
+                        userop,
+                    },
+                    None => ValueRefusal::MissingLiteralProjection {
+                        value: graph_value.id,
+                    },
                 })
             }
         });
@@ -650,8 +669,13 @@ impl BindingPlan {
                         ));
                     }
                 }
+                // Both reasons describe a constant the arena does not hold, and
+                // the seal's question is the same for either: is this value a
+                // constant, and is the refusal about this value.
                 ValueDisposition::Refused {
-                    reason: ValueRefusal::MissingLiteralProjection { value: refused },
+                    reason:
+                        ValueRefusal::MissingLiteralProjection { value: refused }
+                        | ValueRefusal::UnmodelledUserOperation { value: refused, .. },
                 } if *refused == value && graph_value.var.constant_bits().is_some() => {}
                 ValueDisposition::Refused { .. }
                     if graph_value.var.constant_bits().is_none()

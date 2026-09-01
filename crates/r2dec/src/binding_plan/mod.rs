@@ -120,11 +120,36 @@ pub(crate) struct ValueElisionProof {
 /// Typed reason that a value cannot be represented honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueRefusal {
-    MissingBindingCertificate { value: ValueId },
-    MissingLiteralProjection { value: ValueId },
-    IncoherentUseProjection { site: UseSite },
-    IncoherentWriteProjection { value: ValueId },
-    UnsupportedDeclarationWidth { value: ValueId, width_bits: u32 },
+    MissingBindingCertificate {
+        value: ValueId,
+    },
+    MissingLiteralProjection {
+        value: ValueId,
+    },
+    /// A value read only by a Sleigh user-operation this renderer does not
+    /// model.
+    ///
+    /// Separate from `MissingLiteralProjection` because it is not the same
+    /// finding. A missing literal projection says the machine arena lost a
+    /// constant it should hold; this says the constant is an operand of a
+    /// `callother` -- an `brk` immediate, an arm64e pointer-authentication
+    /// operand -- that nothing downstream can render. Refusing is right in both
+    /// cases, and reporting them as one made six functions on `/bin/ls` look
+    /// like a projection defect when what they need is `callother` support.
+    UnmodelledUserOperation {
+        value: ValueId,
+        userop: u32,
+    },
+    IncoherentUseProjection {
+        site: UseSite,
+    },
+    IncoherentWriteProjection {
+        value: ValueId,
+    },
+    UnsupportedDeclarationWidth {
+        value: ValueId,
+        width_bits: u32,
+    },
 }
 
 const fn declaration_width_is_supported(width_bits: u32) -> bool {

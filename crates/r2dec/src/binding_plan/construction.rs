@@ -659,9 +659,29 @@ impl BindingPlan {
                                     .collect::<Vec<_>>(),
                             );
                         }
+                        // A constant the arena never interned because the only
+                        // thing that reads it is a user-operation the machine
+                        // projection does not lower. Say that, rather than
+                        // reporting a projection defect the arena does not have.
+                        let unmodelled_userop = graph
+                            .use_sites(graph_value.id)
+                            .iter()
+                            .filter_map(|site| graph.inst(site.inst))
+                            .find_map(|inst| match &inst.payload {
+                                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallOther {
+                                    userop, ..
+                                }) => Some(*userop),
+                                _ => None,
+                            });
                         ValueDisposition::Refused {
-                            reason: ValueRefusal::MissingLiteralProjection {
-                                value: graph_value.id,
+                            reason: match unmodelled_userop {
+                                Some(userop) => ValueRefusal::UnmodelledUserOperation {
+                                    value: graph_value.id,
+                                    userop,
+                                },
+                                None => ValueRefusal::MissingLiteralProjection {
+                                    value: graph_value.id,
+                                },
                             },
                         }
                     }

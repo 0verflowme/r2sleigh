@@ -2409,8 +2409,8 @@ message:
 |-------|------------|---------|
 | 83 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 6 | import stubs | unrepresentable control flow |
-| 1 | import stub | missing machine projection: missing literal projection |
-| 6 | real functions | missing machine projection: missing literal projection |
+| 1 | import stub | missing machine projection: unmodelled user operation |
+| 6 | real functions | missing machine projection: unmodelled user operation |
 | 6 | real functions | missing machine projection: op lowering |
 | 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 1 | real function | observation journal: `ConflictingUse` |
@@ -2426,11 +2426,15 @@ a jump into the binding table, and rendering them yields nothing a reader wants.
 Among the sixteen refusing **real** functions there is no single dominant cause.
 Traced to their decision sites:
 
-- **6 -- `callother` operands never reach the machine projection.** Every one of
-  the eighteen missing literal projections in the binary is a constant operand of
-  an `SSAOp::CallOther`, so the binding plan refuses a value the arena never
-  interned. This is the largest real blocker and it is the `callother` lowering
-  that revision 2 explicitly deferred.
+- **6 -- Sleigh user-operations nothing models.** Every one of the eighteen
+  refused constants in the binary is an operand of an `SSAOp::CallOther`, and
+  `machine.rs` does not lower that op at all, so the operand never reaches the
+  machine arena. On this target they are `brk` immediates and arm64e
+  pointer-authentication operands: `sym.func.100003844` refuses on `0xc471`,
+  which is the literal operand of its `brk 0xc471`. Refusing is correct -- the
+  renderer has no model for these -- so the work is `callother` support, which
+  revision 2 deferred, and not a projection defect. The refusal now says so
+  rather than reporting a missing literal projection.
 - **4 -- incomplete return boundary**, at
   `fold/op_lower/implementation.rs:2208`: the boundary is missing, not complete,
   or carries register compositions.
@@ -2456,12 +2460,12 @@ Roadmap to Completion
 
 In order, highest leverage first.
 
-1. **Lower `callother` operands into the machine projection.** Six of the
-   sixteen refusing real functions on `/bin/ls` fail because a constant operand
-   of an `SSAOp::CallOther` is never interned in the machine arena, so the
-   binding plan refuses a value it can see but cannot project. All eighteen
-   missing literal projections in the binary are this. It is the largest single
-   cause among functions a reader would want to read.
+1. **Model the user-operations that arm64e actually uses.** Six of the sixteen
+   refusing real functions on `/bin/ls` contain an `SSAOp::CallOther` that
+   `machine.rs` does not lower -- `brk` and the pointer-authentication family.
+   It is the largest single cause among functions a reader would want to read,
+   and the two userops already expanded (`NEON_ext`, `NEON_ushl`) show the
+   shape a fix takes.
 
 2. **Retire the register-role tables.** The program counter is read from the
    processor specification now. mnemonikr/sleigh-config#8 exposes the compiler
