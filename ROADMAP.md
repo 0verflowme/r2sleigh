@@ -2465,50 +2465,141 @@ the right shape, but the engagement is thin enough to be worth a deliberate
 answer rather than an assumption. There is no VM or emulator crate.
 
 
+What is missing, measured
+-------------------------
+
+Taken on DecBench's own dataset and on the 245 functions the whole-binary gate
+renders. Ordered by severity, which is not the same as by size: a silently wrong
+answer outranks a missing feature, and a missing feature outranks debt.
+
+**Severity 1 -- calls are silently dropped.** On `bzip2recover` at `-O0`, the
+machine code makes 26 calls and we render 12. Every function we render drops at
+least one, and the proof line on each says `0 refused`. `readError` is the
+clearest: the source calls `fprintf`, `perror`, `fprintf`, `exit`; we emit
+`perror` and `exit` and discard both `fprintf` calls along with their format
+strings. The callees dropped are the variadic and unknown-signature ones, so the
+mechanism is the call boundary failing to complete and the obligation being
+elided rather than refused -- the same shape as the tail-call defect fixed this
+session, where a transfer was elided as one the structured form expressed and
+nine functions rendered a wrong answer under a clean proof. This is the most
+important open defect in the tree.
+
+**Severity 2 -- whole categories of information are never recovered.** Across
+the 245 rendered functions:
+
+| present in | what |
+|---|---|
+| 0% | string literals -- radare2 has them (`str._s:_I_O_error_...`) and nothing consumes them |
+| 0% | array indexing; everything stays pointer arithmetic |
+| 0% | struct member access |
+| 0% | named globals -- `progName` renders as `0x6000`, though radare2 named it |
+| 48% | no type beyond `uint32_t`/`uint64_t` |
+| 93% | machine temporaries (`tmp_3e480_1`, `stack_m16`) |
+| 97% | register-named locals (`X8_1`, `EDI_0`) |
+| 58% | CPU flag variables exposed as C (`ZF_1`, `NG_1`) |
+| 18% | `r2sleigh_*` helper intrinsics that no real toolchain has |
+
+DecBench scores this directly: `type_match` 0.00 against angr's 0.59 on the same
+binary. The information is largely *available* -- radare2 resolves the strings,
+the globals and the stack slots -- and the pipeline discards it.
+
+**Severity 3 -- coverage.** 54 per cent of the real source functions in a
+DecBench `-O0` binary (7 of 13). 78 per cent across our own corpus. 27 per cent
+of the real functions in an optimised arm64e binary. The largest single cause in
+the gate is the composed return value; the largest population overall is import
+thunks, which are low value and recorded as such.
+
+**Severity 4 -- implementation debt.** `r2sym` is 67k lines using z3 in
+seventeen files and the render path reaches a solver in one, so the largest
+subsystem in the tree is barely engaged by the product. Register roles are still
+hand-written tables. `is_stack_reg_name` matches by substring. `EngineSession`
+is a zero-sized unit struct with twenty methods over ~990 lines. Two thresholds
+in `r2engine/src/route.rs` and `STACK_RESOLVE_MAX_DEPTH` are undderived.
+`doc/duplicated-predicates.md` carries three questions still answered in more
+than one place.
+
+**Not a constraint: performance.** Radare2's own analysis dominates end to end
+and decompilation costs about 93ms per function. Nothing here needs optimising
+before it needs finishing.
+
+Components we do not have and need
+----------------------------------
+
+The measurement above is not a list of bugs; four of its five rows are one
+missing capability each. These are new components, not repairs.
+
+1. **A call-boundary model for variadic and unknown-signature callees.** The
+   severity-1 defect. Until a call whose signature is not known can still be
+   rendered as a call with the arguments the convention proves, every function
+   calling `printf` is wrong rather than incomplete.
+2. **A data reader for `.rodata` and named globals.** The cheapest large win in
+   the tree: radare2 already resolves string literals and object names, and
+   consuming them turns `0x6000` into `progName` and recovers every format
+   string. It moves nothing structural and touches only rendering.
+3. **A type inference engine that answers.** `r2types` is 50k lines and recovers
+   nothing measurable. What is needed is evidence-based inference -- pointer from
+   use as a load address, signedness from a signed comparison, width from access
+   size, struct from consistent offset access off one base, array from strided
+   access -- with today's honest default for whatever stays unproven.
+4. **Stack-frame recovery into named typed locals.** `stack_m16` is a slot, not
+   a variable. DecBench's ground truth for `bzip2recover` has 39 stack variables
+   and we align none of them.
+5. **Expression folding over machine detail.** Flag variables folded into the
+   comparison that consumes them, the unoptimised spill-and-reload collapsed,
+   and the arithmetic helpers reduced to C operators where the operator is
+   exact.
+
 Roadmap to Completion
 ---------------------
 
-In order, highest leverage first.
+In order, highest leverage first. The first item is a correctness defect and
+outranks everything else on the list.
 
-1. **Close out the real-function refusals.** Twenty-six of the forty-eight real
-   functions in `/bin/ls` still refuse, and no single cause accounts for more
-   than seven. The largest is the effect ledger, then declaration placement's
-   `unobserved_binding_write`. Each is a small number of functions, which is
-   what the list looks like once the thunks are counted separately.
+1. **Stop dropping calls.** Fourteen of twenty-six calls in one `-O0` binary,
+   in every function rendered, reported as `0 refused`. Find where a call
+   boundary that cannot complete is elided rather than refused, make it refuse,
+   measure how much coverage that costs, and then model the variadic and
+   unknown-signature call so the coverage comes back honestly.
 
-2. **Retire the register-role tables.** The program counter is read from the
-   processor specification now. mnemonikr/sleigh-config#8 exposes the compiler
-   specification, which states the stack pointer and the ordered parameter
-   storage; when it lands, the remaining lists follow. Three collisions have
-   already come out of those lists and are recorded in the plan.
+2. **Read the data section.** String literals and named globals, from facts
+   radare2 already has. Zero per cent to most functions, and it is rendering
+   work rather than analysis work.
 
-3. **Audit the second spelling table.** `seed_x86_low_register_aliases` in
-   `r2ssa` hardcodes the x86 register families and is gated on the architecture
-   name. Those facts look derivable from the register table's own offsets and
-   sizes, which is how families are computed everywhere else. Either it
-   compensates for something in the x86 table or it is redundant, and which one
-   is unknown.
+3. **Fold the machine out of the expressions.** Flags into their comparisons,
+   the spill-and-reload round trip collapsed, helpers reduced to operators.
+   Moves `byte_match` and readability together, and is protected by the
+   differential oracle.
 
-4. **Decide what the dependency patch becomes.** `Cargo.toml` patches `libsla`
+4. **Infer types, and recover stack locals as variables.** The whole of
+   `type_match`, and the largest single decision on this list: it changes what
+   this decompiler is willing to claim. Evidence-based inference keeps the
+   principle; declining keeps the zero.
+
+5. **Render the composed return value.** The largest single refusal cause in the
+   whole-binary gate, mapped in `doc/handoff-location-ssa.md` with the
+   single-value assumption in five modules that blocks it.
+
+6. **Retire the register-role tables.** The program counter comes from the
+   processor specification now; mnemonikr/sleigh-config#8 exposes the compiler
+   specification, and the remaining lists follow when it lands.
+
+7. **Decide what the dependency patch becomes.** `Cargo.toml` patches `libsla`
    and `libsla-sys` to fork branches carrying two open pull requests, and the
    corpus depends on them. Wait, ask, or vendor.
 
-5. **Generalise the user operations.** `NEON_ext` and `NEON_ushl` are
-   implemented because the corpus needs those two. Identification is sourced
-   from the specification's own table and anything else refuses honestly, but
-   this is not `CALLOTHER` coverage.
+8. **Answer for `r2sym`.** Sixty-seven thousand lines, z3 in seventeen files,
+   and one reach from the render path. Either the engagement is thin because the
+   design is right, or the largest subsystem in the tree is not paying for
+   itself. That question has never been put deliberately.
 
-6. **Clean the undefined behaviour in emitted vector C.** The `ushl` expansion
-   evaluates both shift directions before selecting, so the discarded branch
-   shifts by a negative count, and several `__uint128_t` loads are misaligned.
-   Both render correct values on this target, which is exactly why they are easy
-   to leave.
+9. **Generalise the user operations.** `NEON_ext` and `NEON_ushl` are
+   implemented because the corpus needs those two. Anything else refuses
+   honestly, but this is not `CALLOTHER` coverage.
 
-7. **Re-measure Track B's residual.** Twelve type decisions were recorded as
-   remaining in a cell that did not render at the time. It renders now, and
-   whether they survived the object-width change has not been checked.
+10. **Clean the undefined behaviour in emitted vector C.** The `ushl` expansion
+    evaluates both shift directions before selecting, so the discarded branch
+    shifts by a negative count, and several `__uint128_t` loads are misaligned.
 
-8. **Audit the changed test expectations.** Roughly eight assertions moved and
-   one lift-capture golden was re-blessed during the run to fifty-four. Each is
-   argued in its commit, but a changed test is the easiest place for a mistake
-   to hide, and that audit has not been run.
+11. **Audit the changed test expectations.** Roughly eight assertions moved and
+    one lift-capture golden was re-blessed during the run to fifty-four. A
+    changed test is the easiest place for a mistake to hide.
