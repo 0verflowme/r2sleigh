@@ -1903,6 +1903,21 @@ impl Disassembler {
         let expanded = match self.user_op_name(*userop) {
             Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs, temp_base),
             Some("NEON_ushl") => Self::expand_neon_ushl(output.as_ref(), inputs, temp_base),
+            // A trap, and the pipeline already has one. `R2ILOp::Breakpoint` is
+            // seeded as `Kind::Trap` by the obligation ledger, which is exactly
+            // what these are: control leaves for an exception handler and does
+            // not come back. Sleigh models that as a user-operation writing
+            // `pc`, which nothing downstream could project, so the whole
+            // function refused.
+            //
+            // The trap code -- `brk 0xc471`'s immediate, say -- is dropped,
+            // because `R2ILOp::Breakpoint` carries no operands. It identifies
+            // which check failed and is still in the disassembly; what matters
+            // for rendering is that control stops here, and that is preserved
+            // exactly.
+            Some("SoftwareBreakpoint") | Some("UndefinedInstructionException") => {
+                Some(vec![R2ILOp::Breakpoint])
+            }
             _ => None,
         };
         expanded.unwrap_or_else(|| vec![op])

@@ -162,6 +162,15 @@ pub struct SsaArtifact {
     /// dataflow, ABI or typing decision reads this; it exists so the renderer
     /// can print `sym.imp.strcmp` where it would otherwise print an address.
     display_names: r2source::DisplayNames,
+    /// The names of the architecture's user-defined operations, indexed as
+    /// `SSAOp::CallOther` indexes them.
+    ///
+    /// Retained for the same reason as `display_names`: only the lift ever saw
+    /// the architecture, and `SSAOp::CallOther` carries an index alone. An
+    /// index is meaningless without the table it came from, and matching on one
+    /// would be an architecture-specific constant, so the table travels with
+    /// the artifact rather than the renderer guessing.
+    user_operations: Arc<[String]>,
 }
 
 /// Public classification of an artifact's construction boundary.
@@ -332,6 +341,7 @@ impl SsaArtifact {
             machine_context,
             aggregate_accesses,
             display_names: r2source::DisplayNames::default(),
+            user_operations: Arc::from([] as [String; 0]),
         })
     }
 
@@ -861,12 +871,24 @@ impl SsaArtifact {
             machine_context: self.machine_context.clone(),
             aggregate_accesses,
             display_names: self.display_names.clone(),
+            user_operations: Arc::clone(&self.user_operations),
         }
     }
 
     /// Spellings the source carried for the addresses this function calls.
     pub fn display_names(&self) -> &r2source::DisplayNames {
         &self.display_names
+    }
+
+    /// The name the architecture gives one of its user-defined operations.
+    ///
+    /// `None` when the artifact was built without an architecture, or when the
+    /// index is outside the table -- both of which mean the operation cannot be
+    /// identified and must be refused rather than guessed at.
+    pub fn user_operation_name(&self, userop: u32) -> Option<&str> {
+        self.user_operations
+            .get(userop as usize)
+            .map(String::as_str)
     }
 
     pub fn objects(&self) -> &ObjectModel {
@@ -1327,6 +1349,7 @@ impl TrustedSsaArtifact {
             control,
         )?;
         artifact.display_names = display_names;
+        artifact.user_operations = Arc::from(arch.user_ops.clone());
         if !artifact
             .facts
             .obligations

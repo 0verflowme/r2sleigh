@@ -2361,7 +2361,7 @@ impl LegacyObservationJournal {
                 if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                     let graph = self.source.graph();
                     eprintln!(
-                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?}",
+                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?} readers={readers:?}",
                         self.plan.disposition(value),
                         graph
                             .def_inst(value)
@@ -2371,6 +2371,15 @@ impl LegacyObservationJournal {
                                 .take(130)
                                 .collect::<String>()),
                         uses = graph.use_sites(value).len(),
+                        readers = graph
+                            .use_sites(value)
+                            .iter()
+                            .filter_map(|site| graph.inst(site.inst))
+                            .map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(80)
+                                .collect::<String>())
+                            .collect::<Vec<_>>(),
                         storage = graph
                             .value(value)
                             .and_then(|v| v.canonical_storage)

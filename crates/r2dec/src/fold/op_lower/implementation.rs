@@ -2995,6 +2995,17 @@ impl<'a> FoldingContext<'a> {
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Nop => None,
+            // A trap. `__builtin_trap` is a real compiler builtin, so the
+            // emitted C still compiles standalone with nothing declared, and it
+            // is `noreturn`, which is what the operation means: control leaves
+            // for an exception handler and does not come back.
+            SSAOp::Breakpoint => Some(CStmt::Expr(CExpr::call(
+                CExpr::External {
+                    name: "__builtin_trap".to_string(),
+                    kind: crate::symbol::ExternalKind::Intrinsic,
+                },
+                Vec::new(),
+            ))),
             SSAOp::Unimplemented => Some(CStmt::comment("Unimplemented operation")),
             // No statement lowering for this operation. Saying which one is
             // the difference between a class of refused functions and a
