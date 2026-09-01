@@ -1090,7 +1090,7 @@ impl MachineProjection {
                     });
                 }
                 Err(error) if is_local_projection_failure(&error, inst.id) => {
-                    builder.refuse_inst_uses(inst, use_refusal_for_error(&error))?;
+                    builder.refuse_inst_uses(graph, inst, use_refusal_for_error(&error))?;
                     write_dispositions.push(Some(MachineWriteDisposition::Refused(
                         write_refusal_for_error(&error),
                     )));
@@ -2870,11 +2870,28 @@ impl MachineBuilder {
         self.record_use(graph, inst, input_idx, whole_machine_use(source))
     }
 
+    /// Refuse every read of an instruction whose projection failed.
+    ///
+    /// A constant operand is still interned. Whether a value is a constant is a
+    /// fact about the value, not about whether the operation reading it could be
+    /// lowered, and leaving it out made the binding plan refuse the constant
+    /// too -- reporting a missing literal projection where the truth was an
+    /// operation with no model. On `/bin/ls` that is `brk 0xc471` refusing on
+    /// its own immediate.
     fn refuse_inst_uses(
         &mut self,
+        graph: &SsaGraph,
         inst: &GraphInst,
         refusal: MachineUseRefusal,
     ) -> Result<(), MachineBuildError> {
+        for input in inst.inputs.iter().copied() {
+            let graph_value = graph
+                .value(input)
+                .ok_or(MachineBuildError::MissingGraphValue(input))?;
+            if graph_value.var.constant_bits().is_some() {
+                self.intern_value(graph_value)?;
+            }
+        }
         let row = self
             .use_dispositions
             .get_mut(inst.id.0 as usize)

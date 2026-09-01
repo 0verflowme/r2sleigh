@@ -716,16 +716,15 @@ fn refused_machine_use_leaves_its_constant_explicitly_refused() {
         .iter()
         .find(|value| value.var.constant_bits() == Some(9))
         .expect("constant graph value");
-    // `UnmodelledUserOperation`, not `MissingLiteralProjection`: this
-    // fixture's operation is a `CallOther`, and the constant is refused because
-    // nothing models the user-operation that reads it, not because the machine
-    // arena lost a literal it should hold. The two used to report as one, which
-    // is what made six functions on `/bin/ls` look like a projection defect.
+    // The constant is projected, and only its *reader* is refused. Whether a
+    // value is a constant is a fact about the value; it does not depend on
+    // whether the operation reading it could be lowered. This used to refuse
+    // the constant as well, which reported a missing literal projection where
+    // the truth was an operation with no model -- on `/bin/ls`, `brk 0xc471`
+    // refusing on its own immediate.
     assert!(matches!(
         plan.disposition(constant.id),
-        Some(ValueDisposition::Refused {
-            reason: ValueRefusal::UnmodelledUserOperation { value, .. }
-        }) if *value == constant.id
+        Some(ValueDisposition::Inline { .. })
     ));
     let use_site = source.graph().uses_of[constant.id.0 as usize][0];
     assert!(matches!(

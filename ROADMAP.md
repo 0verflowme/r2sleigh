@@ -2407,11 +2407,10 @@ message:
 
 | count | population | refusal |
 |-------|------------|---------|
-| 83 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 85 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 6 | import stubs | unrepresentable control flow |
-| 1 | import stub | missing machine projection: unmodelled user operation |
-| 6 | real functions | missing machine projection: unmodelled user operation |
-| 6 | real functions | missing machine projection: op lowering |
+| 1 | import stub | missing machine projection: op lowering |
+| 12 | real functions | missing machine projection: op lowering |
 | 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 1 | real function | observation journal: `ConflictingUse` |
 | 1 | real function (`main`) | unrepresentable operation |
@@ -2423,24 +2422,22 @@ one defect standing in front of 83 thunks, not eighty-six defects. It is also
 not worth fixing first: those stubs are `sym.imp.*` entries whose whole body is
 a jump into the binding table, and rendering them yields nothing a reader wants.
 
-Among the sixteen refusing **real** functions there is no single dominant cause.
-Traced to their decision sites:
+Among the sixteen refusing **real** functions, twelve now share one cause, and
+it took two corrections to see it. They first reported a missing literal
+projection, which was untrue -- the machine arena had not lost a constant, it had
+never been asked for one, because a refused instruction did not intern its
+constant operands. `brk 0xc471` was refusing on its own immediate. A constant is
+a constant whether or not the operation reading it can be lowered, so those
+operands are interned now and the refusal moved to where it belongs: `r2dec`
+refuses `SSAOp::CallOther` outright in expression lowering.
 
-- **6 -- Sleigh user-operations nothing models.** Every one of the eighteen
-  refused constants in the binary is an operand of an `SSAOp::CallOther`, and
-  `machine.rs` does not lower that op at all, so the operand never reaches the
-  machine arena. On this target they are `brk` immediates and arm64e
-  pointer-authentication operands: `sym.func.100003844` refuses on `0xc471`,
-  which is the literal operand of its `brk 0xc471`. Refusing is correct -- the
-  renderer has no model for these -- so the work is `callother` support, which
-  revision 2 deferred, and not a projection defect. The refusal now says so
-  rather than reporting a missing literal projection.
-- **4 -- incomplete return boundary**, at
-  `fold/op_lower/implementation.rs:2208`: the boundary is missing, not complete,
-  or carries register compositions.
-- **2 -- journal errors** passed through `fold/op_lower/lowering.rs:30`.
-- 2 -- `ExactUseRequiresRenderedOccurrence`, 1 -- `ConflictingUse`, and `main`
-  alone on an unrepresentable operation.
+The two user-operations this binary uses are `SoftwareBreakpoint` and
+`UndefinedInstructionException` -- traps, not arithmetic. Both write `pc`, which
+is Sleigh's way of saying control leaves for an exception handler. Rendering
+them means emitting a non-returning intrinsic and letting the block end, which
+is a feature to write rather than a defect to repair. The remaining four are two
+`ExactUseRequiresRenderedOccurrence`, one `ConflictingUse`, and `main` alone on
+an unrepresentable operation.
 
 **Performance is not a constraint.** Radare2's own analysis dominates
 end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
