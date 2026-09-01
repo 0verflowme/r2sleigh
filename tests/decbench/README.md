@@ -51,3 +51,36 @@ and a refusal comment is not decompiled C. Reporting one as if it were would
 score a parse failure where the tool actually declined; both are zero on every
 metric, and the decline count and its typed causes are kept in the result
 metadata so the rate stays visible rather than disappearing into the denominator.
+
+
+First measured result
+---------------------
+
+`bzip2recover`, `-O0`, from DecBench's own dataset — r2sleigh beside angr, the
+strongest conventional decompiler on the board:
+
+| metric | r2sleigh | angr |
+|---|---|---|
+| ged (mean, lower is better) | **5.43** | 5.54 |
+| type_match (mean, higher is better) | **0.00** | 0.59 |
+
+Read it with the denominator in view. GED is averaged over the functions each
+decompiler actually produced, and we produced seven of the twelve source
+functions in that file while declining five; a mean over the subset we were
+willing to render is not the same population angr's mean covers. What the number
+does establish is that where we render, our control-flow structure is already
+competitive with the best conventional decompiler — and that the type metric is
+not a small gap but the whole of one.
+
+Three things were needed to get a score at all, and each would have silently
+read as zero rather than as a bug:
+
+* `greadlink` on `PATH` (`brew install coreutils`) — without it Joern cannot
+  parse the source and GED is skipped, not failed.
+* radare2's flag prefixes stripped from function names, so `dbg.readError`
+  matches the source's `readError`.
+* the same name written into the emitted C, because the decompiled CFG is keyed
+  by the function name inside the code, not by the name in the result record.
+
+`byte_match` is still unmeasured here: it recompiles with the original toolchain,
+which means a Linux toolchain this harness was not run under.

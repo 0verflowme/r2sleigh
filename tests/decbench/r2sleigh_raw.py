@@ -68,6 +68,42 @@ _REFUSAL = re.compile(r"/\* r2dec fallback: skipped decompilation for \S+ \((?P<
 
 _R2_FLAGS = ("-e", "scr.color=0", "-e", "bin.relocs.apply=true", "-q")
 
+# radare2 prefixes a function flag with where it learned the name -- `dbg.` from
+# debug info, `sym.` from the symbol table, `fcn.` from its own analysis. The
+# benchmark matches a decompiled function to its source by name, and
+# `dbg.readError` matches nothing, so the prefix comes off. Everything left
+# unprefixed keeps whatever radare2 called it.
+_FLAG_PREFIXES = ("dbg.", "sym.", "fcn.", "loc.", "flirt.")
+
+
+def _retitle(code: str, flag: str, source_name: str) -> str:
+    """Give the emitted C the source's own name for the function.
+
+    The renderer spells a function after radare2's flag with the characters C
+    will not take replaced, so `dbg.readError` is emitted as `dbg_readError`.
+    The benchmark parses the C and matches the resulting control-flow graph to
+    the source function by name, so leaving the flag's spelling in the code
+    means the graph is never matched and the metric is skipped rather than
+    scored.
+    """
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", flag)
+    if not sanitized or sanitized == source_name:
+        return code
+    return re.sub(rf"\b{re.escape(sanitized)}\b", source_name, code)
+
+
+def _source_name(flag: str) -> str:
+    """The name the source would use for a radare2 function flag."""
+    name = flag
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _FLAG_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                changed = True
+    return name or flag
+
 
 def _r2_bin() -> Path | None:
     explicit = os.environ.get("R2SLEIGH_R2_BIN")
@@ -143,6 +179,8 @@ class RawR2SleighDecompiler(Decompiler):
     def _discover(self, binary_path: Path, timeout: float) -> tuple[list[tuple[str, int]], int]:
         """Every function radare2 finds, with its address and the load base."""
         out = _run_r2(binary_path, "a:sla; aaa; e bin.baddr; aflj", timeout=timeout)
+        # `e bin.baddr` answers with a bare integer, decimal or `0x`-prefixed,
+        # and prints `0` for a position-independent executable.
         baddr = 0
         payload = None
         for line in out.splitlines():
@@ -150,19 +188,20 @@ class RawR2SleighDecompiler(Decompiler):
             if stripped.startswith("["):
                 payload = stripped
                 break
-            if stripped.startswith("0x") and baddr == 0:
-                with_prefix = stripped
-                try:
-                    baddr = int(with_prefix, 16)
-                except ValueError:
-                    baddr = 0
+            try:
+                baddr = int(stripped, 0)
+            except ValueError:
+                continue
         if payload is None:
             return [], baddr
         try:
             functions = json.loads(payload)
         except json.JSONDecodeError:
             return [], baddr
-        return [(f.get("name", ""), int(f.get("offset", 0))) for f in functions], baddr
+        # `aflj` names the entry `addr`; older builds used `offset`.
+        return [
+            (f.get("name", ""), int(f.get("addr", f.get("offset", 0)))) for f in functions
+        ], baddr
 
     #
     # Decompilation
@@ -173,6 +212,8 @@ class RawR2SleighDecompiler(Decompiler):
         binary_path: Path,
         functions: list[tuple[str, int]] | None = None,
         output_dir: Path | None = None,
+        function_names: set[int] | None = None,
+        progress_path: Path | None = None,
     ) -> DecompilationResult:
         started = time.time()
         binary_timeout = float(self.config.binary_timeout_seconds)
@@ -190,10 +231,18 @@ class RawR2SleighDecompiler(Decompiler):
             if not common.should_skip_function(name, to_file_addr(addr), text_range)
         ]
         if functions is not None:
-            wanted = common.addr_targets_of({addr for (_, addr) in functions})
-            candidates = [
-                (name, addr) for (name, addr) in candidates if to_file_addr(addr) in wanted
-            ]
+            requested = {name for (name, _) in functions}
+            candidates = [(name, addr) for (name, addr) in candidates if name in requested]
+        # The benchmark hands a stripped binary and names its own targets by
+        # DWARF low_pc, so narrowing is by address, not by symbol.
+        narrowed = common.narrow_to_source(
+            [(name, to_file_addr(addr)) for (name, addr) in candidates],
+            common.addr_targets_of(function_names),
+            backend="r2sleigh",
+            binary_name=binary_path.name,
+        )
+        kept = {name for (name, _) in narrowed}
+        candidates = [(name, addr) for (name, addr) in candidates if name in kept]
 
         rendered: dict[str, FunctionDecompilation] = {}
         declined: dict[str, str] = {}
@@ -218,8 +267,10 @@ class RawR2SleighDecompiler(Decompiler):
                 code = body.strip()
                 if not code:
                     continue
-                rendered[name] = FunctionDecompilation(
-                    name=name,
+                source_name = _source_name(name)
+                code = _retitle(code, name, source_name)
+                rendered[source_name] = FunctionDecompilation(
+                    name=source_name,
                     address=to_file_addr(addr),
                     decompiled_code=code,
                     line_count=len(code.splitlines()),
@@ -234,15 +285,15 @@ class RawR2SleighDecompiler(Decompiler):
                 decompiler_name=self.id,
                 decompiler_version=self.get_version(),
                 total_time_seconds=elapsed,
+                extra={
+                    "requested": len(candidates),
+                    "rendered": len(rendered),
+                    "declined": len(declined),
+                    "decline_causes": declined,
+                },
             ),
             functions=rendered,
             output_dir=output_dir,
-            metadata={
-                "requested": len(candidates),
-                "rendered": len(rendered),
-                "declined": len(declined),
-                "decline_causes": declined,
-            },
         )
 
 
