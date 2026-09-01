@@ -6868,3 +6868,49 @@ is therefore not an option -- it buys a green gate for one percent of the
 benefit. And test fixtures throughout the tree were built from single-use
 values, which fold away entirely; each one that needed something bound gained a
 second reader, which is a fixture correction rather than a concession.
+
+**The corpus is green with folding on, and the two remaining coverage
+regressions are narrower than the earlier note said.** The dead frame slot was
+the whole of the corpus failure:
+`certified_dead_frame_slot_accesses` names the `push rbp` store that the effect
+ledger elides as `DeadFrameSlotStore`, so `certified_elided_read_instructions`
+reports it and the plan no longer folds anything into it. Fifty-four of
+fifty-four cells now pass every gate, and whole-binary coverage is 243 of 313
+against a baseline of 245.
+
+The two left are `branchy_arm64_O2::sym._inverted_goto` and
+`hashes_x64_O1::sym._siphash24`. In `siphash24` the orphans are two address
+computations that fold into one load, `InstId(594)` and `InstId(595)` reaching
+`InstId(596)` at block `0x100000ae3`. Three explanations were tried and each is
+recorded here because each is wrong and cost a build to find out:
+
+Declining every use whose disposition is `MachineUseDisposition::MemoryAddress`
+does clear the refusal and is far too broad. An ordinary `*(uint8_t*)(base + i)`
+carries the same disposition and does render its address, so the nine x86-64
+`-O0` corpus functions went from 367 statements back to 912 -- most of folding,
+given up to fix two functions.
+
+Declining only the addresses whose access the renderer answers without reading
+them -- `certified_stack_owner_expr_for_memory_fact`, which returns a slot's
+name, and the certified array fact with a base or index -- is exact and does
+not fire here. The probe says the load's fact exists, names `ValueId(644)` as
+its address and `ObjectId(0)` as its object, and neither branch claims it. So
+this access does reach `certified_memory_address_expr` and its address
+expression is asked for.
+
+Carrying the dropped observations through the address rebuild does not fire
+either. `render_certified_structured_memory_expr` takes the address apart with
+`certified_linear_address_components` and puts it back as `base[index]`, which
+looked like the same marker leak `carry_all_expr_observations` was written for,
+but adding the carrier at both rebuild sites changed nothing measurable --
+coverage stayed at 243 -- so it was reverted rather than left in the tree.
+
+What that leaves is the question nobody has answered directly for these two:
+whether the markers are allocated at all. The instrumentation that settled it
+for `murmur3_32` is worth rebuilding rather than guessing again -- a
+`R2SLEIGH_DEBUG_DROPPED` env check in `seal_preserving_effects` that collects
+the `RenderObservationId`s the walk sees and prints every `ObservationTarget::
+Effect` in `targets` that is missing from that set. Allocated-and-missing means
+the statement is dropped and the search is for which pass drops it; never
+allocated means `planned_value_expr` was not asked, and the search is for who
+renders that load instead.
