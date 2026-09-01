@@ -4485,7 +4485,9 @@ mod tests {
     fn diagnostics_json_exposes_typed_render_refusal_and_refuses_it() {
         let cases = [
             (
-                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    r2dec::MachineProjectionRefusalOrigin::OpLowering,
+                ),
                 "missing_machine_projection_authorization",
             ),
             (

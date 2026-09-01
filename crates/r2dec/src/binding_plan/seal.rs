@@ -498,9 +498,31 @@ pub(crate) fn build_upstream_shadow_oracle(
         values[graph_value.id.0 as usize] = Some(if literal_values.contains(&graph_value.id) {
             UpstreamValueDisposition::InlineConstant
         } else {
-            UpstreamValueDisposition::Refused(ValueRefusal::MissingLiteralProjection {
-                value: graph_value.id,
-            })
+            {
+                // Same switch the other refusals use. A missing literal
+                // projection says only that some constant never reached the
+                // machine arena; which constant, and what reads it, is what
+                // tells you why no lowering path asked for it.
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "missing literal projection {:?} bits={:?} name={:?} uses={} defs={:?}",
+                        graph_value.id,
+                        graph_value.var.constant_bits(),
+                        graph_value.var.name,
+                        graph.use_sites(graph_value.id).len(),
+                        graph
+                            .def_inst(graph_value.id)
+                            .and_then(|inst| graph.inst(inst))
+                            .map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(110)
+                                .collect::<String>()),
+                    );
+                }
+                UpstreamValueDisposition::Refused(ValueRefusal::MissingLiteralProjection {
+                    value: graph_value.id,
+                })
+            }
         });
     }
 

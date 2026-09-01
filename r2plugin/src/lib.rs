@@ -8526,7 +8526,11 @@ mod integration_tests {
         );
         assert_eq!(
             response.render_refusal,
-            Some(r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization)
+            Some(
+                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    r2dec::MachineProjectionRefusalOrigin::OpLowering,
+                )
+            )
         );
         assert!(
             response.output.starts_with("/* r2dec fallback:")

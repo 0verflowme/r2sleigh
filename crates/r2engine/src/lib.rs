@@ -4713,8 +4713,10 @@ fn refusal_variant_name(debug: &str) -> String {
 
 fn render_refusal_reason(refusal: DecompileRenderRefusal) -> String {
     match refusal {
-        DecompileRenderRefusal::MissingMachineProjectionAuthorization => {
-            "native rendering refused: missing machine projection authorization".to_string()
+        DecompileRenderRefusal::MissingMachineProjectionAuthorization(origin) => {
+            format!(
+                "native rendering refused: missing machine projection authorization: {origin:?}"
+            )
         }
         DecompileRenderRefusal::MissingProgramVariableAuthorization => {
             "native rendering refused: missing program-variable authorization".to_string()
@@ -8389,7 +8391,9 @@ mod tests {
 
     #[test]
     fn renderer_boundary_refusal_produces_a_typed_engine_refusal() {
-        let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization;
+        let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            r2dec::MachineProjectionRefusalOrigin::OpLowering,
+        );
         let reason = render_refusal_reason(render_refusal);
         let render_time = Duration::from_micros(19);
         let mut metrics = EngineMetrics::default();

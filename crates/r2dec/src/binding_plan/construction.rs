@@ -633,11 +633,38 @@ impl BindingPlan {
                             literal: expr,
                         },
                     },
-                    None => ValueDisposition::Refused {
-                        reason: ValueRefusal::MissingLiteralProjection {
-                            value: graph_value.id,
-                        },
-                    },
+                    None => {
+                        if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!(
+                                "missing literal projection {:?} bits={:?} name={:?} uses={} def={:?} users={users:?}",
+                                graph_value.id,
+                                graph_value.var.constant_bits(),
+                                graph_value.var.name,
+                                graph.use_sites(graph_value.id).len(),
+                                graph
+                                    .def_inst(graph_value.id)
+                                    .and_then(|inst| graph.inst(inst))
+                                    .map(|inst| format!("{:?}", inst.payload)
+                                        .chars()
+                                        .take(110)
+                                        .collect::<String>()),
+                                users = graph
+                                    .use_sites(graph_value.id)
+                                    .iter()
+                                    .filter_map(|site| graph.inst(site.inst))
+                                    .map(|inst| format!("{:?}", inst.payload)
+                                        .chars()
+                                        .take(90)
+                                        .collect::<String>())
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                        ValueDisposition::Refused {
+                            reason: ValueRefusal::MissingLiteralProjection {
+                                value: graph_value.id,
+                            },
+                        }
+                    }
                 };
             }
         }

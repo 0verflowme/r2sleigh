@@ -3028,10 +3028,36 @@ impl PlacementAudit {
     }
 }
 
+/// Which upstream authority failed when a machine projection was refused.
+///
+/// Every one of these used to become the same payload-free
+/// `MissingMachineProjectionAuthorization`, so twelve refusing functions on
+/// `/bin/ls` reported one cause between them and could not be told apart. The
+/// upstream error already knows which authority it was; this carries that the
+/// last step to the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineProjectionRefusalOrigin {
+    ShadowAuditPlanBuild,
+    ShadowAuditSourcePairing,
+    ShadowAuditReport,
+    ShadowAuditIncompleteObservations,
+    ShadowAuditNonQuality,
+    OpLowering,
+    RenderedIdentityMachineUse,
+    RenderedIdentityMachineWrite,
+    RenderedIdentityMissingUseDisposition,
+    RenderedIdentityMissingWriteDisposition,
+    RenderedIdentityMissingLiteralProjection,
+    RenderedIdentityIncoherentUseProjection,
+    RenderedIdentityIncoherentWriteProjection,
+    BindingPlanBuild,
+    PlannedLoweringInput,
+}
+
 /// Rendered C paired with the non-consuming Stage 4 binding audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecompileRenderRefusal {
-    MissingMachineProjectionAuthorization,
+    MissingMachineProjectionAuthorization(MachineProjectionRefusalOrigin),
     MissingProgramVariableAuthorization,
     /// The legacy observation journal could not be constructed.
     ///
@@ -3054,7 +3080,7 @@ impl DecompileRenderRefusal {
     /// Stable machine-readable category used by engine and corpus boundaries.
     pub const fn kind(self) -> &'static str {
         match self {
-            Self::MissingMachineProjectionAuthorization => {
+            Self::MissingMachineProjectionAuthorization(_) => {
                 "missing_machine_projection_authorization"
             }
             Self::MissingProgramVariableAuthorization => "missing_program_variable_authorization",
@@ -3103,12 +3129,26 @@ impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
             BindingShadowAuditFailure::JournalConstruction(failure)
             | BindingShadowAuditFailure::JournalRecording(failure)
             | BindingShadowAuditFailure::JournalSeal(failure) => Self::ObservationJournal(failure),
-            BindingShadowAuditFailure::PlanBuild
-            | BindingShadowAuditFailure::SourcePairing
-            | BindingShadowAuditFailure::Report
-            | BindingShadowAuditFailure::IncompleteObservations { .. }
-            | BindingShadowAuditFailure::NonQuality { .. } => {
-                Self::MissingMachineProjectionAuthorization
+            BindingShadowAuditFailure::PlanBuild => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::ShadowAuditPlanBuild,
+            ),
+            BindingShadowAuditFailure::SourcePairing => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditSourcePairing,
+                )
+            }
+            BindingShadowAuditFailure::Report => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::ShadowAuditReport,
+            ),
+            BindingShadowAuditFailure::IncompleteObservations { .. } => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditIncompleteObservations,
+                )
+            }
+            BindingShadowAuditFailure::NonQuality { .. } => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditNonQuality,
+                )
             }
         }
     }
@@ -3118,7 +3158,9 @@ impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
     fn from(refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
         match refusal {
             crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(..) => {
-                Self::MissingMachineProjectionAuthorization
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::OpLowering,
+                )
             }
             crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..) => {
                 Self::MissingProgramVariableAuthorization
@@ -3135,18 +3177,47 @@ fn rendered_identity_refusal_category(
 ) -> DecompileRenderRefusal {
     use crate::binding_plan::{RenderedIdentityRefusal, ValueRefusal};
 
+    use MachineProjectionRefusalOrigin as Origin;
+
     match refusal {
-        RenderedIdentityRefusal::MachineUse { .. }
-        | RenderedIdentityRefusal::MachineWrite { .. }
-        | RenderedIdentityRefusal::MissingUseDisposition { .. }
-        | RenderedIdentityRefusal::MissingWriteDisposition { .. }
-        | RenderedIdentityRefusal::Value {
-            reason:
-                ValueRefusal::MissingLiteralProjection { .. }
-                | ValueRefusal::IncoherentUseProjection { .. }
-                | ValueRefusal::IncoherentWriteProjection { .. },
+        RenderedIdentityRefusal::MachineUse { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMachineUse,
+            )
+        }
+        RenderedIdentityRefusal::MachineWrite { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMachineWrite,
+            )
+        }
+        RenderedIdentityRefusal::MissingUseDisposition { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMissingUseDisposition,
+            )
+        }
+        RenderedIdentityRefusal::MissingWriteDisposition { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMissingWriteDisposition,
+            )
+        }
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::MissingLiteralProjection { .. },
             ..
-        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityMissingLiteralProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::IncoherentUseProjection { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityIncoherentUseProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::IncoherentWriteProjection { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityIncoherentWriteProjection,
+        ),
         RenderedIdentityRefusal::Value {
             reason:
                 ValueRefusal::MissingBindingCertificate { .. }
@@ -4351,7 +4422,9 @@ impl Decompiler {
                         crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
                         | crate::binding_plan::BindingPlanBuildError::Seal(
                             crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
-                        ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                        ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                            MachineProjectionRefusalOrigin::BindingPlanBuild,
+                        ),
                         _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
                     };
                     return Ok(InternalBuildProduct::refused(
@@ -4373,7 +4446,9 @@ impl Decompiler {
             debug_log_render_contract_error(prepared, "planned-lowering-input", &error);
             let refusal = match error {
                 crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_) => {
-                    DecompileRenderRefusal::MissingMachineProjectionAuthorization
+                    DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                        MachineProjectionRefusalOrigin::PlannedLoweringInput,
+                    )
                 }
                 _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
             };
@@ -4399,7 +4474,9 @@ impl Decompiler {
                 let refusal = match error {
                     crate::binding_plan::BindingNameResolutionError::Source(
                         crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
-                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization,
+                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                        MachineProjectionRefusalOrigin::PlannedLoweringInput,
+                    ),
                     crate::binding_plan::BindingNameResolutionError::Source(_)
                     | crate::binding_plan::BindingNameResolutionError::ConflictingCertifiedRoles(
                         _,
@@ -6968,7 +7045,11 @@ mod tests {
         let audited = decompiler.decompile_input_with_binding_audit(&input);
         assert_eq!(
             audited.render_refusal(),
-            Some(DecompileRenderRefusal::MissingMachineProjectionAuthorization)
+            Some(
+                DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    crate::MachineProjectionRefusalOrigin::OpLowering,
+                )
+            )
         );
         assert_eq!(audited.effect_obligations(), EffectObligationAudit::NOT_RUN);
         assert!(!audited.output().contains("return"), "{}", audited.output());

@@ -2409,25 +2409,34 @@ message:
 |-------|------------|---------|
 | 83 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 6 | import stubs | unrepresentable control flow |
-| 1 | import stubs | missing machine projection authorization |
-| 12 | real functions | missing machine projection authorization |
+| 1 | import stub | missing machine projection: missing literal projection |
+| 6 | real functions | missing machine projection: missing literal projection |
+| 6 | real functions | missing machine projection: op lowering |
 | 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 1 | real function | observation journal: `ConflictingUse` |
 | 1 | real function (`main`) | unrepresentable operation |
 
 The eighty-six collapsed, as the corpus said they would, and further than
 expected: 85 of 86 are one variant, and 84 of those are one operation --
-`SSAOp::BranchInd` through `pc`, the indirect branch every one of those stubs
-ends in. The use has an exact disposition and the renderer emits no node for it,
-so the seal refuses. That is one defect standing in front of 83 thunks, not
-eighty-six defects.
+`SSAOp::BranchInd` through `pc`, the indirect branch every stub ends in. That is
+one defect standing in front of 83 thunks, not eighty-six defects. It is also
+not worth fixing first: those stubs are `sym.imp.*` entries whose whole body is
+a jump into the binding table, and rendering them yields nothing a reader wants.
 
-It is also not the thing to fix first. The stubs are `sym.imp.*` entries whose
-whole body is a jump into the binding table; rendering them yields nothing a
-reader wants. The real blocker is the next row down: **12 of the 16 refusing
-real functions fail on missing machine projection authorization**, and that is
-where the remaining coverage is. `main` alone refuses on an unrepresentable
-operation.
+Among the sixteen refusing **real** functions there is no single dominant cause.
+Traced to their decision sites:
+
+- **6 -- `callother` operands never reach the machine projection.** Every one of
+  the eighteen missing literal projections in the binary is a constant operand of
+  an `SSAOp::CallOther`, so the binding plan refuses a value the arena never
+  interned. This is the largest real blocker and it is the `callother` lowering
+  that revision 2 explicitly deferred.
+- **4 -- incomplete return boundary**, at
+  `fold/op_lower/implementation.rs:2208`: the boundary is missing, not complete,
+  or carries register compositions.
+- **2 -- journal errors** passed through `fold/op_lower/lowering.rs:30`.
+- 2 -- `ExactUseRequiresRenderedOccurrence`, 1 -- `ConflictingUse`, and `main`
+  alone on an unrepresentable operation.
 
 **Performance is not a constraint.** Radare2's own analysis dominates
 end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
@@ -2447,11 +2456,12 @@ Roadmap to Completion
 
 In order, highest leverage first.
 
-1. **Take the twelve.** Group the `missing machine projection authorization`
-   refusals across the 16 refusing real functions on `/bin/ls` -- twelve of them
-   share that cause, and it is now the largest blocker on anything a reader
-   would want to read. The eighty-six that used to head this list have been
-   taken: they were 83 import thunks and one defect, recorded above.
+1. **Lower `callother` operands into the machine projection.** Six of the
+   sixteen refusing real functions on `/bin/ls` fail because a constant operand
+   of an `SSAOp::CallOther` is never interned in the machine arena, so the
+   binding plan refuses a value it can see but cannot project. All eighteen
+   missing literal projections in the binary are this. It is the largest single
+   cause among functions a reader would want to read.
 
 2. **Retire the register-role tables.** The program counter is read from the
    processor specification now. mnemonikr/sleigh-config#8 exposes the compiler
