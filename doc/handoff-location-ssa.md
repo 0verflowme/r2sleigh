@@ -6951,3 +6951,32 @@ renderer's `certified_array_fact_for_memory` matches, plus the
 the ones the fold context reads through `self.inputs.render_facts()`, or the
 match differs in a field. Print both sides for that one op before changing the
 predicate again.
+
+**More of `siphash24` ruled out.** The load at block `0x100000ae3` op 40 takes
+neither the stack-owner branch nor the array branch --
+`certified_array_fact_for_memory` returns `None` for it -- so it reaches
+`certified_memory_address_expr`, which calls `planned_value_expr` on the
+address and therefore does ask for the folded value. Printing the access
+expression on both sides of `typed_subscript_access` shows it unchanged and
+fully marked: `*(uint32_t*)(...)` with the whole observation chain intact. So
+op lowering hands the statement over with the markers on it.
+
+Bisecting every pass between there and the seal did not find the loss either.
+None of `simplify_identities_in_function`,
+`reconstruct_flag_conditions_in_function`,
+`normalize_redundant_return_carrier_casts`,
+`normalize_declared_assignment_literals`, `normalize_comparison_operand_order`
+or `fold_constant_arithmetic_in_function` changes the outcome, and neither does
+any of the five `cleanup_recurse` rewrites.
+
+The remaining inconsistency is the thing to resolve first, because one of the
+two measurements must be wrong: `Op(40)`'s own marker survives, so the load's
+statement is in the sealed AST, and the markers for `Op(38)` and `Op(39)` sit
+inside that same statement's right-hand side when op lowering returns it, yet
+the seal reports them missing. Either the surviving statement came from a
+different rendering than the one printed -- `planned_value_expr` is called
+several times for this value and each call allocates fresh marker ids, so the
+ids that reach the AST need to be matched against the ids the seal reports
+missing rather than assumed to be the same ones -- or the walk in
+`inspect_render_observations` does not reach them. Check the id sets against
+each other before touching either the plan or the renderer again.
