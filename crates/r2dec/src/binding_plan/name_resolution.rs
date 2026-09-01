@@ -534,6 +534,19 @@ mod tests {
             dst: Varnode::unique(0x20, 8),
             src: Varnode::unique(0x10, 8),
         });
+        // The temporary is read twice on purpose. A value with one reader is
+        // folded into that reader and gets no binding, and these tests are
+        // about the names bindings carry.
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::unique(0x10, 8),
+        });
+        block.push(R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x20, 8),
+        });
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x20, 8),
         });

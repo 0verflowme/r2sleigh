@@ -198,7 +198,12 @@ pub fn to_c_type_like(arena: &TypeArena, ty: TypeId) -> CTypeLike {
 pub fn render_c_type_like(ty: &CTypeLike) -> String {
     match ty {
         CTypeLike::Void => "void".to_string(),
-        CTypeLike::Bool => "bool".to_string(),
+        // `_Bool`, not `bool`: this spelling goes into the C the decompiler
+        // emits, and that translation unit carries no `#include <stdbool.h>`.
+        // `bool` is a macro from that header, while `_Bool` is a keyword every
+        // C99 and later compiler accepts on its own. The parser above reads
+        // both spellings back, so nothing that consumes this text loses.
+        CTypeLike::Bool => "_Bool".to_string(),
         CTypeLike::Int {
             bits: 8,
             signedness: Signedness::Signed,

@@ -69,6 +69,13 @@ pub(crate) struct FinalBindingWrite {
 /// Placement-relevant projection of the observation journal's private target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementObservationTarget {
+    /// A read inside an expression moved to its use.
+    InlinedRead {
+        value: r2ssa::ValueId,
+        binding: BindingId,
+        symbol: crate::symbol::SymbolId,
+        block: u64,
+    },
     Use {
         site: UseSite,
         /// Where the normalized operation consuming this use is emitted, which
@@ -244,6 +251,22 @@ pub(crate) fn collect_final_placement_occurrences(
         };
         let observation = RenderObservationId::from_dense_index(index);
         match target.expect("only reachable observations receive a scope") {
+            // A read inside a moved expression is an occurrence of its binding
+            // where the expression now sits.
+            PlacementObservationTarget::InlinedRead {
+                value,
+                binding,
+                block,
+                ..
+            } => {
+                reads.push(FinalBindingRead {
+                    binding,
+                    source: PlacementRead::Inlined(value),
+                    region,
+                    order,
+                    block,
+                });
+            }
             PlacementObservationTarget::Use { site, block } => {
                 let inst = graph
                     .inst(site.inst)
@@ -859,7 +882,8 @@ fn direct_stack_assignment_observations(
                     // The address this destination names, and any value read to
                     // form it. Both are evaluated before the store they serve.
                     Some(
-                        PlacementObservationTarget::Use { .. }
+                        PlacementObservationTarget::InlinedRead { .. }
+                        | PlacementObservationTarget::Use { .. }
                         | PlacementObservationTarget::CertifiedValueRead { .. }
                         | PlacementObservationTarget::StackAccess {
                             is_write: false, ..
@@ -1723,7 +1747,7 @@ fn audit_program_symbol(
                 })
             })
             .collect::<Vec<_>>(),
-        active
+        active.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>()
     );
     Err(match access {
         SymbolAccess::Read => PlacementAnalysisError::UnobservedBindingRead { binding },
@@ -1766,6 +1790,14 @@ fn target_authorizes_binding(
                     symbol,
                 )
         }
+        (
+            PlacementObservationTarget::InlinedRead {
+                binding: read_binding,
+                ..
+            },
+            SymbolAccess::Read,
+        ) => read_binding == binding,
+        (PlacementObservationTarget::InlinedRead { .. }, SymbolAccess::Write) => false,
         (
             PlacementObservationTarget::Write {
                 inst,
@@ -3213,6 +3245,9 @@ impl Occurrence {
                 site.inst.0,
                 site.input_idx,
             ),
+            OccurrenceKind::Read(PlacementRead::Inlined(value)) => {
+                (self.order, 0, self.block, self.region.index(), value.0, 0)
+            }
             OccurrenceKind::Read(PlacementRead::CertifiedValue { value, at }) => (
                 self.order,
                 0,

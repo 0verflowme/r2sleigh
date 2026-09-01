@@ -200,6 +200,14 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
             dst: first.clone(),
             src: Varnode::constant(7, 8),
         },
+        // Each version is read twice. A value with a single reader is folded
+        // into that reader and gets no object, so a span made of single-use
+        // versions has nothing to group and this test would have no subject.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2010, 8),
+            val: Varnode::unique(0x10, 8),
+        },
         R2ILOp::IntAdd {
             dst: first,
             a: Varnode::unique(0x10, 8),
@@ -208,6 +216,11 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
         R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2000, 8),
+            val: Varnode::unique(0x10, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2018, 8),
             val: Varnode::unique(0x10, 8),
         },
     ]);
@@ -780,6 +793,14 @@ fn unsupported_c_scalar_width_is_a_typed_value_refusal() {
             addr: Varnode::constant(0x2000, 8),
             val: Varnode::unique(0x10, 3),
         },
+        // Read twice, so the value needs a declaration of its own. A value
+        // read once is folded into its reader and never declared, and an
+        // undeclarable width is only a refusal for something being declared.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x10, 3),
+        },
     ]);
     let output = source_owned
         .source()
@@ -822,6 +843,19 @@ fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
             R2ILOp::Store {
                 space: SpaceId::Ram,
                 addr: Varnode::constant(0x2008, 8),
+                val: Varnode::unique(0x20, 4),
+            },
+            // Second readers. A value read once is folded into its reader and
+            // is bound to nothing, and this test needs two independent
+            // storage bindings to move a value between.
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x2010, 8),
+                val: Varnode::unique(0x10, 8),
+            },
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x2018, 8),
                 val: Varnode::unique(0x20, 4),
             },
         ]
@@ -868,6 +902,11 @@ fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
             dst: first.clone(),
             src: Varnode::constant(1, 8),
         },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2020, 8),
+            val: Varnode::unique(0x10, 8),
+        },
         R2ILOp::IntAdd {
             dst: first,
             a: Varnode::unique(0x10, 8),
@@ -876,6 +915,11 @@ fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
         R2ILOp::Copy {
             dst: second.clone(),
             src: Varnode::constant(2, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2028, 8),
+            val: Varnode::unique(0x20, 8),
         },
         R2ILOp::IntAdd {
             dst: second,
@@ -890,6 +934,18 @@ fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
         R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x20, 8),
+        },
+        // Second readers, so each span holds an object rather than being
+        // folded away into its one reader.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2010, 8),
+            val: Varnode::unique(0x10, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2018, 8),
             val: Varnode::unique(0x20, 8),
         },
     ]);
@@ -956,6 +1012,14 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
             dst: Varnode::register(0x38, 8),
             a: Varnode::register(0x38, 8),
             b: Varnode::constant(1, 8),
+        },
+        // A second reader for the middle version. With one reader it is
+        // folded into that reader and leaves the span, and the component this
+        // test closes transitively would have two members instead of three.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2010, 8),
+            val: Varnode::register(0x38, 8),
         },
         R2ILOp::IntAdd {
             dst: Varnode::register(0x38, 8),

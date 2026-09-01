@@ -325,6 +325,9 @@ fn normalized_upstream_value(
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::MissingCanonicalComponent { component }),
         UpstreamValueDisposition::InlineConstant => Ok(NormalizedValueObservation::InlineConstant),
+        UpstreamValueDisposition::InlineExpression => {
+            Ok(NormalizedValueObservation::InlineNonLiteral)
+        }
         UpstreamValueDisposition::Elided(reason) => Ok(NormalizedValueObservation::Elided(reason)),
         UpstreamValueDisposition::Refused(reason) => {
             Ok(NormalizedValueObservation::Refused(reason))
@@ -387,6 +390,9 @@ fn upstream_value_evidence(
         }
         UpstreamValueDisposition::InlineConstant => {
             Ok(ShadowEvidenceKey::UpstreamLiteral { value })
+        }
+        UpstreamValueDisposition::InlineExpression => {
+            Ok(ShadowEvidenceKey::UpstreamInlineExpression { value })
         }
         UpstreamValueDisposition::Elided(_) => {
             Ok(ShadowEvidenceKey::UpstreamValueElision { value })

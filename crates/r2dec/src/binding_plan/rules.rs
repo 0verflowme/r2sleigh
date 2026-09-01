@@ -21,8 +21,8 @@ use r2types::SourceOwnedFunctionFacts;
 
 use super::{
     BindingPlanBuildError, BindingPlanSourceMismatch, certified_direct_call_target_values,
-    certified_direct_control_target_values, certified_return_control_values,
-    certified_stack_frame_values, certified_stack_geometry_values,
+    certified_direct_control_target_values, certified_elided_read_instructions,
+    certified_return_control_values, certified_stack_frame_values, certified_stack_geometry_values,
 };
 
 /// Which values can be members of a binding at all.
@@ -39,6 +39,7 @@ pub(super) fn component_eligible_values(
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
+    let inlinable = inlinable_values(source);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
@@ -65,6 +66,7 @@ pub(super) fn component_eligible_values(
                 && !stack_frame_values.contains(&value.id)
                 && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)
+                && !inlinable.contains(&value.id)
         })
         .collect())
 }
@@ -209,4 +211,151 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
         }
     }
     false
+}
+
+pub(super) fn inlinable_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let Ok(projection) = r2ssa::MachineProjection::from_artifact(source) else {
+        return BTreeSet::new();
+    };
+    let mut expr_by_value = std::collections::BTreeMap::new();
+    for entity in projection.entities() {
+        expr_by_value.insert(entity.output().value(), entity.root());
+    }
+    let elided_reads = certified_elided_read_instructions(source);
+    let mut inlinable = BTreeSet::new();
+    for value in &graph.values {
+        let [use_site] = graph.use_sites(value.id) else {
+            continue;
+        };
+        let renderable = expr_by_value
+            .get(&value.id)
+            .and_then(|root| projection.expr(*root))
+            .is_some_and(|expr| expression_renders_inline(expr.kind()));
+        if !renderable {
+            continue;
+        }
+        let Some(definition) = graph.def_inst(value.id) else {
+            continue;
+        };
+        // The renderer will ask the plan for a write observation on the
+        // definition and a use observation on each of its operands, and either
+        // can answer refused for something never meant to be rendered here.
+        // Asking now is the difference between declining to fold and failing to
+        // generate: plan and renderer agree before the tree exists.
+        if !matches!(
+            projection.write_disposition(definition),
+            Some(r2ssa::MachineWriteDisposition::Exact(_))
+        ) {
+            continue;
+        }
+        let Some(def_inst) = graph.inst(definition) else {
+            continue;
+        };
+        if !(0..def_inst.inputs.len()).all(|input_idx| {
+            matches!(
+                projection.use_disposition(r2ssa::UseSite {
+                    inst: definition,
+                    input_idx,
+                }),
+                Some(
+                    r2ssa::MachineUseDisposition::Exact(_)
+                        | r2ssa::MachineUseDisposition::MemoryAddress(_)
+                )
+            )
+        }) {
+            continue;
+        }
+        // The read this expression would move into has to be a read that
+        // actually appears. A value whose one use sits in an instruction a
+        // certificate elides -- the prologue's `push rbp` is a certified frame
+        // round trip -- disappears together with that instruction, and the
+        // effect its definition answered for is then owed by nobody. The
+        // ledger scores that as a refusal and the function falls back to no
+        // decompilation at all, which is what `murmur3_32` and `xxhash32` did.
+        if elided_reads.contains(&use_site.inst) {
+            continue;
+        }
+        let Some(use_inst) = graph.inst(use_site.inst) else {
+            continue;
+        };
+        // A merge reads its operands on edges, not at a position in a block, so
+        // comparing ordinals against one says nothing and moving a computation
+        // into a merge operand moves it across the edge that operand arrives
+        // on. `crc32_bitwise` and `pearson` are the cases: their loop carriers
+        // are merges, and folding into them computed the wrong answer while
+        // every other check passed.
+        if matches!(use_inst.payload, r2ssa::InstPayload::Phi { .. }) {
+            continue;
+        }
+        if def_inst.block != use_inst.block || def_inst.ordinal >= use_inst.ordinal {
+            continue;
+        }
+        // Every location the *rendered* expression reads, not only the ones the
+        // defining instruction lists. A machine expression is a tree over the
+        // arena, so moving it moves every leaf in it, and a leaf can name a
+        // location the instruction itself never mentions. Checking only the
+        // instruction's inputs let three corpus cells compute the wrong answer.
+        let mut read_locations = BTreeSet::new();
+        let mut pending = vec![*expr_by_value.get(&value.id).expect("checked above")];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let Some(expr) = projection.expr(node) else {
+                continue;
+            };
+            if let r2ssa::MachineExprKind::Source { binding, storage } = expr.kind() {
+                if let Some(storage) = storage {
+                    read_locations.insert(storage.location());
+                } else if let Some(storage) = graph
+                    .value(binding.value())
+                    .and_then(|v| v.canonical_storage)
+                {
+                    read_locations.insert(storage.location());
+                }
+            }
+            pending.extend(expr.kind().children());
+        }
+        read_locations.extend(
+            def_inst
+                .inputs
+                .iter()
+                .filter_map(|i| graph.value(*i))
+                .filter_map(|v| v.canonical_storage)
+                .map(r2ssa::CanonicalStorageId::location),
+        );
+        let rewritten = graph.insts.iter().any(|inst| {
+            inst.block == def_inst.block
+                && inst.ordinal > def_inst.ordinal
+                && inst.ordinal < use_inst.ordinal
+                && inst
+                    .output
+                    .and_then(|o| graph.value(o))
+                    .and_then(|v| v.canonical_storage)
+                    .is_some_and(|s| read_locations.contains(&s.location()))
+        });
+        if !rewritten {
+            inlinable.insert(value.id);
+        }
+    }
+    inlinable
+}
+
+fn expression_renders_inline(kind: &r2ssa::MachineExprKind) -> bool {
+    use r2ssa::MachineExprKind as Kind;
+    matches!(
+        kind,
+        Kind::Arithmetic { .. }
+            | Kind::Bitwise { .. }
+            | Kind::BitwiseNot { .. }
+            | Kind::Boolean { .. }
+            | Kind::BooleanNot { .. }
+            | Kind::Compare { .. }
+            | Kind::Copy { .. }
+            | Kind::Negate { .. }
+            | Kind::Select { .. }
+            | Kind::Shift { .. }
+    )
 }

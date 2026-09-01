@@ -177,6 +177,9 @@ pub(crate) enum ShadowEvidenceKey {
     UpstreamLiteral {
         value: ValueId,
     },
+    UpstreamInlineExpression {
+        value: ValueId,
+    },
     UpstreamValueElision {
         value: ValueId,
     },

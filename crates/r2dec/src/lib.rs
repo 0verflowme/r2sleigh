@@ -5522,14 +5522,17 @@ fn fold_constant_arithmetic_in_expr(
     }
     if let Some(replacement) = replacement {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_outer_expr_observations(&source, replacement);
+        // Every marker in the collapsed subtree, not only the outermost:
+        // folding a cast chain down to one literal deletes the nodes the inner
+        // markers sat on, and the one literal is what renders them now.
+        *expr = crate::ast::carry_all_expr_observations(&source, replacement);
     }
     // Once the address is one number the string table can answer for it.
     if let Some(value) = literal_value(expr)
         && let Some(text) = strings.get(&value)
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_outer_expr_observations(&source, CExpr::StringLit(text.clone()));
+        *expr = crate::ast::carry_all_expr_observations(&source, CExpr::StringLit(text.clone()));
         return;
     }
     // And so can the object table, for an address radare2 has a name for.
@@ -5542,7 +5545,7 @@ fn fold_constant_arithmetic_in_expr(
         && let Some(name) = symbols.get(&value)
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        *expr = crate::ast::carry_outer_expr_observations(
+        *expr = crate::ast::carry_all_expr_observations(
             &source,
             CExpr::addr_of(CExpr::External {
                 name: {
@@ -6605,7 +6608,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_constant_keeps_only_the_rewritten_root_observation() {
+    fn folded_constant_keeps_every_observation_it_collapsed() {
         let mut observations = crate::ast::RenderObservationOwner::new();
         let (left_id, left) = observations
             .observe_expr(CExpr::UIntLit(0x1000))
@@ -6633,9 +6636,14 @@ mod tests {
             crate::ast::strip_render_observations(&mut function, observations.expected_count())
                 .expect("constant folding preserves a valid marker domain");
 
+        // The one rendered node stands for everything the fold collapsed, so
+        // it owns every occurrence those nodes owned. Keeping only the root
+        // silently discarded the operands' occurrences, and an obligation
+        // whose only rendered occurrence sat on a folded operand was then
+        // scored refused for an effect the program does render.
         assert!(reachable.contains(root_id));
-        assert!(!reachable.contains(left_id));
-        assert!(!reachable.contains(right_id));
+        assert!(reachable.contains(left_id));
+        assert!(reachable.contains(right_id));
         assert_eq!(
             function.body,
             vec![CStmt::Return(Some(CExpr::StringLit("text".to_string())))]

@@ -818,7 +818,8 @@ pub enum MachineExprKind {
 }
 
 impl MachineExprKind {
-    fn children(&self) -> Vec<MachineExprId> {
+    /// The expressions this one is built from.
+    pub fn children(&self) -> Vec<MachineExprId> {
         match self {
             Self::Source { .. } | Self::Constant { .. } => Vec::new(),
             Self::MemoryRead { address, .. } => vec![*address],

@@ -1838,6 +1838,40 @@ pub(crate) fn carry_outer_expr_observations(source: &CExpr, mut replacement: CEx
     replacement
 }
 
+/// Move every observation in a source expression onto a replacement that
+/// stands for the whole of it.
+///
+/// `carry_outer_expr_observations` is right when the replacement keeps the
+/// source's subtrees, since the markers inside them travel with those
+/// subtrees. It is wrong when the replacement discards them: folding
+/// `(uint64_t)(int32_t)0xcc9e2d51` down to one literal, or turning an address
+/// into `&name`, throws away whatever the collapsed nodes were marked with,
+/// and the accounting then reports an effect that was rendered as refused.
+///
+/// The replacement renders everything the source rendered, so it owns every
+/// occurrence the source owned. Order is preserved outermost-first so the
+/// rebuilt chain reads the same way round as the one it replaces.
+pub(crate) fn carry_all_expr_observations(source: &CExpr, mut replacement: CExpr) -> CExpr {
+    fn collect(expr: &CExpr, ids: &mut Vec<crate::observation_journal::RenderObservationId>) {
+        if let CExpr::Observed { id, expr } = expr {
+            ids.push(*id);
+            collect(expr, ids);
+            return;
+        }
+        let _ = expr.clone().map_children(&mut |child| {
+            collect(&child, ids);
+            child
+        });
+    }
+
+    let mut ids = Vec::new();
+    collect(source, &mut ids);
+    for id in ids.into_iter().rev() {
+        replacement = CExpr::observed(id, replacement);
+    }
+    replacement
+}
+
 fn strip_stmt_observations(stmt: &mut CStmt) {
     while let CStmt::Observed { id, stmt: inner } = stmt {
         let _ = id;

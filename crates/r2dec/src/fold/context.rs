@@ -117,6 +117,16 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
+    /// Set while an operation is lowered to stand as an expression at the place
+    /// its result is read, rather than as its own statement.
+    ///
+    /// Statement lowering spells a left-hand side before it builds the
+    /// right-hand side, and an inlined value has no left-hand side to spell --
+    /// the binding plan gave it no symbol precisely because it is written
+    /// nowhere. Under this flag the left-hand side is not asked for and the
+    /// assignment collapses to the expression alone, so both forms come out of
+    /// one body and cannot drift apart.
+    pub(crate) inlined_definition: Cell<bool>,
     /// Legacy cache retained only as a negative test fixture: production
     /// inlining is authorized exclusively by the sealed binding plan.
     ///
@@ -187,6 +197,7 @@ impl<'a> FoldingContext<'a> {
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
+            inlined_definition: Cell::new(false),
             #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
@@ -334,6 +345,118 @@ impl<'a> FoldingContext<'a> {
         match journal
             .borrow_mut()
             .observe_normalized_input_uses_expr(site, input_idx, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                r2il::refusal_evidence!("input-use-observation", "{error:?} at {site:?}");
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Mark one exact use at the site a moved expression now occupies.
+    pub(crate) fn observe_moved_use_expr(
+        &self,
+        site: r2ssa::UseSite,
+        block: u64,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal
+            .borrow_mut()
+            .observe_moved_use_expr(site, block, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// The obligations a definition carries, asked of the source instruction
+    /// rather than of a normalized site.
+    ///
+    /// A definition rendered where its value is read has no normalized site of
+    /// its own to ask about, and its obligations are otherwise never requested
+    /// at all, which the ledger scores as refused.
+    pub(crate) fn exact_effect_obligations_for_source_inst(
+        &self,
+        kind: EffectOccurrenceKind,
+        source_inst: r2ssa::InstId,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        self.exact_value_obligations(kind, source_inst, value)
+    }
+
+    /// Mark every cell a definition rendered at its use still owes.
+    pub(crate) fn observe_inlined_definition_expr(
+        &self,
+        value: r2ssa::ValueId,
+        definition: r2ssa::InstId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal
+            .borrow_mut()
+            .observe_inlined_definition_expr(value, definition, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Mark the value an inlined expression produces.
+    pub(crate) fn observe_inlined_value_expr(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal.borrow_mut().observe_inlined_value_expr(value, expr) {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Mark a read that sits inside an expression moved to its use.
+    ///
+    /// The use the consuming instruction recorded belongs to a statement that
+    /// is no longer emitted, so the read is marked against the value and the
+    /// symbol that spells it. A value with no symbol is not a read this can
+    /// authorise, and says so rather than passing an unmarked name through.
+    pub(crate) fn observe_inlined_value_read_expr(
+        &self,
+        value: r2ssa::ValueId,
+        block: u64,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_inlined_value_read_expr(value, symbol, block, expr)
         {
             Ok(marked) => marked,
             Err(error) => {

@@ -630,6 +630,36 @@ pub(super) fn certified_stack_frame_values(source: &r2ssa::SsaArtifact) -> BTree
         .collect()
 }
 
+/// The instructions whose operand reads a certificate already answers for.
+///
+/// These are read from the same certificates the observation journal reads, so
+/// this is the same fact asked a different way rather than a second opinion:
+/// the journal needs the elision reason per use, and the binding plan needs
+/// only to know that the instruction's reads are not rendered.
+///
+/// It matters because folding a value into a read that never appears loses the
+/// definition: `push rbp` is a certified frame round trip, so the store that
+/// carries the frame pointer is elided, and the copy feeding it then had no
+/// rendered occurrence anywhere. The ledger scored the effect refused and the
+/// whole function fell back to no decompilation at all.
+pub(super) fn certified_elided_read_instructions(
+    source: &r2ssa::SsaArtifact,
+) -> BTreeSet<r2ssa::InstId> {
+    let certificates = source.certificates();
+    certificates
+        .stack_frame_round_trips
+        .values()
+        .flat_map(|certificate| certificate.insts.iter().copied())
+        .chain(
+            certificates
+                .machine_return_controls
+                .values()
+                .flat_map(|certificate| certificate.insts.iter().copied()),
+        )
+        .chain(certificates.stack_geometry.insts.iter().copied())
+        .collect()
+}
+
 pub(super) fn certified_stack_geometry_values(source: &r2ssa::SsaArtifact) -> &BTreeSet<ValueId> {
     &source.certificates().stack_geometry.values
 }
@@ -641,7 +671,12 @@ pub(super) fn certified_stack_geometry_values(source: &r2ssa::SsaArtifact) -> &B
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PlacementRead {
     Use(UseSite),
-    CertifiedValue { value: ValueId, at: InstId },
+    /// A read from inside an expression moved to its use.
+    Inlined(ValueId),
+    CertifiedValue {
+        value: ValueId,
+        at: InstId,
+    },
     StackAccess(r2ssa::StructuredAccessId),
     PreservedCarrierWrite(InstId),
 }
@@ -873,6 +908,7 @@ impl CanonicalComponentId {
 pub(crate) enum UpstreamValueDisposition {
     Bound { component: CanonicalComponentId },
     InlineConstant,
+    InlineExpression,
     Elided(r2ssa::ledger::ElisionReason),
     Refused(ValueRefusal),
 }

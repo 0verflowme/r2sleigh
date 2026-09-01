@@ -1018,6 +1018,14 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
+        // The address is computed once and read twice, so it keeps a binding
+        // of its own. A single reader would fold the subtraction into the
+        // load, and this test is about what the binding spells.
+        entry.push(R2ILOp::Load {
+            dst: Varnode::unique(0x208, 4),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x100, 8),
+        });
         for offset in [0x210, 0x218] {
             entry.push(R2ILOp::IntAdd {
                 dst: Varnode::unique(offset, 4),
@@ -1942,6 +1950,14 @@ mod tests {
             addr: Varnode::constant(0x2000, 8),
             val: Varnode::unique(0x20, 8),
         });
+        // The copy's destination is read twice, so the plan binds it. With a
+        // single reader it would be folded into that reader, and the test
+        // needs one value the plan inlines and one it does not.
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x10, 8),
+        });
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("sealed_inline_admission");
         let block = prepared.function().get_block(0x1000).expect("entry block");
@@ -1975,7 +1991,12 @@ mod tests {
         ctx.inlined_renderings
             .borrow_mut()
             .insert(dst.display_name(), CExpr::IntLit(100));
-        assert_eq!(ctx.get_expr(src), Ok(CExpr::IntLit(7)));
+        // The literal is marked: an inlined value owes its own cell wherever
+        // it renders, and the marker is how the accounting finds it.
+        assert_eq!(
+            ctx.get_expr(src).map(|expr| expr.unobserved().clone()),
+            Ok(CExpr::IntLit(7))
+        );
         assert_eq!(
             ctx.get_expr(dst),
             Ok(CExpr::Var(
@@ -3138,6 +3159,16 @@ mod tests {
             dst: Varnode::register(0x00, 8),
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
+        });
+        // The member address is read twice, so it keeps a binding. Read once
+        // it would fold into the load, and the plan this test checks would
+        // have no address value to answer for. The second read stores the
+        // address rather than loading through it, so the aggregate access
+        // this test counts stays the single one the load makes.
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x3000, 8),
+            val: Varnode::unique(0x100, 8),
         });
         let prepared =
             prepared_x86_with_demo_struct_parameter(&[entry], &arch).with_name("field_with_cert");

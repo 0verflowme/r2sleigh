@@ -533,6 +533,11 @@ impl BindingPlan {
                 literal_by_value.entry(binding.value()).or_insert(expr_id);
             }
         }
+        let mut expr_by_value = BTreeMap::<ValueId, MachineExprId>::new();
+        for entity in machine_projection.entities() {
+            expr_by_value.insert(entity.output().value(), entity.root());
+        }
+        let inlinable = super::rules::inlinable_values(source);
         let mut dispositions = graph
             .values
             .iter()
@@ -622,6 +627,17 @@ impl BindingPlan {
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,
+                    },
+                };
+            } else if graph_value.var.constant_bits().is_none()
+                && inlinable.contains(&graph_value.id)
+                && let Some(expr) = expr_by_value.get(&graph_value.id).copied()
+            {
+                dispositions[index] = ValueDisposition::Inline {
+                    expr,
+                    proof: InlineProof {
+                        authority: source.authority().clone(),
+                        literal: expr,
                     },
                 };
             } else if graph_value.var.constant_bits().is_some() {

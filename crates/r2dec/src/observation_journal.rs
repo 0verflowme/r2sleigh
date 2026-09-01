@@ -85,6 +85,19 @@ enum ObservationTarget {
         binding: crate::binding_plan::BindingId,
         symbol: SymbolId,
     },
+    /// A value read from inside an expression that was moved to its use.
+    ///
+    /// A read is normally authorised by the use the consuming instruction
+    /// records. An inlined value's operands are read inside another statement,
+    /// and the instruction that recorded those uses is no longer emitted, so
+    /// the read is marked against the value itself and the symbol it spells.
+    InlinedValueRead {
+        value: ValueId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+        /// Where the expression carrying this read is emitted.
+        block: u64,
+    },
     Use {
         site: UseSite,
         observation: LegacyUseObservation,
@@ -838,6 +851,16 @@ fn placement_refusal(
             instruction_id: site.inst.0,
             input_index: site.input_idx,
         },
+        // An inlined read has no instruction of its own to name; the value it
+        // reads is what identifies it.
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::Inlined(value),
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: 0,
+        },
         Private::ReadBeforeAssignment {
             binding,
             read: crate::binding_plan::PlacementRead::CertifiedValue { value, at },
@@ -1316,6 +1339,17 @@ impl LegacyObservationJournal {
                     symbol: *symbol,
                 },
             ),
+            ObservationTarget::InlinedValueRead {
+                value,
+                binding,
+                symbol,
+                block,
+            } => Some(crate::placement::PlacementObservationTarget::InlinedRead {
+                value: *value,
+                binding: *binding,
+                symbol: *symbol,
+                block: *block,
+            }),
             ObservationTarget::Use { site, block, .. } => Some(
                 self.source
                     .graph()
@@ -2136,6 +2170,139 @@ impl LegacyObservationJournal {
     /// boundary contract, while the lifted `Return` operand itself is the
     /// control target. This marker carries that exact `(ValueId, InstId)` into
     /// final declaration placement without inventing an operand index.
+    /// Mark every cell the accounting requires of a definition that renders
+    /// where its value is read.
+    ///
+    /// The audit asks three things of the tree, and a value with no statement
+    /// of its own fails all three unless they are answered together: every
+    /// value has a cell, every recorded use has one, and every instruction with
+    /// an output has a write cell. Satisfying them one at a time as each
+    /// refusal surfaced took as many build cycles as there are requirements,
+    /// which is how the shape of this was found.
+    pub(crate) fn observe_inlined_definition_expr(
+        &mut self,
+        value: ValueId,
+        definition: InstId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let mut targets = vec![ObservationTarget::Value(value)];
+        let block = self
+            .source
+            .inst_op_site(definition)
+            .map(|(block, _)| block)
+            .unwrap_or_default();
+        let inst = self
+            .source
+            .graph()
+            .inst(definition)
+            .ok_or(LegacyObservationJournalError::InvalidWrite(definition))?;
+        // The write the vanished statement performed. Its result is the
+        // expression now standing in the reader's place.
+        if inst.output.is_some() {
+            let observation = self.rendered_write_observation(definition)?;
+            targets.push(ObservationTarget::Write {
+                inst: definition,
+                observation,
+                block,
+            });
+        }
+        // Every operand the vanished statement read.
+        for input_idx in 0..inst.inputs.len() {
+            let site = UseSite {
+                inst: definition,
+                input_idx,
+            };
+            let observation = self.rendered_use_observation(site)?;
+            targets.push(ObservationTarget::Use {
+                site,
+                observation,
+                block,
+            });
+        }
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// Mark the value an inlined expression produces, where it is rendered.
+    ///
+    /// A value is accounted for by being rendered somewhere. A value rendered
+    /// where it is read has no statement of its own, so the site it is rendered
+    /// at is the only place its cell can be marked.
+    pub(crate) fn observe_inlined_value_expr(
+        &mut self,
+        value: ValueId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let id = self
+            .allocate_many(vec![ObservationTarget::Value(value)])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(id, expr))
+    }
+
+    /// Mark one exact use at the site the moved expression now occupies.
+    ///
+    /// The use belongs to an instruction whose statement is no longer emitted.
+    /// Its occurrence has not been lost -- the expression that reads it is in
+    /// the tree, one level in -- so the cell is marked here rather than left
+    /// empty for the exact-use audit to report as unrendered.
+    pub(crate) fn observe_moved_use_expr(
+        &mut self,
+        site: UseSite,
+        block: u64,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        let observation = self.rendered_use_observation(site)?;
+        let id = self
+            .allocate_many(vec![ObservationTarget::Use {
+                site,
+                observation,
+                block,
+            }])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(id, expr))
+    }
+
+    /// Mark a read that now sits inside an expression moved to its use.
+    pub(crate) fn observe_inlined_value_read_expr(
+        &mut self,
+        value: ValueId,
+        symbol: SymbolId,
+        block: u64,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
+            return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+        };
+        let binding = *binding;
+        // The value's own cell as well as the read's. A bound value is
+        // accounted for by being rendered somewhere, and for a value whose only
+        // appearance was the operand of a statement that is no longer emitted,
+        // this is that somewhere.
+        let [value_target, target] = self
+            .allocate_many(vec![
+                ObservationTarget::Value(value),
+                ObservationTarget::InlinedValueRead {
+                    value,
+                    binding,
+                    symbol,
+                    block,
+                },
+            ])?
+            .try_into()
+            .map_err(|_| LegacyObservationJournalError::RenderedValueRequired(value))?;
+        Ok(CExpr::observed(target, CExpr::observed(value_target, expr)))
+    }
+
     pub(crate) fn observe_certified_value_read_expr(
         &mut self,
         value: ValueId,
@@ -2308,6 +2475,9 @@ impl LegacyObservationJournal {
                 continue;
             };
             match target {
+                // The read is not the value's own definition, so an elision of
+                // the definition says nothing about it.
+                ObservationTarget::InlinedValueRead { .. } => {}
                 ObservationTarget::Value(value) => {
                     if let Some(slot) = self.values.get_mut(value.0 as usize)
                         && slot.is_none()
@@ -2832,6 +3002,10 @@ impl LegacyObservationJournal {
                     return Ok(());
                 }
                 let result = match target {
+                    // Sealing has nothing to record: the read carries no
+                    // value or use slot of its own, and the placement audit is
+                    // what it exists to answer.
+                    ObservationTarget::InlinedValueRead { .. } => Ok(()),
                     ObservationTarget::CertifiedValueRead { .. } => Ok(()),
                     ObservationTarget::Value(value) => {
                         match plan.disposition(value) {
@@ -3389,8 +3563,18 @@ mod tests {
             a: Varnode::unique(0x10, 8),
             b: Varnode::constant(2, 8),
         });
+        // The first temporary is read twice on purpose. A value with one
+        // reader is folded into that reader and has no object of its own, so a
+        // fixture built only from single-use values leaves nothing bound for
+        // these tests -- which are about what the journal records for a bound
+        // value -- to look at.
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x30, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::unique(0x10, 8),
+        });
         block.push(R2ILOp::Return {
-            target: Varnode::unique(0x20, 8),
+            target: Varnode::unique(0x30, 8),
         });
         source_owned_from_blocks(&[block])
     }

@@ -1536,6 +1536,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
+        if self.inlined_definition.get() {
+            // The result is read where it is computed, so there is nothing to
+            // assign it to; the expression is the whole of the answer.
+            return Some(CStmt::Expr(rhs));
+        }
         // Both sides are exact occurrence projections. Identity-looking text
         // is not an elision proof: distinct SSA values may intentionally share
         // one rendered binding, and a write may still be an observable effect.
@@ -1543,6 +1548,11 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assignment_lhs_expr(&self, _dst: &SSAVar) -> OpLoweringResult<CExpr> {
+        if self.inlined_definition.get() {
+            // Discarded by `assign_stmt` under the same flag. Asking the plan
+            // for a symbol it deliberately withheld would refuse the lowering.
+            return Ok(CExpr::IntLit(0));
+        }
         match self.planned_current_output_expr() {
             Ok(Some(planned)) => Ok(planned),
             Ok(None) => Err(OpLoweringRefusal::missing_program_variable()),

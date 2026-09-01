@@ -436,6 +436,7 @@ pub(crate) fn build_upstream_shadow_oracle(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let inlinable = super::rules::inlinable_values(source);
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
         if return_controls.contains(&graph_value.id) {
@@ -493,6 +494,10 @@ pub(crate) fn build_upstream_shadow_oracle(
             continue;
         }
         if graph_value.var.constant_bits().is_none() {
+            if inlinable.contains(&graph_value.id) {
+                values[graph_value.id.0 as usize] =
+                    Some(UpstreamValueDisposition::InlineExpression);
+            }
             continue;
         }
         values[graph_value.id.0 as usize] = Some(if literal_values.contains(&graph_value.id) {
@@ -655,15 +660,20 @@ impl BindingPlan {
                     members.insert(value);
                 }
                 ValueDisposition::Inline { expr, proof } => {
-                    let exact_literal = proof.authority == *source.authority()
-                        && proof.literal == *expr
-                        && graph_value.var.constant_bits().is_some()
+                    let owned = proof.authority == *source.authority() && proof.literal == *expr;
+                    let exact_expression = graph_value.var.constant_bits().is_none()
+                        && super::rules::inlinable_values(source).contains(&value)
+                        && self
+                            .machine_projection
+                            .entity_for_output(value)
+                            .is_some_and(|entity| entity.root() == *expr);
+                    let exact_literal = graph_value.var.constant_bits().is_some()
                         && matches!(
                             self.machine_projection.expr(*expr).map(|expr| expr.kind()),
                             Some(MachineExprKind::Constant { binding, .. })
                                 if binding.value() == value
                         );
-                    if !exact_literal {
+                    if !owned || !(exact_literal || exact_expression) {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::InvalidLiteralInline { value },
                         ));

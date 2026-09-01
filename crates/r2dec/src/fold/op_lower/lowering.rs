@@ -242,6 +242,43 @@ impl<'a> FoldingContext<'a> {
     /// plan's answer, not this function's. Anything the plan has not settled, or
     /// an expression deeper than a rendered expression has any business being,
     /// refuses rather than guesses.
+    /// The expression the operation lowering itself produces for a value's
+    /// definition, so that a folded value renders exactly as it would have
+    /// rendered in its own statement.
+    ///
+    /// Deriving the expression a second time over the machine arena was the
+    /// earlier approach, and it disagreed with this one about signedness: the
+    /// arena's `interpretation` records how a value is later read, not how the
+    /// defining operation computes it, so a signed comparison came back
+    /// unsigned and folded into a test that is never true.
+    ///
+    /// Lowering in expression mode at the definition's own site also gives the
+    /// operands their ordinary observations, which is what authorises reads
+    /// that now sit nested inside another statement.
+    fn inlined_definition_expr(&self, definition: r2ssa::InstId) -> Option<CExpr> {
+        let prepared = self.inputs.prepared_ssa?;
+        let (block_addr, op_idx) = prepared.inst_op_site(definition)?;
+        // The operation being lowered right now cannot render itself: asking
+        // for its own output as an expression is how a statement spells its
+        // left-hand side, and re-entering would observe its operands twice.
+        if self.current_block_addr.get() == Some(block_addr)
+            && self.current_op_idx.get() == Some(op_idx)
+        {
+            return None;
+        }
+        let site = self.normalized_site(block_addr, op_idx)?;
+        let op = prepared.function().get_block(block_addr)?.ops.get(op_idx)?;
+        let previous_block = self.current_block_addr.replace(Some(block_addr));
+        let previous_op = self.current_op_idx.replace(Some(op_idx));
+        let frame = super::LowerFrame::for_observed_expr(Some(site));
+        let previous_inlined = self.inlined_definition.replace(true);
+        let lowered = self.op_to_expr_impl(op, &frame);
+        self.inlined_definition.set(previous_inlined);
+        self.current_block_addr.set(previous_block);
+        self.current_op_idx.set(previous_op);
+        lowered.ok().flatten()
+    }
+
     fn materialize_machine_expr(
         &self,
         names: &crate::binding_plan::BindingNameResolution,
@@ -264,12 +301,24 @@ impl<'a> FoldingContext<'a> {
         let child =
             |id: r2ssa::MachineExprId| self.materialize_machine_expr(names, value, id, depth + 1);
         Ok(match machine_expr.kind() {
-            Kind::Constant { value: literal, .. } => {
+            Kind::Constant {
+                binding,
+                value: literal,
+            } => {
                 let bits = literal.bits();
-                if bits > i64::MAX as u64 {
+                let rendered = if bits > i64::MAX as u64 {
                     CExpr::UIntLit(bits)
                 } else {
                     CExpr::IntLit(bits as i64)
+                };
+                // Every value owes a cell, and a constant reached as a leaf of
+                // a moved expression is rendered here rather than as an operand
+                // of an emitted statement, so this is where it is marked.
+                let constant = binding.value();
+                if constant == value {
+                    rendered
+                } else {
+                    self.observe_inlined_value_expr(constant, rendered)
                 }
             }
             Kind::Source { binding, .. } => {
@@ -277,7 +326,59 @@ impl<'a> FoldingContext<'a> {
                 if source == value {
                     return Err(invalid());
                 }
-                self.planned_value_expr(source)?
+                // The read moves with the expression, and the observation that
+                // authorises it moves too. The use the defining instruction
+                // recorded belongs to a statement that is no longer emitted, so
+                // the read is marked against the value itself.
+                let rendered = self.planned_value_expr(source)?;
+                // Where the expression is emitted, taken from the value's own
+                // definition rather than from ambient state: the rule that made
+                // this value inlinable requires its definition and its use to
+                // sit in one block, so the definition's block is the block the
+                // expression now lives in, and the materialiser is reached from
+                // places that carry no current block at all.
+                // Only a read of a named object needs authorising. An operand
+                // that is itself rendered where it is read produced an
+                // expression rather than a name, and there is no symbol for the
+                // audit to ask about.
+                let names_a_symbol = self
+                    .inputs
+                    .binding_names
+                    .and_then(|names| names.disposition_for_value(source))
+                    .is_some_and(|disposition| {
+                        matches!(
+                            disposition,
+                            crate::binding_plan::ValueDisposition::Bound { .. }
+                        )
+                    });
+                if !names_a_symbol {
+                    return Ok(rendered);
+                }
+                match self
+                    .prepared_ssa()
+                    .and_then(|prepared| prepared.graph().def_inst(value))
+                    .and_then(|inst| self.prepared_ssa()?.inst_op_site(inst))
+                {
+                    Some((block, _)) => {
+                        let read = self.observe_inlined_value_read_expr(source, block, rendered);
+                        // The use the vanished statement recorded, marked where
+                        // the expression that performs it now sits.
+                        match self
+                            .prepared_ssa()
+                            .map(|prepared| prepared.graph().use_sites(source).to_vec())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|site| {
+                                self.prepared_ssa()
+                                    .and_then(|prepared| prepared.graph().def_inst(value))
+                                    == Some(site.inst)
+                            }) {
+                            Some(site) => self.observe_moved_use_expr(site, block, read),
+                            None => read,
+                        }
+                    }
+                    None => rendered,
+                }
             }
             Kind::Copy { input } => child(*input)?,
             Kind::Arithmetic {
@@ -328,18 +429,37 @@ impl<'a> FoldingContext<'a> {
                 value: shifted,
                 count,
                 ..
-            } => CExpr::binary(
-                match kind {
-                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
-                    // Both right shifts render as `>>`; which one it is follows
-                    // from the signedness of the operand's type, which the
-                    // declaration carries.
-                    r2ssa::MachineShiftKind::LogicalRight
-                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
-                },
-                child(*shifted)?,
-                child(*count)?,
-            ),
+            } => {
+                // An arithmetic right shift is `>>` on a signed operand and
+                // nothing else, so the operand is cast rather than the operator
+                // changed -- the same mistake as the comparison above, and the
+                // same fix.
+                let value_expr = child(*shifted)?;
+                let value_expr = if matches!(kind, r2ssa::MachineShiftKind::ArithmeticRight) {
+                    let bits = names
+                        .inline_expr(*shifted)
+                        .map(|expr| expr.ty().width_bits())
+                        .unwrap_or(32);
+                    CExpr::cast(
+                        CType::Int {
+                            bits,
+                            signedness: r2types::Signedness::Signed,
+                        },
+                        value_expr,
+                    )
+                } else {
+                    value_expr
+                };
+                CExpr::binary(
+                    match kind {
+                        r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                        r2ssa::MachineShiftKind::LogicalRight
+                        | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                    },
+                    value_expr,
+                    child(*count)?,
+                )
+            }
             Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(*input)?),
             Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(*input)?),
             Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(*input)?),
@@ -381,17 +501,69 @@ impl<'a> FoldingContext<'a> {
                         },
                     );
                 };
-                if let r2ssa::MachineExprKind::Constant { binding, .. } = machine_expr.kind()
-                    && binding.value() != value
-                {
-                    return Err(
-                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
-                            value,
-                            expr,
-                        },
-                    );
-                }
-                self.materialize_machine_expr(names, value, expr, 0)
+                // A literal still owes its cells. Returning it straight to the
+                // caller skipped every observation the value and its defining
+                // instruction owe, so a copy of a constant -- `tmp = 0xcc9e2d51`
+                // in `murmur3_32` -- folded into its use and left the effect it
+                // answered for with no rendered occurrence anywhere.
+                let literal = match machine_expr.kind() {
+                    r2ssa::MachineExprKind::Constant { binding, value: literal } => {
+                        if binding.value() != value {
+                            return Err(
+                                crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                                    value,
+                                    expr,
+                                },
+                            );
+                        }
+                        let bits = literal.bits();
+                        Some(if bits > i64::MAX as u64 {
+                            CExpr::UIntLit(bits)
+                        } else {
+                            CExpr::IntLit(bits as i64)
+                        })
+                    }
+                    _ => None,
+                };
+                // A value defined by an operation renders as the expression
+                // that operation's own lowering produces, moved to where the
+                // value is read. Deriving it a second time over the machine
+                // arena was the earlier approach and disagreed about
+                // signedness: the arena's `interpretation` records how a value
+                // is later read, not how the defining operation computes it, so
+                // a signed comparison came back unsigned and folded into a test
+                // that is never true.
+                //
+                // A value with no operation behind it -- a live-in register, a
+                // merge -- has no lowering to move, and the arena still answers
+                // for it.
+                let definition = self
+                    .prepared_ssa()
+                    .and_then(|prepared| prepared.graph().def_inst(value));
+                let rendered = match literal {
+                    Some(literal) => literal,
+                    None => match definition
+                        .and_then(|definition| self.inlined_definition_expr(definition))
+                    {
+                        Some(rendered) => rendered,
+                        None => self.materialize_machine_expr(names, value, expr, 0)?,
+                    },
+                };
+                // A constant has no defining instruction and owes no write or
+                // operand cells, but it still owes its own.
+                let Some(definition) = definition else {
+                    return Ok(self.observe_inlined_value_expr(value, rendered));
+                };
+                let marked = self.observe_inlined_definition_expr(value, definition, rendered);
+                // The effects the definition answered for move with it. Nothing
+                // asks a statement that is not emitted for its obligations, and
+                // the ledger scores an obligation nobody asked about as refused.
+                let obligations = self.exact_effect_obligations_for_source_inst(
+                    crate::fold::context::EffectOccurrenceKind::Expression,
+                    definition,
+                    Some(value),
+                );
+                Ok(self.observe_effect_expr(&obligations, marked))
             }
             Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
