@@ -859,7 +859,7 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             R2ILOp::Branch { .. } | R2ILOp::CBranch { .. } => {
                 !control_op_is_intra_instruction(block, op_index)
             }
-            R2ILOp::Return { .. } => true,
+            R2ILOp::Return { .. } | R2ILOp::Breakpoint => true,
             R2ILOp::BranchInd { .. } => block.block.switch_info.is_some(),
             _ => false,
         };
@@ -876,7 +876,7 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
         }
     }
     match block_terminator(block) {
-        Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
+        Some(R2ILOp::Return { .. } | R2ILOp::Breakpoint) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![target])
             .ok_or_else(|| {
@@ -995,7 +995,7 @@ fn typed_genuine_block_successors(
         .checked_add(u64::from(block.block.size))
         .ok_or_else(|| LiftError::Parse("trusted block fallthrough overflows".to_string()))?;
     match block_terminator(block) {
-        Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
+        Some(R2ILOp::Return { .. } | R2ILOp::Breakpoint) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![(AdvisorySuccessorKind::Direct, target, None)])
             .ok_or_else(|| {
@@ -1851,9 +1851,21 @@ impl Disassembler {
             .max()
             .unwrap_or(0);
 
+        // A trap ends the instruction. Sleigh writes `brk` as a user operation
+        // that produces `pc` followed by a branch through it, so the branch's
+        // only definition of its target is the trap itself; expanding the trap
+        // into `Breakpoint`, which produces nothing, would leave that branch
+        // reading a `pc` nothing defines. Control does not reach it either way
+        // -- the exception is taken at the trap and does not come back -- so
+        // the operations Sleigh writes after it in the same instruction are not
+        // executed, and dropping them is what the machine does.
         for op in ops {
             for expanded in self.expand_user_operation(op, temp_base) {
+                let traps = matches!(expanded, R2ILOp::Breakpoint);
                 block.push(expanded);
+                if traps {
+                    return Ok(block);
+                }
             }
         }
 

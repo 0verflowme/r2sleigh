@@ -628,6 +628,16 @@ impl<'a> FoldingContext<'a> {
                                 ObligationKind::LiveValueProducer | ObligationKind::Trap
                             )
                     }
+                    // A trap renders as the statement that takes it --
+                    // `__builtin_trap()` -- and that statement produces no
+                    // value, so the occurrence carries none either. Without
+                    // this arm the trap fell to the value-producer case below,
+                    // which no valueless statement can satisfy, and every
+                    // function containing a guard instruction was refused for
+                    // an effect it had in fact rendered.
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::Breakpoint) => {
+                        obligation.id.kind == ObligationKind::Trap && inst.output == value
+                    }
                     _ => {
                         obligation.id.kind == ObligationKind::LiveValueProducer
                             && inst.output == value
