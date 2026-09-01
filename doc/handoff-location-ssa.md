@@ -6914,3 +6914,40 @@ Effect` in `targets` that is missing from that set. Allocated-and-missing means
 the statement is dropped and the search is for which pass drops it; never
 allocated means `planned_value_expr` was not asked, and the search is for who
 renders that load instead.
+
+**Where `siphash24` actually loses its two markers, measured.** The markers are
+allocated and then absent from the sealed AST, and the neighbouring operations
+at that block -- `Op(36)`, `Op(37)`, `Op(40)`, `Op(41)`, `Op(42)` -- are not
+among the missing, so the load's own statement is rendered. Printing the
+expression at `observe_effect_expr` names the shape exactly: each marker sits
+on a `Binary { op: Mul }`, the index scaled by the eight-byte element stride.
+The rendering of that load turns the address into a subscript and divides the
+stride out, and the multiplication the marker was on ceases to exist.
+
+Two rebuild sites do that and both were tried with
+`carry_all_expr_observations`, extended to skip ids the replacement still
+holds so a surviving subtree is not counted twice: the pair inside
+`render_certified_memory_expr_for_fact` (the structured branch and the
+byte-address branch), and `typed_subscript_access`, whose `index_in_elements`
+divides the stride out directly. Neither changed the outcome -- coverage stayed
+at 243 -- so both were reverted.
+
+That leaves one path, and it explains why every carrier missed:
+`render_certified_semantic_array_expr(fact)` takes only the fact. It is reached
+before `certified_memory_address_expr` is ever called, builds `base[index]`
+from the certified array fact's own base and index values, and never sees the
+address expression at all. There is nothing to carry there, because the
+expression is not passed in. So the fix belongs in the plan: a value whose one
+reader is the address of an access rendered from an array fact must not be
+folded, exactly as for the dead frame slot.
+
+That guard was written and did not fire, which is the next thing to
+understand rather than to rewrite. It asked
+`source_owned.report().render()` for `array_accesses_by_op` at the fact's own
+`(block_addr, op_index, is_write)` and matched the same four fields the
+renderer's `certified_array_fact_for_memory` matches, plus the
+`base.is_some() || index.is_some()` test that
+`render_certified_memory_expr_for_fact` adds. Either those render facts are not
+the ones the fold context reads through `self.inputs.render_facts()`, or the
+match differs in a field. Print both sides for that one op before changing the
+predicate again.
