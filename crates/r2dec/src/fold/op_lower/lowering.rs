@@ -228,6 +228,137 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Render a machine expression as the C expression it stands for.
+    ///
+    /// A value the plan marks inline is rendered where it is read rather than in
+    /// a statement of its own, and until this existed the only expression that
+    /// could be was a literal. Everything else answered `InvalidPlannedInline`,
+    /// which is why a comparison's flag reached the reader as
+    /// `ZF_1 = (a - b) == 0; if (!ZF_1)` and why a chain of machine temporaries
+    /// each got a name.
+    ///
+    /// A `Source` leaf is where the recursion leaves the machine and re-enters
+    /// the plan: it names another value, and what that value renders as is the
+    /// plan's answer, not this function's. Anything the plan has not settled, or
+    /// an expression deeper than a rendered expression has any business being,
+    /// refuses rather than guesses.
+    fn materialize_machine_expr(
+        &self,
+        names: &crate::binding_plan::BindingNameResolution,
+        value: ValueId,
+        expr: r2ssa::MachineExprId,
+        depth: u32,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        use r2ssa::MachineExprKind as Kind;
+        let invalid =
+            || crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                value,
+                expr,
+            };
+        if depth > 16 {
+            return Err(invalid());
+        }
+        let Some(machine_expr) = names.inline_expr(expr) else {
+            return Err(invalid());
+        };
+        let child =
+            |id: r2ssa::MachineExprId| self.materialize_machine_expr(names, value, id, depth + 1);
+        Ok(match machine_expr.kind() {
+            Kind::Constant { value: literal, .. } => {
+                let bits = literal.bits();
+                if bits > i64::MAX as u64 {
+                    CExpr::UIntLit(bits)
+                } else {
+                    CExpr::IntLit(bits as i64)
+                }
+            }
+            Kind::Source { binding, .. } => {
+                let source = binding.value();
+                if source == value {
+                    return Err(invalid());
+                }
+                self.planned_value_expr(source)?
+            }
+            Kind::Copy { input } => child(*input)?,
+            Kind::Arithmetic {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineArithmeticOp::Add => BinaryOp::Add,
+                    r2ssa::MachineArithmeticOp::Subtract => BinaryOp::Sub,
+                    r2ssa::MachineArithmeticOp::Multiply => BinaryOp::Mul,
+                },
+                child(*left)?,
+                child(*right)?,
+            ),
+            Kind::Bitwise { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBitwiseOp::And => BinaryOp::BitAnd,
+                    r2ssa::MachineBitwiseOp::Or => BinaryOp::BitOr,
+                    r2ssa::MachineBitwiseOp::Xor => BinaryOp::BitXor,
+                },
+                child(*left)?,
+                child(*right)?,
+            ),
+            Kind::Boolean { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBooleanOp::And => BinaryOp::And,
+                    r2ssa::MachineBooleanOp::Or => BinaryOp::Or,
+                    // C has no boolean exclusive-or; on values the machine
+                    // already reduced to zero or one, inequality is it.
+                    r2ssa::MachineBooleanOp::Xor => BinaryOp::Ne,
+                },
+                child(*left)?,
+                child(*right)?,
+            ),
+            Kind::Compare {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineComparisonOp::Equal => BinaryOp::Eq,
+                    r2ssa::MachineComparisonOp::NotEqual => BinaryOp::Ne,
+                    r2ssa::MachineComparisonOp::LessThan => BinaryOp::Lt,
+                    r2ssa::MachineComparisonOp::LessThanOrEqual => BinaryOp::Le,
+                },
+                child(*left)?,
+                child(*right)?,
+            ),
+            Kind::Shift {
+                kind,
+                value: shifted,
+                count,
+                ..
+            } => CExpr::binary(
+                match kind {
+                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                    // Both right shifts render as `>>`; which one it is follows
+                    // from the signedness of the operand's type, which the
+                    // declaration carries.
+                    r2ssa::MachineShiftKind::LogicalRight
+                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                },
+                child(*shifted)?,
+                child(*count)?,
+            ),
+            Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(*input)?),
+            Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(*input)?),
+            Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(*input)?),
+            Kind::Select {
+                condition,
+                if_true,
+                if_false,
+            } => CExpr::Ternary {
+                cond: Box::new(child(*condition)?),
+                then_expr: Box::new(child(*if_true)?),
+                else_expr: Box::new(child(*if_false)?),
+            },
+            // Everything else -- a memory read, a merge, a division that traps,
+            // a flag or a width change whose C form depends on a type this does
+            // not carry -- keeps its own statement.
+            _ => return Err(invalid()),
+        })
+    }
+
     pub(crate) fn planned_value_expr(
         &self,
         value: ValueId,
@@ -250,19 +381,9 @@ impl<'a> FoldingContext<'a> {
                         },
                     );
                 };
-                let r2ssa::MachineExprKind::Constant {
-                    binding,
-                    value: literal,
-                } = machine_expr.kind()
-                else {
-                    return Err(
-                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
-                            value,
-                            expr,
-                        },
-                    );
-                };
-                if binding.value() != value {
+                if let r2ssa::MachineExprKind::Constant { binding, .. } = machine_expr.kind()
+                    && binding.value() != value
+                {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
                             value,
@@ -270,12 +391,7 @@ impl<'a> FoldingContext<'a> {
                         },
                     );
                 }
-                let bits = literal.bits();
-                Ok(if bits > i64::MAX as u64 {
-                    CExpr::UIntLit(bits)
-                } else {
-                    CExpr::IntLit(bits as i64)
-                })
+                self.materialize_machine_expr(names, value, expr, 0)
             }
             Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {

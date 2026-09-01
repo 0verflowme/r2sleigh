@@ -6556,3 +6556,31 @@ one, so the accounting has to accept a fold the way it now accepts a duplicated
 tail -- the machinery for saying "this is one execution, not a loss" is already
 there. And placement stops declaring a local that no longer exists, which is the
 path that is already exercised whenever a value is `Inline` today.
+
+
+**The materialiser is built; the policy that uses it needs the journal.** A
+planned inline is no longer limited to a literal:
+`materialize_machine_expr` in `fold/op_lower/lowering.rs` renders arithmetic,
+bitwise and boolean operations, comparisons, shifts, negation, copies and
+selects, and recurses back into the plan at a `Source` leaf, which is where the
+machine expression stops and the plan's own answer for that value begins.
+Anything outside that set -- a memory read, a merge, a division that traps, a
+width change or a flag whose C form depends on a type the expression does not
+carry -- still keeps its statement, and the set is stated once so the plan can
+be made to mark exactly what the renderer can take.
+
+Wiring the policy to it was implemented and reverted twice, and the second
+attempt found the real remaining blocker. The first attempt did nothing, because
+the disposition loop set `Inline` and a later loop over binding components
+overwrote it with `Bound`; the fix for that is to exclude inlinable values from
+`rules::component_eligible_values`, exactly as constants are excluded, so the
+rule that decides eligibility and the rule that decides inlining are one place.
+With that done the disposition survives and the renderer materialises it -- and
+the whole-binary gate then reports every function refusing with
+`missing program-variable authorization`.
+
+That is the last piece: the observation journal authorises a rendered value
+through its occurrence, and an inlined value is read where another value's
+statement is emitted rather than in one of its own. Until the journal accounts
+for that, the plan cannot mark anything inline. Take that first; the policy is
+already written twice in this document and the materialiser is in the tree.
