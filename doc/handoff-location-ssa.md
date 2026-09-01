@@ -6650,3 +6650,32 @@ materialiser that is already committed, and the seal category that accepts a
 computed inline; then change the journal so a moved marker discharges its
 obligation where it now sits. The AST experiment is not the thing to finish --
 it is the evidence for not finishing it.
+
+**The SSA-side attempt, and the exact probe it stopped on.** With the layer
+question decided, the plan side works: the rule marks the right values, the seal
+accepts a computed inline once it derives the same rule itself, and the
+materialiser renders the expression. Four blockers fell in order. The fifth is
+where it stands.
+
+An inlined value's expression contains operand reads, and placement refuses them
+as `unobserved_binding_read` because the observation that authorises a read is
+attached to the statement being emitted, and that statement no longer exists.
+Marking them at the site they now occupy is what the decided model calls for --
+the occurrence moves with the expression -- and the mechanics are:
+`observe_optional_normalized_input_uses_expr` wants a `NormalizedOpSite` and an
+input index, the site is found by scanning the current block for the operation
+whose source instruction is the inlined value's definition, and the input index
+must come from `graph.use_sites(operand)` rather than from the defining
+instruction's operand list, because a machine expression is a tree over the
+arena and its leaves do not stand one-to-one against SSA inputs.
+
+That works for some operands and returns nothing for others: for one function,
+`ValueId(16)` used by inlined `ValueId(19)` finds no use site at that
+definition, while a neighbouring case resolves cleanly. The next step is to
+print, for a failing pair, what `def_inst` and `use_sites` actually hold -- the
+answer decides whether the leaf names a value the definition does not read
+directly, in which case the operand's use has to be located through the arena's
+own structure rather than through the SSA instruction.
+
+Nothing from any of this is in the tree. The materialiser is committed and
+inert; everything else was reverted, and every gate is green.
