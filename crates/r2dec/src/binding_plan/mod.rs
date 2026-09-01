@@ -657,6 +657,28 @@ pub(super) fn certified_elided_read_instructions(
                 .flat_map(|certificate| certificate.insts.iter().copied()),
         )
         .chain(certificates.stack_geometry.insts.iter().copied())
+        .chain(certified_return_control_insts(source))
+        .chain(certified_call_return_address_insts(source))
+        .chain(certified_direct_call_target_insts(source))
+        // A store into a frame slot the function owns and never reads. The
+        // effect ledger already answers for the store itself with
+        // `DeadFrameSlotStore`, and the statement is not emitted; a value
+        // folded into it goes with it. This certificate is keyed by site
+        // rather than by instruction, so the sites are resolved back here.
+        .chain({
+            let dead_slots = certified_dead_frame_slot_accesses(source);
+            source
+                .graph()
+                .insts
+                .iter()
+                .filter(|inst| {
+                    source
+                        .inst_op_site(inst.id)
+                        .is_some_and(|site| dead_slots.contains(&site))
+                })
+                .map(|inst| inst.id)
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
