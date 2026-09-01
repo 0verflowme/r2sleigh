@@ -1296,23 +1296,49 @@ impl TrustedSsaArtifact {
         // instructions: a register read before it is written carries a value the
         // caller supplied. Recover that rather than refusing the function, but
         // never in preference to an interface the source already carries.
+        //
+        // Three links, and any of them yielding nothing leaves the function with
+        // no ABI at all: every question about its return kind then answers
+        // `unavailable`, the return boundary is incomplete, and the renderer
+        // refuses with no way to tell which link gave up. That was the largest
+        // single refusal cause in the corpus, so each link says so.
         let function_interface = match source.function_interface().cloned() {
             Some(interface) => Some(interface),
-            None => SSAFunction::from_blocks_with_arch(&blocks, Some(&arch))
-                .and_then(|preliminary| {
-                    crate::recover_interface::recover_interface(
-                        &preliminary,
-                        source.convention_slots(),
-                    )
-                })
-                .and_then(|recovered| {
-                    crate::recover_interface::mint_recovered_interface(
-                        &recovered,
-                        source.machine_roles(),
-                        source.source_revision_identity(),
-                        source.convention_slots().calling_convention(),
-                    )
-                }),
+            None => 'recovered: {
+                let Some(preliminary) = SSAFunction::from_blocks_with_arch(&blocks, Some(&arch))
+                else {
+                    r2il::refusal_evidence!(
+                        "interface-recovery",
+                        "the preliminary SSA needed to read the ABI off the instructions \
+                         could not be built from {} blocks",
+                        blocks.len()
+                    );
+                    break 'recovered None;
+                };
+                let Some(recovered) = crate::recover_interface::recover_interface(
+                    &preliminary,
+                    source.convention_slots(),
+                ) else {
+                    break 'recovered None;
+                };
+                let minted = crate::recover_interface::mint_recovered_interface(
+                    &recovered,
+                    source.machine_roles(),
+                    source.source_revision_identity(),
+                    source.convention_slots().calling_convention(),
+                );
+                if minted.is_none() {
+                    r2il::refusal_evidence!(
+                        "interface-recovery",
+                        "the recovered ABI could not be minted into an interface: \
+                         parameters={} result={:?} convention={:?}",
+                        recovered.parameters().len(),
+                        recovered.result(),
+                        source.convention_slots().calling_convention()
+                    );
+                }
+                minted
+            }
         };
         let machine_context = SourceMachineContext::from_blocks_with_interfaces(
             blocks.as_slice(),

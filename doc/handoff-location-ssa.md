@@ -6409,3 +6409,22 @@ offer a callsite interface for a direct branch that leaves the function, the way
 it does for a call radare2 reports. Until it does, the branch rewrite is a
 change that renders nothing new and refuses more, and it was reverted rather
 than left in the tree.
+
+**The composed return value is the top corpus refusal, and it is diagnosed.**
+Eighteen of the eighty-two refusing functions in `tests/coverage` stop at the
+same line: `fold/op_lower/implementation.rs` declines a return boundary whose
+`register_compositions` is not empty. The evidence line says which -- `at_
+mismatch=false incomplete=false compositions=1 values=0` -- so the boundary is
+complete and the value is simply assembled rather than written whole.
+
+`gate_one` at x86-64 `-O1` is the shape: `xor eax, eax` then `sete al` leaves
+the returned `int` as a thirty-two bit zero with a one-byte result laid over its
+low end, which is the ordinary way a compiler materialises a boolean. The facts
+needed to render it are already built and already validated --
+`SourceReturnRegisterCompositionFact` carries the base definition and the
+overlays in order, and `validate` checks them against the graph -- and the
+renderer has no form for it, so it refuses. Rendering one is
+`(base & !mask) | (overlay << shift)` per overlay, in the recorded order.
+
+This is the largest single cause in the deterministic gate and the next thing
+to take.

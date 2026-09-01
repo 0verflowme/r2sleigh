@@ -1643,7 +1643,7 @@ fn audit_program_symbol(
     {
         return Ok(());
     }
-    crate::refusal_evidence::refusal_evidence!(
+    r2il::refusal_evidence!(
         "binding-symbol-observed",
         "{access:?} binding={binding:?} name={:?} members={:?} active={:?}",
         names.spelling(symbol),
@@ -2982,7 +2982,7 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
         if !occurrence_regions_have_proven_order(regions, binding_occurrences) {
-            crate::refusal_evidence::refusal_evidence!(
+            r2il::refusal_evidence!(
                 "occurrence-region-order",
                 "binding={binding:?} occurrences={:?}",
                 binding_occurrences

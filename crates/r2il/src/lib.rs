@@ -30,6 +30,7 @@ pub mod endianness;
 pub mod memory;
 pub mod metadata;
 pub mod opcode;
+pub mod refusal_evidence;
 pub mod regname;
 pub mod serialize;
 pub mod space;

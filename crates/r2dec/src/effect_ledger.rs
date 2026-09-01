@@ -236,7 +236,7 @@ fn upstream_zero_occurrence_outcome(
         return Outcome::Elided(ElisionReason::DirectControlTarget);
     }
 
-    crate::refusal_evidence::refusal_evidence!(
+    r2il::refusal_evidence!(
         "zero-occurrence-outcome",
         "kind={:?} component={:?} block={:#x} source_inst={source_inst:?} inputs={:?}",
         id.kind,

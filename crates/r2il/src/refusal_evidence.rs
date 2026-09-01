@@ -13,6 +13,12 @@
 //! the variable is unset: the arguments live inside the macro body and are
 //! never evaluated.
 //!
+//! It lives in the base crate because refusing is not one layer's job. The
+//! lift, the SSA and the renderer all decline, and the answer to "why" is as
+//! often in a predicate below the renderer as in one inside it -- the return
+//! kind a function's recovered interface claims is decided in `r2ssa`, and the
+//! renderer can only report that the boundary it produced was incomplete.
+//!
 //! This is deliberately a diagnostic channel and not a payload the refusal
 //! carries. What travels with a refusal is its static site name, which is free
 //! and reaches the reader through the rendered comment; what the predicate saw
@@ -24,7 +30,7 @@ use std::sync::OnceLock;
 ///
 /// Read once. The predicates this guards sit in loops over every value in a
 /// function, and an environment lookup per refusal was measurable.
-pub(crate) fn tracing() -> bool {
+pub fn tracing() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("R2DEC_TRACE_REFUSAL").is_some())
 }
@@ -33,6 +39,7 @@ pub(crate) fn tracing() -> bool {
 ///
 /// `file!()` and `line!()` expand at the call site, so the location names the
 /// predicate rather than whatever called it.
+#[macro_export]
 macro_rules! refusal_evidence {
     ($predicate:literal, $($operands:tt)*) => {
         if $crate::refusal_evidence::tracing() {
@@ -46,5 +53,3 @@ macro_rules! refusal_evidence {
         }
     };
 }
-
-pub(crate) use refusal_evidence;

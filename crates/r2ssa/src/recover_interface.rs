@@ -149,6 +149,11 @@ pub fn recover_interface(
     let graph = SsaGraph::from_function(func);
     let facts = crate::semantic::PreparedFunctionFacts::collect(func, &graph);
     if !facts.obligations.is_complete() {
+        r2il::refusal_evidence!(
+            "interface-recovery",
+            "the obligation inventory is incomplete, so no interface is recovered and \
+             every ABI question about this function answers `unavailable`"
+        );
         return None;
     }
 
@@ -163,7 +168,18 @@ pub fn recover_interface(
             live_out = candidate_live_out;
         }
     }
-    let observations = crate::deadphi::ProvenProgramObservations::find(&graph, &live_out, &facts)?;
+    let Some(observations) =
+        crate::deadphi::ProvenProgramObservations::find(&graph, &live_out, &facts)
+    else {
+        r2il::refusal_evidence!(
+            "interface-recovery",
+            "no proven program observations: result_slot={:?} live_out={} unresolved_blocks={}",
+            slots.result_slot(),
+            live_out.len(),
+            live_out.unresolved_blocks().count()
+        );
+        return None;
+    };
     let reads = observed_entry_read_storages(func, &graph, &observations);
     let mut parameters = Vec::new();
     for slot in slots.argument_slots() {
@@ -190,6 +206,12 @@ pub fn recover_interface(
     })
 }
 
+/// The width of a register storage, where it is one an integer type can have.
+fn storage_bits(storage: CanonicalStorageId) -> Option<u32> {
+    let bits = storage.size.checked_mul(8)?;
+    matches!(bits, 8 | 16 | 32 | 64).then_some(bits)
+}
+
 /// Build a source interface from what the machine code proves.
 ///
 /// Every parameter is an unsigned integer of the register's own width. That is
@@ -208,6 +230,34 @@ pub fn mint_recovered_interface(
     revision_identity: &[u8],
     calling_convention: &str,
 ) -> Option<SourceFunctionInterface> {
+    let minted =
+        mint_recovered_interface_inner(recovered, roles, revision_identity, calling_convention);
+    if minted.is_none() {
+        r2il::refusal_evidence!(
+            "interface-minting",
+            "return_address={:?} stack_pointer={:?} identity={} convention={:?} \
+             parameters={:?} result={:?}",
+            roles.return_address_storage(),
+            roles.stack_pointer_storage(),
+            revision_identity.len(),
+            calling_convention,
+            recovered
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.slot().size, parameter.observed().size))
+                .collect::<Vec<_>>(),
+            recovered.result().map(|storage| storage.size)
+        );
+    }
+    minted
+}
+
+fn mint_recovered_interface_inner(
+    recovered: &RecoveredInterface,
+    roles: &SourceMachineRoles,
+    revision_identity: &[u8],
+    calling_convention: &str,
+) -> Option<SourceFunctionInterface> {
     let return_address_storage = roles.return_address_storage()?;
     let stack_pointer_storage = roles.stack_pointer_storage()?;
     if revision_identity.is_empty() || calling_convention.trim().is_empty() {
@@ -215,13 +265,12 @@ pub fn mint_recovered_interface(
     }
 
     // One integer type per distinct width the interface actually uses, so the
-    // graph describes exactly what is referenced and nothing more.
+    // graph describes exactly what is referenced and nothing more. The
+    // constructor enforces that literally: a graph carrying a type no logical
+    // value names is rejected outright.
     let mut widths: Vec<u32> = Vec::new();
     let mut width_of = |storage: CanonicalStorageId| -> Option<u32> {
-        let bits = storage.size.checked_mul(8)?;
-        if !matches!(bits, 8 | 16 | 32 | 64) {
-            return None;
-        }
+        let bits = storage_bits(storage)?;
         if !widths.contains(&bits) {
             widths.push(bits);
         }
@@ -234,10 +283,20 @@ pub fn mint_recovered_interface(
         .iter()
         .map(|parameter| width_of(parameter.observed()))
         .collect::<Option<Vec<_>>>()?;
+    // The slot's width decides whether the read covers the whole carrier or
+    // only its low half, and nothing else. It names no logical value, so it
+    // must not put a type in the graph: an `int` parameter arriving in a
+    // sixty-four-bit register is read as thirty-two bits, and registering the
+    // carrier's width added a type nothing referenced and made the constructor
+    // reject the interface. The function was then left with no ABI at all --
+    // every question about its return kind answering `unavailable`, its return
+    // boundary incomplete, and the renderer refusing. That was the largest
+    // single refusal cause in the corpus, and it fires for any function taking
+    // a parameter narrower than the register that carries it.
     let parameter_slot_widths = recovered
         .parameters()
         .iter()
-        .map(|parameter| width_of(parameter.slot()))
+        .map(|parameter| storage_bits(parameter.slot()))
         .collect::<Option<Vec<_>>>()?;
     let result_width = match recovered.result() {
         Some(storage) => Some(width_of(storage)?),
@@ -317,6 +376,9 @@ pub fn mint_recovered_interface(
         return_logical_value,
         Some(type_graph),
     )
+    .inspect_err(|error| {
+        r2il::refusal_evidence!("interface-minting", "constructor rejected it: {error:?}");
+    })
     .ok()?
     .with_return_address_storage(return_address_storage)
     .ok()?

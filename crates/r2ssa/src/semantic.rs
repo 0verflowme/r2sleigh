@@ -2751,6 +2751,21 @@ fn collect_source_boundary_facts(
                     complete &= return_address.is_some();
                 }
                 machine_state_complete = return_address.is_some() && exit_stack_pointer.is_some();
+                if !complete {
+                    r2il::refusal_evidence!(
+                        "return-boundary-completeness",
+                        "coherent={abi_is_coherent} kind={:?} slots={} values={} \
+                         compositions={} exit_sp={} return_address={}",
+                        machine_context
+                            .function_interface()
+                            .map(|interface| interface.return_kind()),
+                        machine_context.abi_model().return_registers().len(),
+                        values.len(),
+                        register_compositions.len(),
+                        exit_stack_pointer.is_some(),
+                        return_address.is_some()
+                    );
+                }
             }
             facts.returns.insert(
                 inst.id,

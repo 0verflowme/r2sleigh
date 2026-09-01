@@ -607,7 +607,7 @@ impl<'a> FoldingContext<'a> {
                         if obligation.id.kind == ObligationKind::CallArgument
                             && obligation.inputs.is_empty()
                         {
-                            crate::refusal_evidence::refusal_evidence!(
+                            r2il::refusal_evidence!(
                                 "call-argument-occurrence",
                                 "component={:?} has no inputs, so no rendering can discharge it; \
                                  rendered_call={} proof_values={:?}",

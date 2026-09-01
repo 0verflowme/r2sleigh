@@ -97,7 +97,7 @@ impl OpLoweringRefusal {
     #[track_caller]
     fn note(kind: &str) -> RefusalOrigin {
         let origin = RefusalOrigin(std::panic::Location::caller());
-        if crate::refusal_evidence::tracing() {
+        if r2il::refusal_evidence::tracing() {
             eprintln!("refusal {kind} decided at {}", origin.0);
         }
         origin

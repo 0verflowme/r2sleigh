@@ -43,8 +43,6 @@ pub mod highlight;
 pub(crate) mod normalize;
 mod observation_journal;
 mod placement;
-#[macro_use]
-mod refusal_evidence;
 pub(crate) mod planner;
 pub mod region;
 mod shadow_report;
