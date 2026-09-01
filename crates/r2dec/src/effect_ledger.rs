@@ -241,6 +241,13 @@ pub(crate) fn build_obligation_ledger(
             )),
             1 => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
+            // Several occurrences are one execution when the structured form
+            // put them on paths that exclude one another -- a shared tail
+            // emitted once per path that reaches it rather than jumped to.
+            // Anything else rendered twice is a duplicate, which changes what
+            // the program does and is scored as a refusal.
+            _ if effects.duplicates_are_exclusive(id) => rendered_site(id)
+                .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
             _ => Some(Outcome::Refused {
                 layer: LedgerLayer::Codegen,
                 reason: RefusalReason::DuplicateRenderedOccurrence,

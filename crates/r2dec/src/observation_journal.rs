@@ -629,8 +629,16 @@ impl SealedLegacyObservations {
 /// cannot collapse into a misleading boolean "rendered" answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SurvivingEffectObservations {
-    occurrences: BTreeMap<SemanticObligationId, usize>,
+    occurrences: BTreeMap<SemanticObligationId, EffectOccurrences>,
     coalesced_carriers: Box<CoalescedCarrierEffectElisions>,
+}
+
+/// How often one source obligation was rendered, and whether the copies stand
+/// on paths that exclude one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct EffectOccurrences {
+    count: usize,
+    exclusive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,7 +649,17 @@ struct CoalescedCarrierEffectElisions {
 
 impl SurvivingEffectObservations {
     pub(crate) fn occurrence_count(&self, id: SemanticObligationId) -> Option<usize> {
-        self.occurrences.get(&id).copied()
+        self.occurrences
+            .get(&id)
+            .map(|occurrences| occurrences.count)
+    }
+
+    /// Whether every rendered occurrence of this obligation excludes every
+    /// other, which is what makes more than one of them still one execution.
+    pub(crate) fn duplicates_are_exclusive(&self, id: SemanticObligationId) -> bool {
+        self.occurrences
+            .get(&id)
+            .is_some_and(|occurrences| occurrences.exclusive)
     }
 
     pub(crate) fn is_coalesced_carrier_use(&self, site: UseSite) -> bool {
@@ -658,9 +676,9 @@ impl SurvivingEffectObservations {
 
     #[cfg(test)]
     pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
-        self.occurrences
-            .iter()
-            .filter_map(|(id, count)| (*count > 0).then_some((*id, *count)))
+        self.occurrences.iter().filter_map(|(id, occurrences)| {
+            (occurrences.count > 0).then_some((*id, occurrences.count))
+        })
     }
 }
 
@@ -697,6 +715,12 @@ pub(crate) struct LegacyObservationJournal {
     write_has_output: Box<[bool]>,
     writes: Box<[Option<LegacyWriteObservation>]>,
     effect_occurrences: BTreeMap<SemanticObligationId, usize>,
+    /// Regions the sealing walk found each effect obligation rendered in.
+    effect_occurrence_regions:
+        BTreeMap<SemanticObligationId, BTreeSet<crate::structured_region::RegionId>>,
+    /// Obligations whose duplicate occurrences the region tree proved to
+    /// exclude one another.
+    exclusive_duplicate_effects: BTreeSet<SemanticObligationId>,
     targets: Vec<ObservationTarget>,
 }
 
@@ -1116,7 +1140,11 @@ impl MarkedNativeDraft {
         {
             return Err(BindingShadowAuditFailure::Placement(refusal));
         }
-        let observations = match self.journal.seal_preserving_effects(source, &mut ready) {
+        let regions = self.placement.as_ref().map(|placement| &placement.regions);
+        let observations = match self
+            .journal
+            .seal_preserving_effects(source, &mut ready, regions)
+        {
             Ok(LegacyObservationSeal::Complete(observations)) => observations,
             Ok(LegacyObservationSeal::BindingFailure(error)) | Err(error) => {
                 return Err(BindingShadowAuditFailure::JournalSeal(
@@ -1526,6 +1554,8 @@ impl LegacyObservationJournal {
             write_has_output,
             writes,
             effect_occurrences,
+            effect_occurrence_regions: BTreeMap::new(),
+            exclusive_duplicate_effects: BTreeSet::new(),
             targets: Vec::new(),
         };
         journal.record_upstream_nonrendered_dispositions(source, origins)?;
@@ -2717,7 +2747,20 @@ impl LegacyObservationJournal {
             RenderObservationInspectError::Observer(error) => error,
         })?;
         Ok(SurvivingEffectObservations {
-            occurrences: effect_occurrences,
+            // This path has no region tree to prove exclusion with, so it
+            // claims none.
+            occurrences: effect_occurrences
+                .into_iter()
+                .map(|(id, count)| {
+                    (
+                        id,
+                        EffectOccurrences {
+                            count,
+                            exclusive: false,
+                        },
+                    )
+                })
+                .collect(),
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: self.coalesced_carrier_uses,
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
@@ -2731,7 +2774,7 @@ impl LegacyObservationJournal {
         source: &SourceOwnedFunctionFacts,
         ready: &mut EmissionReadyFunction,
     ) -> Result<SealedLegacyObservations, LegacyObservationJournalError> {
-        match self.seal_preserving_effects(source, ready)? {
+        match self.seal_preserving_effects(source, ready, None)? {
             LegacyObservationSeal::Complete(observations) => Ok(observations),
             LegacyObservationSeal::BindingFailure(error) => Err(error),
         }
@@ -2745,6 +2788,7 @@ impl LegacyObservationJournal {
         mut self,
         source: &SourceOwnedFunctionFacts,
         ready: &mut EmissionReadyFunction,
+        regions: Option<&crate::structured_region::SealedStructuredRegionArtifact>,
     ) -> Result<LegacyObservationSeal, LegacyObservationJournalError> {
         if self.authority != *source.source().authority() {
             return Err(LegacyObservationJournalError::SourceAuthority);
@@ -2755,10 +2799,18 @@ impl LegacyObservationJournal {
             return Err(LegacyObservationJournalError::SymbolTableMismatch);
         }
 
+        // Where each observation ended up in the structured tree. Read before
+        // the walk, from the same final tree the walk counts, so the two cannot
+        // disagree about which occurrence sat where.
+        let observation_regions = regions.map(|regions| {
+            crate::placement::final_observation_regions(&function.body, regions, self.targets.len())
+        });
+
         let mut values = std::mem::take(&mut self.values);
         let mut uses = std::mem::take(&mut self.uses);
         let mut writes = std::mem::take(&mut self.writes);
         let mut effect_occurrences = std::mem::take(&mut self.effect_occurrences);
+        let mut effect_occurrence_regions = std::mem::take(&mut self.effect_occurrence_regions);
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
         let plan = &self.plan;
@@ -2822,13 +2874,22 @@ impl LegacyObservationJournal {
                     } => record_same(&mut writes[inst.0 as usize], observation)
                         .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst)),
                     ObservationTarget::StackAccess { .. } => Ok(()),
-                    ObservationTarget::Effect(id) => {
-                        let occurrences = effect_occurrences
-                            .get_mut(&id)
-                            .ok_or(LegacyObservationJournalError::InvalidEffectObligation(id))?;
+                    ObservationTarget::Effect(effect) => {
+                        let occurrences = effect_occurrences.get_mut(&effect).ok_or(
+                            LegacyObservationJournalError::InvalidEffectObligation(effect),
+                        )?;
                         *occurrences = occurrences
                             .checked_add(1)
                             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+                        if let Some(region) = observation_regions
+                            .as_ref()
+                            .and_then(|scoped| scoped.get(id.index() as usize).copied().flatten())
+                        {
+                            effect_occurrence_regions
+                                .entry(effect)
+                                .or_default()
+                                .insert(region);
+                        }
                         return Ok(());
                     }
                 };
@@ -2855,6 +2916,28 @@ impl LegacyObservationJournal {
         self.uses = uses;
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
+        // An obligation rendered more than once is a duplicate unless the
+        // region tree proves the copies exclude one another. Deciding it here,
+        // where the tree that produced the occurrences is still in hand, keeps
+        // the ledger's question a lookup rather than a second analysis.
+        if let Some(regions) = regions {
+            self.exclusive_duplicate_effects = effect_occurrence_regions
+                .iter()
+                .filter(|(effect, occupied)| {
+                    self.effect_occurrences
+                        .get(*effect)
+                        .is_some_and(|count| *count > 1)
+                        && occupied.len() == self.effect_occurrences[*effect]
+                        && occupied.iter().all(|left| {
+                            occupied.iter().all(|right| {
+                                left == right || regions.regions_are_exclusive(*left, *right)
+                            })
+                        })
+                })
+                .map(|(effect, _)| *effect)
+                .collect();
+        }
+        self.effect_occurrence_regions = effect_occurrence_regions;
         self.account_materialized_phi_occurrences();
         if let Some(error) = self.first_unaccounted_render_observation() {
             return Ok(LegacyObservationSeal::BindingFailure(error));
@@ -2989,8 +3072,20 @@ impl LegacyObservationJournal {
         source: &SourceOwnedFunctionFacts,
     ) -> SealedLegacyObservations {
         let coverage = self.final_coverage();
+        let exclusive = std::mem::take(&mut self.exclusive_duplicate_effects);
         let effects = SurvivingEffectObservations {
-            occurrences: std::mem::take(&mut self.effect_occurrences),
+            occurrences: std::mem::take(&mut self.effect_occurrences)
+                .into_iter()
+                .map(|(id, count)| {
+                    (
+                        id,
+                        EffectOccurrences {
+                            count,
+                            exclusive: exclusive.contains(&id),
+                        },
+                    )
+                })
+                .collect(),
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),

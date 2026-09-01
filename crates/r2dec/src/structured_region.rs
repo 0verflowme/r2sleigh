@@ -149,7 +149,6 @@ pub(crate) struct StructuredRegionNode {
     children: Box<[RegionId]>,
     #[cfg(test)]
     emission_anchor: RegionEmissionAnchor,
-    #[cfg(test)]
     kind: StructuredRegionKind,
 }
 
@@ -256,6 +255,74 @@ impl SealedStructuredRegionArtifact {
         let authority = marker.authority()?;
         let anchor = marker.emission_anchor()?;
         self.node_for_anchor(authority, anchor)
+    }
+
+    /// Whether one execution can reach both of these lexical positions.
+    ///
+    /// Two regions are reached together when one contains the other, and when
+    /// they follow one another in a sequence. They exclude each other only when
+    /// the nearest region containing both chooses between them: an `if` or a
+    /// `switch` takes one arm and not the others.
+    ///
+    /// This is what tells a duplicated tail apart from a repeated effect. The
+    /// structured form emits a shared exit once per path that reaches it rather
+    /// than jumping to it, so one source instruction can carry several rendered
+    /// occurrences while still executing at most once. Counting those as a
+    /// duplicate refused every function with two `return` tails over a shared
+    /// comparison.
+    ///
+    /// Anything the artifact cannot answer for -- an unknown region, a missing
+    /// parent, a meeting point that is not a selection -- is not exclusive.
+    pub(crate) fn regions_are_exclusive(&self, left: RegionId, right: RegionId) -> bool {
+        let node = |id: RegionId| self.nodes.get(id.index());
+        let (Some(mut left_node), Some(mut right_node)) = (node(left), node(right)) else {
+            return false;
+        };
+        let (mut left, mut right) = (left, right);
+        while left_node.depth > right_node.depth {
+            let Some(parent) = left_node.parent else {
+                return false;
+            };
+            left = parent;
+            let Some(next) = node(left) else {
+                return false;
+            };
+            left_node = next;
+        }
+        while right_node.depth > left_node.depth {
+            let Some(parent) = right_node.parent else {
+                return false;
+            };
+            right = parent;
+            let Some(next) = node(right) else {
+                return false;
+            };
+            right_node = next;
+        }
+        // Equal depth and equal identity means one contained the other, so an
+        // execution reaching the inner one reached the outer one too.
+        while left != right {
+            let (Some(left_parent), Some(right_parent)) = (left_node.parent, right_node.parent)
+            else {
+                return false;
+            };
+            if left_parent == right_parent {
+                return node(left_parent).is_some_and(|meeting| {
+                    matches!(
+                        meeting.kind,
+                        StructuredRegionKind::IfThenElse | StructuredRegionKind::Switch
+                    )
+                });
+            }
+            left = left_parent;
+            right = right_parent;
+            let (Some(next_left), Some(next_right)) = (node(left), node(right)) else {
+                return false;
+            };
+            left_node = next_left;
+            right_node = next_right;
+        }
+        false
     }
 }
 
@@ -414,7 +481,6 @@ struct DraftNode {
     #[cfg(test)]
     children: Vec<RegionId>,
     emission_anchor: RegionEmissionAnchor,
-    #[cfg(test)]
     kind: StructuredRegionKind,
 }
 
@@ -516,7 +582,6 @@ impl StructuredRegionDraft {
                     children: node.children.into_boxed_slice(),
                     #[cfg(test)]
                     emission_anchor: node.emission_anchor,
-                    #[cfg(test)]
                     kind: node.kind,
                 })
                 .collect(),
@@ -528,7 +593,7 @@ impl StructuredRegionDraft {
         parent: Option<RegionId>,
         depth: u32,
         entry: u64,
-        _kind: StructuredRegionKind,
+        kind: StructuredRegionKind,
     ) -> Result<RegionId, StructuredRegionBuildError> {
         let raw = u32::try_from(self.nodes.len())
             .map_err(|_| StructuredRegionBuildError::TooManyRegions)?;
@@ -540,8 +605,7 @@ impl StructuredRegionDraft {
             #[cfg(test)]
             children: Vec::new(),
             emission_anchor: RegionEmissionAnchor(raw),
-            #[cfg(test)]
-            kind: _kind,
+            kind,
         });
         Ok(id)
     }
@@ -1079,6 +1143,45 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn only_the_arms_of_a_selection_exclude_one_another() {
+        // Sequence [ Block, IfThenElse [ then: Block, else: While [ Block ] ] ]
+        // sealed in preorder as nodes 0..=6, with the function body at 0.
+        let region = Region::Sequence(vec![
+            Region::Block(0x1000),
+            Region::IfThenElse {
+                cond_block: 0x1010,
+                then_region: Box::new(Region::Block(0x1020)),
+                else_region: Some(Box::new(Region::WhileLoop {
+                    header: 0x1030,
+                    body: Box::new(Region::Block(0x1040)),
+                })),
+                merge_block: Some(0x1050),
+            },
+        ]);
+        let sealed = StructuredRegionDraft::from_region(0x1000, &region)
+            .expect("region draft")
+            .seal();
+        let id = |index: u32| RegionId(index);
+
+        // The two arms of the `if`, and a region nested inside one arm against
+        // the other arm: one execution reaches at most one of them.
+        assert!(sealed.regions_are_exclusive(id(4), id(5)));
+        assert!(sealed.regions_are_exclusive(id(4), id(6)));
+
+        // Siblings in a sequence both run.
+        assert!(!sealed.regions_are_exclusive(id(2), id(3)));
+        assert!(!sealed.regions_are_exclusive(id(2), id(4)));
+        // One containing the other is reached by the same execution.
+        assert!(!sealed.regions_are_exclusive(id(3), id(4)));
+        assert!(!sealed.regions_are_exclusive(id(5), id(6)));
+        // A region does not exclude itself; two occurrences in one region are
+        // two executions of it.
+        assert!(!sealed.regions_are_exclusive(id(4), id(4)));
+        // Nothing is claimed about a region the artifact does not have.
+        assert!(!sealed.regions_are_exclusive(id(4), id(99)));
     }
 
     #[test]

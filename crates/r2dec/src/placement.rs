@@ -449,6 +449,145 @@ fn assigned_symbol(statement: &CStmt) -> Option<crate::symbol::SymbolId> {
     }
 }
 
+/// The region each surviving observation was finally emitted in.
+///
+/// Placement collects the same answer for the observations it reasons about,
+/// filtered to those and ordered among them, because the filtering and the
+/// order are part of what it proves. The effect ledger needs the region of
+/// every observation and needs no order, so it is collected on its own rather
+/// than by widening a walk whose selectivity is load-bearing.
+pub(crate) fn final_observation_regions(
+    statements: &[CStmt],
+    regions: &SealedStructuredRegionArtifact,
+    count: usize,
+) -> Vec<Option<RegionId>> {
+    let mut scoped = vec![None; count];
+    for statement in statements {
+        collect_stmt_observation_regions(statement, None, regions, &mut scoped);
+    }
+    scoped
+}
+
+fn record_observation_region(
+    id: RenderObservationId,
+    region: Option<RegionId>,
+    scoped: &mut [Option<RegionId>],
+) {
+    if let (Some(region), Some(slot)) = (region, scoped.get_mut(id.index() as usize)) {
+        *slot = Some(region);
+    }
+}
+
+fn collect_expr_observation_regions(
+    expr: &CExpr,
+    region: Option<RegionId>,
+    scoped: &mut [Option<RegionId>],
+) {
+    let mut ids = Vec::new();
+    visit_expr_observations(expr, &mut |id| ids.push(id));
+    for id in ids {
+        record_observation_region(id, region, scoped);
+    }
+}
+
+fn collect_stmt_observation_regions(
+    statement: &CStmt,
+    current: Option<RegionId>,
+    regions: &SealedStructuredRegionArtifact,
+    scoped: &mut [Option<RegionId>],
+) {
+    if let CStmt::StructuredRegion { marker, stmt } = statement {
+        let entered = regions.node_for_marker(marker).map(|(id, _)| id);
+        collect_stmt_observation_regions(stmt, entered.or(current), regions, scoped);
+        return;
+    }
+    let mut semantic = statement;
+    while let CStmt::Observed { id, stmt } = semantic {
+        record_observation_region(*id, current, scoped);
+        semantic = stmt;
+    }
+    match semantic {
+        CStmt::StructuredRegion { .. } => {
+            collect_stmt_observation_regions(semantic, current, regions, scoped);
+        }
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+            collect_expr_observation_regions(expr, current, scoped);
+        }
+        CStmt::Decl { init, .. } => {
+            if let Some(init) = init {
+                collect_expr_observation_regions(init, current, scoped);
+            }
+        }
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            collect_expr_observation_regions(cond, current, scoped);
+            collect_stmt_observation_regions(then_body, current, regions, scoped);
+            if let Some(else_body) = else_body {
+                collect_stmt_observation_regions(else_body, current, regions, scoped);
+            }
+        }
+        CStmt::While { cond, body } => {
+            collect_expr_observation_regions(cond, current, scoped);
+            collect_stmt_observation_regions(body, current, regions, scoped);
+        }
+        CStmt::DoWhile { body, cond } => {
+            collect_stmt_observation_regions(body, current, regions, scoped);
+            collect_expr_observation_regions(cond, current, scoped);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                collect_stmt_observation_regions(init, current, regions, scoped);
+            }
+            if let Some(cond) = cond {
+                collect_expr_observation_regions(cond, current, scoped);
+            }
+            collect_stmt_observation_regions(body, current, regions, scoped);
+            if let Some(update) = update {
+                collect_expr_observation_regions(update, current, scoped);
+            }
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            collect_expr_observation_regions(expr, current, scoped);
+            for case in cases {
+                collect_expr_observation_regions(&case.value, current, scoped);
+                for statement in &case.body {
+                    collect_stmt_observation_regions(statement, current, regions, scoped);
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    collect_stmt_observation_regions(statement, current, regions, scoped);
+                }
+            }
+        }
+        CStmt::Block(statements) => {
+            for statement in statements {
+                collect_stmt_observation_regions(statement, current, regions, scoped);
+            }
+        }
+        CStmt::Observed { .. } => unreachable!("leading observations were consumed"),
+        CStmt::Empty
+        | CStmt::Return(None)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Goto(_)
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
 fn collect_final_observation_scopes(
     statements: &[CStmt],
     regions: &SealedStructuredRegionArtifact,
@@ -2870,20 +3009,47 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
     })
 }
 
+/// Whether the regions a block's occurrences of one binding fall in are ordered
+/// well enough for a block-granular assignment proof to hold.
+///
+/// One machine block can be rendered more than once -- the structured form
+/// duplicates a shared tail rather than jumping to it -- and then two
+/// occurrences of one binding carry the same block address while sitting in
+/// regions that are not nested. The read-before-assignment proof reasons per
+/// block, so it cannot tell the copies apart, and requiring the regions to nest
+/// is what kept it sound.
+///
+/// A copy that assigns the object before it reads it needs nothing from any
+/// other copy, so where it sits relative to them cannot make a read precede an
+/// assignment. Where every copy is self-contained in that sense there is no
+/// ordering question to answer. A comparator whose two `return` tails each
+/// place their own constant in the result register is the case: four
+/// occurrences, two blocks, each block written then read in both of its copies.
 fn occurrence_regions_have_proven_order(
     regions: &SealedStructuredRegionArtifact,
     occurrences: &[Occurrence],
 ) -> bool {
-    let mut by_block = BTreeMap::<u64, BTreeSet<RegionId>>::new();
+    let mut by_block = BTreeMap::<u64, BTreeMap<RegionId, Vec<&Occurrence>>>::new();
     for occurrence in occurrences {
         by_block
             .entry(occurrence.block)
             .or_default()
-            .insert(occurrence.region);
+            .entry(occurrence.region)
+            .or_default()
+            .push(occurrence);
     }
     by_block.values().all(|block_regions| {
-        block_regions.iter().all(|left| {
-            block_regions.iter().all(|right| {
+        let self_contained = |region_occurrences: &Vec<&Occurrence>| {
+            region_occurrences
+                .iter()
+                .min_by_key(|occurrence| occurrence.order)
+                .is_some_and(|first| matches!(first.kind, OccurrenceKind::Write { .. }))
+        };
+        if block_regions.values().all(self_contained) {
+            return true;
+        }
+        block_regions.keys().all(|left| {
+            block_regions.keys().all(|right| {
                 region_is_ancestor(regions, *left, *right)
                     || region_is_ancestor(regions, *right, *left)
             })
