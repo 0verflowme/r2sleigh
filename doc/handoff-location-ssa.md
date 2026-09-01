@@ -6707,8 +6707,18 @@ carrying the value, its binding, its symbol and the block, mapped to a placement
 target that authorises a read of that binding. With it, declaration placement
 passes, which had been the wall since the first attempt.
 
-What remains is the seal and the journal. One function refuses with
-`RenderedValueRequired` from the journal rather than the plan, and another with
-`Seal(CertificateMembership)`, so there is more than one failure left rather
-than a single last step. That is the honest state: the wall is behind, the
-number of remaining layers is not known.
+What remains is the journal's invariants, and the way to take them is not one
+at a time. Each is an assumption that every value has a statement of its own,
+and satisfying them in the order they surface has now cost fifteen cycles: a
+bound value whose only appearance was an inlined operand has no value cell, so
+the cell is marked at the read; the inlined value itself then has no cell, so it
+is marked where it is rendered; the uses inside the vanished statement then have
+no rendered occurrence, so they are marked there too; and the next one is
+waiting behind that.
+
+The patch carries all of those. The remaining work is to stop discovering them:
+enumerate what `first_unaccounted_render_observation` and the exact-use audit
+require of a value, list which of those assume an emitted statement, and satisfy
+that set together rather than chasing the next refusal. That is a reading task
+against one file, and it is what the next session should start with rather than
+another build-measure cycle.
