@@ -2396,11 +2396,20 @@ addresses into it, and the diagnostic column compiles with warnings off after a
 repair pass. So the score does not say those cells emit self-contained,
 independently compilable C. The corpus is a canary, not a specification.
 
-**Real-world coverage: twenty-two of forty-eight real functions.** The earlier
-figure here said one in ten and was wrong, because it counted every entry
-radare2 lists as a function. On `/bin/ls`, 88 of the 136 are sixteen-byte import
-thunks in `__TEXT.__auth_stubs` -- `adrp`/`add`/`ldr`/`braa` and nothing else.
-Of the 48 real functions, 22 render.
+**Real-world coverage: thirteen of forty-eight real functions, and the number
+went down on purpose.** The earlier figure here said one in ten and was wrong,
+because it counted every entry radare2 lists as a function. On `/bin/ls`, 88 of
+the 136 are sixteen-byte import thunks in `__TEXT.__auth_stubs` --
+`adrp`/`add`/`ldr`/`braa` and nothing else. Of the 48 real functions, 13 render.
+
+It read twenty-two until a direct branch out of a function stopped being treated
+as a transfer the structured form expresses. Nine of those twenty-two were
+rendering a wrong answer: the tail call was elided, the arguments it had set up
+were dead once nothing read them, and a comparator rendered without its fallback
+`strcoll` comparison at all, returning an unspecified value on that path under a
+proof line reading `0 refused`. They refuse now. A coverage figure that counts
+wrong answers is worse than a smaller one that does not, which is the whole
+reason `tests/coverage` exists.
 
 Measured by grouping the refusals by their typed cause rather than their
 message:
@@ -2408,10 +2417,10 @@ message:
 | count | population | refusal |
 |-------|------------|---------|
 | 88 | import thunks | indirect branch out of the function |
-| 7 | real functions | effect obligations refused |
+| 16 | real functions | effect obligations refused |
 | 4 | real functions | placement: `unobserved_binding_write` |
-| 3 | real functions | missing machine projection: op lowering |
 | 3 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 3 | real functions | missing machine projection: op lowering, at two sites |
 | 2 | real functions | placement: `preserved_carrier_read_before_assignment` |
 | 2 | real functions | semantic fallback: worker slice in compiled mode |
 | 1 | real function | placement: `read_before_assignment` |
@@ -2419,6 +2428,10 @@ message:
 | 1 | real function | observation journal: `ConflictingUse` |
 | 1 | real function | unrepresentable control flow |
 | 1 | real function (`main`) | unrepresentable operation |
+
+The corpus binaries carry the same measurement as a gate:
+`tests/coverage/run_coverage.sh` decompiles all 313 functions across the six
+configurations and fails when one that rendered stops rendering.
 
 **The eighty-eight import thunks are one cause and low value.** Every one is
 `braa x16, x17` after loading `x16` from `__auth_got`, which Sleigh writes as
