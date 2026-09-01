@@ -6584,3 +6584,38 @@ through its occurrence, and an inlined value is read where another value's
 statement is emitted rather than in one of its own. Until the journal accounts
 for that, the plan cannot mark anything inline. Take that first; the policy is
 already written twice in this document and the materialiser is in the tree.
+
+
+**Wiring the inline policy: three blockers, found in order, each hidden behind
+the last.** The attempt was made three times and reverted three times. Nothing
+of it is in the tree except the materialiser, which is committed and inert. The
+value of the attempts is the order, because each blocker is invisible until the
+one before it is fixed.
+
+*One.* The disposition loop in `construction` sets `Inline`, and a later loop
+over binding components overwrites it with `Bound`. Nothing changes in the
+output and nothing refuses, which reads as the rule not matching. The fix is to
+exclude inlinable values from `rules::component_eligible_values`, exactly as
+constants are excluded -- and to put the inlining rule *inside* that function so
+the eligibility question and the inlining question cannot be answered
+differently.
+
+*Two.* With the disposition surviving, the seal disagrees: it categorises a
+non-constant value as nothing at all, so `build_shadow` fails and every function
+refuses with `missing program-variable authorization`. The fix is an
+`UpstreamValueDisposition::InlineExpression` beside `InlineConstant`, produced
+from the same shared rule, and mapped through the shadow report -- where
+`NormalizedValueObservation::InlineNonLiteral` already exists and had never had
+a producer.
+
+*Three, and still open.* With construction and seal agreeing, every function
+still refuses with the same message from a different place: the rendered-identity
+audit, which authorises a rendered value through an occurrence of its own. An
+inlined value is read inside another value's statement and has no occurrence to
+authorise it. That is the piece to build first next time, because the two above
+are known and cheap once it exists.
+
+The materialiser handles ten expression kinds today. A width change, a flag, a
+memory read, a merge and a trapping division are deliberately outside it, and
+the set is stated in one place so the plan can be made to mark exactly what the
+renderer can take.
