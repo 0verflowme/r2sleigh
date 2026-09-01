@@ -3210,6 +3210,33 @@ impl<'a> FoldingContext<'a> {
 
 #[cfg(test)]
 #[test]
+fn a_breakpoint_lowers_to_a_trap_that_needs_no_declaration() {
+    let ctx = FoldingContext::new(64);
+    let frame = LowerFrame::for_expr();
+
+    let stmt = ctx
+        .op_to_stmt_impl(&SSAOp::Breakpoint, &frame)
+        .expect("a breakpoint is representable")
+        .expect("a breakpoint is a statement, not an elision");
+
+    // `__builtin_trap` rather than a declared helper: it is a real compiler
+    // builtin, so the emitted C compiles standalone with nothing added to the
+    // externs, and it is `noreturn`, which is what the operation means.
+    let CStmt::Expr(CExpr::Call { func, args, .. }) = &stmt else {
+        panic!("expected a call statement, got {stmt:?}");
+    };
+    assert!(args.is_empty());
+    assert_eq!(
+        **func,
+        CExpr::External {
+            name: "__builtin_trap".to_string(),
+            kind: crate::symbol::ExternalKind::Intrinsic,
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn opaque_operations_are_typed_refusals_before_ast_lowering() {
     let ctx = FoldingContext::new(64);
     let input = SSAVar::new("X30", 0, 8);

@@ -2410,34 +2410,26 @@ message:
 | 85 | import stubs | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 6 | import stubs | unrepresentable control flow |
 | 1 | import stub | missing machine projection: op lowering |
-| 12 | real functions | missing machine projection: op lowering |
+| 7 | real functions | missing machine projection: op lowering |
+| 5 | real functions | observation journal: `RenderedValueRequired` |
 | 2 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
 | 1 | real function | observation journal: `ConflictingUse` |
 | 1 | real function (`main`) | unrepresentable operation |
 
-The eighty-six collapsed, as the corpus said they would, and further than
-expected: 85 of 86 are one variant, and 84 of those are one operation --
-`SSAOp::BranchInd` through `pc`, the indirect branch every stub ends in. That is
-one defect standing in front of 83 thunks, not eighty-six defects. It is also
-not worth fixing first: those stubs are `sym.imp.*` entries whose whole body is
-a jump into the binding table, and rendering them yields nothing a reader wants.
+**An indirect branch through `pc` is now the dominant cause by a wide margin.**
+It accounts for the 85 import thunks and, after the trap work below, five real
+functions as well -- ninety of the hundred and six refusals in the binary. A
+`braa`, a tail branch into a stub, and a jump table all arrive as
+`SSAOp::BranchInd` reading a `pc` nothing defines, and no part of the renderer
+has a shape for it. It is the next thing to take.
 
-Among the sixteen refusing **real** functions, twelve now share one cause, and
-it took two corrections to see it. They first reported a missing literal
-projection, which was untrue -- the machine arena had not lost a constant, it had
-never been asked for one, because a refused instruction did not intern its
-constant operands. `brk 0xc471` was refusing on its own immediate. A constant is
-a constant whether or not the operation reading it can be lowered, so those
-operands are interned now and the refusal moved to where it belongs: `r2dec`
-refuses `SSAOp::CallOther` outright in expression lowering.
-
-The two user-operations this binary uses are `SoftwareBreakpoint` and
-`UndefinedInstructionException` -- traps, not arithmetic. Both write `pc`, which
-is Sleigh's way of saying control leaves for an exception handler. Rendering
-them means emitting a non-returning intrinsic and letting the block end, which
-is a feature to write rather than a defect to repair. The remaining four are two
-`ExactUseRequiresRenderedOccurrence`, one `ConflictingUse`, and `main` alone on
-an unrepresentable operation.
+The trap user-operations are done. `SoftwareBreakpoint` and
+`UndefinedInstructionException` were the only two `/bin/ls` uses, both writing
+`pc` because that is how Sleigh says control leaves for an exception handler.
+The pipeline already had `R2ILOp::Breakpoint` and `SSAOp::Breakpoint`, seeded as
+`Kind::Trap` by the obligation ledger and emitted by nothing; the lift now
+expands into it and `r2dec` renders `__builtin_trap()`. Six functions moved off
+that cause and onto the `BranchInd` one.
 
 **Performance is not a constraint.** Radare2's own analysis dominates
 end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
@@ -2457,12 +2449,12 @@ Roadmap to Completion
 
 In order, highest leverage first.
 
-1. **Model the user-operations that arm64e actually uses.** Six of the sixteen
-   refusing real functions on `/bin/ls` contain an `SSAOp::CallOther` that
-   `machine.rs` does not lower -- `brk` and the pointer-authentication family.
-   It is the largest single cause among functions a reader would want to read,
-   and the two userops already expanded (`NEON_ext`, `NEON_ushl`) show the
-   shape a fix takes.
+1. **Render an indirect branch through `pc`.** Ninety of the hundred and six
+   refusals in `/bin/ls` are `SSAOp::BranchInd` reading a `pc` nothing defines:
+   every import thunk, and five real functions that tail-branch into one. A tail
+   call, a stub jump and a jump table all arrive this way and none of them has a
+   rendered shape. The trap user-operations that used to head this list are
+   done.
 
 2. **Retire the register-role tables.** The program counter is read from the
    processor specification now. mnemonikr/sleigh-config#8 exposes the compiler

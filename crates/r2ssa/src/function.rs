@@ -5716,6 +5716,21 @@ mod tests {
         assert_eq!(control.polls.get(), 6);
     }
 
+    /// An artifact built without an architecture names no user-operation.
+    ///
+    /// `SSAOp::CallOther` carries an index alone, and an index means nothing
+    /// without the table it was assigned from. Returning `None` is what lets a
+    /// consumer refuse; inventing a name, or matching the index against a
+    /// hardcoded one, would make the answer depend on which architecture the
+    /// caller happened to be holding.
+    #[test]
+    fn an_artifact_without_an_architecture_names_no_user_operation() {
+        let blocks = controlled_prep_blocks();
+        let artifact = SsaArtifact::for_decompile(&blocks, None).expect("artifact");
+        assert_eq!(artifact.user_operation_name(0), None);
+        assert_eq!(artifact.user_operation_name(u32::MAX), None);
+    }
+
     #[test]
     fn unchecked_and_controlled_decompile_builders_produce_identical_artifacts() {
         let blocks = controlled_prep_blocks();
