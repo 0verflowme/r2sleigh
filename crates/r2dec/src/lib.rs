@@ -43,6 +43,8 @@ pub mod highlight;
 pub(crate) mod normalize;
 mod observation_journal;
 mod placement;
+#[macro_use]
+mod refusal_evidence;
 pub(crate) mod planner;
 pub mod region;
 mod shadow_report;
@@ -3035,14 +3037,21 @@ impl PlacementAudit {
 /// `/bin/ls` reported one cause between them and could not be told apart. The
 /// upstream error already knows which authority it was; this carries that the
 /// last step to the reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Eq)]
 pub enum MachineProjectionRefusalOrigin {
     ShadowAuditPlanBuild,
     ShadowAuditSourcePairing,
     ShadowAuditReport,
     ShadowAuditIncompleteObservations,
     ShadowAuditNonQuality,
-    OpLowering,
+    /// One of the lowering predicates declined, named by its site.
+    ///
+    /// Every lowering refusal in the pipeline arrived here as one word, and on
+    /// `/bin/ls` that word covered two unrelated causes -- an incomplete return
+    /// boundary and a call whose arguments could not be spelled -- reported as
+    /// a single count of seven. The site the witness carries is free and says
+    /// which.
+    OpLowering(&'static std::panic::Location<'static>),
     RenderedIdentityMachineUse,
     RenderedIdentityMachineWrite,
     RenderedIdentityMissingUseDisposition,
@@ -3053,6 +3062,81 @@ pub enum MachineProjectionRefusalOrigin {
     RenderedIdentityIncoherentWriteProjection,
     BindingPlanBuild,
     PlannedLoweringInput,
+}
+
+impl MachineProjectionRefusalOrigin {
+    /// An op-lowering refusal decided here.
+    ///
+    /// Production builds these from the lowering witness, which took the line
+    /// from `#[track_caller]`. A caller that only means "the lowering authority
+    /// declined" -- a test asserting the cause, say -- uses this and gets its
+    /// own line, which equality ignores.
+    #[track_caller]
+    #[must_use]
+    pub fn op_lowering() -> Self {
+        Self::OpLowering(std::panic::Location::caller())
+    }
+}
+
+/// The cause, and the site only where the cause alone does not identify it.
+impl std::fmt::Debug for MachineProjectionRefusalOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShadowAuditPlanBuild => f.write_str("ShadowAuditPlanBuild"),
+            Self::ShadowAuditSourcePairing => f.write_str("ShadowAuditSourcePairing"),
+            Self::ShadowAuditReport => f.write_str("ShadowAuditReport"),
+            Self::ShadowAuditIncompleteObservations => {
+                f.write_str("ShadowAuditIncompleteObservations")
+            }
+            Self::ShadowAuditNonQuality => f.write_str("ShadowAuditNonQuality"),
+            Self::OpLowering(site) => {
+                let file = site.file();
+                let base = file.rsplit('/').next().unwrap_or(file);
+                write!(f, "OpLowering({base}:{})", site.line())
+            }
+            Self::RenderedIdentityMachineUse => f.write_str("RenderedIdentityMachineUse"),
+            Self::RenderedIdentityMachineWrite => f.write_str("RenderedIdentityMachineWrite"),
+            Self::RenderedIdentityMissingUseDisposition => {
+                f.write_str("RenderedIdentityMissingUseDisposition")
+            }
+            Self::RenderedIdentityMissingWriteDisposition => {
+                f.write_str("RenderedIdentityMissingWriteDisposition")
+            }
+            Self::RenderedIdentityMissingLiteralProjection => {
+                f.write_str("RenderedIdentityMissingLiteralProjection")
+            }
+            Self::RenderedIdentityUnmodelledUserOperation => {
+                f.write_str("RenderedIdentityUnmodelledUserOperation")
+            }
+            Self::RenderedIdentityIncoherentUseProjection => {
+                f.write_str("RenderedIdentityIncoherentUseProjection")
+            }
+            Self::RenderedIdentityIncoherentWriteProjection => {
+                f.write_str("RenderedIdentityIncoherentWriteProjection")
+            }
+            Self::BindingPlanBuild => f.write_str("BindingPlanBuild"),
+            Self::PlannedLoweringInput => f.write_str("PlannedLoweringInput"),
+        }
+    }
+}
+
+/// Two refusals from the same authority are the same refusal.
+///
+/// `OpLowering` carries the line that decided it so a reader can open the
+/// predicate, but a refusal's identity is the authority that failed, not which
+/// of its predicates got there first. Comparing the line would make every
+/// equality assertion in the tree brittle against moving one, and would split a
+/// gate's baseline on a refactor that changed no behaviour.
+impl PartialEq for MachineProjectionRefusalOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        core::mem::discriminant(self) == core::mem::discriminant(other)
+    }
+}
+
+impl std::hash::Hash for MachineProjectionRefusalOrigin {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+    }
 }
 
 /// Rendered C paired with the non-consuming Stage 4 binding audit.
@@ -3158,11 +3242,11 @@ impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
 impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
     fn from(refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
         match refusal {
-            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(..) => {
-                Self::MissingMachineProjectionAuthorization(
-                    MachineProjectionRefusalOrigin::OpLowering,
-                )
-            }
+            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(
+                origin,
+            ) => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::OpLowering(origin.site()),
+            ),
             crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..) => {
                 Self::MissingProgramVariableAuthorization
             }
@@ -7054,7 +7138,7 @@ mod tests {
             audited.render_refusal(),
             Some(
                 DecompileRenderRefusal::MissingMachineProjectionAuthorization(
-                    crate::MachineProjectionRefusalOrigin::OpLowering,
+                    crate::MachineProjectionRefusalOrigin::op_lowering(),
                 )
             )
         );

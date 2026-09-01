@@ -1620,7 +1620,7 @@ mod tests {
         assert_eq!(
             audit.render_refusal(),
             Some(crate::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
-                crate::MachineProjectionRefusalOrigin::OpLowering,
+                crate::MachineProjectionRefusalOrigin::op_lowering(),
             )),
             "the production path must preserve the upstream machine authorization refusal"
         );

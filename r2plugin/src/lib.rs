@@ -8528,7 +8528,7 @@ mod integration_tests {
             response.render_refusal,
             Some(
                 r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
-                    r2dec::MachineProjectionRefusalOrigin::OpLowering,
+                    r2dec::MachineProjectionRefusalOrigin::op_lowering(),
                 )
             )
         );

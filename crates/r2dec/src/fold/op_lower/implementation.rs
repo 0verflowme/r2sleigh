@@ -2205,6 +2205,14 @@ impl<'a> FoldingContext<'a> {
                     || !boundary.complete
                     || !boundary.register_compositions.is_empty()
                 {
+                    crate::refusal_evidence::refusal_evidence!(
+                        "return-boundary",
+                        "at_mismatch={} incomplete={} compositions={} values={}",
+                        boundary.at != source_inst,
+                        !boundary.complete,
+                        boundary.register_compositions.len(),
+                        boundary.values.len()
+                    );
                     return Err(OpLoweringRefusal::missing_machine_projection());
                 }
 

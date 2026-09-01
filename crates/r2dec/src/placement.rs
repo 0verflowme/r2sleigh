@@ -1643,6 +1643,23 @@ fn audit_program_symbol(
     {
         return Ok(());
     }
+    crate::refusal_evidence::refusal_evidence!(
+        "binding-symbol-observed",
+        "{access:?} binding={binding:?} name={:?} members={:?} active={:?}",
+        names.spelling(symbol),
+        (0..source.graph().values.len())
+            .filter(|index| {
+                u32::try_from(*index).ok().is_some_and(|index| {
+                    names
+                        .disposition_for_value(r2ssa::ValueId(index))
+                        .is_some_and(|disposition| {
+                            matches!(disposition, ValueDisposition::Bound { binding: owner } if *owner == binding)
+                        })
+                })
+            })
+            .collect::<Vec<_>>(),
+        active
+    );
     Err(match access {
         SymbolAccess::Read => PlacementAnalysisError::UnobservedBindingRead { binding },
         SymbolAccess::Write => PlacementAnalysisError::UnobservedBindingWrite { binding },
@@ -2965,6 +2982,21 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
         if !occurrence_regions_have_proven_order(regions, binding_occurrences) {
+            crate::refusal_evidence::refusal_evidence!(
+                "occurrence-region-order",
+                "binding={binding:?} occurrences={:?}",
+                binding_occurrences
+                    .iter()
+                    .map(|occurrence| (
+                        occurrence.block,
+                        occurrence.region,
+                        occurrence.order,
+                        matches!(occurrence.kind, OccurrenceKind::Write { .. })
+                            .then_some("write")
+                            .unwrap_or("read"),
+                    ))
+                    .collect::<Vec<_>>()
+            );
             decisions[binding_index] = Some(PlacementDecision::Refused(
                 PlacementRefusal::UnprovableExecutionOrder { binding },
             ));

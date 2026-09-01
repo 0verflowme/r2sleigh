@@ -604,6 +604,18 @@ impl<'a> FoldingContext<'a> {
                     r2ssa::InstPayload::Op(
                         r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. },
                     ) => {
+                        if obligation.id.kind == ObligationKind::CallArgument
+                            && obligation.inputs.is_empty()
+                        {
+                            crate::refusal_evidence::refusal_evidence!(
+                                "call-argument-occurrence",
+                                "component={:?} has no inputs, so no rendering can discharge it; \
+                                 rendered_call={} proof_values={:?}",
+                                obligation.id.component,
+                                rendered_call.is_some(),
+                                rendered_call.map(|fact| fact.proof_values.clone())
+                            );
+                        }
                         rendered_call.is_some()
                             && (obligation.id.kind == ObligationKind::Call
                                 || (obligation.id.kind == ObligationKind::CallArgument

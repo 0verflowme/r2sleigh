@@ -4486,7 +4486,7 @@ mod tests {
         let cases = [
             (
                 r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
-                    r2dec::MachineProjectionRefusalOrigin::OpLowering,
+                    r2dec::MachineProjectionRefusalOrigin::op_lowering(),
                 ),
                 "missing_machine_projection_authorization",
             ),

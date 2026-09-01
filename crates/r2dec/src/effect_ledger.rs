@@ -217,6 +217,18 @@ fn upstream_zero_occurrence_outcome(
         return Outcome::Elided(ElisionReason::DirectControlTarget);
     }
 
+    crate::refusal_evidence::refusal_evidence!(
+        "zero-occurrence-outcome",
+        "kind={:?} component={:?} block={:#x} source_inst={source_inst:?} inputs={:?}",
+        id.kind,
+        id.instruction.site,
+        id.instruction.block_addr,
+        prepared
+            .obligations()
+            .obligations()
+            .get(&id)
+            .map(|obligation| obligation.inputs.clone())
+    );
     Outcome::Refused {
         layer: LedgerLayer::Codegen,
         reason: RefusalReason::BlockNotRendered,

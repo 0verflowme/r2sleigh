@@ -255,6 +255,15 @@ impl BindingNameResolution {
         })
     }
 
+    /// How a symbol is spelled in the rendered C.
+    ///
+    /// Placement reports a binding by its dense index, which names nothing a
+    /// reader can find in the output. The spelling is what connects a refusal
+    /// to the statement that caused it.
+    pub(crate) fn spelling(&self, symbol: SymbolId) -> Rc<str> {
+        crate::symbol::spelling(&self.symbols, symbol)
+    }
+
     pub(crate) fn symbol_for_binding(&self, binding: BindingId) -> Option<SymbolId> {
         self.by_binding.get(binding.index()).copied()
     }

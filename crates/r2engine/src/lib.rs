@@ -8392,7 +8392,7 @@ mod tests {
     #[test]
     fn renderer_boundary_refusal_produces_a_typed_engine_refusal() {
         let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization(
-            r2dec::MachineProjectionRefusalOrigin::OpLowering,
+            r2dec::MachineProjectionRefusalOrigin::op_lowering(),
         );
         let reason = render_refusal_reason(render_refusal);
         let render_time = Duration::from_micros(19);
