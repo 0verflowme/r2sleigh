@@ -6722,3 +6722,27 @@ require of a value, list which of those assume an emitted statement, and satisfy
 that set together rather than chasing the next refusal. That is a reading task
 against one file, and it is what the next session should start with rather than
 another build-measure cycle.
+
+
+**The reading paid off, and named the next failure exactly.** Reading the audit
+instead of chasing its refusals showed it asks three things of the tree, not
+one: every value has a cell, every recorded use has one, and every instruction
+with an output has a write cell. A definition rendered where its value is read
+fails all three, and the fourth requirement is the effect ledger's -- nothing
+asks an unemitted statement for its obligations, so they score as refused.
+
+Answered together, one function folds end to end: `gate_one` at x86-64 `-O0`
+renders seventeen statements as fourteen with `ZF_1` gone into its `if`, and the
+proof line reads `0 refused`. That is the first time any of this has worked
+through the whole pipeline.
+
+It is not landable. Thirty-nine of the fifty-four corpus cells then fail at
+generation, and two name-resolution unit tests fail. The generation failures are
+the thing to take next, and the likely cause is in the same place as the fix:
+`observe_inlined_definition_expr` asks `rendered_use_observation` and
+`rendered_write_observation` for every operand and output of the definition, and
+either can answer `Refused` for a disposition the plan never intended to render
+here -- which turns a fold into a hard generation failure rather than a decline
+to fold. The rule that marks a value inlinable should require those dispositions
+to be renderable, so the plan and the renderer agree before the tree is built,
+which is the same discipline that fixed the seal.
