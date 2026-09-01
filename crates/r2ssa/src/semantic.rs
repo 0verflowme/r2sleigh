@@ -2963,14 +2963,7 @@ fn reaching_abi_return_register_in_block(
     let mut reverse_overlays = Vec::new();
 
     for (op_index, op) in block.ops.get(..boundary_op_index)?.iter().enumerate().rev() {
-        if matches!(
-            op,
-            SSAOp::Call { .. }
-                | SSAOp::CallInd { .. }
-                | SSAOp::CallOther { .. }
-                | SSAOp::CallDefine { .. }
-                | SSAOp::Return { .. }
-        ) {
+        if crate::reaching_rules::op_ends_reaching_walk(op) {
             return None;
         }
         if op.dst().is_none() {

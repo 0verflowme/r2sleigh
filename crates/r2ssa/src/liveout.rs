@@ -115,20 +115,12 @@ impl FunctionLiveOut {
             // nothing. Walking back until the location is covered names every
             // definition the caller actually reads.
             for op in block.ops.iter().rev() {
-                // A call owns the result register. The convention names the
-                // same register for a callee's result and for this function's,
-                // so any call reached walking backwards has overwritten what
-                // came before it, and a definition earlier in the block is not
-                // what the caller reads. Walking past one named the last thing
-                // put in the register before the call -- for a function whose
-                // final act is `warnx(fmt, ...)`, the format string -- as the
-                // value returned. The operation that names a call's result
-                // writes the register itself and is seen first, so a callee
-                // that does return a value still resolves here.
-                if matches!(
-                    op,
-                    crate::op::SSAOp::Call { .. } | crate::op::SSAOp::CallInd { .. }
-                ) {
+                // The shared rule, so this walk and the return boundary's
+                // cannot drift. Walking past a call named the last thing put in
+                // the register before it -- for a function whose final act is
+                // `warnx(fmt, ...)`, the format string -- as the value
+                // returned.
+                if crate::reaching_rules::op_ends_reaching_walk(op) {
                     clobbered = true;
                     break;
                 }

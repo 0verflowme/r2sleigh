@@ -45,6 +45,7 @@ pub(crate) mod op;
 pub(crate) mod optimize;
 pub(crate) mod phi;
 pub mod proven;
+pub(crate) mod reaching_rules;
 pub mod recover_interface;
 pub(crate) mod rename;
 pub(crate) mod semantic;

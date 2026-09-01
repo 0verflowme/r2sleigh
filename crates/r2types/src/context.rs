@@ -1578,14 +1578,7 @@ pub fn is_generic_arg_name(name: &str) -> bool {
 }
 
 fn is_generic_signature_type(ty: Option<&CTypeLike>) -> bool {
-    match ty {
-        None => true,
-        Some(CTypeLike::Unknown | CTypeLike::Void) => true,
-        Some(CTypeLike::Pointer(inner)) => {
-            matches!(inner.as_ref(), CTypeLike::Unknown | CTypeLike::Void)
-        }
-        _ => false,
-    }
+    crate::facts::is_generic_signature_type(ty)
 }
 
 fn signature_param_count_is_authoritative(signature: &FunctionSignatureSpec) -> bool {
