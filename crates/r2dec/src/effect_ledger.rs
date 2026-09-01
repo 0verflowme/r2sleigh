@@ -202,7 +202,26 @@ fn upstream_zero_occurrence_outcome(
         && source_inst
             .and_then(|inst| graph.inst(inst))
             .is_some_and(|inst| match &inst.payload {
-                r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. }) => true,
+                // Only a branch to one of this function's own blocks. The
+                // elision says the structured form expresses the transfer by
+                // where the target sits, and that is a claim about a block the
+                // structured form places. A branch that leaves the function --
+                // `b sym.imp.strcoll` ending a comparator, the ordinary shape
+                // of a tail call -- has no such block, so nothing expresses it
+                // and eliding it dropped the transfer with no trace: the
+                // arguments it set up were dead once the call was gone, dead
+                // store elimination took them, and a comparator rendered
+                // without its fallback comparison at all, under a proof line
+                // reading `0 refused`.
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. }) => graph
+                    .block(inst.block)
+                    .and_then(|block| prepared.function().cfg().get_block(block.addr))
+                    .is_some_and(|block| match block.terminator {
+                        r2ssa::cfg::BlockTerminator::Branch { target } => {
+                            prepared.function().get_block(target).is_some()
+                        }
+                        _ => false,
+                    }),
                 // A certified jump table transfers by which case block the
                 // structured form put the code in, exactly as an unconditional
                 // branch transfers by where its block sits.

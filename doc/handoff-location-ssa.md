@@ -6383,3 +6383,29 @@ recording its `StackAccess` target.
 `unobserved_binding_write` refusal on `fcn_1000040d8` does not render it; the
 seal then refuses with `ConflictingValue`, so there is a second finding behind
 the first and both belong to the same investigation.
+
+**Rendering a direct tail call: designed, measured, and not taken.** Refusing
+the transfer is in the tree; rendering it is not, and the blocker is exact.
+
+Modelling the exiting branch as the call it is turns out to be a one-place
+change in `r2ssa`: `CFG::from_blocks` is the single funnel every SSA
+construction passes through, it has the whole block set, and rewriting the
+block's `R2ILOp::Branch` into `R2ILOp::Call` there is enough for the op, the
+terminator and every consumer downstream, because everything after it reads the
+CFG rather than the original IL slice. The fallthrough a call terminator claims
+must be cleared in the same pass when the address after the call is not a block,
+or the linear form emits a jump to a label nothing declares.
+
+That was written and measured, and it made `/bin/ls` worse: 123 refusals became
+125, and the comparator went from one refused obligation to eighty-one. A call
+boundary is complete only when a source-owned callsite interface exists for that
+site and its raw identity matches, and radare2 reports no call at a branch. An
+incomplete boundary is seeded `VolatileOrUnknownEffect` and then
+`taint_incomplete_boundary_inputs` spreads a live-value obligation across
+everything reaching it, which is where the eighty-one come from.
+
+So the remaining work is not in `r2ssa` at all: the source-facts layer has to
+offer a callsite interface for a direct branch that leaves the function, the way
+it does for a call radare2 reports. Until it does, the branch rewrite is a
+change that renders nothing new and refuses more, and it was reverted rather
+than left in the tree.
