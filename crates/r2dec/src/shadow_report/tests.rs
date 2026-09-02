@@ -337,11 +337,11 @@ fn independently_forged_candidate_is_classified_shadow_wrong() {
     let source = source_owned([
         R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
-            src: Varnode::constant(1, 8),
+            src: Varnode::register(0, 8),
         },
         R2ILOp::Copy {
             dst: Varnode::unique(0x20, 8),
-            src: Varnode::constant(2, 8),
+            src: Varnode::register(8, 8),
         },
         R2ILOp::Store {
             space: r2il::SpaceId::Ram,
@@ -353,9 +353,11 @@ fn independently_forged_candidate_is_classified_shadow_wrong() {
             addr: Varnode::constant(0x2008, 8),
             val: Varnode::unique(0x20, 8),
         },
-        // Second readers. A value read once is folded into its reader and is
-        // bound to nothing, and this test needs two bindings to forge one
-        // against the other.
+        // Second readers, and both values come from registers. A value read
+        // once is folded into its reader, and one that reads nothing but
+        // literals is spelled at every reader; either way it is bound to
+        // nothing, and this test needs two bindings to forge one against the
+        // other.
         R2ILOp::Store {
             space: r2il::SpaceId::Ram,
             addr: Varnode::constant(0x2010, 8),

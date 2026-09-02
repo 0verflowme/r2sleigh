@@ -379,9 +379,35 @@ pub(super) fn inlinable_values(
     let elided_reads = cells.read_elided_instructions;
     let mut inlinable = BTreeSet::new();
     for value in &graph.values {
-        let [use_site] = graph.use_sites(value.id) else {
+        let use_sites = graph.use_sites(value.id);
+        if use_sites.is_empty() {
             continue;
-        };
+        }
+        // A value that reads nothing but literals is the same at every reader
+        // and costs nothing to spell there, so the single-reader rule does not
+        // apply to it. The broader question `r2rewrite` answers for expansion,
+        // whether rendering twice observes anything twice, is satisfied by an
+        // entry value the function never writes as well -- but copying an
+        // expression over two parameters to three readers is three copies of a
+        // real computation, not a local removed, so the plan asks the stricter
+        // question.
+        // ...and whose own storage is a lowering temporary. A register or a
+        // memory cell holding a literal is a machine object the program
+        // writes, and that write is an effect the ledger accounts for once; a
+        // reader spelling the literal instead does not perform it. Rendering
+        // such a value at several readers is the multiplicity question, which
+        // is a separate piece of work. A `Unique` slot is the lifter's own
+        // scratch and its write is not an effect of the program.
+        let literal_only = expr_by_value
+            .get(&value.id)
+            .copied()
+            .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
+            && value.canonical_storage.is_none_or(|storage| {
+                matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
+            });
+        if !literal_only && use_sites.len() != 1 {
+            continue;
+        }
         let renderable = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
@@ -427,9 +453,26 @@ pub(super) fn inlinable_values(
         // effect its definition answered for is then owed by nobody. The
         // ledger scores that as a refusal and the function falls back to no
         // decompilation at all, which is what `murmur3_32` and `xxhash32` did.
-        if elided_reads.contains(&use_site.inst) {
+        // Every reader, not one: an occurrence inside an instruction a
+        // certificate elides disappears with it, and a duplicable value whose
+        // readers are partly elided is a case whose accounting nobody has
+        // established, so it stays bound.
+        if use_sites
+            .iter()
+            .any(|site| elided_reads.contains(&site.inst))
+        {
             continue;
         }
+        if literal_only {
+            // Nothing is being moved past anything. The tests below ask whether
+            // a computation stays correct where it lands, and a literal is the
+            // same in both places.
+            inlinable.insert(value.id);
+            continue;
+        }
+        let [use_site] = use_sites else {
+            unreachable!("a value that is not literal-only was required to have one reader");
+        };
         let Some(use_inst) = graph.inst(use_site.inst) else {
             continue;
         };

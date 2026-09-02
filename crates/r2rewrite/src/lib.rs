@@ -22,7 +22,7 @@ pub use driver::{
 pub use eval::{LeafRef, eval, mask, signed};
 pub use import::{
     COPY_ELIDE, ExpansionPolicy, ExpansionQuery, Import, ImportedValue, default_expansion_policy,
-    import, import_with, term_is_duplicable,
+    import, import_with, machine_expr_is_literal, term_is_duplicable,
 };
 pub use rules::{
     DEFAULT_PROOF_WIDTHS, Measure, MeasureVector, RULES, Rule, RuleGroup, RuleId, measure,

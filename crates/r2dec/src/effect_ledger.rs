@@ -313,6 +313,15 @@ pub(crate) fn build_obligation_ledger(
             // the program does and is scored as a refusal.
             _ if effects.duplicates_are_exclusive(id) => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
+            // And several occurrences are one execution when what was rendered
+            // is a literal. The machine writes the temporary once; a reader
+            // that spells the constant instead of naming it performs nothing,
+            // so the count is how many times the value was spelled and not how
+            // many times it was computed. Admitted only for a value that reads
+            // nothing at all, because an expression repeated at three readers
+            // would be three evaluations.
+            _ if effects.duplicates_are_a_repeated_literal(id) => rendered_site(id)
+                .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
             _ => Some(Outcome::Refused {
                 layer: LedgerLayer::Codegen,
                 reason: RefusalReason::DuplicateRenderedOccurrence,
