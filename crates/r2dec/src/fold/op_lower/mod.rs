@@ -109,7 +109,7 @@ fn certified_compare_truth_relation_handles_complement_and_swapped_equality() {
 
 mod aliases;
 mod calls;
-mod convert;
+pub(crate) mod convert;
 mod lowering;
 mod memory_renderer;
 mod projection;

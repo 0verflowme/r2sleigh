@@ -987,14 +987,36 @@ mod tests {
         else {
             panic!("low-register write must remain an assignment expression");
         };
-        assert!(matches!(
-            copy_rhs.unobserved(),
-            CExpr::Cast {
-                ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
-                expr,
-                ..
-            } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
-        ));
+        // One cast, not two. The write zero-extends a thirty-two bit value
+        // into the sixty-four bit carrier, and the addition already produces
+        // that thirty-two bit value: C computes `uint32_t + uint32_t` in
+        // `uint32_t`. The `(uint32_t)` this once spelled underneath said so a
+        // second time. What has to be spelled is the extension itself, and
+        // that it is an extension of an unsigned value rather than a signed
+        // one, which the operand's own type carries.
+        let CExpr::Cast {
+            ty:
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+            expr: extended,
+            ..
+        } = copy_rhs.unobserved()
+        else {
+            panic!("the write must zero-extend into the carrier: {copy_rhs:?}");
+        };
+        assert!(
+            matches!(
+                extended.unobserved(),
+                CExpr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            ),
+            "the extension applies to the thirty-two bit addition itself, \
+             with no conversion restating the width it already has: {extended:?}"
+        );
 
         assert_eq!(*ctx.observation_error.borrow(), None);
     }

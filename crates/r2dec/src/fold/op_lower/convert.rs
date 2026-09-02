@@ -137,7 +137,7 @@ fn respell_literal(expr: CExpr, signed: bool, bits: u32) -> CExpr {
 }
 
 /// Convert `expr`, which has `from`, to `to`.
-pub(super) fn convert(expr: CExpr, from: &CValue, to: &CType, pointer_bits: u32) -> CExpr {
+pub(crate) fn convert(expr: CExpr, from: &CValue, to: &CType, pointer_bits: u32) -> CExpr {
     match from {
         CValue::Constant => spell_constant(expr, to, pointer_bits),
         CValue::Typed(from) => convert_typed(expr, from, to, pointer_bits),
