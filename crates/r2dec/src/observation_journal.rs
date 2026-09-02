@@ -1458,11 +1458,14 @@ impl LegacyObservationJournal {
                 let Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) = origins.origin(site) else {
                     continue;
                 };
-                if !matches!(
-                    origin.certified_entity,
-                    Some(r2ssa::SemanticId::LoopCarrier(_))
-                ) || !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0)
-                {
+                // Any materialised merge edge, not only a certified loop
+                // carrier's. What makes the copy say nothing is that both
+                // sides resolve to one binding, which is tested below; the
+                // carrier is where the case was found, not the reason it
+                // holds. A version-0 source stays excluded because it has no
+                // defining statement of its own, so its edge copy is the only
+                // place that value is written.
+                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
                     continue;
                 }
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
@@ -1501,18 +1504,16 @@ impl LegacyObservationJournal {
                     .flat_map(|input| input.uses.iter().copied())
             })
             .collect::<BTreeSet<_>>();
+        // Symmetric with the edge uses above. A merge every one of whose
+        // edges is an identity or coalesced to its own binding performs
+        // nothing, so it owes no standalone write.
         let coalesced_carrier_phi_writes = origins
             .removed_phis()
             .iter()
             .filter(|removed| {
-                source
-                    .report()
-                    .render()
-                    .and_then(|render| render.loop_carrier_for_value(removed.definition.value))
-                    .is_some()
-                    && removed.incoming_sites.iter().all(|site| {
-                        removed.noop_sites().contains(site) || coalesced_carrier_uses.contains(site)
-                    })
+                removed.incoming_sites.iter().all(|site| {
+                    removed.noop_sites().contains(site) || coalesced_carrier_uses.contains(site)
+                })
             })
             .map(|removed| removed.definition.inst)
             .collect::<BTreeSet<_>>();
@@ -1622,14 +1623,14 @@ impl LegacyObservationJournal {
             .copied()
             .collect::<Vec<_>>();
         for site in coalesced_carrier_uses {
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCarrierEdge) {
-                Some(r2ssa::ledger::ElisionReason::CoalescedCarrierEdge) | None => {}
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
         for inst in self.coalesced_carrier_phi_writes.iter().copied() {
-            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedCarrierPhi) {
-                Some(r2ssa::ledger::ElisionReason::CoalescedCarrierPhi) | None => {}
+            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
             }
         }
@@ -2100,6 +2101,55 @@ impl LegacyObservationJournal {
     /// has no occurrence of its own. This fills only slots the renderer left
     /// empty: where the phi does still render, that observation already stands
     /// and is not replaced, which is why this cannot be declared up front.
+    /// Fill the value cell of a merge that performs nothing, from the binding
+    /// that carries it.
+    ///
+    /// A merge whose every edge is an identity has no statement: the edge
+    /// copies are suppressed, so `observe_normalized_output_stmt` never runs
+    /// and never marks the value. The value is nonetheless rendered -- under
+    /// the binding's name, by whatever wrote that binding -- so the honest
+    /// cell is the one a rendered marker would have produced, and it is
+    /// spelled the same way `classify_symbol` spells it.
+    ///
+    /// This is the sibling of `observe_discharged_expr`, which accepts that a
+    /// discharged instruction's cells are filled at the site rendering its
+    /// replacement. The two cannot share a path, and the difference is worth
+    /// stating: that function has an expression to hang markers on, because
+    /// something is rendered where the discharged statement used to be. An
+    /// identity merge has no site at all -- its statement is gone and nothing
+    /// stands in its place -- so its cell is closed here, at the seal, in the
+    /// same way `account_materialized_phi_occurrences` closes the cells of
+    /// definitions placement dropped.
+    fn account_identity_merge_values(
+        &mut self,
+        symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    ) -> Result<(), LegacyObservationJournalError> {
+        let graph = self.source.graph();
+        for value in self.plan.identity_merges(graph) {
+            let Some(slot) = self.values.get(value.0 as usize) else {
+                continue;
+            };
+            if slot.is_some() {
+                continue;
+            }
+            let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
+                continue;
+            };
+            // The name the binding is declared under in the emitted function.
+            // Absent means the binding reached no declaration, which is a
+            // placement failure the seal reports for itself rather than
+            // something to paper over here.
+            let Some(symbol) = self.names.symbol_for_binding(*binding) else {
+                continue;
+            };
+            let Some(legacy) = symbol_bindings.get(&symbol).copied() else {
+                continue;
+            };
+            self.values[value.0 as usize] = Some(LegacyValueObservation::Bound { binding: legacy });
+        }
+        Ok(())
+    }
+
     fn account_materialized_phi_occurrences(&mut self) {
         let graph = self.source.graph();
         for inst in self.materialized_removed_phis.clone() {
@@ -2807,6 +2857,7 @@ impl LegacyObservationJournal {
         }
         self.effect_occurrence_regions = effect_occurrence_regions;
         self.account_materialized_phi_occurrences();
+        self.account_identity_merge_values(&symbol_bindings)?;
         if let Some(error) = self.first_unaccounted_render_observation() {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
@@ -4091,7 +4142,7 @@ mod tests {
                 assert_eq!(
                     journal.uses[source_use.inst.0 as usize][source_use.input_idx],
                     Some(LegacyUseObservation::Elided(
-                        r2ssa::ledger::ElisionReason::CoalescedCarrierEdge
+                        r2ssa::ledger::ElisionReason::CoalescedEdgeCopy
                     ))
                 );
             }
@@ -4104,7 +4155,7 @@ mod tests {
             assert_eq!(
                 journal.writes[inst.0 as usize],
                 Some(LegacyWriteObservation::Elided(
-                    r2ssa::ledger::ElisionReason::CoalescedCarrierPhi
+                    r2ssa::ledger::ElisionReason::CoalescedIdentityPhi
                 ))
             );
         }

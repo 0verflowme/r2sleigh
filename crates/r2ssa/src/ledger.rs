@@ -88,14 +88,20 @@ pub enum ElisionReason {
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
     CoalescedImmutablePhi,
-    /// A certified loop-carrier edge whose incoming value and merge output are
-    /// one renderer binding. The update already writes that binding, so the
-    /// synthetic edge copy would only spell `x = x`.
-    CoalescedCarrierEdge,
-    /// Every incoming edge of a certified loop carrier is either an SSA
-    /// identity or coalesced to the carrier binding, so the removed phi itself
-    /// needs no standalone C write.
-    CoalescedCarrierPhi,
+    /// A materialised merge edge whose incoming value and the merge's output
+    /// are one renderer binding. Whatever wrote that binding has already
+    /// written it, so the synthetic edge copy would only spell `x = x`.
+    ///
+    /// This was once restricted to a certified loop carrier, which is where
+    /// the case was found rather than the reason it holds: what makes the copy
+    /// say nothing is that both sides are one binding.
+    CoalescedEdgeCopy,
+    /// Every incoming edge of a merge is either an SSA identity or coalesced
+    /// to the merge's own binding, so the merge needs no standalone C write.
+    ///
+    /// Its output is not elided with it. The value is still rendered, under
+    /// the binding's name, by whatever wrote that binding.
+    CoalescedIdentityPhi,
     /// A condition-code write no rendered predicate reads.
     DeadCpuFlag,
     /// A value only ever read to compute a flag that is itself elided.
@@ -162,8 +168,8 @@ impl std::fmt::Display for ElisionReason {
             Self::CallReturnAddress => "call-return-address",
             Self::DeadFrameSlotStore => "dead-frame-slot-store",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
-            Self::CoalescedCarrierEdge => "coalesced-carrier-edge",
-            Self::CoalescedCarrierPhi => "coalesced-carrier-phi",
+            Self::CoalescedEdgeCopy => "coalesced-edge-copy",
+            Self::CoalescedIdentityPhi => "coalesced-identity-phi",
             Self::DeadCpuFlag => "dead-cpu-flag",
             Self::DeadFlagOnly => "dead-flag-only",
             Self::DeadUnusedTemporary => "dead-unused-temp",
