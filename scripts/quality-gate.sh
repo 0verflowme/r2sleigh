@@ -191,6 +191,7 @@ run cargo +nightly udeps --workspace --all-targets --features x86
 phase "Formatting and Clippy"
 run cargo fmt --all -- --check
 run cargo clippy --workspace --all-targets --features x86 -- -D warnings
+run cargo test -p r2rewrite
 
 phase "Local Dylint lint"
 if [ "$strict_dylint" -eq 1 ]; then

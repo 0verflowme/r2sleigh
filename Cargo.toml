@@ -11,6 +11,7 @@ members = [
     "crates/r2types",
     "crates/r2engine",
     "crates/r2dec",
+    "crates/r2rewrite",
     "r2plugin",
 ]
 
