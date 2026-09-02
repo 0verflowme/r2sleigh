@@ -7623,3 +7623,88 @@ Binding audit reports `non_quality` on fifty-two cells, `pass` on two; whether
 that predates this stretch was not established, because the previous results
 were overwritten by this run. Per-function decompile time was measured only
 end to end, above; the per-phase split is still unobservable from radare2.
+
+## The expression engine work: how it is organised, and what day zero measured
+
+The plan this follows was approved with every open decision settled by the
+user: rewrites are accounted for as certified equivalences rather than as a new
+elision reason; the rule table lives in a new `r2rewrite` crate and every rule
+carries a Z3-checked bit-vector proof at 8, 16, 32 and 64 bits; the C-tree
+expression passes and the production-dead parts of `r2ssa/optimize.rs` are
+deleted once rules replace them; the perf bar is per function rather than
+whole-binary; and the finish line is exact predicate columns on the corpus plus
+a DecBench sample-set run.
+
+Three worktrees branch from `ec8d589`. `arch/expression-engine` integrates;
+`arch/expr-accounting` holds step 1, the accounting rule; `arch/expr-rewrite`
+holds the `r2rewrite` crate. All three install the plugin to one shared path,
+so every measurement that involves `make install` takes
+`/tmp/r2sleigh-plugin-install.lock` for the whole run and not merely for the
+install. The dumps are captured against whatever is installed at that moment,
+and this project has already voided four conclusions to that exact class of
+error.
+
+**The machine detail is now a measured column.** `machine_noise` counts seven
+exact predicates on the extracted raw function of every cell, and `--gate
+noise` requires all of them to be zero. Exact rather than a threshold, because
+each one either appears or does not, and none can be produced by a source
+construct. On the fifty-four cells at `ec8d589`:
+
+    same_type_casts             792
+    cast_chains                 752
+    self_assignments            296
+    literal_only_declarations   292
+    flag_carriers               192
+    gotos                       125
+    comma_conditions             17
+
+Zero of fifty-four cells pass. Two of the predicates had to be narrower than
+they first looked, and each was caught by its own test rather than by the
+corpus. A literal initialiser is only machine detail on a name this renderer
+minted -- a lowered temporary or an SSA-versioned register -- because
+`uint64_t total = 0;` is ordinary C and a named frame slot is a real local. And
+a run of exactly two casts can be legitimate, since a pointer narrowed to a
+smaller integer has to pass through the pointer's own width; only three is
+counted. `goto` is required to be zero only at `-O0`, where structured control
+is claimed.
+
+**The verifier's own unit tests had rotted, and nothing ran them.** Two of the
+forty were failing at `ec8d589`: `map_image_data` reads segments as well as
+sections and owed its mock a third result, and a diagnostic-repair assertion
+still expected a recovered pointer parameter to be retyped to `long`, which is
+component 3 working rather than the repair failing. Both are fixed, and the
+quality gate now runs `tests/corpus/test_verify_rendering.py`, which costs
+0.04 seconds and is the file that decides whether any other corpus phase means
+anything.
+
+**Where a decompile's time actually goes, measured in process.** The engine's
+phase inventory starts after the SSA artifact exists, so the provider path
+reported `ssa=0us` and the capture that builds the artifact was attributed to
+nothing. Split, with two other worktrees compiling throughout (load average 9
+to 19, so the ratios are the claim and the milliseconds are an upper bound):
+
+    case                        capture  decode  callee_lift  callees  root_lift  engine  rendering
+    xxhash32   x64   -O2         112ms    13us       0us          0      112ms    379ms      97%
+    murmur3_32 x64   -O0         129ms    13us      50ms          1       79ms    160ms      95%
+    /bin/ls main, refused        524ms   107us     200ms          4      324ms     71ms   refused
+    /bin/ls func.100003364       274ms    33us     174ms          4      100ms     19ms   refused
+
+Rendering is almost all of the engine's time on a cell that renders, which is
+where the rewriting layer lands. Lifting callees is repeated work nothing
+caches: four callees cost about 45 milliseconds each and every `pdd` pays
+again, which is the case for the per-binary program cache. Decoding the wire
+buffer is microseconds, so the ingress that replaced the callback ABI is not
+worth optimising.
+
+One earlier claim in this document is withdrawn. Refusing `main` was reported
+at 4.3 seconds; it costs about 0.6 seconds. That figure came from subtracting
+one `aaa` run from another, and `aaa` on /bin/ls varies by seconds. Measure the
+thing rather than deriving it from a difference of two large numbers, which is
+the same rule this project already applies to coverage.
+
+**The binding audit was reporting a disagreement that did not exist.** It
+passed on 2 of 54 cells before the accounting work and passes on 54 of 54
+after, and nothing about the emitted program moved. The candidate side mapped
+every inline disposition to `InlineConstant` while the oracle distinguishes a
+constant from an expression, so every function that folds anything reported a
+mismatch. The column had been measuring its own classification.
