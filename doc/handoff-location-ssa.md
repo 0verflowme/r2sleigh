@@ -7884,3 +7884,32 @@ projection.
 it is what makes any further cast removal safe; self-assignment elimination
 comes with it, because the two are the same piece of work; and only then does
 dropping the outermost redundant cast become landable.
+
+**Running several worktrees at once: what it costs and the two rules that make
+it work.** Four efforts ran in parallel on this branch and the throughput was
+real, but two operational facts are worth inheriting rather than rediscovering.
+
+Every worktree installs the plugin to one shared path and `run_matrix.sh`
+captures its dumps against whatever is installed at that moment, so two
+overlapping runs measure each other's build.
+`tests/corpus/locked_matrix.sh` is the answer: it builds first without the
+lock, because `make install` builds before it installs and taking the lock
+first holds it through a cold release build, then holds
+`/tmp/r2sleigh-plugin-install.lock` for the install and the capture only, and
+releases from a trap so an interrupted run does not strand the queue. Use it
+rather than calling `run_matrix.sh` directly. One conclusion in this session
+was drawn from a trace taken against another worktree's installed plugin and
+had to be thrown away; that is the fourth or fifth time this class of error has
+cost this project a measurement.
+
+The second rule is that a worktree has exactly one live agent. Two were pointed
+at one tree here, and although nothing was lost -- the first effort's work was
+already committed and merged -- the second found six modified files it did not
+write and correctly stopped rather than committing them.
+
+Disk is the other constraint. Three active build trees reach about eleven to
+thirteen gigabytes each, and the incremental caches are nearly all of it: they
+regrow to that size within about forty minutes of active building, and deleting
+`target/*/incremental` in each tree reclaims twenty gigabytes in a second and
+costs only a slower next build. ENOSPC killed every tool in this session once
+before that was understood.
