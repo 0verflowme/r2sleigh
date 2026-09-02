@@ -7780,3 +7780,33 @@ Cost of canonicalisation itself, for the record: about one projection build,
 case 3.4 milliseconds against 2.7 on `xxhash32` at x86-64 -O2, with no budget
 failures anywhere. Against a fold stage that is one per cent of a render, the
 rewriter is not a cost worth designing around.
+
+**Coalescing a merge edge that is not a certified carrier needs the value half
+too, and that is the whole of what blocks it.** The journal elides the uses of
+a materialised phi-edge copy only when the edge belongs to a
+`SemanticId::LoopCarrier`, and its own comment gives a reason that is not about
+carriers at all: once both sides resolve to one binding the copy says `x = x`,
+and the statement that computed the update has already said it. Dropping the
+carrier restriction and keeping the binding-identity test -- which is the real
+condition -- was tried.
+
+It renders 53 of 54. `xxhash32` at x86-64 -O2 refuses with
+`rendered_value_required` on `ValueId(920)`: the edge copy is suppressed, so
+the value it defined has no rendered write, and no elision reason covers a
+value whose merge is not a certified carrier. The carrier case works because
+`coalesced_carrier_phi_writes` elides the phi write as `CoalescedCarrierPhi`
+alongside the edge uses, and that set is gated on
+`render.loop_carrier_for_value`.
+
+So the change is symmetric or it is nothing: widening the edge-use elision
+requires widening the value-and-write elision with it, and that needs its own
+argument for why a non-carrier merge whose every edge is an identity owes no
+rendered write. `ElisionReason::CoalescedImmutablePhi` already states something
+close for immutable merges and is the place to look first. The elision reason
+would also want renaming away from `CoalescedCarrierEdge`, since it would no
+longer be about carriers and that name is read by a human in the proof line.
+
+Reverted rather than left in the tree. The measurement is worth keeping: with
+the edges coalesced, self-assignments fall from 296 to 206 and flag carriers
+from 192 to 178 across the corpus, so this is roughly a third of the
+self-assignment column and is worth finishing properly.
