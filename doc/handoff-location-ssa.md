@@ -7061,3 +7061,49 @@ resolves by making one answer rather than by choosing a winner.
 
 Both patches are off the tree, which is green: fifty-four of fifty-four on
 every corpus gate and 2236 of 2236 tests.
+
+### Typed declarations: eight compile errors from landing
+
+`doc/wip/typed-declarations.patch` is now 865 lines and takes the corpus from
+eleven blocked cells to eight, with four more defects fixed at their cause
+along the way. Every one of them was hidden by the old contract that a
+declaration is always an unsigned machine word, and each is a rule the emitted
+C needs whatever the declarations say:
+
+*C adds an integer to a pointer, never a pointer to a pointer.* Both operands
+of an address sum can be pointer-declared honestly -- a value used as an
+address anywhere is a pointer wherever it is read -- and the sum is still one
+base and one offset, so `binary_stmt_typed` integerises the right operand when
+both look like pointers.
+
+*The operand's projection comes before the assignment's conversion.* The
+projection says which bits of the source are read; the conversion says what
+the destination is. Run the other way round, as `SSAOp::Copy` did, it re-wrapped
+a value already converted to the destination's type back into the source
+carrier's integer: `int8_t *p = (uint64_t)(int8_t *)q;`.
+
+*A pointer-valued expression assigned to an integer needs its conversion
+spelled too.* `cast_expr_if_needed` asked only the recorded source type, and an
+unrecorded one meant no cast, so `uint64_t n = p + i;` went out unconverted.
+The expression itself is the evidence when nothing else recorded it.
+
+*A store converts to the declared type of the object it writes.* A store's
+left-hand side is a certified access rather than a variable, so the assignment
+policy had no `dst` to ask and skipped the conversion entirely; the object
+behind the access has a declaration, and it is what the compiler reads.
+
+The eight that remain are three shapes, all cast placement rather than
+inference: a stack store whose conversion does not fire because
+`stored_object_declaration_type` fails to match the access fact by address; a
+`uint32_t` register alias initialised from a pointer, which needs the pointer
+narrowed through `uintptr_t` rather than cast straight to a smaller integer;
+and a load result assigned to a pointer-declared object without the pointer
+conversion, which is the same missing rule as the store had.
+
+One further thing the measurement shows: parameter matches stay at zero even
+with pointers recovered, because the evidence spells the pointee `int8_t`
+while DWARF says `const uint8_t *`. Two facts are missing rather than one --
+the pointee's signedness, which the zero-extension on every loaded byte
+decides, and `const`, which is exactly "no store through this pointer
+anywhere in the function". Both are local and derivable, and neither is worth
+starting before the eight cast errors are gone.
