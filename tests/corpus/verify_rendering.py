@@ -2266,7 +2266,16 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 elif actual.get("value") != expected.get("value"):
                     case_status = "wrong"
                 if case_status != "pass":
-                    differential_status = "failed"
+                    # A case that never produced an answer and a case that
+                    # produced the wrong one are different findings. Both fail
+                    # the gate, and only one of them says the decompiler is
+                    # wrong: a timeout under machine load reported as `failed`
+                    # teaches a reader to disbelieve the column.
+                    differential_status = (
+                        "timeout"
+                        if case_status == "timeout" and differential_status != "failed"
+                        else "failed"
+                    )
                 differential_cases.append(
                     {
                         **case,
