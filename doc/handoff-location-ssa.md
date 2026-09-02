@@ -7382,3 +7382,41 @@ it is blocked earlier still: `uint8_t buf[16]` written at `buf[i]` resolves to
 or declare, and the object resolver has to learn that a frame base plus a
 constant plus a variable index is an access into a frame object before anything
 downstream can help.
+
+### Why the stack buffer escapes, to the exact function
+
+`function.rs::stack_address_root_from_add` is where it happens. A stack address
+root is recorded for `base + delta` only when `signed_stack_delta_through_roots`
+can fold `delta` to a constant:
+
+```rust
+if let (Some(base), Some(delta)) = (
+    stack_root_from_operand(a, ...),
+    signed_stack_delta_through_roots(b, ...),
+) {
+    return Some(StackAddressRoot { base: base.base, offset: base.offset + delta });
+}
+```
+
+`buf[i]` is `frame_base + (-0x20) + i` with `i` a loop variable, so the second
+add has no constant delta, no root is recorded, and
+`semantic.rs::object_for_address_value` falls through to
+`ensure_escaped_unknown`. Every consequence follows from that one miss: no
+object, so no stack-slot certificate, so no name, no size, no declaration, and
+the access renders as raw frame arithmetic.
+
+The missing concept is small to state and not small to build. `StackAddressRoot`
+is `{ base, offset }` and says an address is at an *exact* offset from a base.
+An array element is at an unknown offset from a known object, and there is no
+way to say that. Recording `base.offset` for `base + i` would be a lie -- it
+would alias every element to the first -- so the fix is a third case in the
+model, either a variable-offset root or an `ObjectKind::ArrayElement` carrying
+the object and the index value.
+
+That change starts in `r2ssa` and lands in the machine projection, the
+certificates, the binding plan's declaration rule and the renderer, which is
+why it is a session of its own rather than the tail of this one. The
+declaration side is already prepared for it:
+`rules::declaration_type_for_stack_object` asks the evidence and admits what
+describes the storage, and would need `CTypeLike::Array` admitted beside the
+scalars it admits today.
