@@ -8100,3 +8100,16 @@ remeasured, and several notes above rest on it. And the harness wants a real
 binary in it, with the binary's own hash recorded beside the baseline so a
 different machine reports a different subject rather than silently comparing
 against one it does not have.
+
+Confirmed again after the composed return value landed: still 11, which is
+right, because the eighteen that change were all in `branchy`.
+
+**And measure it with `tests/corpus/locked_probe.sh`, not with a bare `r2`.**
+The shared-plugin hazard has now cost five conclusions, four before it was
+written down here and one after, and every one of them looked like a real
+finding until somebody repeated it. Writing it down does not work, because the
+failure is silent: nothing about a stale plugin's output says it is stale. The
+script builds this tree without the lock, then holds the lock across the
+install and the command together, which is the only window in which the answer
+is about this tree. Releasing between the two is what makes a stale answer
+possible.
