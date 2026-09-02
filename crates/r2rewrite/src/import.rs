@@ -127,15 +127,87 @@ pub fn term_is_duplicable(
     term: TermId,
 ) -> bool {
     !matches!(arena.term(term).kind, TermKind::Opaque(_))
-        && arena.leaves(term).into_iter().all(|leaf| {
-            match projection.expr(leaf).map(|expr| expr.kind()) {
-                Some(MachineExprKind::Constant { .. }) => true,
-                Some(MachineExprKind::Source { binding, .. }) => {
-                    entry_never_redefined.contains(&binding.value())
-                }
-                _ => false,
+        && arena
+            .leaves(term)
+            .into_iter()
+            .all(|leaf| leaf_is_duplicable(projection, entry_never_redefined, leaf))
+}
+
+/// Whether one base-arena leaf may be read at any number of sites.
+///
+/// The single statement of the rule. A literal is the same at every site by
+/// definition, and an entry value the function never writes is the same at
+/// every site because nothing between the sites can change it. Everything else
+/// is read once.
+fn leaf_is_duplicable(
+    projection: &MachineProjection,
+    entry_never_redefined: &BTreeSet<ValueId>,
+    leaf: MachineExprId,
+) -> bool {
+    match projection.expr(leaf).map(|expr| expr.kind()) {
+        Some(MachineExprKind::Constant { .. }) => true,
+        Some(MachineExprKind::Source { binding, .. }) => {
+            entry_never_redefined.contains(&binding.value())
+        }
+        _ => false,
+    }
+}
+
+/// Whether a base-arena expression reads nothing but literals.
+///
+/// A neighbour of [`term_is_duplicable`] and deliberately stricter, because it
+/// answers a different question. That one asks whether rendering a term twice
+/// would observe anything twice, which an entry value the function never
+/// writes also satisfies. This one asks whether a value is cheap enough that a
+/// reader should spell it instead of naming it, and only a literal is: an
+/// expression over two parameters observes nothing twice either, and copying
+/// it to three readers is three copies of a real computation rather than a
+/// local removed.
+pub fn machine_expr_is_literal(projection: &MachineProjection, root: MachineExprId) -> bool {
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        let Some(expr) = projection.expr(node) else {
+            return false;
+        };
+        let children = expr.kind().children();
+        if children.is_empty() {
+            if !matches!(expr.kind(), MachineExprKind::Constant { .. }) {
+                return false;
             }
+        } else {
+            pending.extend(children);
+        }
+    }
+    true
+}
+
+/// Entry values whose storage no instruction of the function writes.
+fn entry_values_never_redefined(graph: &r2ssa::SsaGraph) -> BTreeSet<ValueId> {
+    let mut rewritten_locations = BTreeSet::new();
+    for inst in &graph.insts {
+        if let Some(storage) = inst
+            .output
+            .and_then(|output| graph.value(output))
+            .and_then(|value| value.canonical_storage)
+        {
+            rewritten_locations.insert(storage.location());
+        }
+    }
+    graph
+        .values
+        .iter()
+        .filter(|value| graph.def_inst(value.id).is_none())
+        .filter(|value| {
+            value
+                .canonical_storage
+                .is_some_and(|storage| !rewritten_locations.contains(&storage.location()))
         })
+        .map(|value| value.id)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -173,27 +245,7 @@ pub fn import_with(
     policy: &ExpansionPolicy<'_>,
 ) -> Import {
     let graph = artifact.graph();
-    let mut rewritten_locations = BTreeSet::new();
-    for inst in &graph.insts {
-        if let Some(storage) = inst
-            .output
-            .and_then(|output| graph.value(output))
-            .and_then(|value| value.canonical_storage)
-        {
-            rewritten_locations.insert(storage.location());
-        }
-    }
-    let entry_never_redefined = graph
-        .values
-        .iter()
-        .filter(|value| graph.def_inst(value.id).is_none())
-        .filter(|value| {
-            value
-                .canonical_storage
-                .is_some_and(|storage| !rewritten_locations.contains(&storage.location()))
-        })
-        .map(|value| value.id)
-        .collect();
+    let entry_never_redefined = entry_values_never_redefined(graph);
     let mut importer = Importer {
         artifact,
         projection,

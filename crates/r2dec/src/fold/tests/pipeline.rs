@@ -1941,29 +1941,38 @@ mod tests {
             dst: Varnode::unique(0x10, 8),
             src: Varnode::constant(7, 8),
         });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x30, 8),
+            src: Varnode::register(0, 8),
+        });
         entry.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x20, 8),
             a: Varnode::unique(0x10, 8),
-            b: Varnode::constant(1, 8),
+            b: Varnode::unique(0x30, 8),
         });
         entry.push(R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2000, 8),
             val: Varnode::unique(0x20, 8),
         });
-        // The copy's destination is read twice, so the plan binds it. With a
-        // single reader it would be folded into that reader, and the test
-        // needs one value the plan inlines and one it does not.
+        // The sum is read twice and reads a register, so the plan binds it,
+        // and the test needs one value the plan inlines and one it does not.
+        // Both conditions are load-bearing: a value with one reader is folded
+        // into that reader, and a value that reads nothing but literals is
+        // spelled at every reader it has.
         entry.push(R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2008, 8),
-            val: Varnode::unique(0x10, 8),
+            val: Varnode::unique(0x20, 8),
         });
         let prepared =
             prepared_from_r2il_blocks(&[entry], &arch).with_name("sealed_inline_admission");
         let block = prepared.function().get_block(0x1000).expect("entry block");
-        let SSAOp::Copy { dst, src } = &block.ops[0] else {
+        let SSAOp::Copy { src, .. } = &block.ops[0] else {
             panic!("fixture must begin with a copy");
+        };
+        let SSAOp::IntAdd { dst, .. } = &block.ops[2] else {
+            panic!("fixture must add the register to the literal");
         };
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         let (plan, names, _) = install_observed_lowering(&mut ctx, &prepared);
@@ -1974,7 +1983,7 @@ mod tests {
         let dst_value = prepared
             .graph()
             .value_id_for_var(dst)
-            .expect("copy destination value");
+            .expect("sum destination value");
 
         assert!(matches!(
             plan.disposition(src_value),

@@ -208,11 +208,13 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     let source_owned = source_owned([
         R2ILOp::Copy {
             dst: first.clone(),
-            src: Varnode::constant(7, 8),
+            src: Varnode::register(0, 8),
         },
-        // Each version is read twice. A value with a single reader is folded
-        // into that reader and gets no object, so a span made of single-use
-        // versions has nothing to group and this test would have no subject.
+        // Each version is read twice, and the span is seeded from a register.
+        // A value with a single reader is folded into that reader and gets no
+        // object; so does a value that reads nothing but literals, at every
+        // reader it has. Either way a span made of them has nothing to group
+        // and this test would have no subject.
         R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2010, 8),
@@ -236,11 +238,16 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     ]);
     let source = source_owned.source();
     let plan = BindingPlan::build_shadow(&source_owned).expect("sealed shadow plan");
+    // The two versions the span is made of. The register the chain is seeded
+    // from is also a non-constant value, and it is not one of them: it has no
+    // defining instruction, so it is not a version of anything this function
+    // wrote.
     let nonconstants = source
         .graph()
         .values
         .iter()
         .filter(|value| value.var.constant_bits().is_none())
+        .filter(|value| source.graph().def_inst(value.id).is_some())
         .map(|value| value.id)
         .collect::<Vec<_>>();
     assert_eq!(nonconstants.len(), 2);
@@ -796,16 +803,18 @@ fn unsupported_c_scalar_width_is_a_typed_value_refusal() {
     let source_owned = source_owned([
         R2ILOp::Copy {
             dst: Varnode::unique(0x10, 3),
-            src: Varnode::constant(0x12_3456, 3),
+            src: Varnode::register(0, 3),
         },
         R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2000, 8),
             val: Varnode::unique(0x10, 3),
         },
-        // Read twice, so the value needs a declaration of its own. A value
-        // read once is folded into its reader and never declared, and an
-        // undeclarable width is only a refusal for something being declared.
+        // Read twice and taken from a register, so the value needs a
+        // declaration of its own. A value read once is folded into its reader,
+        // and one that reads nothing but literals is spelled at every reader;
+        // either way it is never declared, and an undeclarable width is only a
+        // refusal for something being declared.
         R2ILOp::Store {
             space: SpaceId::Ram,
             addr: Varnode::constant(0x2008, 8),
@@ -839,11 +848,11 @@ fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
         [
             R2ILOp::Copy {
                 dst: Varnode::unique(0x10, 8),
-                src: Varnode::constant(1, 8),
+                src: Varnode::register(0, 8),
             },
             R2ILOp::Copy {
                 dst: Varnode::unique(0x20, 4),
-                src: Varnode::constant(2, 4),
+                src: Varnode::register(8, 4),
             },
             R2ILOp::Store {
                 space: SpaceId::Ram,
@@ -855,9 +864,11 @@ fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
                 addr: Varnode::constant(0x2008, 8),
                 val: Varnode::unique(0x20, 4),
             },
-            // Second readers. A value read once is folded into its reader and
-            // is bound to nothing, and this test needs two independent
-            // storage bindings to move a value between.
+            // Second readers, and the values come from registers. A value read
+            // once is folded into its reader, and one that reads nothing but
+            // literals is spelled at every reader; either way it is bound to
+            // nothing, and this test needs two independent storage bindings to
+            // move a value between.
             R2ILOp::Store {
                 space: SpaceId::Ram,
                 addr: Varnode::constant(0x2010, 8),
@@ -907,10 +918,13 @@ fn seal_rejects_foreign_authority_and_inverse_membership_drift() {
 fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
     let first = Varnode::unique(0x10, 8);
     let second = Varnode::unique(0x20, 8);
+    // Both spans start from a register: a value reading nothing but literals
+    // is spelled at each reader rather than bound, and this test needs
+    // bindings whose certificate sources it can resolve.
     let source_owned = source_owned([
         R2ILOp::Copy {
             dst: first.clone(),
-            src: Varnode::constant(1, 8),
+            src: Varnode::register(0, 8),
         },
         R2ILOp::Store {
             space: SpaceId::Ram,
@@ -924,7 +938,7 @@ fn seal_resolves_certificate_sources_instead_of_trusting_stored_witnesses() {
         },
         R2ILOp::Copy {
             dst: second.clone(),
-            src: Varnode::constant(2, 8),
+            src: Varnode::register(8, 8),
         },
         R2ILOp::Store {
             space: SpaceId::Ram,

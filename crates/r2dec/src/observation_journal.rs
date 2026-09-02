@@ -651,6 +651,9 @@ pub(crate) struct SurvivingEffectObservations {
 pub(crate) struct EffectOccurrences {
     count: usize,
     exclusive: bool,
+    /// The obligation belongs to a value the plan spells as a literal at every
+    /// reader, so a count above one is one execution spelled several times.
+    repeated_literal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +675,20 @@ impl SurvivingEffectObservations {
         self.occurrences
             .get(&id)
             .is_some_and(|occurrences| occurrences.exclusive)
+    }
+
+    /// Whether the obligation's value is a literal the plan spells at each
+    /// reader, which is the other way several occurrences are one execution.
+    ///
+    /// The machine writes the temporary once. A reader that spells `5` instead
+    /// of naming it performs nothing, so three readers are three spellings of
+    /// one execution rather than three executions. This holds only because the
+    /// value reads nothing: an expression repeated at three readers would be
+    /// three evaluations and is not admitted here.
+    pub(crate) fn duplicates_are_a_repeated_literal(&self, id: SemanticObligationId) -> bool {
+        self.occurrences
+            .get(&id)
+            .is_some_and(|occurrences| occurrences.repeated_literal)
     }
 
     pub(crate) fn is_coalesced_carrier_use(&self, site: UseSite) -> bool {
@@ -2666,6 +2683,8 @@ impl LegacyObservationJournal {
                         EffectOccurrences {
                             count,
                             exclusive: false,
+                            // Nor a plan to ask which values are literals.
+                            repeated_literal: false,
                         },
                     )
                 })
@@ -2986,12 +3005,42 @@ impl LegacyObservationJournal {
         }
     }
 
+    /// The obligations of every value the plan spells as a literal wherever it
+    /// is read.
+    ///
+    /// Asked of `r2rewrite::machine_expr_is_literal`, which is the one place
+    /// that says what a literal expression is; the binding plan asked the same
+    /// function when it decided to inline the value, so the two cannot
+    /// disagree about which values these are.
+    fn repeated_literal_effects(&self) -> BTreeSet<SemanticObligationId> {
+        let projection = self.plan.machine_projection();
+        let graph = self.source.graph();
+        let mut ids = BTreeSet::new();
+        for graph_value in &graph.values {
+            let Some(ValueDisposition::Inline { expr, .. }) = self.plan.disposition(graph_value.id)
+            else {
+                continue;
+            };
+            if !r2rewrite::machine_expr_is_literal(projection, *expr) {
+                continue;
+            }
+            let Some(definition) = graph.def_inst(graph_value.id) else {
+                continue;
+            };
+            if let Some(disposition) = self.source.obligations().instruction_for_inst(definition) {
+                ids.extend(disposition.obligations.iter().copied());
+            }
+        }
+        ids
+    }
+
     fn into_sealed_observations(
         mut self,
         source: &SourceOwnedFunctionFacts,
     ) -> SealedLegacyObservations {
         let coverage = self.final_coverage();
         let exclusive = std::mem::take(&mut self.exclusive_duplicate_effects);
+        let repeated_literals = self.repeated_literal_effects();
         let effects = SurvivingEffectObservations {
             occurrences: std::mem::take(&mut self.effect_occurrences)
                 .into_iter()
@@ -3001,6 +3050,7 @@ impl LegacyObservationJournal {
                         EffectOccurrences {
                             count,
                             exclusive: exclusive.contains(&id),
+                            repeated_literal: repeated_literals.contains(&id),
                         },
                     )
                 })
@@ -3337,20 +3387,23 @@ mod tests {
 
     fn source_owned() -> SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
+        // These tests are about what the journal records for a bound value, so
+        // the fixture has to contain one, and that has taken two corrections.
+        // A value with a single reader is folded into that reader, so the
+        // first temporary is read twice. And a value that reads nothing but
+        // literals is spelled at every reader however many there are, so the
+        // chain starts from a register rather than from a constant: reading
+        // something the function did not compute is what gives a value an
+        // object of its own.
         block.push(R2ILOp::Copy {
             dst: Varnode::unique(0x10, 8),
-            src: Varnode::constant(1, 8),
+            src: Varnode::register(0, 8),
         });
         block.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x20, 8),
             a: Varnode::unique(0x10, 8),
             b: Varnode::constant(2, 8),
         });
-        // The first temporary is read twice on purpose. A value with one
-        // reader is folded into that reader and has no object of its own, so a
-        // fixture built only from single-use values leaves nothing bound for
-        // these tests -- which are about what the journal records for a bound
-        // value -- to look at.
         block.push(R2ILOp::IntAdd {
             dst: Varnode::unique(0x30, 8),
             a: Varnode::unique(0x20, 8),
@@ -4684,10 +4737,12 @@ mod tests {
     fn journal_construction_does_not_allocate_candidate_symbols() {
         let (source, plan, function, _journal) = journal_fixture();
         let (_, binding) = first_bound(&plan, &source);
-        let requested = plan
-            .binding(binding)
-            .and_then(|binding| binding.presentation_name_hint())
-            .unwrap_or("candidate_name");
+        // A name nothing else in the fixture asks for. The binding's own
+        // presentation hint is not one: name resolution allocates it when the
+        // fixture builds, so requesting it here would come back deduplicated
+        // and the test would be measuring that instead of what it is about,
+        // which is whether constructing the journal took the name first.
+        let requested = "candidate_name";
         let symbol = declare_legacy_symbol(&function, &plan, binding, requested);
         assert_eq!(function.symbols.borrow().name(symbol), requested);
     }
