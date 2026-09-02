@@ -2665,6 +2665,7 @@ fn r2sleigh_engine_decompile_trusted_output(
     let crate::ffi_v2::TrustedIngress {
         root: trusted,
         callees,
+        capture: _,
     } = ingress;
     let block_count = trusted.source_blocks().len();
     let function_input = trusted_engine_function_input(&trusted);
@@ -2698,6 +2699,7 @@ fn r2sleigh_engine_type_function_trusted_output(
     let crate::ffi_v2::TrustedIngress {
         root: trusted,
         callees,
+        capture: _,
     } = ingress;
     let function_addr = trusted.source().function().address();
     let function_name = source_function_name(&trusted);

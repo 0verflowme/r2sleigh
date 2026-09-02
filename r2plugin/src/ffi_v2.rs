@@ -1176,8 +1176,10 @@ unsafe fn capture_trusted_ssa_from_buffer(
     // SAFETY: the caller guarantees the buffer extent.
     let bytes =
         unsafe { std::slice::from_raw_parts(payload.snapshot_buffer, payload.snapshot_buffer_len) };
+    let decode_started = Instant::now();
     let (source, callees) = r2source::snapshot_wire::decode_snapshot_set(bytes)
         .map_err(|error| BoundaryError::invalid(format!("snapshot buffer rejected: {error}")))?;
+    let decode_elapsed = decode_started.elapsed();
     // Callees first, so the root can describe a call whose prototype the
     // source never recovered from what the callee's own body does.
     //
@@ -1185,6 +1187,8 @@ unsafe fn capture_trusted_ssa_from_buffer(
     // back to knowing nothing about that call, which is where it started.
     let mut lifted_callees = Vec::new();
     let mut callee_interfaces = std::collections::BTreeMap::new();
+    let callee_started = Instant::now();
+    let callee_count = callees.len();
     for callee in callees {
         let entry = callee.function().address();
         let Ok(artifact) = trusted_from_source(callee, execution) else {
@@ -1195,17 +1199,55 @@ unsafe fn capture_trusted_ssa_from_buffer(
         }
         lifted_callees.push(artifact);
     }
+    let callee_elapsed = callee_started.elapsed();
+    let root_started = Instant::now();
     let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
     Ok(TrustedIngress {
         root,
         callees: lifted_callees,
+        capture: CaptureTiming {
+            decode: decode_elapsed,
+            callee_lift: callee_elapsed,
+            callee_count,
+            root_lift: root_started.elapsed(),
+        },
     })
+}
+
+/// What one snapshot capture cost, split where the cost actually divides.
+///
+/// The engine's phase inventory begins after the artifact exists, so every
+/// decompile through the borrowed-snapshot provider reported `ssa=0us` and the
+/// wire decode, the callee lifts and the root lift were attributed to nothing.
+/// On `/bin/ls` that unmeasured span is most of the wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CaptureTiming {
+    pub(crate) decode: Duration,
+    pub(crate) callee_lift: Duration,
+    pub(crate) callee_count: usize,
+    pub(crate) root_lift: Duration,
+}
+
+impl CaptureTiming {
+    /// One comment naming the capture's cost, when `R2SLEIGH_TIMING` asks.
+    pub(crate) fn comment(&self) -> Option<String> {
+        std::env::var_os("R2SLEIGH_TIMING")?;
+        Some(format!(
+            "/* r2dec timing: capture={}us decode={}us callee_lift={}us callees={} root_lift={}us */",
+            (self.decode + self.callee_lift + self.root_lift).as_micros(),
+            self.decode.as_micros(),
+            self.callee_lift.as_micros(),
+            self.callee_count,
+            self.root_lift.as_micros(),
+        ))
+    }
 }
 
 /// One trusted root and the bodies of what it calls, from one capture.
 pub(crate) struct TrustedIngress {
     pub(crate) root: Arc<r2ssa::TrustedSsaArtifact>,
     pub(crate) callees: Vec<Arc<r2ssa::TrustedSsaArtifact>>,
+    pub(crate) capture: CaptureTiming,
 }
 
 /// Lift and prepare one owned snapshot, whichever transport produced it. Both
@@ -1303,8 +1345,9 @@ unsafe fn execute_request(
     });
     let execution = r2engine::EngineExecutionControl::new(cancellation, deadline);
     let trusted = unsafe { capture_trusted_ssa_from_buffer(payload, &execution) }?;
+    let capture_comment = trusted.capture.comment();
     let ffi_conversion_elapsed_us = elapsed_us(ffi_started);
-    let output = match request.kind {
+    let mut output = match request.kind {
         R2SLEIGH_REQUEST_DECOMPILE_V2 => {
             super::r2sleigh_engine_decompile_trusted_output(payload, trusted, execution)
                 .ok_or_else(|| BoundaryError::engine("decompile engine refused the request"))?
@@ -1319,6 +1362,13 @@ unsafe fn execute_request(
         }
         _ => unreachable!("request kind validated above"),
     };
+    if let Some(comment) = capture_comment {
+        if !output.output.ends_with('\n') {
+            output.output.push('\n');
+        }
+        output.output.push_str(&comment);
+        output.output.push('\n');
+    }
     Ok(ExecutedRequest {
         output,
         request_kind: request.kind,
