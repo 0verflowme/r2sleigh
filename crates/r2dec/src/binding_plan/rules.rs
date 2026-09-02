@@ -37,16 +37,11 @@ use super::{
 /// one of those would be a second answer about the same value.
 pub(super) fn component_eligible_values(
     source_owned: &SourceOwnedFunctionFacts,
+    projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
-    // One projection for this call. Threading the caller's would remove a
-    // second derivation of the same answer and is worth doing; it is a wider
-    // change than the defect being fixed here, which was rebuilding the arena
-    // once per inlined value inside the seal's loop.
-    let projection = r2ssa::MachineProjection::from_artifact(source)
-        .map_err(BindingPlanBuildError::MachineProjection)?;
-    let inlinable = inlinable_values(source, &projection);
+    let inlinable = inlinable_values(source, projection);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);

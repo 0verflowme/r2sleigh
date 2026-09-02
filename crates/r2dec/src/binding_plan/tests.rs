@@ -192,6 +192,16 @@ fn source_owned_blocks_with_stack_slots(
         .expect("source-owned finalization")
 }
 
+/// The projection the component builders now take, built here once per test.
+///
+/// Production shares one projection across the plan and its seal, because
+/// deriving it again is the same answer at a cost rather than a second
+/// opinion. A test that builds its own is exercising the same code path.
+fn test_projection(source_owned: &SourceOwnedFunctionFacts) -> r2ssa::MachineProjection {
+    r2ssa::MachineProjection::from_artifact(source_owned.source())
+        .expect("machine projection for the fixture")
+}
+
 #[test]
 fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     let first = Varnode::unique(0x10, 8);
@@ -298,13 +308,13 @@ fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
         }) if proof.authority == *source.authority() && proof.value == return_control
     ));
     assert!(
-        binding_components(&source_owned)
+        binding_components(&source_owned, &test_projection(&source_owned))
             .expect("construction components")
             .iter()
             .all(|component| !component.members.contains(&return_control))
     );
     assert!(
-        seal_binding_components(&source_owned)
+        seal_binding_components(&source_owned, &test_projection(&source_owned))
             .expect("independent components")
             .iter()
             .all(|component| !component.members.contains(&return_control))
@@ -538,13 +548,13 @@ fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
         }) if proof.authority == *source.authority() && proof.value == dead_support
     ));
     assert!(
-        binding_components(&source_owned)
+        binding_components(&source_owned, &test_projection(&source_owned))
             .expect("construction components")
             .iter()
             .all(|component| !component.members.contains(&dead))
     );
     assert!(
-        seal_binding_components(&source_owned)
+        seal_binding_components(&source_owned, &test_projection(&source_owned))
             .expect("independent components")
             .iter()
             .all(|component| !component.members.contains(&dead))
@@ -1037,7 +1047,8 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
         },
     ]);
     let parameter = BindingCertificateSource::CertifiedEntity(SemanticId::Parameter(0));
-    let constructed = binding_components(&source_owned).expect("union-find components");
+    let constructed = binding_components(&source_owned, &test_projection(&source_owned))
+        .expect("union-find components");
     let component = constructed
         .iter()
         .find(|component| component.sources.contains(&parameter))
@@ -1050,7 +1061,8 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
             .any(|source| matches!(source, BindingCertificateSource::StorageSpan(_)))
     );
 
-    let sealed = seal_binding_components(&source_owned).expect("independent BFS components");
+    let sealed = seal_binding_components(&source_owned, &test_projection(&source_owned))
+        .expect("independent BFS components");
     let sealed_component = sealed
         .iter()
         .find(|component| component.sources.contains(&parameter))

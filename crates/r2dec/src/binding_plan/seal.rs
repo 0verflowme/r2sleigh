@@ -140,11 +140,12 @@ fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
 /// construction representative, union schedule, or component accumulator.
 pub(super) fn seal_binding_components(
     source_owned: &SourceOwnedFunctionFacts,
+    projection: &MachineProjection,
 ) -> Result<Vec<SealBindingComponent>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let eligible = super::rules::component_eligible_values(source_owned)?;
+    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
     let mut members_by_source = BTreeMap::<BindingCertificateSource, BTreeSet<ValueId>>::new();
 
     let mut values_by_span = BTreeMap::<SpanId, BTreeSet<ValueId>>::new();
@@ -410,7 +411,7 @@ pub(crate) fn build_upstream_shadow_oracle(
         .ok_or(BindingPlanBuildError::Seal(
             BindingPlanSourceMismatch::Authority,
         ))?;
-    let resolved = seal_binding_components(source_owned)?;
+    let resolved = seal_binding_components(source_owned, &machine_projection)?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
             count: resolved.len(),
@@ -609,7 +610,7 @@ impl BindingPlan {
             ));
         }
 
-        let expected = seal_binding_components(source_owned)?;
+        let expected = seal_binding_components(source_owned, &self.machine_projection)?;
         let unobserved_merges = source.unobserved_merges();
         let unobserved_values = source.unobserved_values();
         let return_controls = certified_return_control_values(source);

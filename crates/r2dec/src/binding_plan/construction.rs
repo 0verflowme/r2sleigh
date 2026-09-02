@@ -190,11 +190,12 @@ fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDispo
 /// same filtering is used again when the completed plan is sealed.
 pub(super) fn binding_components(
     source_owned: &SourceOwnedFunctionFacts,
+    projection: &MachineProjection,
 ) -> Result<Vec<BindingComponent>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let eligible = super::rules::component_eligible_values(source_owned)?;
+    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
     let mut parent = (0..value_count).collect::<Vec<_>>();
     let mut rank = vec![0_u8; value_count];
 
@@ -705,7 +706,7 @@ impl BindingPlan {
             }
         }
 
-        let components = binding_components(source_owned)?;
+        let components = binding_components(source_owned, &machine_projection)?;
         if u32::try_from(components.len()).is_err() {
             return Err(BindingPlanBuildError::TooManyBindings {
                 count: components.len(),
