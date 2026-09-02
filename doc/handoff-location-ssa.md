@@ -7201,3 +7201,56 @@ again outside it.
 Nine defects have been fixed at their cause on the way to this, every one of
 them a rule the emitted C needs whatever the declarations say. None of the
 four remaining needs a new fact; all four are cast placement.
+
+## Component 3 landed: types from the evidence reach the C
+
+The declaration half of type inference is in the tree and green. Fifty-four of
+fifty-four on every corpus gate -- generation, raw, diagnostic, differential,
+effect obligations, placement and render refusal -- with 2236 tests passing and
+whole-binary coverage unchanged at 243 of 313.
+
+Sixteen corpus cells declare `uint8_t *` for a parameter that used to be
+`uint64_t`, and stack slots holding addresses are declared pointers too. The
+typed-recovery score still reads zero parameter matches, and the reason is now
+spelling rather than inference: DWARF says `const uint8_t *` and `size_t` where
+the rendering says `uint8_t *` and `uint64_t`. `const` is derivable -- it is
+exactly "no store through this pointer anywhere in the function" -- but
+`CTypeLike` has no qualifier to carry it, so adding it touches parsing,
+rendering, sizing, the lattice and writeback. `size_t` against `uint64_t` is a
+naming question and not a recoverable fact; whether DecBench's `type_match`
+counts them equal is worth measuring before spending anything on it.
+
+Eleven defects were fixed at their cause getting here, each a rule the emitted
+C needs whatever a declaration says. The full list is in the two commits; the
+three worth remembering are that `expr_type_hint` answered `None` for a bare
+name and so left every pointer-aware conversion blind to the one expression
+that names an object; that arithmetic on an address is arithmetic on a number,
+because C counts elements where the machine counted bytes and every operator
+other than pointer-plus-integer rejects a pointer outright; and that a pointee
+takes its signedness from the extension its loaded value reaches, since the
+access width says how many bits are read and nothing about what they mean.
+
+Three harness rewrites had to keep up, each of them the verifier failing to
+recognise a better rendering rather than the decompiler emitting a worse one:
+the diagnostic path retyped every parameter to `long` including the pointers,
+its runner passed every argument as `long`, and the image-literal evidence
+recognised `*(uint8_t *)p` but not the plain `*p` a typed pointer renders,
+which made an address the program does read through look unmapped.
+
+### What is still open in component 3
+
+The return width, `doc/wip/return-width-recovery.patch`, takes return matches
+from six to thirty-five of fifty-four and stays off the tree. Its blocker is
+now precisely understood and is not in that patch. A caller builds the callee
+prototype it emits from the call result's machine width, deliberately, so that
+caller and callee agree when both are decompiled into one translation unit.
+Narrowing the callee's own definition breaks that agreement, and the caller
+cannot measure what to narrow to: `known_signature_for_site` answers only from
+a prototype radare2 recorded, which a local static callee has none of, and the
+call result value has no use sites in the graph to infer a width from. The
+zero-extension that proves the width lives in the callee's body.
+
+So this needs the callee's recovered return type to reach its call sites. The
+writeback path in `r2types::writeback` is where that belongs, and it is
+component 1's call-boundary work rather than component 3's. Note that ordering
+alone will not rescue it in the corpus sweep, which decompiles callees last.
