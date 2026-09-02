@@ -8,8 +8,6 @@ pub(crate) use context::FoldingContext;
 pub(crate) type SSABlock = r2ssa::FunctionSSABlock;
 use r2ssa::SSAOp;
 
-pub(super) const MAX_PREDICATE_OPERAND_DEPTH: u32 = 12;
-
 /// Residualize raw SSA operations for public block-level exports.
 ///
 /// Executable C lowering requires an engine-prepared `DecompilerInput` with

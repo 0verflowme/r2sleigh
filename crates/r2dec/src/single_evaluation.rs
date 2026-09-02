@@ -76,67 +76,10 @@ fn count_in_expr(expr: &CExpr, counts: &mut BTreeMap<CallSite, usize>) {
     });
 }
 
-pub(crate) fn children_mut(expr: &mut CExpr) -> Vec<&mut CExpr> {
-    match expr {
-        CExpr::Observed { expr, .. } => vec![expr.as_mut()],
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::Var(_)
-        | CExpr::External { .. }
-        | CExpr::SizeofType(_) => Vec::new(),
-        CExpr::Unary { operand, .. } => vec![operand.as_mut()],
-        CExpr::Binary { left, right, .. } => vec![left.as_mut(), right.as_mut()],
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => vec![cond.as_mut(), then_expr.as_mut(), else_expr.as_mut()],
-        CExpr::Cast { expr, .. } => vec![expr.as_mut()],
-        CExpr::Call { func, args, .. } => {
-            let mut out = vec![func.as_mut()];
-            out.extend(args.iter_mut());
-            out
-        }
-        CExpr::Subscript { base, index } => vec![base.as_mut(), index.as_mut()],
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => vec![base.as_mut()],
-        CExpr::Sizeof(inner) | CExpr::AddrOf(inner) | CExpr::Deref(inner) | CExpr::Paren(inner) => {
-            vec![inner.as_mut()]
-        }
-        CExpr::Comma(items) => items.iter_mut().collect(),
-    }
-}
-
 fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
     match stmt {
         CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
             for_each_expr(stmt, f)
-        }
-        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
-        CStmt::Decl {
-            init: Some(expr), ..
-        } => f(expr),
-        CStmt::If { cond, .. } => f(cond),
-        CStmt::While { cond, .. } | CStmt::DoWhile { cond, .. } => f(cond),
-        CStmt::For { cond, update, .. } => {
-            if let Some(cond) = cond {
-                f(cond);
-            }
-            if let Some(update) = update {
-                f(update);
-            }
-        }
-        CStmt::Switch { expr, .. } => f(expr),
-        _ => {}
-    }
-}
-
-pub(crate) fn for_each_expr_mut(stmt: &mut CStmt, f: &mut impl FnMut(&mut CExpr)) {
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
-            for_each_expr_mut(stmt, f)
         }
         CStmt::Expr(expr) | CStmt::Return(Some(expr)) => f(expr),
         CStmt::Decl {
@@ -188,63 +131,6 @@ pub(crate) fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
             }
             if let Some(default) = default {
                 f(default);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Visit each nested statement list, saying whether it shares the enclosing
-/// scope's bindings on exit. A plain block always runs, so what it binds still
-/// holds afterwards; a branch arm or a loop body does not.
-pub(crate) fn for_each_child_block_mut(
-    stmt: &mut CStmt,
-    f: &mut impl FnMut(&mut Vec<CStmt>, bool),
-) {
-    fn as_block(body: &mut Box<CStmt>, f: &mut impl FnMut(&mut Vec<CStmt>, bool), shares: bool) {
-        match body.as_mut() {
-            CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
-                as_block(stmt, f, shares)
-            }
-            CStmt::Block(stmts) => f(stmts, shares),
-            other => {
-                let mut stmts = vec![std::mem::replace(other, CStmt::Empty)];
-                f(&mut stmts, shares);
-                *other = if stmts.len() == 1 {
-                    stmts.pop().unwrap_or(CStmt::Empty)
-                } else {
-                    CStmt::Block(stmts)
-                };
-            }
-        }
-    }
-
-    match stmt {
-        CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
-            for_each_child_block_mut(stmt, f)
-        }
-        CStmt::Block(stmts) => f(stmts, true),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            as_block(then_body, f, false);
-            if let Some(body) = else_body {
-                as_block(body, f, false);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => as_block(body, f, false),
-        CStmt::For { body, .. } => as_block(body, f, false),
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                let taken = std::mem::take(&mut case.body);
-                let mut stmts = taken;
-                f(&mut stmts, false);
-                case.body = stmts;
-            }
-            if let Some(default) = default {
-                f(default, false);
             }
         }
         _ => {}

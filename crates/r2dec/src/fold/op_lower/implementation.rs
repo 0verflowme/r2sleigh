@@ -1514,27 +1514,6 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
-    /// The identity rules, for a caller outside the fold that renders expressions
-    /// the fold never routed through a stored value.
-    pub(crate) fn simplify_identities(&self, expr: CExpr) -> CExpr {
-        self.identity_simplify_expr(expr)
-    }
-
-    /// Apply the identity rules bottom-up, so a rule reaches an identity that sits
-    /// under a cast or inside a larger term rather than only at the top.
-    fn identity_simplify_expr(&self, mut expr: CExpr) -> CExpr {
-        for child in crate::single_evaluation::children_mut(&mut expr) {
-            let taken = std::mem::replace(child, CExpr::IntLit(0));
-            *child = self.identity_simplify_expr(taken);
-        }
-        match expr {
-            CExpr::Binary { op, left, right } => {
-                self.identity_simplify_binary_semantic(op, *left, *right, None)
-            }
-            other => other,
-        }
-    }
-
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
         if self.inlined_definition.get() {
             // The result is read where it is computed, so there is nothing to
