@@ -1472,17 +1472,32 @@ impl LegacyObservationJournal {
                     block: block_id,
                     op_idx,
                 };
-                let Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) = origins.origin(site) else {
+                // Any materialised merge edge: a copy on an incoming edge, or
+                // an initializer relocated ahead of the edges it replaces.
+                // What makes the copy say nothing is that both sides resolve
+                // to one binding, which is tested below; the certified loop
+                // carrier is where the case was found, not the reason it
+                // holds, and neither is the origin kind or the source's
+                // version. A version-0 source was once excluded on the
+                // grounds that the edge copy is the only statement writing
+                // the merge; but the merge and the source are one object
+                // here, and that object is caller-supplied, so the write the
+                // copy would spell is the caller's, already made. What stayed
+                // was `X1_0 = X1_0;`, hidden from `-Wself-assign` only by a
+                // cast to the type the object already has.
+                let input_uses: Option<&[UseSite]> = match origins.origin(site) {
+                    Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => {
+                        Some(std::slice::from_ref(&origin.incoming))
+                    }
+                    Some(NormalizedOpOrigin::RelocatedInitializer(origin)) => {
+                        Some(&origin.replaced_sites)
+                    }
+                    Some(NormalizedOpOrigin::Original(_)) | None => None,
+                };
+                let Some(input_uses) = input_uses else {
                     continue;
                 };
-                // Any materialised merge edge, not only a certified loop
-                // carrier's. What makes the copy say nothing is that both
-                // sides resolve to one binding, which is tested below; the
-                // carrier is where the case was found, not the reason it
-                // holds. A version-0 source stays excluded because it has no
-                // defining statement of its own, so its edge copy is the only
-                // place that value is written.
-                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
+                if !matches!(op, r2ssa::SSAOp::Copy { .. }) {
                     continue;
                 }
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
@@ -1492,7 +1507,7 @@ impl LegacyObservationJournal {
                 let Some(input) = projection
                     .inputs
                     .iter()
-                    .find(|input| input.uses.contains(&origin.incoming))
+                    .find(|input| input_uses.iter().any(|site| input.uses.contains(site)))
                 else {
                     continue;
                 };

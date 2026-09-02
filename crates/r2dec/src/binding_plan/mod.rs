@@ -1012,6 +1012,40 @@ pub(crate) struct BindingPlan {
     dispositions: Box<[ValueDisposition]>,
     parameters: Box<[Option<ParameterDisposition>]>,
     stack_objects: BTreeMap<r2ssa::ObjectId, StackObjectDisposition>,
+    /// The C type at every boundary of the projection, under these
+    /// dispositions and declarations.
+    ///
+    /// Derived from the projection and the dispositions, so it is one answer
+    /// for one plan; built on first use because it is a function of fields
+    /// the constructor settles first.
+    typed: std::cell::OnceCell<r2rewrite::TypedBoundaries>,
+}
+
+impl r2rewrite::RenderTypes for BindingPlan {
+    fn declaration_type(&self, value: ValueId) -> Option<r2types::CTypeLike> {
+        match self.disposition(value)? {
+            ValueDisposition::Bound { binding } => {
+                Some(self.binding(*binding)?.declaration_type().clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn inline_root(&self, value: ValueId) -> Option<MachineExprId> {
+        match self.disposition(value)? {
+            ValueDisposition::Inline { expr, .. } => Some(*expr),
+            _ => None,
+        }
+    }
+}
+
+impl BindingPlan {
+    /// What every rendered expression has and what every operator requires
+    /// of its operands, from the projection and this plan's declarations.
+    pub(crate) fn typed_boundaries(&self) -> &r2rewrite::TypedBoundaries {
+        self.typed
+            .get_or_init(|| r2rewrite::typed_boundaries(&self.machine_projection, self))
+    }
 }
 
 mod construction;
@@ -1161,6 +1195,8 @@ impl BindingPlan {
         disposition: ValueDisposition,
     ) {
         self.dispositions[value.0 as usize] = disposition;
+        // The boundaries were derived from the dispositions this replaces.
+        self.typed.take();
     }
 }
 

@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use r2ssa::SSAVar;
 
 use super::*;
+use r2rewrite::CValue;
 
 /// Opaque proof that one rendered lvalue came from the exact source-owned
 /// structured memory-access fact for the current operation.
@@ -413,19 +414,30 @@ impl<'a> FoldingContext<'a> {
     /// applying the proved stride keeps C from scaling the addition by an
     /// inferred pointee type. The result remains a raw dereference; source-like
     /// subscript/member syntax is reserved for the upstream facts above.
+    /// What a rendered name is declared as.
+    ///
+    /// Address arithmetic is decomposed from the rendered address, so its
+    /// base reaches here as a name rather than as a value, and the
+    /// declaration the symbol table emits for that name is the one fact it
+    /// carries about its type.
+    fn declared_type_of_name(&self, expr: &CExpr) -> Option<CValue> {
+        match expr.unobserved() {
+            CExpr::Var(symbol) => {
+                Some(CValue::Typed(self.symbols.borrow().get(*symbol).ty.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn render_certified_linear_byte_address(&self, address: &CExpr) -> Option<CExpr> {
         let CertifiedLinearAddress {
             base,
             index,
             offset,
         } = self.certified_linear_address_components(address)?;
-        let mut result = CExpr::cast(
-            CType::ptr(CType::Int {
-                bits: 8,
-                signedness: r2types::Signedness::Unsigned,
-            }),
-            base,
-        );
+        let byte_pointer = CType::ptr(CType::u8());
+        let base_type = self.declared_type_of_name(&base);
+        let mut result = self.convert_from(base, base_type.as_ref(), &byte_pointer);
         if let Some(CertifiedLinearIndex { expr, stride }) = index
             && stride != 0
         {
@@ -460,7 +472,12 @@ impl<'a> FoldingContext<'a> {
         Some(result)
     }
 
-    fn integerize_certified_address_expr(expr: &CExpr, pointer_bits: u32) -> Option<CExpr> {
+    /// Spell an address computation over the integers of its names.
+    ///
+    /// Each name is converted from what it is declared as to the address
+    /// integer: a pointer takes its address-width step, and a name already
+    /// declared as that integer is left alone.
+    fn integerize_certified_address_expr(&self, expr: &CExpr, pointer_bits: u32) -> Option<CExpr> {
         let integer = CType::Int {
             bits: pointer_bits,
             signedness: r2types::Signedness::Unsigned,
@@ -468,18 +485,20 @@ impl<'a> FoldingContext<'a> {
         Some(match expr {
             CExpr::Observed { id, expr } => CExpr::Observed {
                 id: *id,
-                expr: Box::new(Self::integerize_certified_address_expr(expr, pointer_bits)?),
+                expr: Box::new(self.integerize_certified_address_expr(expr, pointer_bits)?),
             },
             CExpr::IntLit(value) => CExpr::IntLit(*value),
             CExpr::UIntLit(value) => CExpr::UIntLit(*value),
-            CExpr::Var(symbol) => CExpr::cast(integer, CExpr::Var(*symbol)),
+            CExpr::Var(symbol) => {
+                let declared = CValue::Typed(self.symbols.borrow().get(*symbol).ty.clone());
+                self.convert(CExpr::Var(*symbol), &declared, &integer)
+            }
             CExpr::Unary { op, operand } if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) => {
                 CExpr::Unary {
                     op: *op,
-                    operand: Box::new(Self::integerize_certified_address_expr(
-                        operand,
-                        pointer_bits,
-                    )?),
+                    operand: Box::new(
+                        self.integerize_certified_address_expr(operand, pointer_bits)?,
+                    ),
                 }
             }
             CExpr::Binary { op, left, right }
@@ -497,14 +516,13 @@ impl<'a> FoldingContext<'a> {
             {
                 CExpr::binary(
                     *op,
-                    Self::integerize_certified_address_expr(left, pointer_bits)?,
-                    Self::integerize_certified_address_expr(right, pointer_bits)?,
+                    self.integerize_certified_address_expr(left, pointer_bits)?,
+                    self.integerize_certified_address_expr(right, pointer_bits)?,
                 )
             }
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(Self::integerize_certified_address_expr(
-                inner,
-                pointer_bits,
-            )?)),
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(
+                self.integerize_certified_address_expr(inner, pointer_bits)?,
+            )),
             CExpr::FloatLit(_)
             | CExpr::StringLit(_)
             | CExpr::CharLit(_)
@@ -604,22 +622,21 @@ impl<'a> FoldingContext<'a> {
         if elem_bytes <= 1 || already_typed {
             return CExpr::Subscript { base, index };
         }
+        let base_type = self.declared_type_of_name(&base);
         match Self::index_in_elements(&index, elem_bytes) {
             Some(unscaled) => CExpr::Subscript {
-                base: Box::new(CExpr::cast(CType::ptr(elem_ty.clone()), *base)),
+                base: Box::new(self.convert_from(
+                    *base,
+                    base_type.as_ref(),
+                    &CType::ptr(elem_ty.clone()),
+                )),
                 index: Box::new(unscaled),
             },
             None => CExpr::Deref(Box::new(CExpr::cast(
                 CType::ptr(elem_ty.clone()),
                 CExpr::binary(
                     BinaryOp::Add,
-                    CExpr::cast(
-                        CType::ptr(CType::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Unsigned,
-                        }),
-                        *base,
-                    ),
+                    self.convert_from(*base, base_type.as_ref(), &CType::ptr(CType::u8())),
                     *index,
                 ),
             ))),
@@ -805,22 +822,25 @@ impl<'a> FoldingContext<'a> {
         {
             return self.render_certified_semantic_array_expr(fact);
         }
-        let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
+        let (_, addr_expr) = self.certified_memory_address_expr(fact)?;
         if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {
             return Some(rendered);
         }
         if matches!(addr_expr, CExpr::Binary { .. }) {
-            let pointer_bits = self.inputs.arch.ptr_size.checked_mul(8)?;
+            let pointer_bits = self.pointer_bits();
             let byte_address = self
                 .render_certified_linear_byte_address(&addr_expr)
-                .or_else(|| Self::integerize_certified_address_expr(&addr_expr, pointer_bits))?;
+                .or_else(|| self.integerize_certified_address_expr(&addr_expr, pointer_bits))?;
             return Some(CExpr::Deref(Box::new(CExpr::cast(
                 CType::ptr(elem_ty),
                 byte_address,
             ))));
         }
+        // The address is a value, and what it is declared as is what the
+        // conversion to the pointee's pointer is made from.
         let ptr_ty = CType::ptr(elem_ty);
-        let casted = self.cast_addr_expr_to_ptr_if_needed(&addr, addr_expr, &ptr_ty);
+        let address_type = self.value_type(fact.address);
+        let casted = self.convert_from(addr_expr, address_type.as_ref(), &ptr_ty);
         Some(CExpr::Deref(Box::new(casted)))
     }
 

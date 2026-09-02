@@ -133,6 +133,26 @@ cast_rule!(
         )
     }]
 );
+// An extension to the width its input already has extends nothing. The
+// importer never builds one -- a zero or sign extension is admitted only from
+// a narrower input -- so this fires on terms a rule produced, and it is what
+// makes an extension nested in an identical one, `zext_W(zext_W(x))`, collapse
+// through `cast.zext_zext` to the one extension that remains.
+cast_rule!(
+    EXTEND_IDENTITY,
+    "cast.extend_identity",
+    |arena, id| match arena.term(id).kind {
+        TermKind::Cast {
+            kind: MachineCastKind::ZeroExtend | MachineCastKind::SignExtend,
+            input,
+        } if width(arena, input) == width(arena, id) => Some(input),
+        _ => None,
+    },
+    &[
+        |arena, w, l| extend(arena, MachineCastKind::ZeroExtend, l[0], w),
+        |arena, w, l| extend(arena, MachineCastKind::SignExtend, l[0], w),
+    ]
+);
 cast_rule!(
     EXTRACT_EXTRACT,
     "cast.extract_extract",

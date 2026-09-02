@@ -89,8 +89,8 @@ pub(super) fn component_eligible_values(
 /// width is the pointer width rather than the declared object's, and it is
 /// admitted at exactly that width.
 ///
-/// Casts follow the declaration -- `source_type_for_var` asks the declaration
-/// before the certified hint -- so asserting here changes the operands too,
+/// Casts follow the declaration -- the typed boundaries read a bound value
+/// at its declared type -- so asserting here changes the operands too,
 /// which is what keeps the emitted C compiling under `-Werror` rather than
 /// converting an argument's signedness against its own declaration.
 pub(super) fn declaration_type_for_binding(

@@ -422,3 +422,75 @@ fn an_address_sum_reaches_its_affine_normal_form() {
     assert!(matches!(roots.arena().term(i).kind, TermKind::Leaf(_)));
     assert!(roots.budget_failures().is_empty());
 }
+
+/// `(uint64_t)(uint32_t)(uint64_t)(uint32_t)x` in the C is, in the arena,
+/// `zext(trunc(zext(trunc(x))))`, and no rule is needed for the sandwich as
+/// such: the driver canonicalises children first, `cast.extract_of_extend_whole`
+/// removes the inner truncation of an extension of the same width, and what
+/// remains is the one extension of the one truncation.
+#[test]
+fn an_extension_sandwiched_in_its_own_truncation_is_one_extension() {
+    let artifact = artifact(vec![
+        R2ILOp::Trunc {
+            dst: tmp(0x100, 4),
+            src: reg(RDI, 8),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x200, 8),
+            src: tmp(0x100, 4),
+        },
+        R2ILOp::Trunc {
+            dst: tmp(0x300, 4),
+            src: tmp(0x200, 8),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x400, 8),
+            src: tmp(0x300, 4),
+        },
+        R2ILOp::Copy {
+            dst: reg(RAX, 8),
+            src: tmp(0x400, 8),
+        },
+        ret(),
+    ]);
+    let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    let once = roots
+        .value(value_named(&artifact, "tmp:200_1"))
+        .expect("the first extension");
+    let twice = roots
+        .value(value_named(&artifact, "tmp:400_1"))
+        .expect("the second extension");
+    assert_eq!(
+        twice.canonical, once.canonical,
+        "the sandwich must canonicalise to the first extension"
+    );
+    let arena = roots.arena();
+    let TermKind::Cast {
+        kind: r2ssa::MachineCastKind::ZeroExtend,
+        input,
+    } = arena.term(twice.canonical).kind
+    else {
+        panic!(
+            "expected one zero extension, got {:?}",
+            arena.term(twice.canonical)
+        );
+    };
+    assert!(
+        matches!(
+            arena.term(input).kind,
+            TermKind::Extract { lsb_bits: 0, .. }
+        ),
+        "expected the extension of one truncation, got {:?}",
+        arena.term(input)
+    );
+    assert!(
+        twice
+            .trace
+            .iter()
+            .any(|rewrite| rewrite.rule == "cast.extract_of_extend_whole"),
+        "the inner truncation of the extension is what the existing rule removes: {:?}",
+        twice.trace
+    );
+    assert!(roots.budget_failures().is_empty());
+}

@@ -221,6 +221,7 @@ pub static RULES: &[&Rule] = &[
     &identity::BOOLOR_FALSE,
     &cast::ZEXT_ZEXT,
     &cast::SEXT_SEXT,
+    &cast::EXTEND_IDENTITY,
     &cast::EXTRACT_EXTRACT,
     &cast::EXTRACT_FULL,
     &cast::EXTRACT_OF_EXTEND_WHOLE,

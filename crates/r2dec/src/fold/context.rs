@@ -127,6 +127,13 @@ pub(crate) struct FoldingContext<'a> {
     /// assignment collapses to the expression alone, so both forms come out of
     /// one body and cannot drift apart.
     pub(crate) inlined_definition: Cell<bool>,
+    /// What the right-hand side of the assignment being lowered has.
+    ///
+    /// The operation's lowering states it when it spells the assignment,
+    /// and the finaliser reads it when it applies the write projection and
+    /// the conversion to the declared object, which happen after the
+    /// statement has been built. One transaction sets and takes it.
+    pub(crate) pending_assignment_type: Cell<Option<r2rewrite::CValue>>,
     /// Legacy cache retained only as a negative test fixture: production
     /// inlining is authorized exclusively by the sealed binding plan.
     ///
@@ -198,6 +205,7 @@ impl<'a> FoldingContext<'a> {
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
             inlined_definition: Cell::new(false),
+            pending_assignment_type: Cell::new(None),
             #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),
             #[cfg(test)]
