@@ -2222,7 +2222,12 @@ fn apply_decisions_once(
     writes: &[FinalBindingWrite],
     demoted: &BTreeMap<BindingId, PlacementDecision>,
 ) -> Result<PlacementRemovals, PlacementApplicationError> {
-    let mut candidate = function.clone();
+    // The caller hands over a copy it discards unless the whole application
+    // succeeds, and it is the caller that writes the result back to the real
+    // tree. Cloning again here bought nothing: the transactional property --
+    // an early `return Err` leaves the emitted function untouched -- is the
+    // caller's, not this function's.
+    let candidate = &mut *function;
     let mut discarded_bindings = BTreeSet::new();
     let mut discarded_observations = BTreeSet::<RenderObservationId>::new();
     let mut declarations =
@@ -2262,21 +2267,19 @@ fn apply_decisions_once(
                 // Dropping the declaration then emits an undeclared identifier,
                 // which is the one thing this must never do, so the tree itself
                 // is asked before anything is removed.
-                let mut trial = candidate.clone();
-                let mut trial_observations = BTreeSet::new();
-                let mut discarded = 0;
-                for occurrence in writes.iter().filter(|w| w.binding == binding) {
-                    discarded += discard_observed_statement(
-                        &mut trial.body,
-                        occurrence.observation,
-                        &mut trial_observations,
-                    );
-                }
-                if discarded > 0 && !function_body_mentions_symbol(&trial.body, symbol) {
-                    trial.locals.retain(|local| local.name != symbol);
-                    candidate = trial;
+                let targets = binding_write_observations(writes, binding);
+                if discarding_clears_symbol(&candidate.body, &targets, symbol) {
+                    let mut removed_observations = BTreeSet::new();
+                    for target in &targets {
+                        discard_observed_statement(
+                            &mut candidate.body,
+                            *target,
+                            &mut removed_observations,
+                        );
+                    }
+                    candidate.locals.retain(|local| local.name != symbol);
                     discarded_bindings.insert(binding);
-                    discarded_observations.append(&mut trial_observations);
+                    discarded_observations.append(&mut removed_observations);
                 } else if function_body_mentions_symbol(&candidate.body, symbol)
                     && let Some(region) = region
                 {
@@ -2395,22 +2398,16 @@ fn apply_decisions_once(
             {
                 continue;
             }
-            let mut trial = candidate.clone();
-            let mut trial_observations = BTreeSet::new();
-            let mut discarded = 0;
-            for occurrence in writes.iter().filter(|w| w.binding == binding) {
-                discarded += discard_observed_statement(
-                    &mut trial.body,
-                    occurrence.observation,
-                    &mut trial_observations,
-                );
-            }
-            if discarded == 0 || function_body_mentions_symbol(&trial.body, symbol) {
+            let targets = binding_write_observations(writes, binding);
+            if !discarding_clears_symbol(&candidate.body, &targets, symbol) {
                 continue;
             }
-            trial.locals.retain(|local| local.name != symbol);
-            candidate = trial;
-            discarded_observations.append(&mut trial_observations);
+            let mut removed_observations = BTreeSet::new();
+            for target in &targets {
+                discard_observed_statement(&mut candidate.body, *target, &mut removed_observations);
+            }
+            candidate.locals.retain(|local| local.name != symbol);
+            discarded_observations.append(&mut removed_observations);
             for declared in declarations.values_mut() {
                 declared.retain(|(declared, _, _)| *declared != binding);
             }
@@ -2457,7 +2454,6 @@ fn apply_decisions_once(
         }
     }
 
-    *function = candidate;
     Ok(PlacementRemovals {
         bindings: discarded_bindings,
         observations: discarded_observations,
@@ -2653,6 +2649,176 @@ fn expr_mentions_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -> bool {
         }
     });
     found
+}
+
+/// Every observation one binding's writes are marked on.
+fn binding_write_observations(
+    writes: &[FinalBindingWrite],
+    binding: BindingId,
+) -> BTreeSet<RenderObservationId> {
+    writes
+        .iter()
+        .filter(|write| write.binding == binding)
+        .map(|write| write.observation)
+        .collect()
+}
+
+/// Whether discarding every statement `targets` names would leave the body
+/// with no mention of `symbol`, and name at least one statement to discard.
+///
+/// This is the question a trial copy used to answer by cloning the whole
+/// function, discarding into the copy and looking at the result -- once per
+/// binding, so a render copied its entire AST as many times as it had
+/// candidate dead stores. No copy is needed. `discard_observed_statement`
+/// replaces a whole statement with `CStmt::Empty` and touches nothing else, so
+/// the mentions that disappear are exactly those inside the statements
+/// carrying a target, and a mention survives precisely when it lies outside
+/// all of them.
+///
+/// Order does not enter into it, which is why one traversal can answer what a
+/// sequence of discards would produce. Where one target's statement contains
+/// another's, the outer takes the inner with it, so the union of removed
+/// content is the same whichever is discarded first -- and the union is what
+/// this asks about. The count differs by order, but the count is only ever
+/// compared against zero, and at least one statement is emptied whenever any
+/// carries a target.
+fn discarding_clears_symbol(
+    statements: &[CStmt],
+    targets: &BTreeSet<RenderObservationId>,
+    symbol: crate::symbol::SymbolId,
+) -> bool {
+    let mut probe = DiscardProbe::default();
+    probe_discarded_body(statements, targets, symbol, &mut probe);
+    probe.discards && !probe.survives
+}
+
+#[derive(Default)]
+struct DiscardProbe {
+    /// A statement carrying one of the targets was found, so discarding would
+    /// remove something.
+    discards: bool,
+    /// A mention of the symbol lies outside every statement that would go.
+    survives: bool,
+}
+
+/// Whether this statement is one `discard_observed_statement` would empty.
+///
+/// It mirrors that function's two reasons exactly: a marker on any of the
+/// observation layers wrapping the statement, or a marker on the target of an
+/// assignment, which is how a store into a stack object is marked.
+fn statement_is_discarded(statement: &CStmt, targets: &BTreeSet<RenderObservationId>) -> bool {
+    let mut current = statement;
+    while let CStmt::Observed { id, stmt } = current {
+        if targets.contains(id) {
+            return true;
+        }
+        current = stmt;
+    }
+    matches!(
+        current,
+        CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            ..
+        }) if expr_carries_any_observation(left, targets)
+    )
+}
+
+/// Whether this expression is marked with any of the observations, at any of
+/// the layers wrapping the expression itself.
+fn expr_carries_any_observation(expr: &CExpr, targets: &BTreeSet<RenderObservationId>) -> bool {
+    let mut current = expr;
+    loop {
+        match current {
+            CExpr::Observed { id, expr } => {
+                if targets.contains(id) {
+                    return true;
+                }
+                current = expr;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn probe_discarded_body(
+    statements: &[CStmt],
+    targets: &BTreeSet<RenderObservationId>,
+    symbol: crate::symbol::SymbolId,
+    probe: &mut DiscardProbe,
+) {
+    for statement in statements {
+        probe_discarded_statement(statement, targets, symbol, probe);
+    }
+}
+
+/// Descends exactly the statement positions `discard_observed_statement`
+/// descends, so the two agree about what a discard reaches.
+fn probe_discarded_statement(
+    statement: &CStmt,
+    targets: &BTreeSet<RenderObservationId>,
+    symbol: crate::symbol::SymbolId,
+    probe: &mut DiscardProbe,
+) {
+    if statement_is_discarded(statement, targets) {
+        probe.discards = true;
+        return;
+    }
+    match statement.unobserved() {
+        CStmt::StructuredRegion { stmt, .. } => {
+            probe_discarded_statement(stmt, targets, symbol, probe);
+        }
+        CStmt::Block(statements) => probe_discarded_body(statements, targets, symbol, probe),
+        CStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            probe.survives |= expr_mentions_symbol(cond, symbol);
+            probe_discarded_statement(then_body, targets, symbol, probe);
+            if let Some(body) = else_body {
+                probe_discarded_statement(body, targets, symbol, probe);
+            }
+        }
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            probe.survives |= expr_mentions_symbol(cond, symbol);
+            probe_discarded_statement(body, targets, symbol, probe);
+        }
+        CStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            if let Some(init) = init {
+                probe_discarded_statement(init, targets, symbol, probe);
+            }
+            if let Some(cond) = cond {
+                probe.survives |= expr_mentions_symbol(cond, symbol);
+            }
+            if let Some(update) = update {
+                probe.survives |= expr_mentions_symbol(update, symbol);
+            }
+            probe_discarded_statement(body, targets, symbol, probe);
+        }
+        CStmt::Switch {
+            expr,
+            cases,
+            default,
+        } => {
+            probe.survives |= expr_mentions_symbol(expr, symbol);
+            for case in cases {
+                probe_discarded_body(&case.body, targets, symbol, probe);
+            }
+            if let Some(body) = default {
+                probe_discarded_body(body, targets, symbol, probe);
+            }
+        }
+        // Every remaining variant is a leaf as far as discarding is concerned:
+        // it holds no statement a discard could reach, so its own mentions
+        // survive.
+        leaf => probe.survives |= statement_mentions_symbol(leaf, symbol),
+    }
 }
 
 /// Discard the statement carrying `target`, recording every observation that
