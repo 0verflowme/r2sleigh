@@ -1080,6 +1080,41 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Analysis)?;
+        // A placement refusal names a binding by number, and the number is
+        // never the question: which program object could not be placed, and
+        // where it was mentioned, is. Both are in hand exactly here, and
+        // nowhere downstream -- the refusal that reaches the reader carries
+        // only its category. So the operands travel on the same diagnostic
+        // channel every other refusing predicate uses.
+        if r2il::refusal_evidence::tracing() {
+            for (binding, decision) in decisions.iter() {
+                let Some(crate::placement::PlacementDecision::Refused(reason)) = decision else {
+                    continue;
+                };
+                let name = placement
+                    .names
+                    .symbol_for_binding(binding)
+                    .map(|symbol| placement.names.spelling(symbol).to_string())
+                    .unwrap_or_default();
+                let reads = occurrences
+                    .reads()
+                    .iter()
+                    .filter(|read| read.binding == binding)
+                    .map(|read| (read.block, read.source))
+                    .collect::<Vec<_>>();
+                let writes = occurrences
+                    .writes()
+                    .iter()
+                    .filter(|write| write.binding == binding)
+                    .map(|write| (write.block, write.inst))
+                    .collect::<Vec<_>>();
+                r2il::refusal_evidence!(
+                    "placement-decision",
+                    "binding={binding:?} name={name} reason={reason:?} \
+                     reads={reads:?} writes={writes:?}"
+                );
+            }
+        }
         // Which writes lost their statements is only known once the decisions
         // have been applied: one can be declined because the tree still
         // mentions the symbol, and one binding's removal can take away the last
