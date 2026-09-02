@@ -284,9 +284,26 @@ pub struct ObjectModel {
     pub parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     pub escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
+    /// Addresses that reach their object at an offset the machine computes.
+    ///
+    /// The object is exact -- `buf[i]` is inside `buf` -- and the offset within
+    /// it is not known, which is the difference between an array element and a
+    /// scalar slot. Every stage that would otherwise assume an access sits at
+    /// its object's own offset has to ask this first.
+    pub indexed_addresses: BTreeMap<ValueId, ValueId>,
 }
 
 impl ObjectModel {
+    /// Whether this address reaches its object at a computed offset.
+    pub fn address_is_indexed(&self, value: ValueId) -> bool {
+        self.indexed_addresses.contains_key(&value)
+    }
+
+    /// The value that supplies a computed offset into an object.
+    pub fn index_for_address(&self, value: ValueId) -> Option<ValueId> {
+        self.indexed_addresses.get(&value).copied()
+    }
+
     pub fn object_for_value(&self, value: ValueId, space: SpaceId) -> Option<ObjectId> {
         self.value_objects
             .get(&MemoryObjectKey { value, space })
@@ -1679,6 +1696,7 @@ struct ObjectModelBuilder<'a> {
     addresses: &'a AddressProvenanceFacts,
     objects: BTreeMap<ObjectId, ObjectFact>,
     value_objects: BTreeMap<MemoryObjectKey, ObjectId>,
+    indexed_addresses: BTreeMap<ValueId, ValueId>,
     stack_objects: BTreeMap<StackObjectKey, ObjectId>,
     entry_stack_roots: BTreeMap<ObjectId, StackAddressRoot>,
     ambiguous_entry_stack_objects: BTreeSet<ObjectId>,
@@ -1725,6 +1743,7 @@ impl<'a> ObjectModelBuilder<'a> {
             addresses,
             objects,
             value_objects: BTreeMap::new(),
+            indexed_addresses: BTreeMap::new(),
             stack_objects: BTreeMap::new(),
             entry_stack_roots: BTreeMap::new(),
             ambiguous_entry_stack_objects: BTreeSet::new(),
@@ -1779,6 +1798,7 @@ impl<'a> ObjectModelBuilder<'a> {
         ObjectModel {
             objects: self.objects,
             value_objects: self.value_objects,
+            indexed_addresses: self.indexed_addresses,
             stack_objects: self.stack_objects,
             entry_stack_roots: self.entry_stack_roots,
             address_bits_by_space: self.address_bits_by_space,
@@ -1814,6 +1834,9 @@ impl<'a> ObjectModelBuilder<'a> {
                 }
                 object
             } else if let Some(root) = resolve_indexed_stack_root(self.facts, value) {
+                if let Some(index) = self.index_operand_for_indexed_address(graph, value_id) {
+                    self.indexed_addresses.insert(value_id, index);
+                }
                 // An address inside a stack object at an offset the machine
                 // computes. It is the same object a constant offset from that
                 // base would reach -- `buf[i]` and `buf[0]` are one buffer --
@@ -1834,6 +1857,34 @@ impl<'a> ObjectModelBuilder<'a> {
         };
         self.value_objects.insert(key, object);
         object
+    }
+
+    /// The operand of an indexed address that supplies the offset.
+    ///
+    /// The address is a sum of a value that carries a stack root and one that
+    /// does not; the second is the index. Taking it from the graph rather than
+    /// from the rendered expression keeps the answer exact -- the renderer
+    /// would have to take an address apart again and guess which half is which.
+    fn index_operand_for_indexed_address(
+        &self,
+        graph: &SsaGraph,
+        address: ValueId,
+    ) -> Option<ValueId> {
+        let inst = graph.inst(graph.def_inst(address)?)?;
+        let crate::InstPayload::Op(crate::SSAOp::IntAdd { a, b, .. }) = &inst.payload else {
+            return None;
+        };
+        let a_id = graph.value_id_for_var(a)?;
+        let b_id = graph.value_id_for_var(b)?;
+        let a_rooted = resolve_stack_root(self.facts, a).is_some()
+            || resolve_indexed_stack_root(self.facts, a).is_some();
+        let b_rooted = resolve_stack_root(self.facts, b).is_some()
+            || resolve_indexed_stack_root(self.facts, b).is_some();
+        match (a_rooted, b_rooted) {
+            (true, false) => Some(b_id),
+            (false, true) => Some(a_id),
+            _ => None,
+        }
     }
 
     fn ensure_stack_object(&mut self, root: StackAddressRoot) -> ObjectId {

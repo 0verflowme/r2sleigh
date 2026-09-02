@@ -871,7 +871,9 @@ fn placement_refusal(
         },
         Private::ReadBeforeAssignment {
             binding,
-            read: crate::binding_plan::PlacementRead::StackAccess(access),
+            read:
+                crate::binding_plan::PlacementRead::StackAccess(access)
+                | crate::binding_plan::PlacementRead::IndexedStackAccess(access),
         } => Public::StackAccessReadBeforeAssignment {
             binding_index: binding.index(),
             instruction_id: access.inst.0,

@@ -7454,3 +7454,172 @@ Both are small. Neither was landed, because a subscript rule that fires nowhere
 is worse than none, and the corpus has no case where the address folds -- its
 byte loops carry a pointer round a phi, which is a use the fold must not
 duplicate and which needs induction-variable recovery rather than a subscript.
+
+## Assessment: where the expression engine stands, measured
+
+Written after the question "what does the best mathematical engine need, and is
+folding in the right shape". Everything here was measured on the tree at
+`0e58632` with the uncommitted indexed-stack-root diff applied; the corpus
+effect of that diff is recorded at the end of this section once the matrix
+finishes.
+
+**What the decompiler uses of SSA, symex and the VM module.** SSA is the whole
+substrate: certificates, obligations, the machine expression arena and the
+binding plan all read it. Symbolic execution (`r2sym`, about 62,000 lines, Z3
+backed) is not on the certified C path at all. It is consulted for route policy
+(summary, VM and structured-worker routes), for comment-only bodies, and for a
+return-type hint; nothing it proves reaches an expression, a condition or a
+declaration. The VM module recognises interpreter dispatch loops and renders a
+statistics comment. The type evidence solver in `r2types` is wired to
+declarations and is the one non-SSA engine that changes the emitted C.
+
+**Folding is a single-use inliner, not an expression simplifier.** Over the
+fifty-four corpus cells (5,271 statement lines) the residue is:
+
+| noise class | count |
+| --- | --- |
+| same-type double casts `(uint64_t)(uint64_t)x` | 730 |
+| triple-or-longer cast chains | 727 |
+| flag locals declared (`CF`, `ZF`, `ZR`, `TMPZR`) | 192 |
+| self-assignments `X = (T)X` | 141 |
+| `goto` | 125 |
+| constants bound to a temporary | 37 |
+| `x & x` | 19 |
+| `while` with a comma-packed header block | 17 of 60 |
+
+Casts run at 1.5 to 2.5 times the statement count in every cell. The 64-bit
+FNV offset basis renders as a five-operation `movz`/`movk` chain because the
+only constant folder on the path handles `Add` and `Sub`. None of this is a
+correctness defect -- all fifty-four cells agree with the oracle -- but it is
+the machine rendered faithfully rather than the program.
+
+**There are three rewriting layers, and the decision was one.**
+
+1. `r2ssa/src/optimize.rs`, 3,690 lines: SCCP, an instruction combiner with
+   about fifteen constant identities, copy propagation, CSE and DCE. Production
+   runs SCCP alone (`from_blocks_raw_with_policy_and_control` builds its own
+   config with everything else off); `DecompilePrepConfig` enables the
+   combiner but is not what the plugin path calls. The rest is dead in
+   production.
+2. The binding plan's `rules::inlinable_values` with the materialiser in
+   `fold/op_lower/lowering.rs`. This is the right layer. Its rules are narrow:
+   exactly one use (so a constant temporary with two readers gets a local),
+   same block and ordinal order, and only arithmetic, bitwise, boolean,
+   compare, copy, negate, select and shift kinds. No extension, truncation or
+   subpiece, no load, no merge, no flag arithmetic.
+3. The C-tree passes: `normalize.rs` (3,114 lines), `fold/flags.rs` (a
+   pattern matcher with four shapes), `fold_constant_arithmetic_in_function`,
+   `simplify_identities_in_function`, three `normalize_*` passes and the five
+   `cleanup_recurse` rewrites in `structure.rs`. The section "Where the
+   rewriting layer belongs, decided by measurement" above already showed this
+   layer computes wrong answers when asked to fold; it still runs.
+
+Nothing in the live path is an algebraic engine. That is the gap the question
+was about.
+
+**What every rewrite has to pay.** The proof accounting is about 20,000 lines:
+`observation_journal.rs` 4,849, `placement.rs` 4,276, `binding_plan/` about
+5,000, `shadow_report/` about 1,700, `r2ssa/src/obligation.rs` 2,775, the two
+ledgers about 900. It was built for "render every operation or refuse", and a
+rewrite is neither. Single-use folding cost about fifteen build-measure cycles
+through it and three multi-layer changes were reverted whole. Every further
+rewrite kind -- algebraic identity, spill round trip, subscript, member -- pays
+the same again unless the accounting rule is generalised once.
+
+**Timing, end to end, one process per measurement.** `r2 -q -c "a:sla; aa"`
+on the nine-function corpus binary costs 2.3 seconds before any analysis, which
+is process start plus plugin load. Net decompile time for one function after
+`aaa`:
+
+| binary | function | obligations | `pdd` net |
+| --- | --- | --- | --- |
+| x86-64 -O2 | `xxhash32` | 381 | 0.52 s |
+| x86-64 -O0 | `murmur3_32` | 376 | 0.69 s |
+| arm64 -O0 | `xxhash32` | 573 | 0.99 s |
+| `/bin/ls` | `main` | refused: unrepresentable operation | 4.27 s |
+| `/bin/ls` | `sym.func.100001a78` | summary fallback | 0.45 s |
+| `/bin/ls` | `sym.func.100003364` | refused: observation journal | 0.13 s |
+
+So roughly two milliseconds per obligation on a function that renders, and four
+seconds to refuse `main`. `a:sla; aaa` on `/bin/ls` takes 13 to 14 seconds and
+prints `post-analysis budget exhausted during function sweep after 10050203
+usec` at 79 of 136 functions: the plugin's own sweep is what the budget caps,
+and it hits the cap on a 136-function binary. The engine records per-phase
+timings (`R2SleighPhaseTimingV2`, `phase_timings` in the decompile JSON) and no
+reachable command prints them -- `a:sla.decj` reports itself unavailable
+outside the provider -- so where the two milliseconds go is not yet observable
+from radare2.
+
+Known cost shapes, from reading rather than profiling: `inlinable_values`
+scans every instruction of the function for each candidate value (quadratic in
+function size); `MachineBuilder::lower_op` filters every structured memory
+access for each load (quadratic in access count); the machine projection is
+built three times per function, once each in the rule, construction and the
+seal; `placement.rs` deep-copies the whole `CFunction` per binding per demotion
+round.
+
+**What to build, in order.**
+
+1. A canonicaliser on `MachineExprArena`. The arena is already the boundary
+   between prepared SSA and renderers: name-free, typed, one node per value,
+   derived after the certificates so SSA instruction identities and their
+   obligations are untouched by anything done to it. The rules are wrapping
+   constant folding across every operation; the identities (`x & x`, `x ^ x`,
+   `x | 0`, `x * 1`, `x >> 0`); cast-chain normalisation to the narrowest
+   width crossed and then the destination; `!(!c)`, `!(a < b)` to `a >= b`,
+   `(a - b) == 0` to `a == b`; and the flag-to-comparison rules that
+   `flags.rs` currently matches on rendered text. Each rule is a small
+   equivalence and is to be proven once by Z3 in a unit test. That is the
+   right use of symbolic execution here: prove the rules when the tree is
+   built, never run the solver while rendering -- the determinism rule and
+   solver timeouts both forbid it.
+2. One accounting rule for rewrites, which needs a decision. Inlining moves an
+   occurrence with the expression (already decided). An algebraic deletion --
+   `x & x` to `x` -- leaves no node for the occurrence to move onto. Option A:
+   the arena records the rewrite as a certified equivalence on the surviving
+   node (rule identity and operands) and the journal accepts an occurrence of
+   the replacement as the occurrence of every original it stands for; one
+   mechanism then serves inlining, algebra, the spill round trip, subscripts
+   and members. Option B: a new elision reason, `AlgebraicIdentity`. B is
+   cheaper and is a second accounting path, and the ledger then says
+   "elided" for something that was rendered. A is the recommendation and is
+   the option consistent with the "one rewriting layer" decision.
+3. Widen the inlining rule once 2 is in: a constant, and a copy of a constant,
+   duplicates for free and should inline whatever its use count; admit
+   extension, truncation and subpiece; admit loads with the hazard stated as
+   "no store to the same `ObjectId` between definition and use", which the
+   object model already answers; admit compare and flag operations; elide a
+   merge-edge identity copy when the plan has coalesced both sides into one
+   binding. Loop headers then collapse to their condition, the comma-packed
+   `while` disappears, and the flag locals with it.
+4. Delete layer 3 and the dead four-fifths of layer 1.
+5. Cast policy from declared types rather than from projections: one
+   conversion at each type boundary. This depends on the `CTypeLike`
+   unification already decided.
+6. Induction-variable recovery, needed for `a[i]` and for a `for` with a real
+   condition. `r2sym/src/loops.rs` already recognises `AffineConst`
+   recurrences for the solver and the decompiler cannot see them; the
+   recurrence fact belongs in `r2ssa` with both reading one owner.
+7. The four cost shapes above, and a command that prints the phase timings,
+   before the engine is pointed at coreutils.
+
+Not needed now: symbolic execution on the render path, the VM route rendered
+as C, or more of Z3.
+
+Coverage on real binaries is a separate ledger from all of this and its causes
+are already traced above: the composed return value (eighteen refusals, the
+largest single cause), `CallOther` traps, pass-through call arguments and the
+direct tail call.
+
+**The matrix, run on the tree with the indexed-stack-root change.** That
+change was committed as `aece1f6` by a concurrent session while this ran.
+Fifty-four of fifty-four on raw, diagnostic, differential, effect obligations,
+placement and render refusal. Snapshot reports `mismatch` on all fifty-four,
+which is staleness rather than a regression: the baseline was last blessed at
+`1e2af4e` on 2026-09-01 and thirty-one commits have changed output since,
+folding and typed declarations among them. It needs re-blessing once the
+current output is believed correct, so the column detects something again.
+Binding audit reports `non_quality` on fifty-two cells, `pass` on two; whether
+that predates this stretch was not established, because the previous results
+were overwritten by this run. Per-function decompile time was measured only
+end to end, above; the per-phase split is still unobservable from radare2.

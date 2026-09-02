@@ -700,6 +700,15 @@ pub(crate) enum PlacementRead {
         at: InstId,
     },
     StackAccess(r2ssa::StructuredAccessId),
+    /// A read of stack storage at an offset the machine computes.
+    ///
+    /// Kept apart from `StackAccess` because the must-assignment proof does not
+    /// apply to it. A scalar slot read before anything writes it is a read of
+    /// something the decompiler invented; an array element read before any
+    /// write is an ordinary uninitialised local, which the storage's own
+    /// declaration defines and which no per-element proof can be built for --
+    /// the write that would answer for it is at an offset nobody knows.
+    IndexedStackAccess(r2ssa::StructuredAccessId),
     PreservedCarrierWrite(InstId),
 }
 

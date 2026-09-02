@@ -387,9 +387,18 @@ pub(crate) fn collect_final_placement_occurrences(
                         ),
                     });
                 } else {
+                    let indexed = source
+                        .certificates()
+                        .memory_accesses
+                        .get(&access)
+                        .is_some_and(|fact| source.objects().address_is_indexed(fact.address));
                     reads.push(FinalBindingRead {
                         binding,
-                        source: PlacementRead::StackAccess(access),
+                        source: if indexed {
+                            PlacementRead::IndexedStackAccess(access)
+                        } else {
+                            PlacementRead::StackAccess(access)
+                        },
                         region,
                         block,
                         order,
@@ -3256,7 +3265,9 @@ impl Occurrence {
                 at.0,
                 value.0 as usize,
             ),
-            OccurrenceKind::Read(PlacementRead::StackAccess(access)) => (
+            OccurrenceKind::Read(
+                PlacementRead::StackAccess(access) | PlacementRead::IndexedStackAccess(access),
+            ) => (
                 self.order,
                 0,
                 self.block,
@@ -3344,6 +3355,7 @@ fn first_read_before_assignment(
         let mut assigned = must_in[block_index].contains(binding);
         for occurrence in block_occurrences {
             match occurrence.kind {
+                OccurrenceKind::Read(PlacementRead::IndexedStackAccess(_)) => {}
                 OccurrenceKind::Read(read) if !assigned => return Some(read),
                 OccurrenceKind::Read(_) => {}
                 OccurrenceKind::Write { .. } => assigned = true,
