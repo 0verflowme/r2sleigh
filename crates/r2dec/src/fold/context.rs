@@ -367,7 +367,7 @@ impl<'a> FoldingContext<'a> {
         source_inst: r2ssa::InstId,
         value: Option<ValueId>,
     ) -> BTreeSet<SemanticObligationId> {
-        self.exact_value_obligations(kind, source_inst, value)
+        self.exact_value_obligations(kind, source_inst, value.as_slice())
     }
 
     /// Mark every cell the instructions a rendered expression discharges still
@@ -608,14 +608,23 @@ impl<'a> FoldingContext<'a> {
             .is_some_and(|origins| origins.is_unconditional_phi_edge_copy(site, successor))
     }
 
+    /// Takes every value the occurrence carries, because a return can carry
+    /// more than one: a composed ABI register is a base with ordered overlays
+    /// laid over it, and each of them is seeded as its own obligation.
     fn exact_value_obligations(
         &self,
         kind: EffectOccurrenceKind,
         source_inst: InstId,
-        value: Option<ValueId>,
+        values: &[ValueId],
     ) -> BTreeSet<SemanticObligationId> {
         use r2ssa::SemanticObligationKind as ObligationKind;
 
+        // Every occurrence but a composed return carries at most one value,
+        // and the rules below are written about that one.
+        let value: Option<ValueId> = match values {
+            [single] => Some(*single),
+            _ => None,
+        };
         let Some(prepared) = self.inputs.prepared_ssa else {
             return BTreeSet::new();
         };
@@ -641,7 +650,7 @@ impl<'a> FoldingContext<'a> {
         // certainly rendered. A complete boundary with no values and no
         // compositions is the source's own statement that the return carries
         // nothing, which is exactly what `return;` renders.
-        let void_return = value.is_none()
+        let void_return = values.is_empty()
             && prepared
                 .facts()
                 .boundaries
@@ -660,7 +669,7 @@ impl<'a> FoldingContext<'a> {
                         .render_facts()?
                         .return_for_op(block_addr, op_idx)
                 })
-                .is_some_and(|fact| Some(fact.value) == value);
+                .is_some_and(|fact| fact.values().eq(values.iter().copied()));
         let rendered_call = call_fact.filter(|fact| {
             !matches!(
                 fact.disposition,
@@ -668,17 +677,26 @@ impl<'a> FoldingContext<'a> {
                     | r2types::CallsiteRenderDisposition::Residualized
             )
         });
-        let unique_return_value = value.is_some_and(|value| {
-            prepared
+        // Every carried value owns exactly one return-value obligation. A
+        // composed return discharges all of them at the one expression that
+        // reassembles it, so a value whose obligation is ambiguous disqualifies
+        // the whole occurrence rather than being silently dropped from it.
+        // One return-value obligation carries the whole composition, with every
+        // value it is assembled from as its ordered inputs -- not one
+        // obligation per value, which is what this first assumed and what the
+        // ledger disproved: `inputs=[ValueId(11), ValueId(32)]` on a single
+        // obligation. A composed return discharges that one obligation at the
+        // one expression that reassembles it.
+        let unique_return_value = !values.is_empty()
+            && prepared
                 .obligations()
                 .obligations_for_inst(source_inst)
                 .filter(|obligation| {
                     obligation.id.kind == ObligationKind::ReturnValue
-                        && obligation.inputs == [value]
+                        && obligation.inputs.as_slice() == values
                 })
                 .count()
-                == 1
-        });
+                == 1;
         let unique_call_result = value.is_some_and(|value| {
             prepared
                 .obligations()
@@ -698,7 +716,7 @@ impl<'a> FoldingContext<'a> {
                         && (obligation.id.kind == ObligationKind::Return
                             || (obligation.id.kind == ObligationKind::ReturnValue
                                 && unique_return_value
-                                && obligation.inputs.as_slice() == value.as_slice()))
+                                && obligation.inputs.as_slice() == values))
                 }
                 EffectOccurrenceKind::Expression => match &inst.payload {
                     r2ssa::InstPayload::Op(
@@ -816,18 +834,36 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
         value: Option<ValueId>,
     ) -> BTreeSet<SemanticObligationId> {
+        self.exact_effect_obligations_for_normalized_values(
+            kind,
+            block_addr,
+            op_idx,
+            value.as_slice(),
+        )
+    }
+
+    /// The occurrence carries several values, which only a composed return
+    /// does: its ABI register is a base with ordered overlays laid over it and
+    /// every one of them owns an obligation the single expression discharges.
+    pub(crate) fn exact_effect_obligations_for_normalized_values(
+        &self,
+        kind: EffectOccurrenceKind,
+        block_addr: u64,
+        op_idx: usize,
+        values: &[ValueId],
+    ) -> BTreeSet<SemanticObligationId> {
         let Some(site) = self.normalized_site(block_addr, op_idx) else {
             return BTreeSet::new();
         };
         let Some(origins) = self.inputs.normalization_origins else {
             return self
                 .source_inst_for_normalized_site(site)
-                .map(|inst| self.exact_value_obligations(kind, inst, value))
+                .map(|inst| self.exact_value_obligations(kind, inst, values))
                 .unwrap_or_default();
         };
         match origins.origin(site) {
             Some(crate::normalize::NormalizedOpOrigin::Original(inst)) => {
-                self.exact_value_obligations(kind, *inst, value)
+                self.exact_value_obligations(kind, *inst, values)
             }
             Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => self
                 .exact_effect_obligations_for_phi_edges(

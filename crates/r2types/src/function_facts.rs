@@ -1079,7 +1079,18 @@ pub struct ReturnValueRenderFact {
     pub op_index: usize,
     pub value: r2ssa::ValueId,
     pub width: u32,
+    /// Ordered contained-slice writes over `value`, empty for an ordinary
+    /// return. See `r2ssa::ReturnValueCertificate::overlays`: when this is not
+    /// empty `value` is the base rather than the whole returned value.
+    pub overlays: Vec<r2ssa::ReturnValueOverlay>,
     pub control_domain: r2ssa::ControlDomain,
+}
+
+impl ReturnValueRenderFact {
+    /// Every value this return carries, base first and overlays in order.
+    pub fn values(&self) -> impl Iterator<Item = r2ssa::ValueId> + '_ {
+        std::iter::once(self.value).chain(self.overlays.iter().map(|overlay| overlay.value))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3961,6 +3972,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         op_index: cert.op_index,
                         value: cert.value,
                         width: cert.width,
+                        overlays: cert.overlays.clone(),
                         control_domain,
                     },
                 },
@@ -6936,6 +6948,7 @@ mod tests {
                             op_index: 2,
                             value,
                             width: 8,
+                            overlays: Vec::new(),
                             control_domain: test_control_domain(),
                         },
                     },
