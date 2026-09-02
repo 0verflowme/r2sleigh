@@ -40,7 +40,13 @@ pub(super) fn component_eligible_values(
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
-    let inlinable = inlinable_values(source);
+    // One projection for this call. Threading the caller's would remove a
+    // second derivation of the same answer and is worth doing; it is a wider
+    // change than the defect being fixed here, which was rebuilding the arena
+    // once per inlined value inside the seal's loop.
+    let projection = r2ssa::MachineProjection::from_artifact(source)
+        .map_err(BindingPlanBuildError::MachineProjection)?;
+    let inlinable = inlinable_values(source, &projection);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
@@ -353,11 +359,18 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
     false
 }
 
-pub(super) fn inlinable_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+/// Takes the projection rather than building one.
+///
+/// It used to build its own, and the seal asked it per value inside a loop, so
+/// one render lowered the whole machine arena once for every inlined value.
+/// That was seventy-two per cent of a render on `xxhash32`. The projection is
+/// derived from the artifact and is the same object either way; deriving it
+/// again is not a second opinion, only the same answer at a cost.
+pub(super) fn inlinable_values(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+) -> BTreeSet<ValueId> {
     let graph = source.graph();
-    let Ok(projection) = r2ssa::MachineProjection::from_artifact(source) else {
-        return BTreeSet::new();
-    };
     let mut expr_by_value = std::collections::BTreeMap::new();
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
@@ -365,7 +378,7 @@ pub(super) fn inlinable_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId>
     // One statement of which reads the certificates elide, shared with the
     // observation journal. A certificate the cells cannot be built from is a
     // function the journal will refuse, so there is nothing to fold for.
-    let Ok(cells) = certificate_elided_cells(source, &projection) else {
+    let Ok(cells) = certificate_elided_cells(source, projection) else {
         return BTreeSet::new();
     };
     let elided_reads = cells.read_elided_instructions;

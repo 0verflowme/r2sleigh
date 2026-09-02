@@ -429,7 +429,7 @@ pub(crate) fn build_upstream_shadow_oracle(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let inlinable = super::rules::inlinable_values(source);
+    let inlinable = super::rules::inlinable_values(source, &machine_projection);
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
         if return_controls.contains(&graph_value.id) {
@@ -593,6 +593,9 @@ impl BindingPlan {
         self.validate_source(source)
             .map_err(BindingPlanBuildError::Seal)?;
         let graph = source.graph();
+        // Once per seal, not once per inlined value: this walks the whole
+        // machine arena.
+        let inlinable = super::rules::inlinable_values(source, &self.machine_projection);
         let ptr_bits = source
             .machine_context()
             .memory_model()
@@ -659,7 +662,7 @@ impl BindingPlan {
                 ValueDisposition::Inline { expr, proof } => {
                     let owned = proof.authority == *source.authority() && proof.literal == *expr;
                     let exact_expression = graph_value.var.constant_bits().is_none()
-                        && super::rules::inlinable_values(source).contains(&value)
+                        && inlinable.contains(&value)
                         && self
                             .machine_projection
                             .entity_for_output(value)

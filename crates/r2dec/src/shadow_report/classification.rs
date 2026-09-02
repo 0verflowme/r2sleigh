@@ -355,7 +355,11 @@ fn normalized_candidate_value(
         // both a constant here disagreed with the oracle on every function
         // that folded anything, which is nearly all of them.
         ValueDisposition::Inline { expr, .. } => Ok(
-            match plan.machine_projection().expr(*expr).map(|node| node.kind()) {
+            match plan
+                .machine_projection()
+                .expr(*expr)
+                .map(|node| node.kind())
+            {
                 Some(r2ssa::MachineExprKind::Constant { binding, .. })
                     if binding.value() == value =>
                 {

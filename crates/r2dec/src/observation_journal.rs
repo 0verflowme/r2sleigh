@@ -2726,11 +2726,11 @@ impl LegacyObservationJournal {
                             value_is_literal,
                             &symbol_bindings,
                         )
-                            .and_then(|observation| {
-                                record_same(&mut values[value.0 as usize], observation).map_err(
-                                    |()| LegacyObservationJournalError::ConflictingValue(value),
-                                )
+                        .and_then(|observation| {
+                            record_same(&mut values[value.0 as usize], observation).map_err(|()| {
+                                LegacyObservationJournalError::ConflictingValue(value)
                             })
+                        })
                     }
                     ObservationTarget::Use {
                         site, observation, ..
@@ -4610,7 +4610,9 @@ mod tests {
                 .map(|(block, _)| block)
                 .expect("discharged instruction has a site");
             let write = match plan.write_disposition(inst_id) {
-                Some(MachineWriteDisposition::Exact(write)) => LegacyWriteObservation::Exact(*write),
+                Some(MachineWriteDisposition::Exact(write)) => {
+                    LegacyWriteObservation::Exact(*write)
+                }
                 other => panic!("discharged write must be exact, got {other:?}"),
             };
             expected.push(ObservationTarget::Write {
@@ -4628,7 +4630,9 @@ mod tests {
                     input_idx,
                 };
                 let observation = match plan.use_disposition(site) {
-                    Some(MachineUseDisposition::Exact(slice)) => LegacyUseObservation::Exact(*slice),
+                    Some(MachineUseDisposition::Exact(slice)) => {
+                        LegacyUseObservation::Exact(*slice)
+                    }
                     Some(MachineUseDisposition::MemoryAddress(address)) => {
                         LegacyUseObservation::MemoryAddress(*address)
                     }

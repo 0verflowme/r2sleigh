@@ -537,7 +537,7 @@ impl BindingPlan {
         for entity in machine_projection.entities() {
             expr_by_value.insert(entity.output().value(), entity.root());
         }
-        let inlinable = super::rules::inlinable_values(source);
+        let inlinable = super::rules::inlinable_values(source, &machine_projection);
         let mut dispositions = graph
             .values
             .iter()

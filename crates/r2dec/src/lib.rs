@@ -47,6 +47,7 @@ pub(crate) mod planner;
 pub mod region;
 mod shadow_report;
 pub(crate) mod single_evaluation;
+pub(crate) mod stage_timing;
 pub mod structure;
 mod structured_region;
 pub mod symbol;
@@ -3838,6 +3839,8 @@ impl Decompiler {
         }
         let output =
             CodeGenerator::new(self.config.codegen.clone()).generate_function(product.emission());
+        crate::stage_timing::mark("codegen");
+        crate::stage_timing::report(&product.emission().function().name);
         if let Err(stop) = render_work.poll() {
             return Err((
                 stop,
@@ -4332,6 +4335,7 @@ impl Decompiler {
         semantic_route: &DecompileRouteFacts,
         work: DecompileWorkControl<'a>,
     ) -> Result<InternalBuildProduct, DecompileExecutionStop> {
+        crate::stage_timing::begin();
         // The names this rendering declares, from the first pass that mints one.
         let symbol_table =
             std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new()));
@@ -4502,6 +4506,7 @@ impl Decompiler {
                 DecompileRenderRefusal::NormalizationOriginUnavailable,
             ));
         }
+        crate::stage_timing::mark("prepare");
         let binding_plan =
             match crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts()) {
                 Ok(plan) => std::rc::Rc::new(plan),
@@ -4757,6 +4762,7 @@ impl Decompiler {
             binding_names: Some(&binding_names),
             prepared_semantic_view: Some(&prepared_semantic_view),
         };
+        crate::stage_timing::mark("binding_plan");
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
         // One rendered function has one table, and this is the one the passes
         // before now declared into.
@@ -4778,6 +4784,7 @@ impl Decompiler {
                 }
             }
         }
+        crate::stage_timing::mark("fold");
         structuring_work.poll()?;
         // Structure control flow (primary path: folded)
         let mut structurer =
@@ -4879,6 +4886,7 @@ impl Decompiler {
         let data_symbols = display.symbols();
         let used_objects: std::cell::RefCell<std::collections::BTreeSet<(String, u64)>> =
             std::cell::RefCell::new(std::collections::BTreeSet::new());
+        crate::stage_timing::mark("structure");
         fold_constant_arithmetic_in_function(&mut c_function, strings, data_symbols, &used_objects);
         c_function.extern_objects = used_objects.into_inner().into_iter().collect();
 
@@ -4903,6 +4911,7 @@ impl Decompiler {
         normalize_declared_assignment_literals(&mut c_function);
         normalize_comparison_operand_order(&mut c_function);
         debug_assigned_locals(&c_function, "normalize_comparison_operand_order");
+        crate::stage_timing::mark("normalize");
         unrendered::prune_unreferenced_labels(&mut c_function);
         if void_function_has_value_return(&c_function) {
             let refusal = DecompileRenderRefusal::UnrepresentableOperation;
@@ -4950,6 +4959,7 @@ impl Decompiler {
                 ));
             }
         };
+        crate::stage_timing::mark("placement_seal");
         let ledger = effect_ledger::build_obligation_ledger(
             prepared,
             &normalization_origins,
