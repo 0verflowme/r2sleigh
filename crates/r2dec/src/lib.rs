@@ -5299,12 +5299,15 @@ fn fold_constant_arithmetic_in_function(
 /// what the string is to what the outermost conversion required, spelled by
 /// the one emitter. Where the two are the same the chain disappears, which is
 /// the common case -- a string reaches a `char *` parameter as itself.
-/// The C type of `char`, which is what an unqualified `char` renders as.
+/// The type of a `char` in C, which is its own type.
+///
+/// Not `int8_t`. C has three character types and `char` is distinct from both
+/// `signed char` and `unsigned char`, so a `char *` and an `int8_t *` are
+/// different pointers and converting between them is a cast the compiler
+/// asks for. A string literal is an array of `char`, and saying so is what
+/// lets it reach a `char *` with nothing spelled.
 fn plain_char_type() -> CType {
-    CType::Int {
-        bits: 8,
-        signedness: r2types::Signedness::Signed,
-    }
+    CType::Typedef("char".to_string())
 }
 
 /// The address a chain of conversions is wrapped around, and what it is.
@@ -5937,10 +5940,7 @@ mod tests {
         // string makes every one of them a statement about a type the
         // expression no longer has.
         let text = CExpr::StringLit("usage: %s\n".to_string());
-        let char_ptr = CType::ptr(CType::Int {
-            bits: 8,
-            signedness: r2types::Signedness::Signed,
-        });
+        let char_ptr = CType::ptr(plain_char_type());
         let mut expr = CExpr::cast(
             char_ptr.clone(),
             CExpr::cast(
