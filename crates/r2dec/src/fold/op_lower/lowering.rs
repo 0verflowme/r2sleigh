@@ -1,6 +1,6 @@
 use super::calls::CertifiedCallArgs;
 use super::memory_renderer::CertifiedMemoryAccessExpr;
-use super::projection::{project_machine_use, project_machine_write};
+use super::projection::project_machine_write;
 use super::*;
 
 fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
@@ -148,11 +148,40 @@ impl<'a> FoldingContext<'a> {
         };
         match names.require_write(output.inst) {
             Ok(r2ssa::MachineWriteDisposition::Exact(projection)) => {
-                project_machine_write(lhs, rhs, *projection).map_err(|_| {
+                // A value already spelled at the object's own type is not
+                // projected again. The projection exists to say how the
+                // machine writes a carrier -- a lane, or a zero-extension into
+                // the full register -- in that carrier's unsigned integer, and
+                // applying it to an expression that is already the pointer the
+                // object is declared as converts it straight back to an
+                // integer and the assignment stops compiling.
+                if matches!(
+                    rhs.unobserved(),
+                    CExpr::Cast {
+                        ty: CType::Pointer(_),
+                        ..
+                    }
+                ) {
+                    return Ok((lhs, rhs));
+                }
+                let (lhs, rhs) = project_machine_write(lhs, rhs, *projection).map_err(|_| {
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
                         output.inst,
                     )
-                })
+                })?;
+                // The projection spells how the machine writes the carrier --
+                // a lane, or a zero-extension into the full register -- in the
+                // carrier's unsigned integer. That is the last word only while
+                // the object being written is that integer. Where the plan
+                // declared it a pointer, the conversion to the declaration is
+                // what the compiler reads, and it goes outside the projection
+                // rather than under it.
+                if let Some(declared @ CType::Pointer(_)) =
+                    self.value_declaration_type(output.value)
+                {
+                    return Ok((lhs, CExpr::cast(declared, rhs)));
+                }
+                Ok((lhs, rhs))
             }
             Ok(r2ssa::MachineWriteDisposition::Refused(_)) => {
                 unreachable!("require_write cannot return a refused disposition")
@@ -277,6 +306,17 @@ impl<'a> FoldingContext<'a> {
         self.current_block_addr.set(previous_block);
         self.current_op_idx.set(previous_op);
         lowered.ok().flatten()
+    }
+
+    /// The type the plan declares for a value, if it declares one.
+    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        Some(names.plan().binding(*binding)?.declaration_type().clone())
     }
 
     fn materialize_machine_expr(
@@ -733,14 +773,35 @@ impl<'a> FoldingContext<'a> {
                     input_idx,
                     self.planned_value_expr(input.value)?,
                 );
-                project_machine_use(base, slice).map_err(|_| {
+                // A pointer read whole is spelled at its own type. The
+                // projection casts to the unsigned integer of the carrier's
+                // width, which is what every object used to be declared as;
+                // applied to an object the evidence declared a pointer it says
+                // `(uint64_t)p`, and the assignment that follows will not
+                // compile. The slice is the whole carrier at offset zero, so
+                // the projection selects nothing and the declared type is the
+                // exact statement to make about what is read.
+                let declared_pointer = matches!(
+                    self.value_declaration_type(input.value),
+                    Some(CType::Pointer(_))
+                );
+                if declared_pointer
+                    && slice.bit_offset() == 0
+                    && slice.width_bits() == slice.carrier_width_bits()
+                    && let Some(declared) = self.value_declaration_type(input.value)
+                {
+                    return Ok(CExpr::cast(declared, base));
+                }
+                super::projection::project_machine_use_of(base, slice, declared_pointer).map_err(
+                    |_| {
                     // The machine use is exact, but the strict C dialect cannot spell
                     // this projection without more type evidence. Refuse the emitted
                     // occurrence instead of inventing an integer or pointer type.
-                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
-                        first_site,
-                    )
-                })
+                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                            first_site,
+                        )
+                    },
+                )
             }
             // A contextual address cannot be projected from an arbitrary AST.
             // Only `planned_memory_input_expr` accepts the opaque expression

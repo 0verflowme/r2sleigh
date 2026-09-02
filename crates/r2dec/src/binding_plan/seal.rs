@@ -128,15 +128,8 @@ fn seal_parameter_width(
         })
 }
 
-fn binding_declaration_width(ty: &CType) -> Option<u32> {
-    match ty {
-        CType::Int {
-            bits,
-            signedness: r2types::Signedness::Unsigned,
-        } if *bits <= 128 => Some(*bits),
-        CType::BitVector(bits) if *bits > 128 => Some(*bits),
-        _ => None,
-    }
+fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
+    super::rules::declaration_type_width(ty, ptr_bits)
 }
 
 /// Resolve the certificate relation independently of construction's union-find.
@@ -600,6 +593,10 @@ impl BindingPlan {
         self.validate_source(source)
             .map_err(BindingPlanBuildError::Seal)?;
         let graph = source.graph();
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
         if self.dispositions.len() != graph.values.len() {
             return Err(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::DispositionCount {
@@ -780,7 +777,8 @@ impl BindingPlan {
                             },
                         ));
                     }
-                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
+                    let Some(width_bits) =
+                        binding_declaration_width(&binding.declaration_type, ptr_bits)
                     else {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::DeclarationWidth {
@@ -898,7 +896,11 @@ impl BindingPlan {
                                 BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
                             ));
                         }
-                        if planned.declaration_type != CType::machine_bits(width_bits) {
+                        if !super::rules::declaration_type_describes_width(
+                            &planned.declaration_type,
+                            width_bits,
+                            ptr_bits,
+                        ) {
                             return Err(BindingPlanBuildError::Seal(
                                 BindingPlanSourceMismatch::ParameterDeclarationWidth {
                                     slot,
@@ -1072,7 +1074,11 @@ impl BindingPlan {
                             BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
                         ));
                     }
-                    if planned.declaration_type != CType::machine_bits(width_bits) {
+                    if !super::rules::declaration_type_describes_width(
+                        &planned.declaration_type,
+                        width_bits,
+                        ptr_bits,
+                    ) {
                         return Err(BindingPlanBuildError::Seal(
                             BindingPlanSourceMismatch::StackObjectDeclarationWidth {
                                 object,
@@ -1122,7 +1128,11 @@ impl BindingPlan {
                             ));
                         }
                         if width_bits.is_none_or(|width_bits| {
-                            planned.declaration_type != CType::machine_bits(width_bits)
+                            !super::rules::declaration_type_describes_width(
+                                &planned.declaration_type,
+                                width_bits,
+                                ptr_bits,
+                            )
                         }) {
                             return Err(BindingPlanBuildError::Seal(
                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
@@ -1189,7 +1199,11 @@ impl BindingPlan {
                                     },
                                 ));
                             }
-                            if planned.declaration_type != CType::machine_bits(width_bits) {
+                            if !super::rules::declaration_type_describes_width(
+                                &planned.declaration_type,
+                                width_bits,
+                                ptr_bits,
+                            ) {
                                 return Err(BindingPlanBuildError::Seal(
                                     BindingPlanSourceMismatch::StackObjectDeclarationWidth {
                                         object,

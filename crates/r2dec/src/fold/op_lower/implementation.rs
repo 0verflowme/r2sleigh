@@ -1996,7 +1996,14 @@ impl<'a> FoldingContext<'a> {
     }
     fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
         let Some(source) = source.map(RecordedType::get) else {
-            return false;
+            // Not knowing what the expression's type is says nothing about
+            // whether a conversion is needed, and for a pointer target it is
+            // exactly the case where one always is: C converts an integer to a
+            // pointer only when the program says so. Returning `false` here
+            // was safe while every declaration was an unsigned machine word
+            // and became `int8_t *p = some_uint64;` the moment the evidence
+            // was allowed to name a pointer.
+            return matches!(target, CType::Pointer(_));
         };
 
         if target == source {
@@ -2033,6 +2040,19 @@ impl<'a> FoldingContext<'a> {
         {
             return expr;
         }
+        // A pointer narrowed straight to a smaller integer is
+        // `-Wpointer-to-int-cast`: address bits are lost and the compiler will
+        // not let that be implicit. Converting at the pointer's own width
+        // first makes the narrowing the program's own statement.
+        if let CExpr::Cast {
+            ty: CType::Pointer(_),
+            ..
+        } = expr.unobserved()
+            && let CType::Int { bits, .. } = &target
+            && *bits < 64
+        {
+            return CExpr::cast(target, CExpr::cast(CType::uint(64), expr));
+        }
         CExpr::cast(target, expr)
     }
 
@@ -2047,11 +2067,81 @@ impl<'a> FoldingContext<'a> {
         {
             return expr;
         }
-        if self.cast_needed(&target, source) {
+        // The expression itself is evidence when the source type is not
+        // recorded. A pointer-valued expression assigned to an integer needs
+        // the conversion spelled exactly as the other direction does, and
+        // asking only the recorded type meant `uint64_t n = p + i;` went out
+        // unconverted.
+        let pointer_valued = source.is_none()
+            && !matches!(target, CType::Pointer(_))
+            && self.int_meta(&target).is_some()
+            && self.looks_like_pointer(&expr);
+        if pointer_valued || self.cast_needed(&target, source) {
+            // A pointer converts to an integer of its own width; converting it
+            // straight to a narrower one is a diagnostic in its own right
+            // (`-Wpointer-to-int-cast`) because the conversion loses address
+            // bits silently. Spelling the full-width step makes the narrowing
+            // the program's statement rather than the compiler's guess.
+            if let CType::Pointer(_) = &target
+                && let Some((_, bits)) = self.expr_type_hint(&expr).and_then(|ty| self.int_meta(&ty))
+                && let Some(pointer_bits) = self
+                    .inputs
+                    .prepared_ssa
+                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
+                && bits < pointer_bits
+            {
+                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
+            }
+            if self.looks_like_pointer(&expr)
+                && let Some((_, bits)) = self.int_meta(&target)
+                && let Some(pointer_bits) = self
+                    .inputs
+                    .prepared_ssa
+                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
+                && bits < pointer_bits
+            {
+                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
+            }
             CExpr::cast(target, expr)
         } else {
             expr
         }
+    }
+
+    /// Convert a stored value to the declared type of the object written.
+    ///
+    /// A store's left-hand side is a certified access rather than a variable,
+    /// so the assignment policy above has no `dst` to ask. The object behind
+    /// the access has a declaration all the same, and it is what the compiler
+    /// reads.
+    fn assignment_rhs_from_stored_object_type(
+        &self,
+        access: r2ssa::StructuredAccessId,
+        val: &SSAVar,
+        rhs: CExpr,
+    ) -> CExpr {
+        let Some(target @ CType::Pointer(_)) = self.stored_object_declaration_type(access) else {
+            return rhs;
+        };
+        let source = self.source_type_for_var(val);
+        self.cast_expr_if_needed(rhs, target, source.as_ref())
+    }
+
+    /// The declared type of the stack object a certified access writes.
+    fn stored_object_declaration_type(
+        &self,
+        access: r2ssa::StructuredAccessId,
+    ) -> Option<CType> {
+        let names = self.inputs.binding_names?;
+        let fact = self
+            .certified_memory_access_for_current_op(true)
+            .filter(|fact| fact.access == access)?;
+        let crate::binding_plan::StackObjectDisposition::Bound { binding } =
+            names.plan().stack_object_disposition(fact.object)?
+        else {
+            return None;
+        };
+        Some(names.plan().binding(binding)?.declaration_type().clone())
     }
 
     fn assignment_rhs_with_type_policy(
@@ -2367,8 +2457,15 @@ impl<'a> FoldingContext<'a> {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let rhs_base = self.get_expr(src)?;
                 let rhs = self.resolve_predicate_rhs_for_var(src, rhs_base);
-                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+                // The operand is projected before it is converted, not after.
+                // The projection says which bits of the source object are
+                // read; the assignment cast says what the destination is. Run
+                // the other way round it re-wrapped a value already converted
+                // to the destination's type back into the source carrier's
+                // integer, which spells `int8_t *p = (uint64_t)(int8_t *)q;`
+                // once a destination may be a pointer.
                 let rhs = self.observed_input(frame, 0, rhs);
+                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Load { dst, addr, space } => {
@@ -2409,6 +2506,7 @@ impl<'a> FoldingContext<'a> {
                     .unwrap_or_else(|| type_from_size(val.size));
                 let certified_lhs =
                     self.render_certified_store_access_expr(addr, val, elem_ty.clone())?;
+                let stored_access = certified_lhs.access();
                 // A use of a call result used to re-render the call, because
                 // the result had no name of its own. It has one now: the site
                 // assigns it, and rendering the call here as well would call
@@ -2437,6 +2535,12 @@ impl<'a> FoldingContext<'a> {
                 }
                 let lhs = self.observed_memory_input(frame, 0, certified_lhs);
                 let rhs = self.observed_input(frame, 1, rhs);
+                // A slot the evidence declared a pointer takes a pointer;
+                // storing the machine word into it does not compile. Only that
+                // direction is spelled here -- converting a stored value *to*
+                // an integer is what the access projection already did, and
+                // saying it again undid the pointer the read had just given.
+                let rhs = self.assignment_rhs_from_stored_object_type(stored_access, val, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
@@ -2733,16 +2837,21 @@ impl<'a> FoldingContext<'a> {
             SSAOp::Subpiece { dst, src, offset } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let src_expr = input(0, src)?;
+                // Through `cast_expr_to`, which knows that a pointer narrowed
+                // straight to a smaller integer loses address bits and has to
+                // be converted at its own width first. A register alias is a
+                // `Subpiece` at offset zero, and taking the low half of a
+                // pointer-declared register is exactly that case.
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
                 } else if *offset == 0 {
-                    CExpr::cast(uint_type_from_size(dst.size), src_expr)
+                    Self::cast_expr_to(src_expr, uint_type_from_size(dst.size))
                 } else {
                     let shift_bits = offset.saturating_mul(8);
-                    let src_cast = CExpr::cast(uint_type_from_size(src.size), src_expr);
+                    let src_cast = Self::cast_expr_to(src_expr, uint_type_from_size(src.size));
                     let shifted =
                         CExpr::binary(BinaryOp::Shr, src_cast, CExpr::IntLit(shift_bits as i64));
-                    CExpr::cast(uint_type_from_size(dst.size), shifted)
+                    Self::cast_expr_to(shifted, uint_type_from_size(dst.size))
                 };
                 self.assign_stmt(lhs, rhs)
             }
@@ -3123,6 +3232,26 @@ impl<'a> FoldingContext<'a> {
             self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
         let mut rhs_expr =
             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
+        // C adds an integer to a pointer, never a pointer to a pointer. Both
+        // operands can be pointer-declared honestly -- a value used as an
+        // address somewhere else is a pointer wherever it is read -- and the
+        // sum is still one base and one offset. The left operand keeps the
+        // pointer and the right becomes the offset it is being used as, which
+        // is what the machine addition computes either way.
+        // Machine address arithmetic counts bytes; C pointer arithmetic counts
+        // elements. `(int32_t *)p + 4` moves sixteen bytes where the
+        // instruction moved four, and `xxhash32` at arm64 -O1 computed the
+        // wrong hash from exactly that. Neither operand stays a pointer here:
+        // the addition is done on the addresses as numbers, which is what the
+        // machine did, and the destination's own declaration puts the pointer
+        // back. It also settles the cases C rejects outright -- a pointer
+        // added to a pointer, and a pointer subtracted from an integer.
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+            && (self.looks_like_pointer(&lhs_expr) || self.looks_like_pointer(&rhs_expr))
+        {
+            lhs_expr = Self::cast_expr_to(lhs_expr, uint_type_from_size(a.size));
+            rhs_expr = Self::cast_expr_to(rhs_expr, uint_type_from_size(b.size));
+        }
         let produced_ty = operand_ty.clone();
         if let Some(ty) = operand_ty {
             // Stated, not hinted. This type is the operation: `IntSLess` and

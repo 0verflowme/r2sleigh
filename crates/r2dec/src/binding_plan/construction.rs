@@ -742,7 +742,15 @@ impl BindingPlan {
                 .iter()
                 .any(|value| graph.def_inst(*value).is_none());
             bindings.push(Binding {
-                declaration_type: CType::machine_bits(width_bits),
+                declaration_type: super::rules::declaration_type_for_binding(
+                    source_owned,
+                    component.members.iter().copied(),
+                    width_bits,
+                    source
+                        .machine_context()
+                        .memory_model()
+                        .default_address_bits(),
+                ),
                 certificate: BindingCertificate {
                     sources: component
                         .sources
@@ -925,7 +933,15 @@ impl BindingPlan {
                         });
                     };
                     bindings.push(Binding {
-                        declaration_type: CType::machine_bits(width_bits),
+                        declaration_type: super::rules::declaration_type_for_stack_object(
+                            source_owned,
+                            *object,
+                            width_bits,
+                            source
+                                .machine_context()
+                                .memory_model()
+                                .default_address_bits(),
+                        ),
                         certificate: BindingCertificate {
                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
                         },
@@ -949,7 +965,15 @@ impl BindingPlan {
                         });
                     };
                     bindings.push(Binding {
-                        declaration_type: CType::machine_bits(width_bits),
+                        declaration_type: super::rules::declaration_type_for_stack_object(
+                            source_owned,
+                            *object,
+                            width_bits,
+                            source
+                                .machine_context()
+                                .memory_model()
+                                .default_address_bits(),
+                        ),
                         certificate: BindingCertificate {
                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
                         },
@@ -983,7 +1007,15 @@ impl BindingPlan {
                             });
                         };
                         bindings.push(Binding {
-                            declaration_type: CType::machine_bits(width_bits),
+                            declaration_type: super::rules::declaration_type_for_stack_object(
+                                source_owned,
+                                *object,
+                                width_bits,
+                                source
+                                    .machine_context()
+                                    .memory_model()
+                                    .default_address_bits(),
+                            ),
                             certificate: BindingCertificate {
                                 sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
                             },

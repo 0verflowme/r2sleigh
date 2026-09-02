@@ -65,10 +65,23 @@ fn checked_int_type(width_bits: u32) -> Result<CType, MachineUseProjectionError>
 /// Translate one exact upstream slice. The unsigned carrier cast makes the
 /// shift logical; the selected-width cast removes every bit outside the use;
 /// and only then is the source-owned conversion applied.
-pub(super) fn project_machine_use(
+/// Project a use, saying whether the object being read is a pointer.
+///
+/// A pointer cannot be sliced: `(uint32_t)p` narrows an address and the
+/// compiler says so (`-Wpointer-to-int-cast`), and casting it to the carrier's
+/// unsigned integer is the step that makes the slice meaningful. Reading the
+/// whole of a pointer is not a projection at all, and spelling it at the
+/// pointer's own type keeps the value a pointer for whatever reads it.
+pub(super) fn project_machine_use_of(
     base: CExpr,
     slice: MachineUseSlice,
+    base_is_pointer: bool,
 ) -> Result<CExpr, MachineUseProjectionError> {
+    let base = if base_is_pointer && c_integer_width_is_spellable(slice.carrier_width_bits()) {
+        CExpr::cast(checked_uint_type(slice.carrier_width_bits())?, base)
+    } else {
+        base
+    };
     let projected = if c_integer_width_is_spellable(slice.carrier_width_bits()) {
         let carrier_type = checked_uint_type(slice.carrier_width_bits())?;
         let selected_type = checked_uint_type(slice.width_bits())?;

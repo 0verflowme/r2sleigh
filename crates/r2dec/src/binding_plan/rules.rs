@@ -71,6 +71,145 @@ pub(super) fn component_eligible_values(
         .collect())
 }
 
+/// The type one object is declared with.
+///
+/// Until now every binding was declared `CType::machine_bits(width)` -- the
+/// unsigned integer of its storage's width -- and the recovered type was
+/// reported by the typed-recovery score rather than asserted in the C. That
+/// makes every parameter a `uint64_t`, so nothing the evidence solver proves
+/// about a pointer or a narrower result reaches a reader or a recompile.
+///
+/// The evidence decides it now, and only where it agrees with itself and with
+/// the storage. Every member of one binding is one object, so members that
+/// carry different evidence types are a genuine conflict and the machine word
+/// stands; a type whose width does not match the storage is not a description
+/// of this object and is refused the same way. A pointer is the one type whose
+/// width is the pointer width rather than the declared object's, and it is
+/// admitted at exactly that width.
+///
+/// Casts follow the declaration -- `source_type_for_var` asks the declaration
+/// before the certified hint -- so asserting here changes the operands too,
+/// which is what keeps the emitted C compiling under `-Werror` rather than
+/// converting an argument's signedness against its own declaration.
+pub(super) fn declaration_type_for_binding(
+    source_owned: &SourceOwnedFunctionFacts,
+    members: impl IntoIterator<Item = ValueId>,
+    width_bits: u32,
+    ptr_bits: u32,
+) -> r2types::CTypeLike {
+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+    let evidence = source_owned.evidence_types();
+    let mut agreed: Option<r2types::CTypeLike> = None;
+    for value in members {
+        let Some(ty) = evidence.value_type(value) else {
+            continue;
+        };
+        match &agreed {
+            None => agreed = Some(ty.clone()),
+            Some(existing) if existing == ty => {}
+            Some(_) => return machine,
+        }
+    }
+    let Some(agreed) = agreed else {
+        return machine;
+    };
+    admit_declaration(agreed, width_bits, ptr_bits)
+}
+
+/// The type a stack object is declared with.
+///
+/// A spilled pointer is a pointer. Declaring the slot the machine word while
+/// the register it is spilled from is a pointer makes the reload
+/// `p = slot;` -- an integer assigned to a pointer, which does not compile --
+/// so the object and the values that flow through it have to be declared from
+/// the same evidence.
+pub(super) fn declaration_type_for_stack_object(
+    source_owned: &SourceOwnedFunctionFacts,
+    object: r2ssa::ObjectId,
+    width_bits: u32,
+    ptr_bits: u32,
+) -> r2types::CTypeLike {
+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+    let source = source_owned.source();
+    let Some(fact) = source.objects().object(object) else {
+        return machine;
+    };
+    let (base, offset) = match fact.kind {
+        r2ssa::ObjectKind::StackSlot { base, offset, .. }
+        | r2ssa::ObjectKind::FrameObject { base, offset, .. } => (base, offset),
+        _ => return machine,
+    };
+    let key = r2types::StackSlotKey {
+        base: match base {
+            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
+            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
+        },
+        offset,
+    };
+    let Some((_, ty)) = source_owned
+        .evidence_types()
+        .stack_slot_types()
+        .find(|(slot, _)| **slot == key)
+    else {
+        return machine;
+    };
+    admit_declaration(ty.clone(), width_bits, ptr_bits)
+}
+
+/// Admit a recovered type only where it describes an object of this storage.
+///
+/// A type whose width is not the storage's width is not a description of this
+/// object, whatever else it may be true of, and the machine word stands. A
+/// pointer is the one type whose width is the pointer width rather than the
+/// declared object's, and it is admitted at exactly that width.
+fn admit_declaration(ty: r2types::CTypeLike, width_bits: u32, ptr_bits: u32) -> r2types::CTypeLike {
+    let admissible = match &ty {
+        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
+        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
+        r2types::CTypeLike::Float(bits) => *bits == width_bits,
+        _ => false,
+    };
+    if admissible {
+        ty
+    } else {
+        r2types::CTypeLike::machine_bits(width_bits)
+    }
+}
+
+/// The storage width a declared type describes.
+///
+/// This is what the seal checks a declaration against. It used to compare the
+/// declaration to `CType::machine_bits(width)` outright, which is a check that
+/// the declaration is the machine word rather than a check that it describes
+/// the storage -- so it rejected every recovered type on sight. The width is
+/// the part the seal can re-derive from the source; what the evidence proved
+/// beyond it is not something a second derivation of the *plan* can confirm.
+pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
+    match ty {
+        r2types::CTypeLike::Int {
+            bits,
+            signedness: r2types::Signedness::Unsigned,
+        } if *bits <= 128 => Some(*bits),
+        r2types::CTypeLike::Int {
+            bits,
+            signedness: r2types::Signedness::Signed,
+        } if *bits <= 128 => Some(*bits),
+        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
+        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// Whether a declaration describes an object of exactly this storage width.
+pub(super) fn declaration_type_describes_width(
+    ty: &r2types::CTypeLike,
+    width_bits: u32,
+    ptr_bits: u32,
+) -> bool {
+    declaration_type_width(ty, ptr_bits) == Some(width_bits)
+}
+
 /// The pairs of values some one instruction reads at the same time.
 ///
 /// If a single instruction takes both values as inputs, both hold their
