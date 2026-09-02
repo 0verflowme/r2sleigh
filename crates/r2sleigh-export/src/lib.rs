@@ -12,7 +12,7 @@ use thiserror::Error;
 ///
 /// This is one exact schema, not a compatibility selector. Consumers must
 /// reject any value other than this constant.
-pub const SSA_JSON_SCHEMA_VERSION: u32 = 2;
+pub const SSA_JSON_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionAction {

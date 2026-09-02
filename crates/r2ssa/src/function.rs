@@ -2063,10 +2063,8 @@ impl SSAFunction {
         let cfg = crate::optimize::OptimizationConfig {
             max_iterations: 1,
             enable_sccp: true,
-            enable_const_prop: false,
             enable_inst_combine: false,
             enable_copy_prop: false,
-            enable_cse: false,
             enable_dce: false,
             preserve_memory_reads: false,
         };
@@ -2146,10 +2144,8 @@ impl SSAFunction {
         let cfg = crate::optimize::OptimizationConfig {
             max_iterations: 1,
             enable_sccp: true,
-            enable_const_prop: false,
             enable_inst_combine: false,
             enable_copy_prop: false,
-            enable_cse: false,
             enable_dce: false,
             preserve_memory_reads: true,
         };
@@ -2175,10 +2171,8 @@ impl SSAFunction {
         let cfg = crate::optimize::OptimizationConfig {
             max_iterations: 1,
             enable_sccp: true,
-            enable_const_prop: false,
             enable_inst_combine: false,
             enable_copy_prop: false,
-            enable_cse: false,
             enable_dce: false,
             preserve_memory_reads: true,
         };
