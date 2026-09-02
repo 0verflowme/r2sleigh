@@ -8113,3 +8113,180 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+## Where a function's cost actually went: a Sleigh load, not the program
+
+The per-function cost was the task, and the shape of the answer was agreed
+before the work: an engine-owned per-binary cache of prepared bodies, because
+the snapshot walk pulls in callee bodies and a callee is lifted again for every
+caller that mentions it. That cache is built and it works. It is not what was
+making a function expensive.
+
+**Every measurement below was taken on the Linux VM against the DecBench GCC
+-O0 builds, with each column's plugin installed under its own `HOME` so that
+neither column can be overwritten while it is being measured.** That precaution
+was not optional: the first two attempts at this measurement were void. The
+shared install lock in `tests/locked_run.sh` was held for the whole of the
+second run and another tree on the same host still installed over the plugin
+between two sections of it, so half of that run was measuring somebody else's
+build. radare2 reads its user plugins from `$HOME`, so a private `HOME` per
+column is an isolation nothing outside the script can defeat, and it needs no
+cooperation from the other agent. That is the sixth measurement this class of
+error has cost the project and the first one it cannot cost again.
+
+    bzip2recover, 38 functions        absent    before     after
+      aaa                              0.76s     6.30s     3.29s
+      aa                               0.19s     2.70s     2.29s
+      aaa minus aa                     0.57s     3.60s     1.00s
+      proof sweep, plugin's share         --     3.03s     0.43s
+      per proved function (22)            --      138ms      20ms
+      pdd capture, first                  --      599ms    58.8ms
+      pdd capture, repeated               --      586ms     114us
+      pdd wall clock over aaa             --   in noise    0.073s
+
+    bzip2, 154 functions              absent    before     after
+      aaa                             10.84s    23.90s    22.00s
+      aa                               3.00s     5.99s     5.66s
+      functions the sweep reached         --        35        97
+      of those, proved                    --        35        42
+      budget exhausted at                 --    10.35s    10.02s
+      pdd capture, first                  --     1065ms     204ms
+      pdd capture, repeated               --      880ms     135us
+
+Medians of three on bzip2recover and two on bzip2; the machine is shared and
+noisy, so the ratios are the claim and the milliseconds are approximate.
+
+### The cache works completely, and the sweep gets nothing from it
+
+Repeated work vanishes. A second `pdd` of one function costs 114 microseconds
+of capture against 586 milliseconds, five thousand times less, with
+`cached_callees=3 cached_root=1` on the line saying why.
+
+And the analysis sweep reported `cache_hits=0` across the whole of `aaa`, with
+26 entries for the 22 functions bzip2recover proves. The reason is worth
+keeping, because it invalidates the premise the cache was designed from: **the
+functions an analysis sweep proves are import thunks, and a thunk has no
+callees to share.** The sweep produced 22 entries, exactly its 22 roots, and
+not one callee entry. So the sweep's cost was never repeated work between
+functions. It was the first-time cost of one function, and no cache removes
+that.
+
+### What the first time was spent on
+
+`Disassembler::from_trusted_profile` parses the whole compiled `.sla` and
+rebuilds the register and address-space tables from it, and `lift_owned_function`
+called it once for the function asked for and once for every callee captured
+beside it.
+
+    x86-64 Sleigh profile load      58000-91000us
+    one three-byte block lift             21-83us
+
+Three orders of magnitude, and the load was on the per-function path. A request
+with three callees spent about a quarter of a second building four identical
+copies of one specification. A twelve-byte import thunk cost a profile load and
+almost nothing else, which is the whole explanation for twenty-two tiny
+functions taking three seconds to prove.
+
+`shared_trusted_profile` loads each embedded profile on first ask and hands the
+same one out afterwards -- 52588us, then 0us, then 1us. Reuse across functions
+is the reuse that already happens across blocks: `lift_genuine_block` takes
+`&self`, every block of a function already goes through one instance at
+arbitrary addresses in arbitrary order, and nothing is reset between them now
+or before. It is thread-local rather than global because the instance owns a
+C++ Sleigh object that declares neither `Send` nor `Sync`, so the bound is one
+per embedded profile per lifting thread: at most eleven, in practice one.
+
+Both changes were needed and neither substitutes for the other. The profile
+load is what makes a *first* look at a function cheap; the program cache is what
+makes every look after the first nearly free. Together the per-proved-function
+cost falls from 138ms to 20ms and a repeated decompile from 586ms to 114us.
+
+### Keying a cache when a stale hit is a wrong answer
+
+The key is the whole serialized snapshot, byte for byte, not a hash of it. A
+miss costs time and a wrong hit renders a body that is not the function's, with
+nothing downstream to say so. A hash small enough to store makes two claims at
+once -- that it covers every input, and that no two inputs collide -- and
+neither can be checked at the point of use, while the snapshot *is* the whole
+input to a lift by construction of the V2 boundary. Comparing it costs one
+`memcmp` and a few kilobytes per function against hundreds of milliseconds.
+
+`stable_ssa_semantic_fingerprint` is recorded beside each entry rather than used
+as the key, which is the only honest place for it: it is computed from the
+prepared artifact, so it cannot be known until the work the lookup exists to
+avoid has been done.
+
+Two things the design had to get right, both of which would have silently
+produced a cache that never hits:
+
+*A root and a callee body are two different artifacts for one address.* The
+function a request asks about is prepared knowing the recovered interfaces of
+everything it calls; a body captured as a callee is prepared alone. Under one
+address key each would be the other's eviction and neither would ever hit, so
+`PreparedRole` is part of the key.
+
+*A callee carries its caller's capture tag.* radare2 gives every callee the
+root's `revision_identity`, deliberately, so a consumer can tell the bodies were
+read together -- which means the same body under two callers serializes two
+ways and a byte-exact key never matches in the one case a callee cache exists
+for. `encode_snapshot_cache_key` writes the body's own `content_identity` in
+the tag's place. Every other field is still written and still compared, so two
+different bodies are still told apart by the bytes describing them, and the
+substituted field is a hash of those same bytes rather than a new claim. On a
+radare2 predating `content_identity` the two are equal and this degrades to a
+key that misses rather than one that is wrong.
+
+The entry bound is one per address per preparation, replaced when that address's
+input changes, so the count is the program's own function count at most twice
+over. Nothing is evicted while a session runs: an eviction policy would have to
+guess which function a later request wants, and a sweep asks about all of them.
+
+### The machine arena was lowered twice per render
+
+`BindingPlan::build_shadow` builds a `MachineProjection` and keeps it;
+`build_upstream_shadow_oracle` built a second from the same source. The oracle's
+comment explains that it takes no plan as input so a wrong plan disposition is
+observable rather than self-validating, and that argument is about the plan's
+*decisions*. A projection is not one: it is derived from the source alone, and
+`validate_source`, which `derive_report` already calls first, has proven the
+plan's copy is what this exact source produces. The oracle now borrows it, and
+the module documentation says which independence is load-bearing and which was
+only cost, because the next reader of the first sentence would otherwise put
+the second build back.
+
+### Two open items, and one decision that is not ours
+
+**The dominant cost is now the `aa` path, and nobody has measured it.** On
+bzip2recover the plugin adds 2.10 seconds to `aa` after this work against 0.43
+seconds to the proof sweep -- five times as much, over 38 functions, or about
+55ms each. That is `sleigh_analyze_fcn`'s semantic comments,
+`sleigh_get_data_refs`, and `sleigh_op` per instruction, none of which this
+work touched and none of which has ever been split. It is the next measurement
+to take, and it is a bigger number than the one this task was given.
+
+**The two smaller hot shapes were deliberately not taken.** `inlinable_values`
+scanning `graph.insts` per candidate sits in `binding_plan/rules.rs`, which
+another effort is editing for the inlining guard, and the load-lowering access
+filter is in `MachineProjection::from_artifact`. Both are inside the
+`binding_plan` stage, which is 10ms of a 21ms render on `bsGetBit` and 275ms
+against the structurer's 2274ms on `main`. Halving either moves nothing that
+matters while the structurer is superlinear, so the structurer comes first.
+
+**Whether the `aaa` sweep should become lazy is still open, and it is the
+owner's call rather than ours.** The measurement says the question is live:
+bzip2 still exhausts the ten-second budget, now reaching 97 of 154 functions
+instead of 35 and proving 42 instead of 35. So the sweep is 2.8 times further
+through the program and still does not finish it. Deferring proofs to first
+`pdd` would finish `aaa` in the lift alone -- but the indirect-call xrefs and
+unreachable-block comments radare2 consumes are produced by those proofs, so
+`axt` immediately after `aaa` would no longer show them. Trading a fact radare2
+can currently see for analysis time is a decision about what the plugin
+promises, not an optimisation, and it is recorded here unmade.
+
+The ten-second budget itself deserves the same scrutiny the project gives every
+other bound. It is a constant per analysis mode in `r2engine`, not derived from
+anything the sweep has to clear, and on bzip2 it is the only thing deciding how
+much of the program gets proved. Whatever replaces it should be derived from
+the work in front of it -- the function count and the measured per-function
+cost, both of which the sweep now knows -- rather than from a number that
+happens to feel like a long time.
