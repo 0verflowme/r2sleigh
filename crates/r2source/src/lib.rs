@@ -165,6 +165,26 @@ impl SourceSignaturePresentation {
     pub fn parameters(&self) -> &[SourceSignatureParameter] {
         &self.parameters
     }
+
+    /// The parameters the prototype names, without the variadic tail.
+    ///
+    /// A prototype that ends in an ellipsis carries it as a trailing
+    /// parameter, so the parameter list on its own over-counts what the callee
+    /// is declared to take by one, and every caller that treated its length as
+    /// the arity said so for every call site of a variadic callee alike.
+    pub fn named_parameters(&self) -> &[SourceSignatureParameter] {
+        match self.parameters.split_last() {
+            Some((last, rest)) if last.is_variadic_tail() => rest,
+            _ => &self.parameters,
+        }
+    }
+
+    /// Whether the callee takes a variadic tail.
+    pub fn is_variadic(&self) -> bool {
+        self.parameters
+            .last()
+            .is_some_and(SourceSignatureParameter::is_variadic_tail)
+    }
 }
 
 /// One parameter of a recovered prototype: what it is called and its spelling.
@@ -191,6 +211,20 @@ impl SourceSignatureParameter {
 
     pub fn type_spelling(&self) -> Option<&str> {
         self.type_spelling.as_deref()
+    }
+
+    /// Whether this entry is the ellipsis rather than a parameter.
+    ///
+    /// This is how the source spells a variadic tail: a trailing entry called
+    /// `...`, which names no storage and stands for however many arguments a
+    /// call chooses to pass. Older captures put the ellipsis in the type half
+    /// instead, so both spellings are recognised -- the same two the source's
+    /// own `r_type_arg_is_vararg` accepts.
+    pub fn is_variadic_tail(&self) -> bool {
+        [self.name(), self.type_spelling()]
+            .into_iter()
+            .flatten()
+            .any(|spelling| spelling.trim() == "...")
     }
 }
 

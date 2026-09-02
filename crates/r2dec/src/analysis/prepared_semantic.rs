@@ -1777,7 +1777,6 @@ fn populate_calls(
                 &owner,
             );
         }
-        let max_arity = prepared_call_max_arity(inputs, &call_view);
         let authoritative_args = canonical_call_authoritative_args(
             symbols,
             site,
@@ -1785,7 +1784,6 @@ fn populate_calls(
             inputs.prepared,
             view,
             inputs.callsite_facts(),
-            max_arity,
         );
         call_view.authoritative_arg_values =
             authoritative_args.iter().map(|(value, _)| *value).collect();
@@ -1809,6 +1807,19 @@ fn callsite_direct_target(
         .direct_target
 }
 
+/// The arguments this call passes, in convention order.
+///
+/// How many there are is a fact about the call site, so the call site's own
+/// certificate answers it and nothing else does. Asking the callee instead --
+/// taking the arity off its recovered signature and truncating to it -- gives
+/// one answer for every site that calls it, which is wrong the moment the
+/// callee is variadic: `fprintf` declares two parameters and its three calls
+/// in `bzip2recover`'s `tooManyBlocks` pass five, three and three. The cap
+/// silently discarded the difference.
+///
+/// The sequence still has to be contiguous from index zero and every entry
+/// still has to carry a location certificate, so a certificate with a gap in
+/// it yields the prefix before the gap rather than a resequenced list.
 fn canonical_call_authoritative_args(
     symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
     site: (u64, usize),
@@ -1816,7 +1827,6 @@ fn canonical_call_authoritative_args(
     prepared: &SsaArtifact,
     view: &PreparedSemanticView,
     callsite_facts: Option<&FunctionCallsiteFacts>,
-    max_arity: Option<usize>,
 ) -> Vec<(ValueId, CExpr)> {
     let Some(callsite_facts) = callsite_facts else {
         return Vec::new();
@@ -1832,9 +1842,8 @@ fn canonical_call_authoritative_args(
     };
 
     let mut args = Vec::new();
-    let limit = max_arity.unwrap_or(usize::MAX);
     for argument in &call_facts.argument_values {
-        if argument.index != args.len() || args.len() >= limit {
+        if argument.index != args.len() {
             break;
         }
         if !call_arg_value_has_location_certificate(call_facts, argument.index, argument.value) {
@@ -1849,8 +1858,14 @@ fn canonical_call_authoritative_args(
         }
     }
 
+    // A stack-carried argument continues the same sequence, so it is admitted
+    // only where its certificate says it does. The stack certificates are
+    // numbered in their own space starting at zero, which is what a register
+    // argument at the same index already claims, so the ones that do not
+    // continue the register run stop the list rather than being renumbered
+    // onto positions the machine never proved.
     for stack_arg in &call_facts.stack_argument_locations {
-        if args.len() >= limit {
+        if stack_arg.index != args.len() {
             break;
         }
         if let Some(expr) =
@@ -1892,16 +1907,6 @@ fn authoritative_expr_for_prepared_value(
         .or_else(|| scalar_owner_expr_for_value(symbols, prepared, view, var, var.size))
         .or_else(|| view.owner_expr_for_var(var).cloned())
         .or_else(|| prepared_value_program_expr(symbols, view, var))
-}
-
-fn prepared_call_max_arity(
-    _inputs: &PreparedSemanticViewInputs<'_>,
-    call_view: &PreparedCallView,
-) -> Option<usize> {
-    call_view
-        .callee_identity
-        .as_ref()
-        .and_then(CalleeIdentity::non_variadic_known_arity)
 }
 
 fn authoritative_scalar_expr_for_value(

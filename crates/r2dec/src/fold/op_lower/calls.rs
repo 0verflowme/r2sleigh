@@ -72,15 +72,23 @@ impl<'a> FoldingContext<'a> {
     /// recovered the parameter list is left unspecified rather than asserted,
     /// which is the same distinction `params_known` draws for the function
     /// being rendered: an empty list would claim the callee takes nothing.
+    ///
+    /// One declaration serves every call to the callee in this function, so it
+    /// may only state what all of them agree on. For a variadic callee that is
+    /// the named parameters and an ellipsis: the tail differs from call to
+    /// call and the ellipsis is precisely the spelling for "and however many
+    /// more". Where two calls disagree about anything the declaration does
+    /// state, there is no declaration that describes both, and the rendering
+    /// refuses rather than declaring one of them and contradicting the other.
     pub(super) fn record_callee_declaration(
         &self,
         func_expr: &CExpr,
         block_addr: u64,
         op_idx: usize,
         args: &CertifiedCallArgs,
-    ) {
+    ) -> OpLoweringResult<()> {
         let CExpr::External { name, .. } = func_expr.unobserved() else {
-            return;
+            return Ok(());
         };
         // The widths the call itself proves: the storage the result is defined
         // at, and the storage each certified argument occupies.
@@ -94,22 +102,47 @@ impl<'a> FoldingContext<'a> {
         // hard `conflicting types` error rather than a warning. Recorded types
         // are also often absent, and an absent one spells `/* unknown */`,
         // which does not parse at all.
+        let cert = self
+            .certified_callsite_for_op(block_addr, op_idx)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        // Only the named parameters go in the list. The tail this call passes
+        // is what differs between call sites, and the ellipsis stands for it.
+        let named = if cert.variadic {
+            cert.fixed_argument_count
+                .filter(|count| *count <= args.values.len())
+                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?
+        } else {
+            args.values.len()
+        };
         let declaration = crate::ast::CExternDecl {
             name: name.clone(),
             ret_type: self
                 .certified_call_result_value((block_addr, op_idx))
                 .and_then(|value| self.machine_value_width_bits(value))
                 .map_or(CType::Void, CType::uint),
-            params: args
-                .values
+            params: args.values[..named]
                 .iter()
                 .map(|value| self.machine_value_width_bits(*value).map(CType::uint))
                 .collect::<Option<Vec<_>>>(),
+            variadic: cert.variadic,
         };
-        self.callee_declarations
+        match self
+            .callee_declarations
             .borrow_mut()
             .entry(declaration.name.clone())
-            .or_insert(declaration);
+        {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(declaration);
+                Ok(())
+            }
+            // Two calls that need different declarations for one name have no
+            // declaration between them. Keeping the first, which is what a
+            // name-keyed insert does, declares one call's shape and leaves the
+            // other contradicting it.
+            std::collections::btree_map::Entry::Occupied(slot) => (*slot.get() == declaration)
+                .then_some(())
+                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection()),
+        }
     }
 
     /// The width a value occupies in machine storage, in bits.

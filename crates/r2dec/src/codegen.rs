@@ -197,13 +197,24 @@ impl CodeGenerator {
             self.output.push_str(&declaration.name);
             self.output.push('(');
             match &declaration.params {
-                Some(params) if params.is_empty() => self.output.push_str("void"),
+                // C has no spelling for a function whose whole parameter list
+                // is an ellipsis, so a variadic callee with no named
+                // parameters is declared with an unspecified list instead: it
+                // accepts the arguments the call passes, which is the point,
+                // and asserts nothing else.
+                Some(params) if params.is_empty() => {
+                    self.output
+                        .push_str(if declaration.variadic { "" } else { "void" });
+                }
                 Some(params) => {
                     for (index, param) in params.iter().enumerate() {
                         if index > 0 {
                             self.output.push_str(", ");
                         }
                         self.emit_type(param);
+                    }
+                    if declaration.variadic {
+                        self.output.push_str(", ...");
                     }
                 }
                 None => {}
