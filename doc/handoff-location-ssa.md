@@ -8113,3 +8113,152 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+The tail transfer: what the source now carries, and the two forks that remain
+-----------------------------------------------------------------------------
+
+**The brief's numbers were wrong in both directions, and the corrected ones
+reorder the work.** The direct tail call was described as 22 of the 41 refusing
+real `/bin/ls` functions and as the project's largest coverage lever. Measured
+against the coverage baseline, the direct tail call is ten functions, sixteen
+counting the short forwarders, and the largest lever by a wide margin is its
+sibling: the transfer *through a value*, which is every import thunk, at
+**0 of 105 rendered** across the whole sweep -- 84 in `/bin/ls` and 21 across
+the corpus binaries. Every one of the 105 refuses identically, with
+`observation journal: RenderedValueRequired`. Of the 72 refusing real
+functions, only twelve are `RenderedValueRequired`, and those are a different
+cause.
+
+**Measured, on this tree, before and after.** 271 of 449 both before and after
+the two commits below: 261 of 313 on the corpus binaries, 10 of 136 on
+`/bin/ls`, 0 of 105 on thunks. The commits are plumbing and an honesty fix, so
+coverage is unchanged by design; what moved is which cause each refusal
+reports. The one `REGRESSION` line the harness prints against its blessed
+baseline, `sym.func.10000306c`, predates this work: it comes from the
+integration branch's new linear-body refusal, and was measured identically
+before anything here was written.
+
+**What radare2 now carries.** The function map is what knows that a jump's
+target is where another function starts, and the relocation table is what
+knows which import a loaded slot names, so the detection sits in the fork at
+`libr/anal/function.c` rather than being guessed from addresses in Rust.
+`fcn_context_collect_callees` kept only the `CALL` references leaving the
+image; it now also offers a *tail jump* -- a direct successor outside the image
+that is exactly a function entry, so a jump into the middle of another function
+stays what it was -- and a *tail slot*, a block with no successor whose last
+instruction decodes as a jump through a value. Each callee, each call site
+interface and the interface hash carry an `RAnalCallTransfer`, the snapshot
+exposes it through `r_anal_function_snapshot_call_site_transfer`, and the wire
+format is version 7: one byte after the target name, read as `Call` from any
+older buffer. `RBinBind` gained a relocation-at-address lookup, and
+`function_get_signature` split so a prototype can be built for a bare name that
+is no function of this binary, which is what an imported callee is.
+
+**An empty body was being reported as unrepresentable control flow.** A
+function whose body renders no statement had its `FunctionBody` marker
+collapsed by the structurer cleanup along with the body it wrapped; sealing
+then failed for want of a marker at the root, and that became
+`unrepresentable control flow`. Six `/bin/ls` forwarders reported a structural
+refusal for a fact about their contents. With the marker kept, that column goes
+from six to zero and all six report the cause they actually have --
+`effect obligations refused`, the refused `ControlTransfer` for the tail branch,
+which is the real subject. Worth stating plainly because it was the risk in
+the fix: they did **not** become empty-bodied renders. An empty body would have
+counted as rendered by the harness and claimed the function does nothing, which
+is the wrong-answer class; the effect ledger refuses first and no cell was
+bought with a lie.
+
+**Fork one, and it is the whole of the 105: what a thunk is allowed to claim.**
+The refusal is exact and the machine side is easier than expected. On x86-64 a
+thunk is one instruction and its whole SSA is
+`BranchInd { target: ram:0x100002010 }` -- the GOT slot *is* the target value,
+with no definition, which is why the journal has nothing to account. On arm64
+the slot is `adrp` plus a displacement and the branch reads a register loaded
+from it. So the machine can prove the exact slot, and radare2's relocation
+names it. Note in passing that radare2's own `ICOD` reference for these blocks
+is the `adrp` page base, not the slot: at `0x1000042a4` it points at
+`0x100008000`, whose relocation says `humanize_number`, while the `add #0x28`
+makes the true slot `0x100008028`, which the relocation table names
+`__assert_rtn` -- matching the thunk. Keying on that reference would have named
+every thunk in a page after the first relocation in it. The source must
+therefore describe slots and let the machine pick, never pick for it.
+
+What is *not* settled is what may then be rendered, and the arithmetic decides
+nothing on its own. A thunk forwards the arguments its caller left in
+registers; it reads none of them and writes none of them. So the standing rule
+that an unknown call takes its arity from the convention's argument registers
+provably written and live into the transfer yields **zero arguments** here, and
+would render `acl_get_entry()` for a function of three arguments -- silently
+dropping them, which is exactly the class of wrong answer the variadic
+callsite-arity defect was just raised for. Counting `/bin/ls`'s 84 thunks by
+what radare2 knows about the callee:
+
+    complete non-variadic prototype, forwardable as a call        54
+    no recovered prototype, so arity unknown                      22
+    variadic                                                       8
+
+The eight variadic ones are not a gap in the recovery: C cannot forward `...`,
+so no call expression exists for them at any level of knowledge. The options,
+with the trade-off that separates them:
+
+1. *Render the 54, refuse the 30.* Truthful, and refusing per-callee where the
+   evidence is absent is what this project already does per-value. Buys 54 of
+   105 cells and leaves the metric honest about the rest.
+2. *Render all 105 as a call through the named slot.* Requires asserting an
+   arity radare2 never recovered for 22 of them, which drops arguments
+   silently, and has no expression at all for the 8 variadic.
+3. *Render none.* The status quo, and the position the earlier survey took when
+   it recorded the value of rendering thunks as low.
+
+Option 1 is the one consistent with the rest of the system, but it decides that
+a thunk may claim a direct call to the symbol its slot's relocation names, on
+radare2's authority and marked as such, and that is a claim about what the
+decompiler asserts rather than an implementation detail. It is put here rather
+than taken.
+
+Two smaller things fall out of it either way. The thunk's parameters have to
+exist for a forwarding call to name them, and radare2 already supplies them --
+it gives the thunk function the callee's own signature -- so this does not need
+the pass-through parameter work that four other `/bin/ls` functions do. And the
+marking has no home yet: nothing in the renderer says which facts came from
+radare2, so "the callee at this site is named by the relocation at slot S"
+needs a line the proof can carry.
+
+**Fork two: what IL shape a direct tail call takes.** Independent of the above
+and needed for the ten-to-sixteen real functions. The source now offers the
+callsite; what is unsettled is the representation.
+
+*Option A -- rewrite at the lift into a call followed by the machine's own
+return sequence.* `lift_owned_function` has the external exits, the advisory
+sites and the architecture, so it can replace a terminal `Branch f` licensed by
+a `TailJump` site with `Call f` and then the ops the architecture's return
+performs. Downstream nothing changes: the block is an ordinary call-then-return
+and every certificate already applies. The costs are real: the synthesized ops
+are the *callee's* epilogue attributed to the caller's `jmp`, so the
+per-instruction ledger states a load and a stack adjust that instruction does
+not perform; the genuine lift stops being a function of bytes and Sleigh alone;
+and on AArch64 the synthesized `return [x30]` reads x30 after the call, whose
+`CallDefine` clobbers it, so either a tail call gets no `CallDefine` for the
+return-address carrier or the return-address fact learns to look through one.
+
+*Option C -- a terminal call with no fallthrough as a first-class tail return
+boundary.* The op becomes `Call f`, the terminator `Call { fallthrough: None }`,
+and `collect_source_boundary_facts` records a return boundary at the call whose
+machine state is the stack-pointer and return-address carriers reaching it
+entry-preserved -- which is the true requirement of a tail transfer, rather
+than a load of a return slot that never happens. The renderer emits
+`return f(args);`. The cost is breadth: every place that keys a return on
+`SSAOp::Return` needs a tail arm -- the boundary collector, the return-control
+and return-value certificates, the render plan, placement, the observation
+journal, and both terminators -- which is the five-places shape this document
+already records being reverted whole when attempted late in a session.
+
+*Option B, keeping the `Branch` op and giving it a form,* is dominated by C: it
+needs the result register defined at the branch, which is what calling it a
+call provides.
+
+**One caution for whoever takes either fork.** Do not build anything that
+assumes a callee has one arity. A separate confirmed defect decides argument
+count once per callee rather than per callsite, so three `fprintf` calls of
+five, three and three arguments all render as three; the thunk work touches the
+same call-boundary machinery and must not deepen that assumption.
