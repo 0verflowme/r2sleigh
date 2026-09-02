@@ -7983,3 +7983,44 @@ without a rendered occurrence. That is consistent with the identity-merge
 accounting, which fills cells for values whose merges no longer render a
 statement, and it means the thunk work described earlier now starts from a
 different symptom than the one recorded against it.
+
+**Widening inlining to duplicable values: the accounting cannot come second.**
+The plan sequenced the literal admission first and the multiplicity rule after
+it, and that order does not exist. Admitting literal-only values on their own
+renders 53 of 54: the ledger counts one rendered occurrence per obligation, a
+literal spelled at three readers produces three, and nine cells refuse with
+`DuplicateRenderedOccurrence` immediately. The two land together or not at all.
+`duplicates_are_a_repeated_literal` now sits beside `duplicates_are_exclusive`
+as the second way several occurrences are one execution.
+
+`literal_only_declarations` falls from 292 to 103 with 54 of 54 on every
+column. Two restrictions hold it back from the rest, each with a reason rather
+than to pass a gate: the value's own storage must be a lowering temporary,
+because a register or memory cell holding a literal is a machine object the
+program writes and a reader spelling the constant does not perform that write;
+and no reader may sit in a certificate-elided instruction, because the
+accounting for a partly-elided duplicable value is not established.
+
+**The plan's question and the rewriter's are not the same question.** The first
+attempt asked `term_is_duplicable`, which is "does rendering this twice observe
+anything twice", and inlined any expression over never-redefined entry values,
+dissolving parameter bindings across twenty-one tests. The plan's question is
+whether a value is cheap enough to spell instead of name, and only a literal
+is. Two neighbouring questions with one obvious-looking answer, which is the
+shape this branch has now hit three times.
+
+**The flag carriers were never a flag problem, and admitting flag operations
+cannot fix them.** `Compare` is already an inlinable kind and the carriers hold
+comparisons, so there is nothing for `ArithmeticFlag` to convert; admitting it
+anyway fails, because the materialiser has no flag arm and the plan then
+promises an inline the renderer cannot produce. Why a comparison-holding
+carrier stays bound is a separate question that needs instrumentation, and it
+is the open one for the 192.
+
+**Seventeen fixtures were corrected, for the second time and for the same
+reason.** They were chains of constants, so every value in them now inlines and
+a test about a bound value had no subject; they read a register instead. The
+first time was when single-use folding landed and each fixture gained a second
+reader. A fixture built from the simplest possible values is a fixture that
+stops having a subject every time the renderer gets better, and the comments
+now name both reasons.

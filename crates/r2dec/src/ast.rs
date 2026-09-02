@@ -2608,7 +2608,11 @@ mod cast_collapse {
                 "({outer:?})({inner:?}) should be one conversion"
             );
             for source in [u(8), i(8)] {
-                agrees(&[outer.clone(), inner.clone()], &[outer.clone()], &source);
+                agrees(
+                    &[outer.clone(), inner.clone()],
+                    std::slice::from_ref(&outer),
+                    &source,
+                );
             }
         }
     }
