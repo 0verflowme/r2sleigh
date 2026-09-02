@@ -77,8 +77,10 @@ pub(super) fn project_machine_use_of(
     slice: MachineUseSlice,
     base_is_pointer: bool,
 ) -> Result<CExpr, MachineUseProjectionError> {
+    // A pointer cannot be sliced, and the conversion to the carrier's own
+    // unsigned integer is the address-width step, not an ordinary widening.
     let base = if base_is_pointer && c_integer_width_is_spellable(slice.carrier_width_bits()) {
-        CExpr::cast(checked_uint_type(slice.carrier_width_bits())?, base)
+        CExpr::pointer_width_cast(checked_uint_type(slice.carrier_width_bits())?, base)
     } else {
         base
     };
@@ -334,7 +336,8 @@ mod tests {
             rhs,
             CExpr::Cast {
                 ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
-                expr
+                expr,
+                ..
             } if matches!(*expr, CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
     }
@@ -359,6 +362,7 @@ mod tests {
                     signedness: r2types::Signedness::Unsigned,
                 },
             expr: combined,
+            ..
         } = rhs
         else {
             panic!("insert must return the carrier type");

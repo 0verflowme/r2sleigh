@@ -1472,7 +1472,7 @@ impl<'a> FoldingContext<'a> {
         match expr {
             CExpr::Var(name) if self.linear_var_is_integer_scalar(*name) => Some(expr.clone()),
             CExpr::Paren(inner) => self.linear_atom_expr(inner),
-            CExpr::Cast { ty, expr: inner }
+            CExpr::Cast { ty, expr: inner, .. }
                 if ty.is_integer() && self.linear_atom_expr(inner).is_some() =>
             {
                 Some(expr.clone())
@@ -2063,7 +2063,7 @@ impl<'a> FoldingContext<'a> {
             && let CType::Int { bits, .. } = &target
             && *bits < 64
         {
-            return CExpr::cast(target, CExpr::cast(CType::uint(64), expr));
+            return CExpr::cast(target, CExpr::pointer_width_cast(CType::uint(64), expr));
         }
         CExpr::cast(target, expr)
     }
@@ -2121,7 +2121,10 @@ impl<'a> FoldingContext<'a> {
                     .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
                 && bits < pointer_bits
             {
-                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
+                return CExpr::cast(
+                    target,
+                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
+                );
             }
             if self.looks_like_pointer(&expr)
                 && let Some((_, bits)) = self.int_meta(&target)
@@ -2131,7 +2134,10 @@ impl<'a> FoldingContext<'a> {
                     .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
                 && bits < pointer_bits
             {
-                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
+                return CExpr::cast(
+                    target,
+                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
+                );
             }
             CExpr::cast(target, expr)
         } else {

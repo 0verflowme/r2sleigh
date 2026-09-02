@@ -4812,10 +4812,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_expr: Box::new(Self::normalize_condition_addr_artifacts(*then_expr)),
                 else_expr: Box::new(Self::normalize_condition_addr_artifacts(*else_expr)),
             },
-            CExpr::Cast { ty, expr } => CExpr::Cast {
-                ty,
-                expr: Box::new(Self::normalize_condition_addr_artifacts(*expr)),
-            },
+            CExpr::Cast { ty, expr, role } => {
+                CExpr::cast_with_role(ty, Self::normalize_condition_addr_artifacts(*expr), role)
+            }
             CExpr::Call { func, args, site } => CExpr::Call {
                 site,
                 func: Box::new(Self::normalize_condition_addr_artifacts(*func)),

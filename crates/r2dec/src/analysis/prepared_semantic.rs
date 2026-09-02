@@ -2664,9 +2664,9 @@ fn prepared_linear_atom_expr(view: &PreparedSemanticView, expr: &CExpr) -> Optio
     match expr {
         CExpr::Var(name) if prepared_parameter_rank(view, *name).is_some() => Some(expr.clone()),
         CExpr::Paren(inner) => prepared_linear_atom_expr(view, inner),
-        CExpr::Cast { ty, expr: inner }
-            if ty.is_integer() && prepared_linear_atom_expr(view, inner).is_some() =>
-        {
+        CExpr::Cast {
+            ty, expr: inner, ..
+        } if ty.is_integer() && prepared_linear_atom_expr(view, inner).is_some() => {
             Some(expr.clone())
         }
         _ => None,
@@ -3321,7 +3321,7 @@ fn normalize_prepared_inline_expr(expr: CExpr, depth: u32) -> CExpr {
         CExpr::Paren(inner) => {
             CExpr::Paren(Box::new(normalize_prepared_inline_expr(*inner, depth + 1)))
         }
-        CExpr::Cast { ty, expr } => {
+        CExpr::Cast { ty, expr, .. } => {
             CExpr::cast(ty, normalize_prepared_inline_expr(*expr, depth + 1))
         }
         CExpr::AddrOf(inner) => {
