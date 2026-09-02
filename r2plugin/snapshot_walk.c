@@ -929,6 +929,19 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	}
 	r2sleigh_wire_bytes (writer, revision_bytes, sizeof (revision_bytes));
 
+	/* And this function's own payload identity, which the capture identity
+	 * above is deliberately not: a callee carries the root's revision so a
+	 * consumer can tell the bodies were read together, and its own content
+	 * hash so the same callee under two callers is recognisably one body. */
+	if (top.content_identity == 0) {
+		return false;
+	}
+	uint8_t content_bytes[8];
+	for (unsigned i = 0; i < 8; i++) {
+		content_bytes[i] = (uint8_t)((top.content_identity >> (8 * i)) & 0xff);
+	}
+	r2sleigh_wire_bytes (writer, content_bytes, sizeof (content_bytes));
+
 	/* An interface exists only when radare2 minted exact-interface authority.
 	 * The view answering is not enough: a thunk has a readable view that carries
 	 * no recovered prototype, and treating it as one refuses the whole

@@ -639,6 +639,15 @@ struct SnapshotState {
     image: OwnedFunctionImage,
     advisory_calls: Box<[AdvisoryCallSite]>,
     source_revision_identity: Box<[u8]>,
+    /// This function's own payload identity, which the capture identity above
+    /// deliberately is not.
+    ///
+    /// A callee collected beside a root carries the root's revision, so a
+    /// consumer can tell the bodies were read together; that makes the same
+    /// callee reached from two callers carry two revisions. Its content
+    /// identity is its own, so it is recognisably one body. For the function
+    /// asked for, the two are equal.
+    source_content_identity: Box<[u8]>,
     function_interface: Option<SourceFunctionInterface>,
     machine_roles: SourceMachineRoles,
     convention_slots: SourceConventionSlots,
@@ -786,6 +795,7 @@ impl OwnedFunctionSnapshot {
             presentation,
             image,
             advisory_calls,
+            source_content_identity: source_revision_identity.clone(),
             source_revision_identity,
             function_interface,
             machine_roles,
@@ -843,6 +853,24 @@ impl OwnedFunctionSnapshot {
 
     pub fn source_revision_identity(&self) -> &[u8] {
         &self.0.source_revision_identity
+    }
+
+    /// This function's own payload identity. See `source_content_identity` on
+    /// the state for why it is not the revision.
+    pub fn source_content_identity(&self) -> &[u8] {
+        &self.0.source_content_identity
+    }
+
+    /// Replace the content identity with the one the capture reported.
+    ///
+    /// Only the wire decoder calls this, because it is the only place that
+    /// learns a callee's own identity: everywhere else a snapshot is minted
+    /// from parts that cannot distinguish the two, and the mint defaults them
+    /// equal.
+    pub(crate) fn with_source_content_identity(mut self, identity: Box<[u8]>) -> Self {
+        let state = std::sync::Arc::make_mut(&mut self.0);
+        state.source_content_identity = identity;
+        self
     }
 
     pub fn function_interface(&self) -> Option<&SourceFunctionInterface> {
