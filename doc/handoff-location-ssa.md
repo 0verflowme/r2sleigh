@@ -8046,8 +8046,17 @@ inlining rule admits, and it stays bound anyway. That is the question to
 answer, and it is one value's disposition rather than a survey: take one such
 carrier and read why the plan bound it.
 
-The probe that produced the shape counts did not answer that, and the reason is
-worth knowing for the next attempt: `R2SLEIGH_BINDING_AUDIT=1` on a bare `pdd`
-emitted only the rendered function. The audit markers come out through the
-corpus sweep's own command stream, `tests/corpus/sweep.sh`, and reading a
-disposition means going through that rather than through a single `pdd`.
+Two things about the probe, the second correcting the first. The audit does
+come out of a bare `pdd`: `R2SLEIGH_BINDING_AUDIT=1` writes one JSON line to
+**stderr** prefixed `R2SLEIGH_BINDING_AUDIT__`, from
+`r2plugin/r_anal_sleigh.c:939`, and the first attempt saw nothing only because
+it sent stderr to `/dev/null`. But capturing it does not answer the question
+either: the audit reports aggregate counts per domain -- for `fnv1a64` at arm64
+-O1, 97 values of which 41 rendered and 56 were justified elisions -- and
+carries no per-value disposition.
+
+So answering "why did the plan bind this carrier" needs a probe inside
+`binding_plan::rules::inlinable_values` printing which of its tests rejected a
+named value, in the shape of the `R2DEC_TRACE_REFUSAL` probes that already pay
+for themselves elsewhere in this document. That is a few lines in a file no
+current effort holds, and it is the next step on the 192.
