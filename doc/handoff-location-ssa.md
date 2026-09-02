@@ -7907,12 +7907,17 @@ at one tree here, and although nothing was lost -- the first effort's work was
 already committed and merged -- the second found six modified files it did not
 write and correctly stopped rather than committing them.
 
-Disk is the other constraint. Three active build trees reach about eleven to
-thirteen gigabytes each, and the incremental caches are nearly all of it: they
-regrow to that size within about forty minutes of active building, and deleting
-`target/*/incremental` in each tree reclaims twenty gigabytes in a second and
-costs only a slower next build. ENOSPC killed every tool in this session once
-before that was understood.
+Disk is the other constraint, and it has two halves. Three active build trees
+reach about eleven to thirteen gigabytes each. The incremental caches are the
+half that regrows: they return to several gigabytes per tree within about forty
+minutes of active building, and deleting `target/*/incremental` reclaims them
+in a second at the cost of a slower next build. The other half is
+`target/debug/deps`, which reaches eleven gigabytes on its own because cargo
+never removes the test binaries of earlier builds; clearing it costs one full
+debug rebuild and is worth doing in a tree that is between runs rather than
+mid-build. ENOSPC killed every tool in this session once before either was
+understood, and a monitor that reclaims rather than warns is what kept it from
+happening again.
 
 **Where the machine-detail columns stand, and what each remaining one is
 waiting on.** All 54 cells pass raw, diagnostic, differential, binding audit,
