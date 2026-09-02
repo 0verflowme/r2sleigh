@@ -5393,6 +5393,31 @@ fn restate_string_conversions_in_expr(
         restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols);
         return;
     }
+    // Arithmetic on an address is arithmetic on a number. C has one operator
+    // that means anything by a pointer operand, and it counts elements rather
+    // than bytes -- and `&name` is a pointer to an incomplete array, which C
+    // will not do arithmetic on at all. So an address that reaches an
+    // arithmetic operator crosses into the address integer first, and the
+    // conversion back to a pointer is whatever the surrounding place asks
+    // for.
+    if let CExpr::Binary { op, left, right } = expr
+        && matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+        )
+    {
+        let address = CType::uint(pointer_bits);
+        restate_string_conversions_in_expr(left, pointer_bits, Some(&address), symbols);
+        restate_string_conversions_in_expr(right, pointer_bits, Some(&address), symbols);
+        return;
+    }
     let taken = std::mem::replace(expr, CExpr::IntLit(0));
     *expr = taken.map_children(&mut |mut child| {
         restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols);

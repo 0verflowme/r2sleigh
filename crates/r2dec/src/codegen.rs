@@ -11,7 +11,7 @@ use crate::observation_journal::ObservationSealAuthority;
 /// Threshold for detecting 64-bit negative values stored as unsigned.
 /// Values above this are likely negative offsets (within ~65536 of u64::MAX).
 /// This handles cases like stack offsets: 0xffffffffffffffb8 represents -72.
-const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
+pub(crate) const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
 
 /// Above this, an integer literal reads better in hexadecimal.
 ///

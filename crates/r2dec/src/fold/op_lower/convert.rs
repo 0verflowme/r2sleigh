@@ -111,6 +111,15 @@ fn implicit_is_exact(from: (bool, u32), _to: (bool, u32)) -> bool {
 /// type it fits, so the constant is respelled -- signed where the reader is
 /// signed, at the reader's width -- rather than cast. A constant read as a
 /// pointer is a conversion the program performs and is spelled as one.
+///
+/// A constant whose spelling cannot carry its type is the exception, and it
+/// is cast. A mask the renderer prints as `-0x4` because that is how a
+/// reader wants to see it is an `int` to the compiler whatever value it
+/// stands for, and `x &= -0x4` on a `uint64_t` is then a signedness-changing
+/// conversion that `-Wsign-conversion` rejects. Spelling the value out
+/// instead -- `0xfffffffffffffffc` -- needs a width suffix to mean the same
+/// thing, and the literal does not carry a width, so the type is stated the
+/// one way that is always available.
 fn spell_constant(expr: CExpr, to: &CType, pointer_bits: u32) -> CExpr {
     if matches!(to, CType::Pointer(_)) {
         return CExpr::cast(to.clone(), expr);
@@ -121,7 +130,24 @@ fn spell_constant(expr: CExpr, to: &CType, pointer_bits: u32) -> CExpr {
     if !(8..=64).contains(&bits) {
         return expr;
     }
-    respell_literal(expr, signed, bits)
+    let respelled = respell_literal(expr, signed, bits);
+    if !signed && renders_as_signed(&respelled) {
+        return CExpr::cast(to.clone(), respelled);
+    }
+    respelled
+}
+
+/// Whether the rendered form of this literal is a signed constant.
+///
+/// `codegen` prints a high unsigned value as the negative it stands for,
+/// which is what a mask should look like and is an `int` to the compiler.
+fn renders_as_signed(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::Observed { expr, .. } | CExpr::Paren(expr) => renders_as_signed(expr),
+        CExpr::IntLit(value) => *value < 0,
+        CExpr::UIntLit(value) => *value > crate::codegen::LIKELY_NEGATIVE_THRESHOLD,
+        _ => false,
+    }
 }
 
 fn respell_literal(expr: CExpr, signed: bool, bits: u32) -> CExpr {
@@ -129,9 +155,7 @@ fn respell_literal(expr: CExpr, signed: bool, bits: u32) -> CExpr {
         CExpr::Observed { id, expr } => CExpr::observed(id, respell_literal(*expr, signed, bits)),
         CExpr::Paren(inner) => CExpr::Paren(Box::new(respell_literal(*inner, signed, bits))),
         CExpr::UIntLit(value) => crate::typed_integer_literal_expr(value, signed, bits),
-        CExpr::IntLit(value) if value >= 0 => {
-            crate::typed_integer_literal_expr(value as u64, signed, bits)
-        }
+        CExpr::IntLit(value) => crate::typed_integer_literal_expr(value as u64, signed, bits),
         other => other,
     }
 }
@@ -397,11 +421,12 @@ mod tests {
             ),
             CExpr::IntLit(-1)
         );
-        assert_eq!(
-            convert(CExpr::IntLit(-1), &CValue::Constant, &CType::u64(), 64),
-            CExpr::IntLit(-1),
-            "a negative literal is left as the program spelled it"
-        );
+        // A negative literal read as an unsigned type keeps the spelling a
+        // reader wants and states the type, because `-1` alone is an `int`.
+        let negative = convert(CExpr::IntLit(-1), &CValue::Constant, &CType::u64(), 64);
+        let (ty, inner, _) = cast_of(&negative).expect("the type is stated");
+        assert_eq!(ty, CType::u64());
+        assert!(renders_as_signed(&inner), "got {inner:?}");
         let (ty, inner, _) = cast_of(&convert(
             CExpr::IntLit(16),
             &CValue::Constant,

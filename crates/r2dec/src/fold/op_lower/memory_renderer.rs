@@ -420,7 +420,7 @@ impl<'a> FoldingContext<'a> {
     /// base reaches here as a name rather than as a value, and the
     /// declaration the symbol table emits for that name is the one fact it
     /// carries about its type.
-    fn declared_type_of_name(&self, expr: &CExpr) -> Option<CValue> {
+    pub(super) fn declared_type_of_name(&self, expr: &CExpr) -> Option<CValue> {
         match expr.unobserved() {
             CExpr::Var(symbol) => {
                 Some(CValue::Typed(self.symbols.borrow().get(*symbol).ty.clone()))

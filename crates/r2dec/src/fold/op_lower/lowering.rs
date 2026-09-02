@@ -1034,7 +1034,10 @@ impl<'a> FoldingContext<'a> {
             let call = match self
                 .certified_call_result_value((block_addr, op_idx))
                 .and_then(|value| self.value_declaration_type(value))
-            {
+                .or_else(|| {
+                    self.declared_type_of_name(&owner)
+                        .and_then(|owner| owner.as_type().cloned())
+                }) {
                 Some(declared) => self.convert_from(call, returned.as_ref(), &declared),
                 None => call,
             };
