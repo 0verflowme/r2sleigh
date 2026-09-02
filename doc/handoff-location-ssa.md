@@ -8024,3 +8024,30 @@ first time was when single-use folding landed and each fixture gained a second
 reader. A fixture built from the simplest possible values is a fixture that
 stops having a subject every time the renderer gets better, and the comments
 now name both reasons.
+
+**The flag carriers are not the comma-condition problem, and the guess that
+they were is worth recording because it was wrong.** `djb2` at x86-64 -O0 shows
+`CF_2` declared above its loop and assigned inside a comma-packed header, which
+reads as one problem with two symptoms. Counting across the corpus says
+otherwise: 23 of the 192 carriers are named inside a comma condition and 169
+are not. The two columns move independently.
+
+What the 192 actually are, counted by shape over the rendered cells:
+
+    uint8_t ZR_N   = (uint8_t)TMPZR_N;                              33
+    uint8_t ZF_N   = (uint8_t)(tmp_Nf180_N == 0);                   26
+    uint8_t CY_N   = (uint8_t)TMPCY_N;                              14
+    uint8_t TMPZR_N = (uint8_t)(X1_N == 0);                         13
+
+So arm64 writes a flag twice: the specification computes into a temporary flag
+and then copies it to the architectural one, and both survive as carriers. The
+copy is `ZR = (uint8_t)TMPZR`, a single-use copy of exactly the kind the
+inlining rule admits, and it stays bound anyway. That is the question to
+answer, and it is one value's disposition rather than a survey: take one such
+carrier and read why the plan bound it.
+
+The probe that produced the shape counts did not answer that, and the reason is
+worth knowing for the next attempt: `R2SLEIGH_BINDING_AUDIT=1` on a bare `pdd`
+emitted only the rendered function. The audit markers come out through the
+corpus sweep's own command stream, `tests/corpus/sweep.sh`, and reading a
+disposition means going through that rather than through a single `pdd`.
