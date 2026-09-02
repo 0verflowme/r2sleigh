@@ -7304,3 +7304,44 @@ could be declared at. And `int64_t *RAX_1 = (int64_t *)*(uint64_t *)&__DATA_CONS
 is the stack-guard load, which names the segment rather than `__stack_chk_guard`
 because the data-symbol walk found the segment flag and no symbol flag at that
 address.
+
+### Array indexing: the renderer is one folding decision away
+
+Two changes toward `src[i]` were written, measured inert, and reverted, and
+both are worth writing again the moment the thing blocking them moves.
+
+The first renders a one-byte pointer plus an index as a subscript, in
+`render_certified_memory_expr_for_fact` before the byte-address fallback. It is
+restricted to a one-byte pointee and a zero offset on purpose: C scales a
+subscript by the pointee and the machine did not, so a wider element would move
+the wrong distance. The second widens `certified_pointer_base_expr`, which
+decides which operand of an address is the base. It asks upstream certificates
+for a parameter with a recovered pointer type or a loop carrier, because no
+object used to be *declared* a pointer; one is now, and an object declared a
+pointer is a pointer wherever it is read.
+
+Neither fires, and the reason is not in either of them. The address never
+reaches the dereference as an expression:
+
+```c
+uint8_t *tmp_4a00_2 = (uint8_t *)((uint64_t)RAX_3 + (uint64_t)tmp_4900_2);
+uint8_t tmp_11e00_2 = *tmp_4a00_2;
+```
+
+`certified_memory_address_expr` asks the plan for the address value and gets
+`Var(tmp_4a00_2)`, which decomposes into no base and no index. The sum is a
+statement of its own because the plan bound that value instead of inlining it,
+and `rules::inlinable_values` skips it before any of its own tests run: the
+`let [use_site] = graph.use_sites(value.id) else { continue }` at the top means
+the value has some number of uses other than one. Eighty-eight load addresses
+in `fnv1a32` reach that probe and every one of them is a stack slot; the
+buffer's is not among them. Finding that second use is the next step, and it is
+a small one.
+
+The stack buffer is a separate and larger problem. `uint8_t buf[16]` written at
+`buf[i]` resolves to `ObjectKind::EscapedUnknown { space: Ram }` -- the object
+model does not recognise a frame base plus a constant plus a variable index as
+an access into a frame object, so there is no object to name, size or declare.
+The pointer parameter's pointee, by contrast, is already
+`ObjectKind::Parameter { index: 0 }`, which is why indexing through a parameter
+is the reachable half and the stack buffer is not.
