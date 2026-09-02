@@ -111,6 +111,40 @@ fn observed_entry_read_storages(
     reads
 }
 
+/// Storages this function hands to a call without ever defining them.
+///
+/// A parameter is otherwise proven by an entry read, and a carrier the function
+/// only passes on is never read explicitly: a call takes its arguments
+/// implicitly, so no SSA value names it and the entry-read scan cannot see it.
+/// The consequence was that the argument had no parameter to name, the call
+/// rendered with it dropped, and its obligation could never be discharged --
+/// four functions on `/bin/ls` refuse that way.
+///
+/// The evidence is the callee's, not a guess about this function. A boundary's
+/// arguments come from the callee's own interface, so the argument exists
+/// because the callee takes it, and `SourceCallArgumentValue::PreservedEntry`
+/// says the value it receives is the one this function was entered with. That
+/// is what a parameter is.
+fn passed_through_entry_storages(
+    boundaries: &crate::semantic::SourceBoundaryFacts,
+) -> Vec<CanonicalStorageId> {
+    let mut storages = Vec::new();
+    for boundary in boundaries.calls.values() {
+        for argument in &boundary.arguments {
+            let crate::semantic::SourceCallArgumentValue::PreservedEntry = argument.value else {
+                continue;
+            };
+            let crate::semantic::CallBoundarySlot::Register { storage, .. } = argument.slot else {
+                continue;
+            };
+            if !storages.contains(&storage) {
+                storages.push(storage);
+            }
+        }
+    }
+    storages
+}
+
 /// True when a read of `read` observes bytes of the candidate slot.
 ///
 /// A convention slot names the full register; a function may read only its low
@@ -180,7 +214,15 @@ pub fn recover_interface(
         );
         return None;
     };
-    let reads = observed_entry_read_storages(func, &graph, &observations);
+    let mut reads = observed_entry_read_storages(func, &graph, &observations);
+    // A carrier passed straight to a call is read by that call, so it belongs
+    // in the same evidence as an explicit entry read. The prefix rule below is
+    // unchanged and still stops at the first candidate slot nothing observes.
+    for storage in passed_through_entry_storages(&facts.boundaries) {
+        if !reads.contains(&storage) {
+            reads.push(storage);
+        }
+    }
     let mut parameters = Vec::new();
     for slot in slots.argument_slots() {
         // The widest read that lands in this slot. A callee that both spills
@@ -470,6 +512,68 @@ mod tests {
         let arch = arch();
         let func = SSAFunction::from_blocks_with_arch(&[block], Some(&arch)).expect("ssa");
         recover_interface(&func, &candidates()).expect("recovery")
+    }
+
+    fn call_boundary_with(
+        arguments: Vec<crate::semantic::SourceCallArgumentFact>,
+    ) -> crate::semantic::SourceBoundaryFacts {
+        let mut boundaries = crate::semantic::SourceBoundaryFacts::default();
+        boundaries.calls.insert(
+            crate::semantic::CallSiteId(0),
+            crate::semantic::SourceCallBoundaryFact {
+                call_site: crate::semantic::CallSiteId(0),
+                at: crate::graph::InstId(0),
+                calling_convention: None,
+                variadic: None,
+                noreturn: None,
+                result_kind: None,
+                arguments,
+                results: Vec::new(),
+                complete: true,
+            },
+        );
+        boundaries
+    }
+
+    fn register_argument(
+        index: u32,
+        storage: CanonicalStorageId,
+        value: crate::semantic::SourceCallArgumentValue,
+    ) -> crate::semantic::SourceCallArgumentFact {
+        crate::semantic::SourceCallArgumentFact {
+            slot: crate::semantic::CallBoundarySlot::Register { index, storage },
+            value,
+        }
+    }
+
+    #[test]
+    fn a_carrier_passed_straight_to_a_call_counts_as_read() {
+        // The callee's own interface says the argument exists and
+        // `PreservedEntry` says the value is the one this function was entered
+        // with, so it is a parameter even though nothing here reads it: a call
+        // takes its arguments implicitly and leaves no explicit read behind.
+        let boundaries = call_boundary_with(vec![register_argument(
+            0,
+            register(0, 8),
+            crate::semantic::SourceCallArgumentValue::PreservedEntry,
+        )]);
+        assert_eq!(
+            passed_through_entry_storages(&boundaries),
+            vec![register(0, 8)]
+        );
+    }
+
+    #[test]
+    fn an_argument_this_function_computed_is_not_a_passed_through_carrier() {
+        // A value defined here already has a producer and an SSA value naming
+        // it, so it needs no help from this rule and must not be reported as an
+        // entry read: that would claim a parameter the function may not have.
+        let boundaries = call_boundary_with(vec![register_argument(
+            0,
+            register(0, 8),
+            crate::semantic::SourceCallArgumentValue::Value(crate::graph::ValueId(3)),
+        )]);
+        assert!(passed_through_entry_storages(&boundaries).is_empty());
     }
 
     #[test]
