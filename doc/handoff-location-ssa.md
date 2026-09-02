@@ -8113,3 +8113,127 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+## The plan after the first benchmark run and the architecture survey
+
+Two things happened on the same day and between them they reorder the work.
+
+### The engine ran on the benchmark's own platform for the first time
+
+The plugin now builds and runs on Linux x86-64 against the radare2 fork, and
+DecBench is installed there with joern. The first head-to-head, on
+`bzip2recover` compiled by GCC at `-O0`, thirteen functions scored by graph edit
+distance against the source control-flow graph:
+
+| decompiler | decompiled | perfect | mean GED |
+| --- | --- | --- | --- |
+| angr 9.3.3 | 13 of 14 | 4 | 5.54 |
+| r2sleigh | 8 of 14 | 4 | 5.43 |
+
+The reading is unambiguous and it is not the reading this branch has been
+working from. **Accuracy is already competitive.** Where r2sleigh renders, it
+matches the source structure slightly better than angr does, on the same
+functions, with the same number of exact matches. **Coverage is the entire
+gap.** Every point of the difference is a function that refused.
+
+The six it missed refused for three causes, none of which is a tail call:
+`unobserved_binding_write` from placement, `missing_definition` from placement,
+and `RenderedValueRequired` from the observation journal, the last twice. Those
+are accounting failures in the binding plan and the journal, and the survey
+below independently traced two of them to duplicated predicates that have
+diverged. So the noise work and the accounting work are the same work as the
+coverage work on real code, which is not how this branch had them ordered.
+
+### The eager sweep was making analysis seventeen times slower
+
+Measured by moving the plugin's directory aside and back, on the same binary:
+radare2 analyses `bzip2recover` in 0.68 seconds alone, and 11.98 seconds with
+r2sleigh installed. The plugin's post-analysis reported spending 10.16 of those
+seconds and then refusing the rest of the program against its own budget.
+
+The cause was `sleigh_function_may_prove`, whose comment says it looks for a
+transfer radare2 could not resolve and whose test was that a block has no
+successor -- which is also true of every `ret`. Every function was admitted.
+Asking the block's last instruction instead takes `bzip2recover` to 6.94 seconds
+with sixteen of thirty-eight functions skipped and the same two unreachable
+blocks proven. What remains is the per-function cost, about 286 ms per proved
+function and about 1.05 s for one `pdd`, against an agreed bar of 100 ms for a
+500-obligation function. That is the per-binary program cache, and it is now the
+performance item rather than the sweep.
+
+### What the survey found that the plan did not have
+
+A seventy-agent read of the tree, with every finding put to independent
+refutation, left fifty standing. The ones that change the ordering:
+
+- **A transfer through a value has no renderer form at all**, at
+  `crates/r2dec/src/fold/op_lower/implementation.rs:3233`. It costs **105 of the
+  449 matrix cells and 84 of the 136 `/bin/ls` entries**, which makes it the
+  largest single coverage item in the tree, far larger than the direct tail
+  call it was grouped with. It is one machine shape with two SSA shapes: on x64
+  the operand is a `Bound` value with no definition whose canonical storage is a
+  RAM address, and on arm64 it is an `Inline` value defined by a copy from a
+  register. A fix keyed to either alone gets half the cells.
+- **The direct tail call is smaller than reported.** Ten of the forty-one
+  refusing real `/bin/ls` functions are on the exact path, sixteen counting the
+  short forwarders. The earlier figure of twenty-two was co-occurrence. The six
+  functions mislabelled "unrepresentable control flow" are the same forwarders,
+  so the counts do not add.
+- **The exiting branch must not be rewritten into a call in `CFG::from_blocks`.**
+  That was written, measured and reverted: `/bin/ls` went from 123 to 125
+  refusals and from one to eighty-one refused obligations. The capability
+  belongs in the source-facts layer, as a callsite interface offered for a
+  branch whose target lies outside the function's bounds.
+- **`same_type_casts` was measuring the rarer of two shapes.** It compared only
+  directly adjacent casts, so a lone cast to a value's own declared type was
+  never examined. The corrected predicate counts 3,395 across the fifty-four
+  cells where the column had read zero. Every noise fix before this landed was
+  scored against a blind gate.
+- **The identity-merge predicate is stated twice and the copies have diverged**,
+  and the divergence is a whole-function refusal rather than a style problem:
+  the phi output's value cell stays empty and the journal refuses with
+  `RenderedValueRequired`. The obvious repair is backwards; the term has to move
+  to the rule, not be copied into the journal.
+- **The parameter-slot conflict rule and the width rule are each written four
+  times**, and the certified-entities pair has diverged into a whole-function
+  refusal with `UnexpectedParameterDisposition`. The root cause is that the two
+  candidate enums differ.
+- **Fifteen register-alias tables, and the name-keyed ones give wrong answers
+  today**: `rdx` and `dh` are reported as the same family, so an external type
+  assumption for `dh` is applied to the `rdx` parameter; `ah` and `al` get the
+  same key, so an alias pair is emitted between disjoint storages and
+  pointer-ness propagates across it; and the AArch64 frame pointer is spelled
+  two ways that can never meet, so those slots are structurally un-rebasable.
+- **Thirty-two-bit x86 is given the SysV-64 argument registers**, because the
+  prepared arch name is re-spelled from a substring match rather than passed as
+  the typed family.
+- **Import evidence never crosses into r2sym**, so an eighteen-model libc seed
+  table, a role source and a name hint are all permanently inert, and the
+  twenty-one summaries the registry builds are discarded per function.
+
+### Decisions the owner settled
+
+| question | answer |
+| --- | --- |
+| a value with one rendered and one elided reader | inline it; the guard counts only rendered readers |
+| the unreachable r2sym subsystems | delete, keeping what they proved as tests |
+| interprocedural helper inlining | delete; out of scope, and a working owner already computes those summaries |
+| import thunks in the coverage denominator | render them and keep them; report against 136 |
+| a type spelling the parser cannot place | refuse, rather than inventing a typedef |
+| radare2 type ingestion | the trusted snapshot is canonical, not the JSON schema |
+| what CI sweeps | a pinned binary the repository ships gates; the runner's own binary is reported |
+
+### The ordering now
+
+1. The accounting refusals, because they are what the benchmark measures:
+   the identity-merge predicate, the parameter-slot rules, and the two
+   placement refusals behind `unobserved_binding_write` and
+   `missing_definition`.
+2. The transfer through a value, at 105 matrix cells and 84 `/bin/ls` entries.
+3. The per-binary program cache, for the 286 ms per function.
+4. Cast policy, now that 3,395 redundant casts are visible to the gate.
+5. The direct tail call and the empty-body mislabel, together.
+6. Array indexing, stack buffers and `for`, which is the largest information
+   recovery win and is unblocked.
+7. The register-identity collapse, which removes four live wrong-answer paths.
+8. The deletions.
