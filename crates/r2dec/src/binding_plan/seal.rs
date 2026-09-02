@@ -598,8 +598,21 @@ impl BindingPlan {
         // derives the canonical terms again and requires the same answer.
         // Sharing the plan's would prove nothing: a rewriter that varied with
         // hash order or with a stale budget would agree with itself.
-        let sealed_canonical = r2rewrite::canonicalize(source, &self.machine_projection)
-            .map_err(BindingPlanBuildError::Canonicalisation)?;
+        let sealed_inlinable = super::rules::inlinable_values(source, &self.machine_projection);
+        let sealed_canonical = r2rewrite::canonicalize_with(
+            source,
+            &self.machine_projection,
+            &|query: &r2rewrite::ExpansionQuery<'_>| {
+                sealed_inlinable.contains(&query.value)
+                    || r2rewrite::term_is_duplicable(
+                        query.projection,
+                        query.arena,
+                        query.entry_never_redefined,
+                        query.producer_term,
+                    )
+            },
+        )
+        .map_err(BindingPlanBuildError::Canonicalisation)?;
         for graph_value in &graph.values {
             let planned = self.canonical.value(graph_value.id);
             let sealed = sealed_canonical.value(graph_value.id);
