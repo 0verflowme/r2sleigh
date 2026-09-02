@@ -369,7 +369,30 @@ impl CExpr {
     }
 
     /// Create a cast expression.
+    /// Create a cast, which never nests directly inside itself.
+    ///
+    /// Converting to a type a value has already been converted to converts
+    /// nothing: `(uint32_t)(uint32_t)x` and `(uint32_t)x` are the same value,
+    /// the same type and the same bits, for every type C can spell. Casting
+    /// is idempotent, so the constructor states it once.
+    ///
+    /// This is where the rule belongs rather than at each caller. A cast is
+    /// applied at a type boundary, and a projection, an operand rule and an
+    /// assignment policy each state their own boundary without being able to
+    /// see what the others already said; twenty-six sites in operation
+    /// lowering alone call this, and asking each of them to check first is
+    /// twenty-six chances to forget. The nesting the renderer does need --
+    /// a narrowing inside a widening, or the pointer-width step before a
+    /// pointer becomes a smaller integer -- is between two *different* types
+    /// and is untouched.
     pub fn cast(ty: CType, expr: CExpr) -> Self {
+        // Through the render markers, which are metadata: the cast the
+        // renderer already spelled is the one under them.
+        if let CExpr::Cast { ty: inner, .. } = expr.unobserved()
+            && *inner == ty
+        {
+            return expr;
+        }
         Self::Cast {
             ty,
             expr: Box::new(expr),

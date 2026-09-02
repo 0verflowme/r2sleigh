@@ -94,7 +94,7 @@ pub(super) fn project_machine_use_of(
             );
         }
         if slice.bit_offset() != 0 || slice.width_bits() != slice.carrier_width_bits() {
-            projected = cast_unless_already(projected, selected_type);
+            projected = CExpr::cast(selected_type, projected);
         }
         projected
     } else if c_bitvector_width_is_supported(slice.carrier_width_bits()) {
@@ -138,35 +138,17 @@ pub(super) fn project_machine_use_of(
         MachineCastKind::ZeroExtend
         | MachineCastKind::Truncate
         | MachineCastKind::BitReinterpret
-        | MachineCastKind::AddressToInteger => Ok(cast_unless_already(
-            projected,
-            checked_uint_type(target_width)?,
-        )),
-        MachineCastKind::SignExtend => Ok(cast_unless_already(
-            cast_unless_already(projected, checked_int_type(slice.width_bits())?),
+        | MachineCastKind::AddressToInteger => {
+            Ok(CExpr::cast(checked_uint_type(target_width)?, projected))
+        }
+        MachineCastKind::SignExtend => Ok(CExpr::cast(
             checked_int_type(target_width)?,
+            CExpr::cast(checked_int_type(slice.width_bits())?, projected),
         )),
         MachineCastKind::IntegerToAddress => Err(
             MachineUseProjectionError::IntegerToAddressRequiresType(target_width),
         ),
     }
-}
-
-/// Cast to `target` unless the expression already is exactly that cast.
-///
-/// Every step of a projection states the type it needs. A step that asks for
-/// the type the expression is already spelled at converts nothing, and the
-/// pair `(uint32_t)(uint32_t)x` states one conversion twice. This says the
-/// step once. It compares the spelled cast rather than inferring a type, so
-/// it can only ever remove a cast that is textually redundant with the one
-/// below it.
-fn cast_unless_already(expr: CExpr, target: CType) -> CExpr {
-    if let CExpr::Cast { ty, .. } = expr.unobserved()
-        && *ty == target
-    {
-        return expr;
-    }
-    CExpr::cast(target, expr)
 }
 
 fn checked_write_uint_type(width_bits: u32) -> Result<CType, MachineWriteProjectionError> {
@@ -198,7 +180,7 @@ pub(super) fn project_machine_write(
         // target here, because there is nothing to preserve.
         MachineWriteProjection::Lane { width_bits, .. } => {
             let lane = checked_write_uint_type(width_bits)?;
-            Ok((lhs, cast_unless_already(rhs, lane)))
+            Ok((lhs, CExpr::cast(lane, rhs)))
         }
         MachineWriteProjection::ZeroExtend {
             from_width_bits,
@@ -220,7 +202,7 @@ pub(super) fn project_machine_write(
             }
             let from = checked_write_uint_type(from_width_bits)?;
             let to = checked_write_uint_type(to_width_bits)?;
-            Ok((lhs, cast_unless_already(cast_unless_already(rhs, from), to)))
+            Ok((lhs, CExpr::cast(to, CExpr::cast(from, rhs))))
         }
         MachineWriteProjection::Insert {
             bit_offset,
