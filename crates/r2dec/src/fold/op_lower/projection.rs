@@ -79,6 +79,21 @@ pub(super) fn project_machine_use_of(
 ) -> Result<CExpr, MachineUseProjectionError> {
     // A pointer cannot be sliced, and the conversion to the carrier's own
     // unsigned integer is the address-width step, not an ordinary widening.
+    //
+    // The caller's flag reports the object's declared type, which is not the
+    // only way the base arrives as a pointer: an expression already converted
+    // to one is a pointer here whatever the declaration said, and the
+    // conversion above it is the same step for the same reason. Sixty of the
+    // corpus's casts were spelled unmarked through that gap, and an unmarked
+    // step is one a round trip back to the pointer cannot collapse.
+    let base_is_pointer = base_is_pointer
+        || matches!(
+            base.unobserved(),
+            CExpr::Cast {
+                ty: CType::Pointer(_),
+                ..
+            }
+        );
     let base = if base_is_pointer && c_integer_width_is_spellable(slice.carrier_width_bits()) {
         CExpr::pointer_width_cast(checked_uint_type(slice.carrier_width_bits())?, base)
     } else {

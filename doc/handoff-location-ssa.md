@@ -7907,12 +7907,17 @@ at one tree here, and although nothing was lost -- the first effort's work was
 already committed and merged -- the second found six modified files it did not
 write and correctly stopped rather than committing them.
 
-Disk is the other constraint. Three active build trees reach about eleven to
-thirteen gigabytes each, and the incremental caches are nearly all of it: they
-regrow to that size within about forty minutes of active building, and deleting
-`target/*/incremental` in each tree reclaims twenty gigabytes in a second and
-costs only a slower next build. ENOSPC killed every tool in this session once
-before that was understood.
+Disk is the other constraint, and it has two halves. Three active build trees
+reach about eleven to thirteen gigabytes each. The incremental caches are the
+half that regrows: they return to several gigabytes per tree within about forty
+minutes of active building, and deleting `target/*/incremental` reclaims them
+in a second at the cost of a slower next build. The other half is
+`target/debug/deps`, which reaches eleven gigabytes on its own because cargo
+never removes the test binaries of earlier builds; clearing it costs one full
+debug rebuild and is worth doing in a tree that is between runs rather than
+mid-build. ENOSPC killed every tool in this session once before either was
+understood, and a monitor that reclaims rather than warns is what kept it from
+happening again.
 
 **Where the machine-detail columns stand, and what each remaining one is
 waiting on.** All 54 cells pass raw, diagnostic, differential, binding audit,
@@ -7952,3 +7957,29 @@ carrier on the page is that the value is bound.
 `ElisionReason::CoalescedImmutablePhi` fires zero times in production, against
 65 for the carrier path, measured across all 54 cells. It is live only in its
 own unit test, so it is not a precedent for anything.
+
+**Whole-binary coverage, checked after the expression-engine work: unchanged at
+243 of 313.** The two functions below the blessed baseline of 245 are
+`branchy_arm64_O2::sym._inverted_goto` and `hashes_x64_O1::sym._siphash24`,
+which are the same two this document already recorded as open before any of
+this session's work, with `siphash24`'s two lost markers diagnosed as far as
+the address rebuild. Nothing regressed and nothing newly rendered, across the
+canonical terms, the shared projection, the identity merges, the classifier and
+both cast rules.
+
+The baseline stays at 245 rather than being accepted down to 243. Blessing it
+would record two known refusals as the expected state and remove the only thing
+that keeps them visible.
+
+Fifteen refusals did change their stated cause, from
+`ExactUseRequiresRenderedOccurrence` to `RenderedValueRequired`. They are the
+arm64 import thunks and three `branchy` functions, all of which refused before
+and refuse now, so this is not a coverage change. It is worth knowing which
+work moved them, because a cause is the thing a later session searches on: the
+thunks are the `braa x16, x17` tail-call shape whose refusal has always been
+that nothing in the renderer has a form for a branch through a value, and the
+new cause says the value now reaches the seal without a cell rather than
+without a rendered occurrence. That is consistent with the identity-merge
+accounting, which fills cells for values whose merges no longer render a
+statement, and it means the thunk work described earlier now starts from a
+different symptom than the one recorded against it.
