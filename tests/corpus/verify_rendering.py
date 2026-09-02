@@ -1447,6 +1447,21 @@ def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]]
         r"long \1",
         rest,
     )
+    # A dereference of a pointer-declared local carries no cast, because the
+    # declaration already says the type. The rewrites below all key on the
+    # `*(T *)x` form the rendering used while every object was a machine word,
+    # so the cast is put back before they run and the diagnostic pass keeps
+    # seeing the shape it was written for.
+    for pointee, pointer_name in re.findall(
+        r"\b((?:__)?u?int(?:8|16|32|64|128)_t)\s*\*\s*(\w+)\s*[;=]", rest
+    ):
+        rest = rewrite(
+            "plain_deref_retype",
+            rf"(?<=[=(,;{{])(\s*)\*\s*{re.escape(pointer_name)}\b",
+            rf"\1*({pointee} *){pointer_name}",
+            rest,
+            semantic=False,
+        )
     rest = rewrite(
         "typed_deref_stash",
         r"\*\s*\(\s*((?:__)?u?int(?:8|16|32|64|128)_t)\s*\*\s*\)\s*",
@@ -1549,8 +1564,15 @@ def certified_image_literals(
         )
         if assignment and re.match(r"(?:[uUlL]{0,3})\s*;", suffix):
             target = re.escape(assignment.group(1))
-            if re.search(rf"\*\s*\([^()]*\*\s*\)[^;]*\b{target}\b", source) or re.search(
-                rf"\b{target}\b[^;]*?;[\s\S]{{0,4000}}?\*\s*\([^()]*\*\s*\)", source
+            # A dereference is `*(uint8_t *)p` while the rendering spells its
+            # pointers as machine words, and plain `*p` once the decompiler
+            # declares the object a pointer and has no cast left to write. Both
+            # are the same evidence -- a name this literal reaches is read
+            # through -- and recognising only the first made a better rendering
+            # look like an unmapped address and read the wrong bytes.
+            dereference = r"\*\s*(?:\([^()]*\*\s*\)|\w)"
+            if re.search(rf"{dereference}[^;]*\b{target}\b", source) or re.search(
+                rf"\b{target}\b[^;]*?;[\s\S]{{0,4000}}?{dereference}", source
             ):
                 evidence.append("pointer_valued_assignment")
         if evidence:

@@ -436,6 +436,7 @@ impl<'a> EvidenceBuilder<'a> {
             if !self.value_is_constant(access.address)
                 && let Some(elem) = pointee_type_for_width(access.width)
             {
+                let elem = self.pointee_with_loaded_signedness(access, elem);
                 address_bounds.push((EvidenceNode::Value(access.address), elem));
             }
             let Some(value) = access.value else {
@@ -859,6 +860,62 @@ fn type_is_unresolved(arena: &TypeArena, ty: TypeId) -> bool {
 }
 
 /// A pointee known only by the width of the accesses made through it.
+impl EvidenceBuilder<'_> {
+    /// Refine a pointee's signedness by how the loaded value is widened.
+    ///
+    /// The access width says how many bits are read and nothing about what
+    /// they mean, so a pointee derived from it alone is `Signedness::Unknown`
+    /// and spells `int8_t *` -- a signed pointee asserted from not knowing.
+    /// The instruction after the load says which it is: the machine widens a
+    /// byte it means as unsigned with a zero extension and one it means as
+    /// signed with a sign extension, and that is a fact about the pointee
+    /// rather than a reading of the C.
+    fn pointee_with_loaded_signedness(
+        &self,
+        access: &r2ssa::MemoryAccessCertificate,
+        elem: CTypeLike,
+    ) -> CTypeLike {
+        let CTypeLike::Pointer(pointee) = &elem else {
+            return elem;
+        };
+        let CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unknown,
+        } = pointee.as_ref()
+        else {
+            return elem;
+        };
+        let Some(value) = access.value else {
+            return elem;
+        };
+        let graph = self.source.graph();
+        let mut signedness = None;
+        for site in graph.use_sites(value) {
+            let Some(inst) = graph.inst(site.inst) else {
+                return elem;
+            };
+            let widened = match &inst.payload {
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::IntZExt { .. }) => Signedness::Unsigned,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::IntSExt { .. }) => Signedness::Signed,
+                _ => continue,
+            };
+            match signedness {
+                None => signedness = Some(widened),
+                // Widened both ways, so the bits are not one or the other.
+                Some(seen) if seen != widened => return elem,
+                Some(_) => {}
+            }
+        }
+        let Some(signedness) = signedness else {
+            return elem;
+        };
+        CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: *bits,
+            signedness,
+        }))
+    }
+}
+
 fn pointee_type_for_width(width: u32) -> Option<CTypeLike> {
     let bits = width.checked_mul(8)?;
     matches!(bits, 8 | 16 | 32 | 64).then(|| {
