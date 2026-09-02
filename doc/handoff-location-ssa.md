@@ -7149,3 +7149,55 @@ is the thing to convert to, not whatever `source_type_for_var` reports.
 Neither shape needs a new fact. Both are the same rule the Copy path already
 follows -- convert to what the destination is declared as -- applied at the
 two sites that still do not.
+
+### Typed declarations: four cells from green
+
+`doc/wip/typed-declarations.patch` is 2099 lines and holds at **four blocked
+cells of fifty-four, fifty agreeing with the oracle and none wrong**, with
+pointer types recovered onto parameters, locals and stack slots. Four more
+rules were added, and one of them caught a wrong answer that had nothing to do
+with declarations:
+
+*Machine address arithmetic counts bytes; C pointer arithmetic counts
+elements.* `(int32_t *)p + 4` moves sixteen bytes where the instruction moved
+four, and `xxhash32` at arm64 -O1 computed the wrong hash from exactly that.
+Neither operand of an address add or subtract stays a pointer now -- the
+arithmetic is done on the addresses as numbers, which is what the machine did,
+and the destination's declaration puts the pointer back. It settles the two
+shapes C rejects outright as a side effect: a pointer added to a pointer, and
+a pointer subtracted from an integer.
+
+*A `Subpiece` at offset zero narrows through `cast_expr_to`*, which knows a
+pointer has to be converted at its own width first. A register alias is a
+`Subpiece` at offset zero, so taking the low half of a pointer-declared
+register was `(uint32_t)(int8_t *)p`.
+
+*The conversion to the destination's declaration goes outside the machine
+write projection, not under it.* The projection spells how the machine writes
+the carrier -- a lane, or a zero-extension into the full register -- in the
+carrier's unsigned integer, and that is the last word only while the object is
+that integer.
+
+*A store converts toward a pointer and never away from one.* Saying the
+conversion in the other direction undid the pointer the read projection had
+just given, which cost a cell rather than fixing one.
+
+The four that remain are two shapes:
+
+`stack_m16 = (uint64_t)(int8_t *)RDI_0;` in three cells. The slot is declared
+`int8_t *`, the value is a pointer, and something between the two spells a
+`(uint64_t)` that neither the read projection (which produces the
+`(int8_t *)`) nor the store conversion (which now only converts toward
+pointers) accounts for. The next step is to find which write path renders a
+store to a *stack object* -- the evidence so far says it is not
+`SSAOp::Store`, because that path's every cast is now accounted for.
+
+`EDI_2 = (int8_t *)(uint64_t)(uint32_t)(int8_t *)(...)` in one cell: the same
+value converted to a pointer, back to an integer, and to a pointer again. The
+innermost `(int8_t *)` is the assignment policy converting to the destination,
+and it should not be there when the write projection is going to convert
+again outside it.
+
+Nine defects have been fixed at their cause on the way to this, every one of
+them a rule the emitted C needs whatever the declarations say. None of the
+four remaining needs a new fact; all four are cast placement.
