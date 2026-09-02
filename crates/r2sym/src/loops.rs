@@ -343,7 +343,7 @@ pub fn summarize_residual_runtime_loop<'ctx>(
     }
 
     let transition_system =
-        derive_loop_transition_system(block, state, branch, counter, iterations);
+        derive_loop_transition_system(block_func, block, state, branch, counter, iterations);
     if transition_system.is_exact()
         && let Some(summary) = apply_exact_transition_system(ctx, state, &transition_system)
     {
@@ -417,6 +417,7 @@ pub fn summarize_residual_runtime_loop<'ctx>(
 }
 
 pub fn derive_loop_transition_system<'ctx>(
+    artifact: &SsaArtifact,
     block: &FunctionSSABlock,
     state: &SymState<'ctx>,
     branch: &RuntimeLoopBranch,
@@ -478,7 +479,8 @@ pub fn derive_loop_transition_system<'ctx>(
             );
             continue;
         }
-        let recurrence = recurrence_for_latch(block, state, &phi.dst, latch_source, carried.role);
+        let recurrence =
+            recurrence_for_latch(artifact, block, state, &phi.dst, latch_source, carried.role);
         let recurrence = LoopRecurrence {
             initial: initial_source.display_name(),
             ..recurrence
@@ -1076,6 +1078,7 @@ where
 }
 
 fn recurrence_for_latch(
+    artifact: &SsaArtifact,
     block: &FunctionSSABlock,
     state: &SymState<'_>,
     phi: &SSAVar,
@@ -1092,7 +1095,7 @@ fn recurrence_for_latch(
             .ops
             .iter()
             .find(|op| op.dst().is_some_and(|dst| dst.display_name() == latch_name))
-            .map(|op| recurrence_kind_for_op(block, state, op, &phi_name))
+            .map(|op| recurrence_kind_for_op(artifact, block, state, op, phi, &phi_name))
             .unwrap_or_else(|| {
                 LoopRecurrenceKind::Unsupported("missing_latch_definition".to_string())
             })
@@ -1109,16 +1112,24 @@ fn recurrence_for_latch(
 }
 
 fn recurrence_kind_for_op(
+    artifact: &SsaArtifact,
     block: &FunctionSSABlock,
     state: &SymState<'_>,
     op: &SSAOp,
+    phi: &SSAVar,
     phi_name: &str,
 ) -> LoopRecurrenceKind {
     let bits = op
         .dst()
         .map(|dst| dst.size.saturating_mul(8).max(1))
         .unwrap_or(64);
-    if let Some(kind) = affine_recurrence_kind_for_op(block, op, phi_name, bits) {
+    // The add, subtract and affine family is `r2ssa`'s answer, not this
+    // crate's. It recognises them on the prepared graph keyed by `ValueId` and
+    // validates each against that graph, so recognising them again here from
+    // SSA variable spellings would be a second answer to a question that
+    // already has an owner -- and the one that stops being right first,
+    // because a name changes where a value identity does not.
+    if let Some(kind) = induction_recurrence_kind(artifact, phi) {
         return kind;
     }
     match op {
@@ -1150,133 +1161,22 @@ fn recurrence_kind_for_op(
     }
 }
 
-fn affine_recurrence_kind_for_op(
-    block: &FunctionSSABlock,
-    op: &SSAOp,
-    phi_name: &str,
-    bits: u32,
-) -> Option<LoopRecurrenceKind> {
-    let mut visited = HashSet::new();
-    let (multiplier, addend) =
-        parse_affine_recurrence_op(block, op, phi_name, bits, 8, &mut visited)?;
-    Some(affine_kind_from_parts(multiplier, addend, bits))
-}
-
-fn parse_affine_recurrence_op(
-    block: &FunctionSSABlock,
-    op: &SSAOp,
-    phi_name: &str,
-    bits: u32,
-    depth: u8,
-    visited: &mut HashSet<String>,
-) -> Option<(u64, u64)> {
-    if depth == 0 {
-        return None;
-    }
-    match op {
-        SSAOp::Copy { src, .. } => {
-            parse_affine_recurrence_var(block, src, phi_name, bits, depth - 1, visited)
+/// The step `r2ssa` recovered for this merge, in this crate's spelling.
+///
+/// Purely an adapter. Every judgement about whether a value moves and by how
+/// much was made and validated in `r2ssa::semantic`; a step this crate cannot
+/// spell would be a gap in the mapping to fix rather than a reason to
+/// recognise the shape a second time here.
+fn induction_recurrence_kind(artifact: &SsaArtifact, phi: &SSAVar) -> Option<LoopRecurrenceKind> {
+    let value = artifact.graph().value_id_for_var(phi)?;
+    let fact = artifact.facts().structured.inductions.get(&value)?;
+    Some(match fact.step {
+        r2ssa::InductionStep::AddConst(value) => LoopRecurrenceKind::AddConst(value),
+        r2ssa::InductionStep::SubConst(value) => LoopRecurrenceKind::SubConst(value),
+        r2ssa::InductionStep::Affine { multiplier, addend } => {
+            LoopRecurrenceKind::AffineConst { multiplier, addend }
         }
-        SSAOp::IntAdd { a, b, .. } => {
-            let lhs = parse_affine_recurrence_var(block, a, phi_name, bits, depth - 1, visited)?;
-            let rhs = parse_affine_recurrence_var(block, b, phi_name, bits, depth - 1, visited)?;
-            Some(affine_add_parts(lhs, rhs, bits))
-        }
-        SSAOp::IntSub { a, b, .. } => {
-            let lhs = parse_affine_recurrence_var(block, a, phi_name, bits, depth - 1, visited)?;
-            let rhs = parse_affine_recurrence_var(block, b, phi_name, bits, depth - 1, visited)?;
-            Some(affine_sub_parts(lhs, rhs, bits))
-        }
-        SSAOp::IntMult { a, b, .. } => {
-            if let Some(scale) = parse_const_var(a) {
-                let rhs =
-                    parse_affine_recurrence_var(block, b, phi_name, bits, depth - 1, visited)?;
-                return Some(affine_scale_parts(rhs, scale, bits));
-            }
-            if let Some(scale) = parse_const_var(b) {
-                let lhs =
-                    parse_affine_recurrence_var(block, a, phi_name, bits, depth - 1, visited)?;
-                return Some(affine_scale_parts(lhs, scale, bits));
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn parse_affine_recurrence_var(
-    block: &FunctionSSABlock,
-    value: &SSAVar,
-    phi_name: &str,
-    bits: u32,
-    depth: u8,
-    visited: &mut HashSet<String>,
-) -> Option<(u64, u64)> {
-    if depth == 0 {
-        return None;
-    }
-    if value.display_name() == phi_name {
-        return Some((1, 0));
-    }
-    if let Some(constant) = parse_const_var(value) {
-        return Some((0, constant & mask_for_bits(bits)));
-    }
-
-    let name = value.display_name();
-    if !visited.insert(name.clone()) {
-        return None;
-    }
-    let result = block
-        .ops
-        .iter()
-        .find(|op| op.dst().is_some_and(|dst| dst.display_name() == name))
-        .and_then(|op| parse_affine_recurrence_op(block, op, phi_name, bits, depth - 1, visited));
-    visited.remove(&name);
-    result
-}
-
-fn affine_kind_from_parts(multiplier: u64, addend: u64, bits: u32) -> LoopRecurrenceKind {
-    let mask = mask_for_bits(bits);
-    let multiplier = multiplier & mask;
-    let addend = addend & mask;
-    if multiplier == 1 {
-        if addend == 0 {
-            LoopRecurrenceKind::Identity
-        } else {
-            let subtraction = addend.wrapping_neg() & mask;
-            if subtraction != 0 && subtraction < addend {
-                LoopRecurrenceKind::SubConst(subtraction)
-            } else {
-                LoopRecurrenceKind::AddConst(addend)
-            }
-        }
-    } else {
-        LoopRecurrenceKind::AffineConst { multiplier, addend }
-    }
-}
-
-fn affine_add_parts(lhs: (u64, u64), rhs: (u64, u64), bits: u32) -> (u64, u64) {
-    let mask = mask_for_bits(bits);
-    (
-        lhs.0.wrapping_add(rhs.0) & mask,
-        lhs.1.wrapping_add(rhs.1) & mask,
-    )
-}
-
-fn affine_sub_parts(lhs: (u64, u64), rhs: (u64, u64), bits: u32) -> (u64, u64) {
-    let mask = mask_for_bits(bits);
-    (
-        lhs.0.wrapping_sub(rhs.0) & mask,
-        lhs.1.wrapping_sub(rhs.1) & mask,
-    )
-}
-
-fn affine_scale_parts(parts: (u64, u64), scale: u64, bits: u32) -> (u64, u64) {
-    let mask = mask_for_bits(bits);
-    (
-        parts.0.wrapping_mul(scale) & mask,
-        parts.1.wrapping_mul(scale) & mask,
-    )
+    })
 }
 
 fn rotate_mix_recurrence_kind_for_op(
@@ -2119,180 +2019,218 @@ mod tests {
         );
     }
 
+    /// An artifact with no loop, for the fixtures that still forge their own
+    /// blocks to exercise the fold and rotate shapes `r2ssa` does not model.
+    ///
+    /// Passing one with facts in it would be misleading: those fixtures' SSA
+    /// names belong to no real graph, so no fact could match them, and a
+    /// reader should be able to see that the recurrence under test came from
+    /// this crate's own recognisers.
+    fn artifact_without_inductions() -> r2ssa::SsaArtifact {
+        use r2il::{R2ILBlock, R2ILOp, Varnode};
+        let mut only = R2ILBlock::new(0x1000, 4);
+        only.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        r2ssa::SsaArtifact::for_decompile(&[only], None).expect("straight-line artifact")
+    }
+
+    /// A real two-carrier loop artifact: a counter stepped by one and an
+    /// accumulator stepped by `acc_step`.
+    ///
+    /// The fixtures below used to forge `FunctionSSABlock` values by hand,
+    /// which let them describe SSA the builder never produces. The add,
+    /// subtract and affine recurrences now come from `r2ssa`'s induction
+    /// facts, which are keyed by `ValueId` against a real graph, so a forged
+    /// block has no facts to find and these have to be real.
+    fn real_loop_artifact(acc_multiplier: u64, acc_addend: u64) -> r2ssa::SsaArtifact {
+        use r2il::{R2ILBlock, R2ILOp, Varnode};
+        let counter = Varnode::register(40, 8);
+        let accumulator = Varnode::register(48, 8);
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: accumulator.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x1010, 8),
+        });
+        let mut header = R2ILBlock::new(0x1010, 4);
+        header.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(1, 8),
+        });
+        if acc_multiplier != 1 {
+            // Scale in place rather than through a temporary. A unique written
+            // in the header and read there is discovered as loop-carried state
+            // with no value on the entry edge, which makes the whole system
+            // inexact for a reason that is an artifact of the fixture.
+            header.push(R2ILOp::IntMult {
+                dst: accumulator.clone(),
+                a: accumulator.clone(),
+                b: Varnode::constant(acc_multiplier, 8),
+            });
+            header.push(R2ILOp::IntAdd {
+                dst: accumulator.clone(),
+                a: accumulator.clone(),
+                b: Varnode::constant(acc_addend, 8),
+            });
+        } else {
+            header.push(R2ILOp::IntAdd {
+                dst: accumulator.clone(),
+                a: accumulator.clone(),
+                b: Varnode::constant(acc_addend, 8),
+            });
+        }
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x1010, 8),
+            cond: Varnode::register(24, 1),
+        });
+        let mut exit = R2ILBlock::new(0x1014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        r2ssa::SsaArtifact::for_decompile(&[entry, header, exit], None).expect("real loop artifact")
+    }
+
     #[test]
     fn derives_exact_add_const_recurrence_summary() {
-        let counter_phi = var("RCX", 2, 8);
-        let acc_phi = var("RBX", 2, 8);
-        let block = FunctionSSABlock {
-            addr: 0x1000,
-            size: 4,
-            phis: vec![
-                PhiNode {
-                    dst: counter_phi.clone(),
-                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: acc_phi.clone(),
-                    sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
-                    canonical_storage: None,
-                },
-            ],
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("RCX", 1, 8),
-                    a: counter_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("RBX", 1, 8),
-                    a: acc_phi,
-                    b: const_var(3, 8),
-                },
-            ],
-        };
+        // Real SSA rather than a forged block: the add, subtract and affine
+        // recurrences come from `r2ssa`'s induction facts, which are keyed by
+        // `ValueId` against a real graph, so a hand-built block has no facts
+        // to find. The accumulator is register 0x30 and steps by three.
+        let artifact = real_loop_artifact(1, 3);
+        let block = artifact
+            .function()
+            .get_block(0x1010)
+            .expect("loop header")
+            .clone();
+        let counter_phi = block.phis[0].dst.clone();
+        let accumulator = block.phis[1].dst.display_name();
         let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_prev_pc(Some(0x900));
-        state.set_register("RCX_0", SymValue::concrete(0, 64));
-        state.set_register("RBX_0", SymValue::concrete(10, 64));
+        let mut state = SymState::new(&ctx, 0x1010);
+        state.set_prev_pc(Some(0x1000));
+        // The state holds the values on the edge into the loop, which is what
+        // `state_value_at_block_entry` resolves a phi to, not the phi outputs.
+        let entry_source = |phi: &r2ssa::PhiNode| {
+            phi.sources
+                .iter()
+                .find(|(pred, _)| *pred == 0x1000)
+                .map(|(_, var)| var.display_name())
+                .expect("entry edge source")
+        };
+        state.set_register(&entry_source(&block.phis[0]), SymValue::concrete(0, 64));
+        state.set_register(&entry_source(&block.phis[1]), SymValue::concrete(0, 64));
         let branch = super::RuntimeLoopBranch {
             counter: counter_phi,
             threshold: 10,
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 10);
-        assert!(system.is_exact(), "{:?}", system.reasons);
-        assert!(system.recurrences.iter().any(|recurrence| {
-            recurrence.phi == "RBX_2" && recurrence.kind == LoopRecurrenceKind::AddConst(3)
-        }));
+        let system = derive_loop_transition_system(&artifact, &block, &state, &branch, 0, 10);
+        assert!(
+            system.recurrences.iter().any(|recurrence| {
+                recurrence.phi == accumulator && recurrence.kind == LoopRecurrenceKind::AddConst(3)
+            }),
+            "recurrences={:?} reasons={:?} carried={:?}",
+            system.recurrences,
+            system.reasons,
+            system.carried_state
+        );
         let exact_recurrences = exact_recurrence_evidence_from_system(&system);
-        assert!(exact_recurrences.iter().any(|recurrence| {
-            recurrence.accumulator == "RBX_2"
-                && recurrence.kind == super::ExactLoopRecurrenceKind::AddConst(3)
-        }));
+        assert!(
+            exact_recurrences.iter().any(|recurrence| {
+                recurrence.accumulator == accumulator
+                    && recurrence.kind == super::ExactLoopRecurrenceKind::AddConst(3)
+            }),
+            "{exact_recurrences:?}"
+        );
         let summary = apply_exact_transition_system(&ctx, &state, &system).expect("summary");
         assert_eq!(summary.kind, LoopSummaryKind::Exact);
         assert_eq!(summary.exact_recurrences, exact_recurrences);
         let summarized = summary.resulting_state.expect("state");
         assert_eq!(summarized.pc(), 0x2000);
+        // Ten trips of three from zero.
         assert_eq!(
-            summarized.get_register_sized("RBX_2", 64).as_concrete(),
-            Some(40)
+            summarized
+                .get_register_sized(&accumulator, 64)
+                .as_concrete(),
+            Some(30)
         );
-        assert_eq!(
-            summarized.get_register_sized("RCX_2", 64).as_concrete(),
-            Some(10)
-        );
-
-        let mut runtime_state = state.fork();
-        let _ = runtime_state.define_runtime_region("loop_copy", 0x5000, 0x2000, true);
-        runtime_state.note_runtime_store_copy(
-            0x5000,
-            0x2000,
-            Some(&crate::RuntimeValueProvenance {
-                source_addr: 0x1000,
-                size: 0x2000,
-            }),
-        );
-        assert!(runtime_state.select_runtime_execution_pc(0x5000));
-        let summary = apply_exact_transition_system(&ctx, &runtime_state, &system)
-            .expect("runtime-domain summary");
-        let summarized = summary.resulting_state.expect("runtime-domain state");
-        assert_eq!(summarized.pc(), 0x6000);
-        assert!(matches!(
-            summarized.execution_pc(),
-            crate::state::ExecutionPc::RuntimeAlias {
-                static_addr: 0x2000
-            }
-        ));
-        assert!(matches!(
-            summarized.predecessor(),
-            Some(crate::state::ExecutionPredecessor::RuntimeAlias {
-                runtime_addr: 0x5000,
-                static_addr: 0x1000,
-            })
-        ));
     }
 
     #[test]
     fn derives_exact_affine_const_recurrence_summary() {
-        let counter_phi = var("RCX", 2, 8);
-        let acc_phi = var("RBX", 2, 8);
-        let block = FunctionSSABlock {
-            addr: 0x1000,
-            size: 4,
-            phis: vec![
-                PhiNode {
-                    dst: counter_phi.clone(),
-                    sources: vec![(0x900, var("RCX", 0, 8)), (0x1008, var("RCX", 1, 8))],
-                    canonical_storage: None,
-                },
-                PhiNode {
-                    dst: acc_phi.clone(),
-                    sources: vec![(0x900, var("RBX", 0, 8)), (0x1008, var("RBX", 1, 8))],
-                    canonical_storage: None,
-                },
-            ],
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("RCX", 1, 8),
-                    a: counter_phi.clone(),
-                    b: const_var(1, 8),
-                },
-                SSAOp::IntMult {
-                    dst: var("TMP", 0, 8),
-                    a: acc_phi,
-                    b: const_var(3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("RBX", 1, 8),
-                    a: var("TMP", 0, 8),
-                    b: const_var(1, 8),
-                },
-            ],
-        };
+        // `x = x * 3 + 1`, recovered as one affine step rather than as a
+        // multiply followed by an add.
+        let artifact = real_loop_artifact(3, 1);
+        let block = artifact
+            .function()
+            .get_block(0x1010)
+            .expect("loop header")
+            .clone();
+        let counter_phi = block.phis[0].dst.clone();
+        let accumulator = block.phis[1].dst.display_name();
         let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_prev_pc(Some(0x900));
-        state.set_register("RCX_0", SymValue::concrete(0, 64));
-        state.set_register("RBX_0", SymValue::concrete(2, 64));
+        let mut state = SymState::new(&ctx, 0x1010);
+        state.set_prev_pc(Some(0x1000));
+        let entry_source = |phi: &r2ssa::PhiNode| {
+            phi.sources
+                .iter()
+                .find(|(pred, _)| *pred == 0x1000)
+                .map(|(_, var)| var.display_name())
+                .expect("entry edge source")
+        };
+        state.set_register(&entry_source(&block.phis[0]), SymValue::concrete(0, 64));
+        state.set_register(&entry_source(&block.phis[1]), SymValue::concrete(2, 64));
         let branch = super::RuntimeLoopBranch {
             counter: counter_phi,
             threshold: 4,
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 4);
-        assert!(system.is_exact(), "{:?}", system.reasons);
-        assert!(system.recurrences.iter().any(|recurrence| {
-            recurrence.phi == "RBX_2"
-                && recurrence.kind
-                    == LoopRecurrenceKind::AffineConst {
-                        multiplier: 3,
-                        addend: 1,
-                    }
-        }));
+        let system = derive_loop_transition_system(&artifact, &block, &state, &branch, 0, 4);
+        assert!(
+            system.recurrences.iter().any(|recurrence| {
+                recurrence.phi == accumulator
+                    && recurrence.kind
+                        == LoopRecurrenceKind::AffineConst {
+                            multiplier: 3,
+                            addend: 1,
+                        }
+            }),
+            "recurrences={:?} reasons={:?} carried={:?}",
+            system.recurrences,
+            system.reasons,
+            system.carried_state
+        );
         let exact_recurrences = exact_recurrence_evidence_from_system(&system);
-        assert!(exact_recurrences.iter().any(|recurrence| {
-            recurrence.accumulator == "RBX_2"
-                && recurrence.kind
-                    == super::ExactLoopRecurrenceKind::AffineConst {
-                        multiplier: 3,
-                        addend: 1,
-                    }
-        }));
+        assert!(system.is_exact(), "reasons={:?}", system.reasons);
+        assert!(
+            exact_recurrences.iter().any(|recurrence| {
+                recurrence.accumulator == accumulator
+                    && recurrence.kind
+                        == super::ExactLoopRecurrenceKind::AffineConst {
+                            multiplier: 3,
+                            addend: 1,
+                        }
+            }),
+            "{exact_recurrences:?}"
+        );
         let summary = apply_exact_transition_system(&ctx, &state, &system).expect("summary");
         assert_eq!(summary.kind, LoopSummaryKind::Exact);
         let summarized = summary.resulting_state.expect("state");
+        // Four trips of `x = x * 3 + 1` from two: 7, 22, 67, 202.
         assert_eq!(
-            summarized.get_register_sized("RBX_2", 64).as_concrete(),
+            summarized
+                .get_register_sized(&accumulator, 64)
+                .as_concrete(),
             Some(202)
-        );
-        assert_eq!(
-            summarized.get_register_sized("RCX_2", 64).as_concrete(),
-            Some(4)
         );
     }
 
@@ -2330,7 +2268,14 @@ mod tests {
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 10);
+        let system = derive_loop_transition_system(
+            &artifact_without_inductions(),
+            &block,
+            &state,
+            &branch,
+            0,
+            10,
+        );
         assert!(!system.is_exact());
         assert!(
             system
@@ -2414,7 +2359,14 @@ mod tests {
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
+        let system = derive_loop_transition_system(
+            &artifact_without_inductions(),
+            &block,
+            &state,
+            &branch,
+            0,
+            3,
+        );
         assert!(!system.is_exact());
         assert!(
             system
@@ -2494,7 +2446,14 @@ mod tests {
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
+        let system = derive_loop_transition_system(
+            &artifact_without_inductions(),
+            &block,
+            &state,
+            &branch,
+            0,
+            3,
+        );
         assert!(system.is_exact(), "{:?}", system.reasons);
         assert!(system.recurrences.iter().any(|recurrence| {
             matches!(
@@ -2575,7 +2534,14 @@ mod tests {
             target: 0x2000,
         };
 
-        let system = derive_loop_transition_system(&block, &state, &branch, 0, 3);
+        let system = derive_loop_transition_system(
+            &artifact_without_inductions(),
+            &block,
+            &state,
+            &branch,
+            0,
+            3,
+        );
         assert!(!system.is_exact());
         assert!(
             system

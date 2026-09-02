@@ -835,6 +835,96 @@ impl LoopCarrierUpdateFact {
     }
 }
 
+/// How one loop-carried value changes on a single trip round the latch.
+///
+/// Only shapes that can be stated exactly appear here. A recurrence whose step
+/// this cannot name is absent rather than approximated: a consumer reading a
+/// step is entitled to assume it is the whole truth about the value's motion,
+/// and an approximate step would let a renderer spell `a[i]` for a pointer
+/// that does not advance the way the spelling claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InductionStep {
+    /// `x = x + value`, wrapping at the value's width.
+    AddConst(u64),
+    /// `x = x - value`, wrapping at the value's width.
+    SubConst(u64),
+    /// `x = x * multiplier + addend`, wrapping at the value's width, with a
+    /// multiplier that is not one -- a unit multiplier is an add or a subtract
+    /// and is spelled as one.
+    Affine { multiplier: u64, addend: u64 },
+}
+
+impl InductionStep {
+    /// The value after one trip, given the value before it.
+    ///
+    /// Wrapping, because the machine wraps: a step that disagreed with the
+    /// program at its width would be worse than no step at all.
+    pub const fn apply(self, value: u64, width_bits: u32) -> u64 {
+        let mask = if width_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width_bits) - 1
+        };
+        let stepped = match self {
+            Self::AddConst(addend) => value.wrapping_add(addend),
+            Self::SubConst(subtrahend) => value.wrapping_sub(subtrahend),
+            Self::Affine { multiplier, addend } => {
+                value.wrapping_mul(multiplier).wrapping_add(addend)
+            }
+        };
+        stepped & mask
+    }
+}
+
+/// One loop-carried value whose motion round the latch is known exactly.
+///
+/// This is induction-variable recovery stated as a fact rather than as a
+/// transformation: the merge that carries the value, the value it holds on
+/// entry, the value the latch writes back, and the step between them. It is
+/// keyed by `ValueId` throughout, because a recurrence recognised by SSA
+/// variable spelling is a recurrence that stops being recognised the moment a
+/// name changes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InductionFact {
+    pub loop_id: LoopId,
+    pub header: u64,
+    /// The header merge carrying the value.
+    pub phi: ValueId,
+    /// What the merge holds on the edge into the loop.
+    pub init: ValueId,
+    /// What the latch writes back.
+    pub update: ValueId,
+    /// The latch block whose edge carries `update`.
+    pub latch: u64,
+    pub width_bits: u32,
+    pub step: InductionStep,
+}
+
+impl InductionFact {
+    /// Prove this fact against the graph that owns it.
+    ///
+    /// The merge must be a phi, `init` and `update` must both be inputs of it,
+    /// and re-deriving the step from `update`'s own definition must produce
+    /// the step recorded here. The last check is the one that matters: it
+    /// makes a stored step that no longer follows from the graph a validation
+    /// failure rather than a fact a consumer would trust.
+    pub fn validate(&self, graph: &SsaGraph) -> bool {
+        let Some(phi_inst) = graph.def_inst(self.phi) else {
+            return false;
+        };
+        let Some(inst) = graph.inst(phi_inst) else {
+            return false;
+        };
+        if !matches!(inst.payload, InstPayload::Phi { .. }) {
+            return false;
+        }
+        if !inst.inputs.contains(&self.init) || !inst.inputs.contains(&self.update) {
+            return false;
+        }
+        induction_step_for_update(graph, self.phi, self.update, self.width_bits) == Some(self.step)
+    }
+}
+
 /// A loop-carried mutable value proven directly from header phi edges.
 ///
 /// `identity_values` contains phi outputs that denote the carrier state after
@@ -1356,6 +1446,9 @@ pub struct PreparedFunctionCertificates {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StructuredDataflowFacts {
     pub loops: BTreeMap<LoopId, StructuredLoopFact>,
+    /// Loop-carried values whose motion round the latch is known exactly,
+    /// keyed by the header merge that carries them.
+    pub inductions: BTreeMap<ValueId, InductionFact>,
     /// Cyclic CFG blocks not represented by a structured loop fact.
     pub unstructured_cycle_blocks: BTreeSet<u64>,
     pub memory_accesses: BTreeMap<StructuredAccessId, StructuredMemoryAccessFact>,
@@ -2627,6 +2720,190 @@ struct StructuredCollectionInputs<'a> {
     machine_context: Option<&'a SourceMachineContext>,
 }
 
+/// Mask for a width, saturating at the widest value this can state.
+const fn induction_mask(width_bits: u32) -> u64 {
+    if width_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width_bits) - 1
+    }
+}
+
+/// The constant a value holds, if it holds one.
+fn induction_constant(graph: &SsaGraph, value: ValueId) -> Option<u64> {
+    graph.value(value)?.var.constant_bits()
+}
+
+/// The affine parts `(multiplier, addend)` of `value` in terms of `phi`.
+///
+/// `phi` itself is `(1, 0)`; a constant is `(0, c)`; and add, subtract and
+/// multiply-by-constant compose. Anything else has no affine reading and
+/// returns `None`, which is what keeps a shape this cannot state exactly out
+/// of the fact entirely.
+///
+/// The depth bound and the visited set are both needed: the bound stops a
+/// legitimately deep expression from costing more than it is worth, and the
+/// set stops a cycle through a merge from recursing forever.
+fn induction_affine_parts(
+    graph: &SsaGraph,
+    phi: ValueId,
+    value: ValueId,
+    width_bits: u32,
+    depth: u8,
+    visited: &mut BTreeSet<ValueId>,
+) -> Option<(u64, u64)> {
+    if depth == 0 {
+        return None;
+    }
+    if value == phi {
+        return Some((1, 0));
+    }
+    let mask = induction_mask(width_bits);
+    if let Some(constant) = induction_constant(graph, value) {
+        return Some((0, constant & mask));
+    }
+    if !visited.insert(value) {
+        return None;
+    }
+    let parts = induction_affine_parts_of_definition(graph, phi, value, width_bits, depth);
+    visited.remove(&value);
+    parts
+}
+
+fn induction_affine_parts_of_definition(
+    graph: &SsaGraph,
+    phi: ValueId,
+    value: ValueId,
+    width_bits: u32,
+    depth: u8,
+) -> Option<(u64, u64)> {
+    let inst = graph.inst(graph.def_inst(value)?)?;
+    let InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
+    let mask = induction_mask(width_bits);
+    let operand = |index: usize| inst.inputs.get(index).copied();
+    let mut visited = BTreeSet::from([value]);
+    let mut parts_of = |value: ValueId| {
+        induction_affine_parts(graph, phi, value, width_bits, depth - 1, &mut visited)
+    };
+    match op {
+        SSAOp::Copy { .. } => parts_of(operand(0)?),
+        SSAOp::IntAdd { .. } => {
+            let (lm, la) = parts_of(operand(0)?)?;
+            let (rm, ra) = parts_of(operand(1)?)?;
+            Some((lm.wrapping_add(rm) & mask, la.wrapping_add(ra) & mask))
+        }
+        SSAOp::IntSub { .. } => {
+            let (lm, la) = parts_of(operand(0)?)?;
+            let (rm, ra) = parts_of(operand(1)?)?;
+            Some((lm.wrapping_sub(rm) & mask, la.wrapping_sub(ra) & mask))
+        }
+        SSAOp::IntMult { .. } => {
+            let left = operand(0)?;
+            let right = operand(1)?;
+            // Exactly one operand must be constant. Multiplying two affine
+            // terms is quadratic in the carrier and has no affine reading.
+            if let Some(scale) = induction_constant(graph, left) {
+                let (multiplier, addend) = parts_of(right)?;
+                return Some((
+                    multiplier.wrapping_mul(scale) & mask,
+                    addend.wrapping_mul(scale) & mask,
+                ));
+            }
+            let scale = induction_constant(graph, right)?;
+            let (multiplier, addend) = parts_of(left)?;
+            Some((
+                multiplier.wrapping_mul(scale) & mask,
+                addend.wrapping_mul(scale) & mask,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The step `update` applies to `phi`, when it applies one this can state.
+///
+/// A multiplier of one is an add or a subtract; the subtract spelling is
+/// chosen when the addend reads as a smaller negative number at this width,
+/// which is what makes a decrementing counter say so rather than claim to add
+/// a value near the top of its range. A multiplier of one with a zero addend
+/// is the identity, which is not motion and is refused: a value that does not
+/// change is a loop-invariant, and calling it an induction variable would let
+/// a consumer index by something that never advances.
+fn induction_step_for_update(
+    graph: &SsaGraph,
+    phi: ValueId,
+    update: ValueId,
+    width_bits: u32,
+) -> Option<InductionStep> {
+    let mut visited = BTreeSet::new();
+    let (multiplier, addend) =
+        induction_affine_parts(graph, phi, update, width_bits, 8, &mut visited)?;
+    let mask = induction_mask(width_bits);
+    let multiplier = multiplier & mask;
+    let addend = addend & mask;
+    if multiplier != 1 {
+        return Some(InductionStep::Affine { multiplier, addend });
+    }
+    if addend == 0 {
+        return None;
+    }
+    let negated = addend.wrapping_neg() & mask;
+    if negated != 0 && negated < addend {
+        Some(InductionStep::SubConst(negated))
+    } else {
+        Some(InductionStep::AddConst(addend))
+    }
+}
+
+/// Every loop-carried value whose motion round the latch is known exactly.
+///
+/// Derived from the carrier facts rather than from a second walk of the CFG:
+/// the carriers already prove which merge carries a value, which edge enters
+/// it and which edge updates it, and this only asks what the update does to
+/// the merge. A carrier with more than one update edge is skipped, because two
+/// latches may step the value differently and one step would not describe
+/// both.
+fn collect_induction_facts(
+    graph: &SsaGraph,
+    loops: &BTreeMap<LoopId, StructuredLoopFact>,
+) -> BTreeMap<ValueId, InductionFact> {
+    let mut inductions = BTreeMap::new();
+    for loop_fact in loops.values() {
+        for carrier in &loop_fact.carriers {
+            let [update] = carrier.updates.as_slice() else {
+                continue;
+            };
+            let [entry] = carrier.entries.as_slice() else {
+                continue;
+            };
+            let width_bits = carrier.width.saturating_mul(8).max(1);
+            let Some(step) =
+                induction_step_for_update(graph, carrier.phi, update.value, width_bits)
+            else {
+                continue;
+            };
+            let fact = InductionFact {
+                loop_id: loop_fact.id,
+                header: loop_fact.header,
+                phi: carrier.phi,
+                init: entry.value,
+                update: update.value,
+                latch: update.predecessor,
+                width_bits,
+                step,
+            };
+            // A fact that does not prove itself against the graph it came from
+            // is a fact nobody should read.
+            if fact.validate(graph) {
+                inductions.insert(carrier.phi, fact);
+            }
+        }
+    }
+    inductions
+}
+
 fn collect_structured_dataflow_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -2644,6 +2921,7 @@ fn collect_structured_dataflow_facts(
         collect_structured_memory_access_facts(function, graph, inputs.objects, inputs.memory);
     StructuredDataflowFacts {
         unstructured_cycle_blocks: collect_unstructured_cycle_blocks(graph, &loops),
+        inductions: collect_induction_facts(graph, &loops),
         loops,
         memory_accesses,
         recursive_calls: collect_structured_recursive_call_facts(
@@ -11183,6 +11461,171 @@ mod tests {
                 .is_none()
         );
         assert!(convergent_boundary.complete);
+    }
+
+    /// A counting loop: `x = 0` on entry, `x = x + step` round the latch.
+    ///
+    /// `step_op` builds the latch update from the header phi's register, so a
+    /// test can say what motion the loop has without restating the fixture.
+    fn induction_loop_artifact(step_ops: &[R2ILOp]) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let mut entry = R2ILBlock::new(0x7000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7010, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7010, 4);
+        for op in step_ops {
+            header.push(op.clone());
+        }
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7010, 8),
+            cond: Varnode::register(24, 1),
+        });
+
+        let mut exit = R2ILBlock::new(0x7014, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        SsaArtifact::for_decompile(&[entry, header, exit], Some(&return_boundary_arch()))
+            .expect("induction loop artifact")
+    }
+
+    fn recovered_induction_step(artifact: &SsaArtifact) -> Option<super::InductionStep> {
+        artifact
+            .facts()
+            .structured
+            .inductions
+            .values()
+            .find(|fact| fact.width_bits == 64)
+            .map(|fact| fact.step)
+    }
+
+    #[test]
+    fn a_counter_stepped_by_a_constant_is_an_induction_variable() {
+        let counter = Varnode::register(40, 8);
+        let artifact = induction_loop_artifact(&[R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(1, 8),
+        }]);
+        assert_eq!(
+            recovered_induction_step(&artifact),
+            Some(super::InductionStep::AddConst(1))
+        );
+    }
+
+    #[test]
+    fn a_decrementing_counter_says_it_subtracts_rather_than_adding_a_huge_number() {
+        // `x - 1` and `x + 0xffff_ffff_ffff_ffff` are the same bits. Reporting
+        // the second would make a consumer reading the step for a bound
+        // conclude the value races away from zero rather than towards it.
+        let counter = Varnode::register(40, 8);
+        let artifact = induction_loop_artifact(&[R2ILOp::IntSub {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(1, 8),
+        }]);
+        assert_eq!(
+            recovered_induction_step(&artifact),
+            Some(super::InductionStep::SubConst(1))
+        );
+    }
+
+    #[test]
+    fn a_multiply_and_add_is_recovered_as_one_affine_step() {
+        let counter = Varnode::register(40, 8);
+        let scaled = Varnode::unique(0x7100, 8);
+        let artifact = induction_loop_artifact(&[
+            R2ILOp::IntMult {
+                dst: scaled.clone(),
+                a: counter.clone(),
+                b: Varnode::constant(31, 8),
+            },
+            R2ILOp::IntAdd {
+                dst: counter.clone(),
+                a: scaled,
+                b: Varnode::constant(7, 8),
+            },
+        ]);
+        assert_eq!(
+            recovered_induction_step(&artifact),
+            Some(super::InductionStep::Affine {
+                multiplier: 31,
+                addend: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn a_value_that_does_not_move_is_not_an_induction_variable() {
+        // Multiplier one and addend zero is the identity. A loop-invariant is
+        // not motion, and calling it one would let a consumer index by
+        // something that never advances.
+        let counter = Varnode::register(40, 8);
+        let artifact = induction_loop_artifact(&[R2ILOp::Copy {
+            dst: counter.clone(),
+            src: counter,
+        }]);
+        assert_eq!(recovered_induction_step(&artifact), None);
+        assert!(
+            artifact.facts().structured.inductions.is_empty(),
+            "an invariant earns no induction fact at any width"
+        );
+    }
+
+    #[test]
+    fn a_step_this_cannot_state_exactly_is_absent_rather_than_approximated() {
+        // Exclusive-or has no affine reading. The old recogniser answered
+        // `XorConst` here; this refuses, because a consumer reading a step is
+        // entitled to assume it describes the whole motion.
+        let counter = Varnode::register(40, 8);
+        let artifact = induction_loop_artifact(&[R2ILOp::IntXor {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(0x9e3779b9, 8),
+        }]);
+        // The loop and its carrier exist; it is the step that is refused. A
+        // `None` from a fixture with no carrier would prove nothing.
+        let carriers: usize = artifact
+            .facts()
+            .structured
+            .loops
+            .values()
+            .map(|loop_fact| loop_fact.carriers.len())
+            .sum();
+        assert_eq!(carriers, 1, "the fixture carries a value round the latch");
+        assert_eq!(recovered_induction_step(&artifact), None);
+    }
+
+    #[test]
+    fn every_recovered_induction_proves_itself_against_its_graph() {
+        let counter = Varnode::register(40, 8);
+        let artifact = induction_loop_artifact(&[R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter,
+            b: Varnode::constant(4, 8),
+        }]);
+        let graph = artifact.graph();
+        let inductions = &artifact.facts().structured.inductions;
+        assert!(!inductions.is_empty(), "the fixture has an induction");
+        for (phi, fact) in inductions {
+            assert_eq!(*phi, fact.phi, "keyed by the merge it describes");
+            assert!(fact.validate(graph), "{fact:?} must prove itself");
+        }
+    }
+
+    #[test]
+    fn a_step_applies_at_the_width_the_machine_used() {
+        let step = super::InductionStep::AddConst(1);
+        assert_eq!(step.apply(0xff, 8), 0, "an eight-bit counter wraps");
+        assert_eq!(step.apply(0xff, 64), 0x100, "a sixty-four bit one does not");
+        assert_eq!(super::InductionStep::SubConst(1).apply(0, 8), 0xff);
     }
 
     #[test]
