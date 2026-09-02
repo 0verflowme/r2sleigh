@@ -6279,6 +6279,18 @@ match a local one that still carries the collapsed form. Confirming that means
 printing both signatures on either side of `structurally_compatible` for that
 test, which is where the next attempt should start.
 
+**Superseded: the trap user-operation is built.** `SsaArtifact` carries
+`user_operations` with a public `user_operation_name`, populated on the trusted
+decompile ingress in `function.rs`; the lift expands both trap user-operations
+into `SSAOp::Breakpoint`, which the obligation ledger already seeds as
+`Kind::Trap`, and `r2dec` renders `__builtin_trap()`. The `pc` question was
+answered by mapping the trap onto the breakpoint the pipeline already models
+rather than giving the write a new disposition. Verified on the binary:
+`sym.func.100003844` no longer refuses as unrepresentable and now stops at a
+later cause. The section below is what was true before that landed, kept for
+the reasoning rather than the plan, and it cost an agent time before the
+staleness was noticed.
+
 **What rendering a trap user-operation needs, mapped and not built.** Twelve of
 the sixteen refusing real functions on `/bin/ls` now stop at one place:
 `fold/op_lower/implementation.rs:2339` refuses `SSAOp::CallOther` outright. The
@@ -8060,3 +8072,31 @@ So answering "why did the plan bind this carrier" needs a probe inside
 named value, in the shape of the `R2DEC_TRACE_REFUSAL` probes that already pay
 for themselves elsewhere in this document. That is a few lines in a file no
 current effort holds, and it is the next step on the 192.
+
+**`/bin/ls` renders 11 of 136 and has for longer than anyone noticed.** An
+agent raised it as a regression from this session's work, which was the right
+alarm and the wrong cause. Measured on the integration branch and on `ec8d589`,
+the commit this session started from, the two are identical, cause for cause:
+
+    rendered                                                        11
+    refused: observation journal RenderedValueRequired (the thunks) 87
+    refused: effect obligations, one to seven each                  18
+    refused: unrepresentable control flow                            6
+    refused: unobserved_binding_write                                4
+
+This document records 22 of 48 real functions rendering, against 136 total with
+88 thunks, which is 22 of 136 by the same arithmetic. So the count halved
+somewhere earlier in this branch, and nothing caught it.
+
+Nothing caught it because the coverage harness sweeps only `branchy` and
+`hashes`, the two binaries this project compiles for itself. It reported 243 of
+313 throughout and is structurally incapable of seeing a real system binary
+halve. That is the same failure as trusting the rendering corpus as a
+specification, moved from correctness to coverage: a gate over input we
+generate cannot tell us how we do on input we did not.
+
+Two things follow. The 22 is not a number to plan against until it is
+remeasured, and several notes above rest on it. And the harness wants a real
+binary in it, with the binary's own hash recorded beside the baseline so a
+different machine reports a different subject rather than silently comparing
+against one it does not have.
