@@ -24,18 +24,27 @@ pub fn signed(bits: u128, width_bits: u32) -> i128 {
     ((bits << shift) as i128) >> shift
 }
 
-/// Evaluate `root`, asking `leaf` for the value of every base-arena node it
-/// reads. A Bool-typed leaf must be answered with 0 or 1.
+/// What a term reads from outside itself: a base-arena node, or a free
+/// variable of a proof template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeafRef {
+    Expr(MachineExprId),
+    Variable(u32),
+}
+
+/// Evaluate `root`, asking `leaf` for the value of every base-arena node or
+/// variable it reads. A Bool-typed leaf must be answered with 0 or 1.
 pub fn eval(
     arena: &TermArena,
     root: TermId,
-    leaf: &mut dyn FnMut(MachineExprId, &MachineType) -> u128,
+    leaf: &mut dyn FnMut(LeafRef, &MachineType) -> u128,
 ) -> u128 {
     let term = arena.term(root);
     let width = term.width_bits();
     let m = mask(width);
     let value = match term.kind {
-        TermKind::Leaf(expr) | TermKind::Opaque(expr) => leaf(expr, &term.ty),
+        TermKind::Leaf(expr) | TermKind::Opaque(expr) => leaf(LeafRef::Expr(expr), &term.ty),
+        TermKind::Variable(index) => leaf(LeafRef::Variable(index), &term.ty),
         TermKind::Literal(bits) => u128::from(bits.bits()),
         TermKind::Arithmetic { op, left, right } => {
             let l = eval(arena, left, leaf);

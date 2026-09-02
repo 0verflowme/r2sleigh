@@ -45,6 +45,10 @@ pub enum TermKind {
     Opaque(MachineExprId),
     /// A constant the rewriter introduced or folded; it names no value.
     Literal(MachineBitVector),
+    /// A free variable. Only the proof harness builds these: a rule's
+    /// template is stated over variables, and the equivalence is checked for
+    /// every assignment to them. Never produced by import, so never rendered.
+    Variable(u32),
     Arithmetic {
         op: MachineArithmeticOp,
         left: TermId,
@@ -124,7 +128,7 @@ impl TermKind {
     pub fn children(&self) -> Children {
         let placeholder = TermId(0);
         let (items, len) = match *self {
-            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) => {
+            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_) => {
                 ([placeholder, placeholder, placeholder], 0)
             }
             Self::Negate(input)
@@ -154,13 +158,16 @@ impl TermKind {
 
     /// Whether this term has no children.
     pub const fn is_nullary(&self) -> bool {
-        matches!(self, Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_))
+        matches!(
+            self,
+            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_)
+        )
     }
 
     /// Rebuild this term over new children, given in operand order.
     pub fn with_children(&self, new: &[TermId]) -> Self {
         match *self {
-            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) => *self,
+            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_) => *self,
             Self::Negate(_) => Self::Negate(new[0]),
             Self::BitwiseNot(_) => Self::BitwiseNot(new[0]),
             Self::BooleanNot(_) => Self::BooleanNot(new[0]),
@@ -297,11 +304,34 @@ impl TermArena {
                         out.push(expr);
                     }
                 }
+                TermKind::Literal(_) | TermKind::Variable(_) => {}
                 kind => {
                     let children: Vec<TermId> = kind.children().collect();
                     stack.extend(children.into_iter().rev());
                 }
             }
+        }
+        out
+    }
+
+    /// Every free variable in the term, each once, in first-visit order.
+    pub fn variables(&self, root: TermId) -> Vec<(u32, MachineType)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let term = self.term(id);
+            if let TermKind::Variable(index) = term.kind {
+                if !out.contains(&(index, term.ty)) {
+                    out.push((index, term.ty));
+                }
+                continue;
+            }
+            let children: Vec<TermId> = term.kind.children().collect();
+            stack.extend(children.into_iter().rev());
         }
         out
     }

@@ -17,9 +17,13 @@ pub mod term;
 
 pub use driver::{
     BudgetFailure, CanonicalRoots, CanonicalValue, Multiplicity, Rewrite, RewriteError,
-    canonicalize, discharged_origins, renders_inline,
+    canonicalize, canonicalize_with, discharged_origins, renders_inline,
 };
-pub use import::{COPY_ELIDE, Import, ImportedValue};
+pub use eval::{LeafRef, eval, mask, signed};
+pub use import::{
+    COPY_ELIDE, ExpansionPolicy, ExpansionQuery, Import, ImportedValue, default_expansion_policy,
+    import, import_with, term_is_duplicable,
+};
 pub use rules::{
     DEFAULT_PROOF_WIDTHS, Measure, MeasureVector, RULES, Rule, RuleGroup, RuleId, measure,
 };

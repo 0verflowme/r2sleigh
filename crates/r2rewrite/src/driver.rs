@@ -27,7 +27,7 @@ use r2ssa::{
 use serde::Serialize;
 
 use crate::canon::normalize;
-use crate::import::{Import, import};
+use crate::import::{ExpansionPolicy, Import, default_expansion_policy, import_with};
 use crate::rules::{RULES, RuleId};
 use crate::term::{TermArena, TermId, TermKind};
 
@@ -237,10 +237,21 @@ impl Driver<'_> {
     }
 }
 
-/// Canonicalise every value of `projection`.
+/// Canonicalise every value of `projection` under the default expansion
+/// policy.
 pub fn canonicalize(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
+) -> Result<CanonicalRoots, RewriteError> {
+    canonicalize_with(artifact, projection, &default_expansion_policy)
+}
+
+/// Canonicalise every value of `projection`, asking `policy` whether each
+/// read may absorb its producer's term.
+pub fn canonicalize_with(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    policy: &ExpansionPolicy<'_>,
 ) -> Result<CanonicalRoots, RewriteError> {
     let graph = artifact.graph();
     for entity in projection.entities() {
@@ -250,7 +261,7 @@ pub fn canonicalize(
         }
     }
     let mut arena = TermArena::new();
-    let import = import(artifact, projection, &mut arena);
+    let import = import_with(artifact, projection, &mut arena, policy);
     let imported_len = arena.len();
     let mut driver = Driver {
         arena: &mut arena,

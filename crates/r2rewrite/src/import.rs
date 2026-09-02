@@ -3,13 +3,15 @@
 //! Every value-producing instruction has one root in the base arena, and that
 //! root reads its operands as `Source` leaves: the base arena is one node deep
 //! per instruction. A rule that wants to see `(a - b) == 0` therefore has to
-//! see through the leaf that names `a - b`. The importer does that once, by a
-//! stated policy: a leaf is replaced by its producer's term when the producer
-//! is modelled, its dispositions are exact, and either the value has exactly
-//! one reader or its term is duplicable (every leaf a literal or an entry value
-//! the function never redefines). Which producers were expanded is recorded,
-//! because rendering the resulting term renders those instructions here, and
-//! the accounting has to know.
+//! see through the leaf that names `a - b`. The importer does that once. A
+//! leaf is replaced by its producer's term when the producer is modelled and
+//! its dispositions are exact -- import establishes that -- and the
+//! [`ExpansionPolicy`] says the reader may absorb it; the default policy is
+//! [`default_expansion_policy`], one named function so that the binding plan,
+//! which asks a neighbouring question, can share or replace it rather than
+//! state it a second time. Which producers were expanded is recorded, because
+//! rendering the resulting term renders those instructions here, and the
+//! accounting has to know.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -68,16 +70,72 @@ impl Import {
         arena: &TermArena,
         term: TermId,
     ) -> bool {
-        arena.leaves(term).into_iter().all(|leaf| {
+        term_is_duplicable(projection, arena, &self.entry_never_redefined, term)
+    }
+}
+
+/// What the expansion policy is asked about: one read of `value` inside a
+/// reader's term, with the producer's own imported term already built.
+pub struct ExpansionQuery<'a> {
+    pub artifact: &'a SsaArtifact,
+    pub projection: &'a MachineProjection,
+    pub arena: &'a TermArena,
+    /// The value being read.
+    pub value: ValueId,
+    /// The producer's term, not opaque, with exact write and read
+    /// dispositions -- import has already established that, so the policy
+    /// answers only whether this reader may absorb it.
+    pub producer_term: TermId,
+    /// Entry values whose storage no instruction of the function writes.
+    pub entry_never_redefined: &'a BTreeSet<ValueId>,
+}
+
+/// Whether a read of a value may be replaced by its producer's term inside
+/// the reader's term.
+///
+/// This answers "may this producer's term be expanded into its reader". It is
+/// a neighbour of the binding plan's question, "may this value be rendered
+/// without a local", and the two coincide today: a value with one reader is
+/// expanded here and inlined there, and a term over literals and never
+/// redefined entry values is expanded at every reader here and would need
+/// [`crate::Multiplicity::Any`] there. It is one named function so that
+/// integration can pass the plan's rule in place of this one, or adopt this
+/// one, and either way there is one place the answer lives.
+pub type ExpansionPolicy<'p> = dyn Fn(&ExpansionQuery<'_>) -> bool + 'p;
+
+/// The default policy: the value has exactly one reader, or the producer's
+/// term reads nothing but literals and entry values the function never
+/// redefines, so rendering it at every reader computes the same value each
+/// time and observes nothing twice.
+pub fn default_expansion_policy(query: &ExpansionQuery<'_>) -> bool {
+    let single_reader = query.artifact.graph().use_sites(query.value).len() == 1;
+    single_reader
+        || term_is_duplicable(
+            query.projection,
+            query.arena,
+            query.entry_never_redefined,
+            query.producer_term,
+        )
+}
+
+/// Whether every read `term` makes is of a literal or of an entry value the
+/// function never redefines, and the term is not opaque.
+pub fn term_is_duplicable(
+    projection: &MachineProjection,
+    arena: &TermArena,
+    entry_never_redefined: &BTreeSet<ValueId>,
+    term: TermId,
+) -> bool {
+    !matches!(arena.term(term).kind, TermKind::Opaque(_))
+        && arena.leaves(term).into_iter().all(|leaf| {
             match projection.expr(leaf).map(|expr| expr.kind()) {
                 Some(MachineExprKind::Constant { .. }) => true,
                 Some(MachineExprKind::Source { binding, .. }) => {
-                    self.entry_never_redefined.contains(&binding.value())
+                    entry_never_redefined.contains(&binding.value())
                 }
                 _ => false,
             }
-        }) && !matches!(arena.term(term).kind, TermKind::Opaque(_))
-    }
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -92,15 +150,27 @@ struct Importer<'a> {
     artifact: &'a SsaArtifact,
     projection: &'a MachineProjection,
     arena: &'a mut TermArena,
+    policy: &'a ExpansionPolicy<'a>,
     roots: HashMap<MachineExprId, RootImport>,
     in_progress: HashSet<MachineExprId>,
     entry_never_redefined: BTreeSet<ValueId>,
 }
 
+/// Import under [`default_expansion_policy`].
 pub fn import(
     artifact: &SsaArtifact,
     projection: &MachineProjection,
     arena: &mut TermArena,
+) -> Import {
+    import_with(artifact, projection, arena, &default_expansion_policy)
+}
+
+/// Import, asking `policy` whether each read may absorb its producer's term.
+pub fn import_with(
+    artifact: &SsaArtifact,
+    projection: &MachineProjection,
+    arena: &mut TermArena,
+    policy: &ExpansionPolicy<'_>,
 ) -> Import {
     let graph = artifact.graph();
     let mut rewritten_locations = BTreeSet::new();
@@ -128,6 +198,7 @@ pub fn import(
         artifact,
         projection,
         arena,
+        policy,
         roots: HashMap::new(),
         in_progress: HashSet::new(),
         entry_never_redefined,
@@ -566,24 +637,19 @@ impl Importer<'_> {
         if imported.opaque {
             return None;
         }
-        let single_reader = graph.use_sites(value).len() == 1;
-        if !single_reader && !self.is_duplicable(imported.term) {
+        let query = ExpansionQuery {
+            artifact: self.artifact,
+            projection: self.projection,
+            arena: self.arena,
+            value,
+            producer_term: imported.term,
+            entry_never_redefined: &self.entry_never_redefined,
+        };
+        if !(self.policy)(&query) {
             return None;
         }
         let mut substituted = imported.substituted;
         substituted.insert(producer);
         Some((imported.term, imported.trace, substituted))
-    }
-
-    fn is_duplicable(&self, term: TermId) -> bool {
-        self.arena.leaves(term).into_iter().all(|leaf| {
-            match self.projection.expr(leaf).map(|expr| expr.kind()) {
-                Some(MachineExprKind::Constant { .. }) => true,
-                Some(MachineExprKind::Source { binding, .. }) => {
-                    self.entry_never_redefined.contains(&binding.value())
-                }
-                _ => false,
-            }
-        }) && !matches!(self.arena.term(term).kind, TermKind::Opaque(_))
     }
 }
