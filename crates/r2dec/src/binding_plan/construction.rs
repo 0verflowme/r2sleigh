@@ -1078,9 +1078,12 @@ impl BindingPlan {
             }
         }
 
+        let canonical = r2rewrite::canonicalize(source, &machine_projection)
+            .map_err(BindingPlanBuildError::Canonicalisation)?;
         let plan = Self {
             authority: source.authority().clone(),
             machine_projection,
+            canonical,
             bindings: bindings.into_boxed_slice(),
             dispositions: dispositions.into_boxed_slice(),
             parameters: parameters.into_boxed_slice(),

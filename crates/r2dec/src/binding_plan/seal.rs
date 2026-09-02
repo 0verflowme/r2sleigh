@@ -594,6 +594,30 @@ impl BindingPlan {
         self.validate_source(source)
             .map_err(BindingPlanBuildError::Seal)?;
         let graph = source.graph();
+        // The rewriter must be a function of the projection, so the seal
+        // derives the canonical terms again and requires the same answer.
+        // Sharing the plan's would prove nothing: a rewriter that varied with
+        // hash order or with a stale budget would agree with itself.
+        let sealed_canonical = r2rewrite::canonicalize(source, &self.machine_projection)
+            .map_err(BindingPlanBuildError::Canonicalisation)?;
+        for graph_value in &graph.values {
+            let planned = self.canonical.value(graph_value.id);
+            let sealed = sealed_canonical.value(graph_value.id);
+            let agrees = match (planned, sealed) {
+                (Some(planned), Some(sealed)) => {
+                    planned.canonical == sealed.canonical
+                        && planned.discharges == sealed.discharges
+                        && planned.multiplicity == sealed.multiplicity
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !agrees {
+                return Err(BindingPlanBuildError::CanonicalDisagreement {
+                    value: graph_value.id,
+                });
+            }
+        }
         // Once per seal, not once per inlined value: this walks the whole
         // machine arena.
         let inlinable = super::rules::inlinable_values(source, &self.machine_projection);

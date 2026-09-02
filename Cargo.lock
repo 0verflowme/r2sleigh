@@ -843,6 +843,7 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "r2il",
+ "r2rewrite",
  "r2sleigh-lift",
  "r2source",
  "r2ssa",

@@ -889,11 +889,28 @@ pub(crate) enum BindingPlanSourceMismatch {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BindingPlanBuildError {
     MachineProjection(r2ssa::MachineBuildError),
-    MissingStorageSpan { value: ValueId },
-    InvalidValueWidth { value: ValueId, size_bytes: u32 },
-    TooManyBindings { count: usize },
-    InvalidCertifiedEntityValue { entity: SemanticId, value: ValueId },
+    MissingStorageSpan {
+        value: ValueId,
+    },
+    InvalidValueWidth {
+        value: ValueId,
+        size_bytes: u32,
+    },
+    TooManyBindings {
+        count: usize,
+    },
+    InvalidCertifiedEntityValue {
+        entity: SemanticId,
+        value: ValueId,
+    },
     Seal(BindingPlanSourceMismatch),
+    /// Canonicalisation refused outright.
+    Canonicalisation(r2rewrite::RewriteError),
+    /// The seal canonicalised the same projection and got a different term for
+    /// a value, which means the rewriter is not a function of its input.
+    CanonicalDisagreement {
+        value: ValueId,
+    },
 }
 
 #[derive(Debug)]
@@ -983,6 +1000,14 @@ impl UpstreamShadowOracle {
 pub(crate) struct BindingPlan {
     authority: SsaArtifactAuthority,
     machine_projection: MachineProjection,
+    /// One canonical term per value, with the rewrites that produced it and
+    /// the instructions rendering it would discharge.
+    ///
+    /// Derived from `machine_projection`, which is derived from the artifact,
+    /// so it is the same answer for one function however many times it is
+    /// built. The seal builds its own and requires the two to agree, which is
+    /// the independence the seal already has about every other decision here.
+    canonical: r2rewrite::CanonicalRoots,
     bindings: Box<[Binding]>,
     dispositions: Box<[ValueDisposition]>,
     parameters: Box<[Option<ParameterDisposition>]>,
