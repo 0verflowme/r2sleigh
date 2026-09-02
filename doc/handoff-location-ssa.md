@@ -7254,3 +7254,53 @@ So this needs the callee's recovered return type to reach its call sites. The
 writeback path in `r2types::writeback` is where that belongs, and it is
 component 1's call-boundary work rather than component 3's. Note that ordering
 alone will not rescue it in the corpus sweep, which decompiles callees last.
+
+## Component 4, measured: where aggregate recovery actually stops
+
+Stack-frame recovery already produces named locals, and after the type work
+above it produces named *typed* locals -- a slot holding an address is declared
+a pointer. What is missing is the aggregate half, and a three-function fixture
+compiled at -O0 shows exactly where it stops. The fixture is a byte buffer
+copied into and summed, a struct passed by value, and a pointer walked as an
+array; the interesting one is the buffer.
+
+`uint8_t buf[16]` on the stack, written at `buf[i]`, renders as this:
+
+```c
+uint64_t tmp_4e80_4 = (uint64_t)-0x20 + (uint64_t)(int64_t *)RBP_1;
+uint64_t tmp_4f00_4 = (uint64_t)tmp_11f80_15;
+uint8_t *tmp_5000_4 = (uint8_t *)((uint64_t)tmp_4e80_4 + (uint64_t)tmp_4f00_4);
+*(int8_t *)tmp_5000_4 = (uint8_t)tmp_6980_5;
+```
+
+That is frame-pointer arithmetic with the index added to it, and it is what a
+reader has to decode back into `buf[i]` themselves. Every scalar slot beside it
+recovers fine -- `stack_m72` is the loop counter, `stack_m88` the total -- so
+the gap is precisely a stack object accessed at a *varying* index.
+
+The pieces to build it with are all present and none of them is wired to this
+case. `ObjectKind::FrameObject { base, offset }` models an object at a constant
+frame offset. `MemoryAccessCertificate` names the object an access reaches.
+`render_certified_semantic_array_expr` and `certified_array_fact_for_memory`
+already render `base[index]`, and `certified_stack_owner_expr_for_memory_fact`
+already renders a slot by name. What is missing between them is the *recovered*
+array fact: the aggregate projections those renderers consult come from
+`r2types` aggregate facts, which come from declared or DWARF types, so a stack
+buffer with no declared type has none and the access falls through to the raw
+address form above.
+
+So the work is: recognise a stack region whose accesses share a frame base and
+a constant element stride and differ by a non-constant index, certify it as one
+object with an element width and an extent, declare it `uint8_t name[n]`, and
+route its accesses through the array renderer that already exists. The
+declaration side now has somewhere to put the type, since
+`declaration_type_for_stack_object` already asks the evidence and would only
+need `CTypeLike::Array` admitted alongside the scalars it admits today.
+
+Two smaller observations from the same fixture. The stack pointer itself is
+declared `int64_t *` because it is used as an address, which is true and reads
+as noise; a frame or stack pointer is a role the certificates already know and
+could be declared at. And `int64_t *RAX_1 = (int64_t *)*(uint64_t *)&__DATA_CONST;`
+is the stack-guard load, which names the segment rather than `__stack_chk_guard`
+because the data-symbol walk found the segment flag and no symbol flag at that
+address.
