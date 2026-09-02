@@ -2324,9 +2324,7 @@ impl SSAFunction {
             decompile_prep_facts: None,
             query_index: RwLock::new(None),
         };
-        if let Some(arch) = arch
-            && std::env::var_os("R2SLEIGH_NO_ALIAS_REPAIR").is_none()
-        {
+        if let Some(arch) = arch {
             function.normalize_register_alias_sources_with_control(arch, control)?;
         }
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
