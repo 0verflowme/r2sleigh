@@ -1154,16 +1154,6 @@ impl<'a> FoldingContext<'a> {
             ))));
         }
         let normalized_site = self.normalized_site(block_addr, op_idx);
-        // A carrier extension the projection of an earlier write absorbed has
-        // no statement where the plan renders the two as one object: that
-        // write's statement has already zero-extended into the carrier, and
-        // this one would only spell `x = (uint64_t)(uint32_t)x`. Its cells are
-        // marked on that statement, below.
-        let source_inst =
-            normalized_site.and_then(|site| self.source_inst_for_normalized_site(site));
-        if source_inst.is_some_and(|inst| self.write_is_discharged_by_absorbing_write(inst)) {
-            return Ok(None);
-        }
         let source_call_site = source_site.or(Some((block_addr, op_idx)));
         let mut frame = LowerFrame::for_stmt(normalized_site, source_call_site, true);
         let lowered = self.lower_op(op, &mut frame)?;
@@ -1183,15 +1173,7 @@ impl<'a> FoldingContext<'a> {
         let obligations = self.exact_normalized_op_effects(op, block_addr, op_idx);
         let rendered = !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty);
         let stmt = if op.dst().is_some() && rendered {
-            let stmt = self.observe_normalized_output_stmt(block_addr, op_idx, stmt);
-            let discharged = source_inst
-                .map(|inst| self.absorbed_extensions_discharged_by(inst))
-                .unwrap_or_default();
-            if discharged.is_empty() {
-                stmt
-            } else {
-                self.observe_discharged_stmt(&discharged, stmt)
-            }
+            self.observe_normalized_output_stmt(block_addr, op_idx, stmt)
         } else if rendered
             && matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
             && self.call_site_assigns_its_own_result((block_addr, op_idx))

@@ -1003,23 +1003,6 @@ mod tests {
             } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
 
-        // The extension that certified the projection has been spoken for by
-        // that statement: rendering it as well would spell
-        // `x = (uint64_t)(uint32_t)x`. Its cells travel with the statement
-        // above, so nothing is left unaccounted by its absence.
-        let extension_idx = copy_idx + 1;
-        assert!(matches!(
-            block.ops[extension_idx],
-            SSAOp::IntZExt { .. }
-        ));
-        enter_exact_test_site(&ctx, block.addr, extension_idx);
-        assert!(
-            ctx.op_to_stmt_with_args(&block.ops[extension_idx], block.addr, extension_idx)
-                .expect("supported extension lowering")
-                .is_none(),
-            "the absorbed carrier extension has no statement of its own"
-        );
-
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
 

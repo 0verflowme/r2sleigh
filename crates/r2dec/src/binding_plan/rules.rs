@@ -518,16 +518,6 @@ pub(super) fn inlinable_values(
         return BTreeSet::new();
     };
     let elided_reads = cells.read_elided_instructions;
-    let elided_uses = cells.uses;
-    // A reader that renders nothing consumes nothing at render time: a read
-    // inside an instruction a certificate elides, or a use the certificates
-    // elide on its own, is not an occurrence, and counting it as one treats a
-    // non-occurrence as an occurrence. So the single-reader rule counts the
-    // readers that appear. The elided reader keeps the elision it was given;
-    // folding the value into its rendered reader changes nothing about it.
-    let use_renders = |site: &r2ssa::UseSite| {
-        !elided_reads.contains(&site.inst) && !elided_uses.contains_key(site)
-    };
     // Which gate turned a value away, by name. Reading this function said a
     // flag copy passes every test in it, and the corpus said it stays bound;
     // the two could only be reconciled by asking the function itself, one
@@ -548,16 +538,8 @@ pub(super) fn inlinable_values(
             }
         };
         let use_sites = graph.use_sites(value.id);
-        let rendered_sites = use_sites
-            .iter()
-            .filter(|site| use_renders(site))
-            .copied()
-            .collect::<Vec<_>>();
-        if rendered_sites.is_empty() {
-            rejected(&format!(
-                "no rendered readers ({} readers, all elided)",
-                use_sites.len()
-            ));
+        if use_sites.is_empty() {
+            rejected("no readers");
             continue;
         }
         // A value that reads nothing but literals is the same at every reader
@@ -568,35 +550,53 @@ pub(super) fn inlinable_values(
         // expression over two parameters to three readers is three copies of a
         // real computation, not a local removed, so the plan asks the stricter
         // question.
+        // ...and whose own storage is a lowering temporary. A register or a
+        // memory cell holding a literal is a machine object other values are
+        // coalesced with, and its write is frequently the only definition the
+        // resulting C object has: `RAX_1 = 0xcbf29ce484222325` initialises
+        // the accumulator that the loop then updates, and the two are one
+        // binding. Spelling the constant at each reader deletes that
+        // definition, and placement then finds the object read before it is
+        // assigned -- ten of the fifty-four corpus cells, all on x86-64,
+        // where the initialiser is a bare register literal.
         //
-        // Whatever storage holds it. This once admitted only a lowering
-        // temporary, on the ground that a register holding a literal is a
-        // machine object the program writes and a reader spelling the literal
-        // does not perform that write. But nothing in C observes a register:
-        // the write is observed only through its readers, each of which sees
-        // the literal, and the ledger answers for the one write at every
-        // reader through `duplicates_are_a_repeated_literal`. A register
-        // literal nothing reads is unobserved and elided before this is
-        // asked. Memory never reaches here -- a load's expression reads an
-        // address, and is not literal.
+        // The honest test is not the storage class but whether the value is
+        // coalesced with anything, and that cannot be asked here: the
+        // partition is computed *from* this answer. A `Unique` slot is the
+        // lifter's own scratch, which is the case this can decide without the
+        // partition. Widening it needs the two-pass structure described in
+        // the handoff, and is a design question rather than a bug.
         let literal_only = expr_by_value
             .get(&value.id)
             .copied()
-            .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root));
+            .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
+            && value.canonical_storage.is_none_or(|storage| {
+                matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
+            });
         let root_kind = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
             .map_or("<no entity>", |expr| machine_expr_kind_name(expr.kind()));
-        if !literal_only && rendered_sites.len() != 1 {
+        // Every reader, not only the ones that render. Discounting a reader
+        // whose instruction a certificate elides looks right -- such a read
+        // spells nothing -- and it is what the DecBench staging locals need.
+        // It is also unsound as the rest of this function stands: with the
+        // elided readers discounted, a value that is read again after its
+        // object is rewritten becomes single-use, and the interference test
+        // below spans only the window between the definition and the one
+        // reader it then believes in. `fnv1a64` at x86-64 -O2 renders
+        // `R8_1 = byte3; R8_1 = (R8_1 ^ (... ^ R8_1) * k) * k`, reading the
+        // accumulator after the byte load has overwritten it, and computes a
+        // wrong hash under a proof line claiming nothing was refused. Three
+        // corpus cells do this and five more refuse. See the handoff.
+        if !literal_only && use_sites.len() != 1 {
             rejected(&format!(
-                "{} rendered readers ({} elided); root {root_kind}, storage {:?}, literal root {}",
-                rendered_sites.len(),
-                use_sites.len() - rendered_sites.len(),
-                value.canonical_storage.map(|storage| storage.space),
-                expr_by_value
-                    .get(&value.id)
-                    .copied()
-                    .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root)),
+                "{} readers, of which {} sit in a certificate-elided instruction; root {root_kind}",
+                use_sites.len(),
+                use_sites
+                    .iter()
+                    .filter(|site| elided_reads.contains(&site.inst))
+                    .count(),
             ));
             continue;
         }
@@ -645,16 +645,20 @@ pub(super) fn inlinable_values(
             rejected("an operand of the definition has no exact use disposition");
             continue;
         }
-        // The read this expression moves into is one that appears: the
-        // rendered readers were filtered above, and a value with none of them
-        // stays bound. A value whose one use sat in an instruction a
+        // The read this expression would move into has to be a read that
+        // actually appears. A value whose one use sits in an instruction a
         // certificate elides -- the prologue's `push rbp` is a certified frame
-        // round trip -- used to be folded into it and disappeared together
-        // with that instruction, and the effect its definition answered for
-        // was then owed by nobody, which is what refused `murmur3_32` and
-        // `xxhash32`. Counting only the readers that render is what keeps
-        // that from happening while still folding a value one elided reader
-        // also names.
+        // round trip -- disappears together with that instruction, and the
+        // effect its definition answered for is then owed by nobody. The
+        // ledger scores that as a refusal and the function falls back to no
+        // decompilation at all, which is what `murmur3_32` and `xxhash32` did.
+        if use_sites
+            .iter()
+            .any(|site| elided_reads.contains(&site.inst))
+        {
+            rejected("a reader sits in a certificate-elided instruction");
+            continue;
+        }
         if literal_only {
             // Nothing is being moved past anything. The tests below ask whether
             // a computation stays correct where it lands, and a literal is the
@@ -662,10 +666,8 @@ pub(super) fn inlinable_values(
             inlinable.insert(value.id);
             continue;
         }
-        let [use_site] = rendered_sites.as_slice() else {
-            unreachable!(
-                "a value that is not literal-only was required to have one rendered reader"
-            );
+        let [use_site] = use_sites else {
+            unreachable!("a value that is not literal-only was required to have one reader")
         };
         let Some(use_inst) = graph.inst(use_site.inst) else {
             rejected("reading instruction missing from the graph");
@@ -1095,15 +1097,14 @@ pub(crate) fn certificate_elided_cells(
 /// called, so neither derivation has to agree with the other about names in
 /// order to agree about the answer.
 ///
-/// An input's SSA version is not part of the question. A version-0 input --
-/// a parameter, or a register the function entered holding -- was once
-/// excluded on the ground that it has no defining statement, so that the
-/// copy on its edge was the only place the value was written. But the copy
-/// is `x = x`, which writes nothing: the value is rendered under the
-/// binding's name by the declaration the binding already has, and the
-/// journal closes its cell on that ground. Excluding it here and not in the
-/// journal's own spelling of this predicate is how a merge came to have its
-/// write elided and its value unaccounted, which refuses the function.
+/// A version-0 input is excluded, mirroring the journal's own exclusion: such
+/// an input has no defining statement, so its edge copy is the only place the
+/// value is written and is therefore rendered. Removing the exclusion is
+/// tempting -- the copy spells `x = x` and the binding has a name already --
+/// but a live-in register that is not a parameter has no declaration to be
+/// rendered by, and placement then reports the object read before it is
+/// assigned. Whether such a value should get an entry declaration is the
+/// open question; until it is answered the edge copy is what defines it.
 pub(super) fn identity_merge_values(
     graph: &SsaGraph,
     group_of: impl Fn(ValueId) -> Option<u32>,
@@ -1119,11 +1120,12 @@ pub(super) fn identity_merge_values(
         let Some(output_group) = group_of(output) else {
             continue;
         };
-        if inst
-            .inputs
-            .iter()
-            .all(|input| group_of(*input) == Some(output_group))
-        {
+        if inst.inputs.iter().all(|input| {
+            group_of(*input) == Some(output_group)
+                && graph
+                    .value(*input)
+                    .is_some_and(|value| value.var.version != 0)
+        }) {
             merges.insert(output);
         }
     }
