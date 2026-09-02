@@ -327,7 +327,7 @@ fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
             .all(|component| !component.members.contains(&return_control))
     );
     assert_eq!(
-        build_upstream_shadow_oracle(&source_owned)
+        build_upstream_shadow_oracle(&source_owned, &test_projection(&source_owned))
             .expect("upstream oracle")
             .value_disposition(return_control),
         Some(UpstreamValueDisposition::Elided(
@@ -412,7 +412,7 @@ fn direct_cfg_target_is_elided_only_when_every_use_is_control_topology() {
         }) if proof.authority == *source.authority() && proof.value == target_value
     ));
     assert_eq!(
-        build_upstream_shadow_oracle(&source_owned)
+        build_upstream_shadow_oracle(&source_owned, &test_projection(&source_owned))
             .expect("independent direct-control oracle")
             .value_disposition(target_value),
         Some(UpstreamValueDisposition::Elided(
@@ -566,7 +566,8 @@ fn unobserved_merge_is_elided_by_its_source_certificate_not_bound() {
             .iter()
             .all(|component| !component.members.contains(&dead))
     );
-    let oracle = build_upstream_shadow_oracle(&source_owned).expect("upstream oracle");
+    let projection = test_projection(&source_owned);
+    let oracle = build_upstream_shadow_oracle(&source_owned, &projection).expect("upstream oracle");
     assert_eq!(
         oracle.value_disposition(dead),
         Some(UpstreamValueDisposition::Elided(

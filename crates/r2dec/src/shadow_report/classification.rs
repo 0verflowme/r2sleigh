@@ -118,8 +118,11 @@ fn derive_report(
         .map_err(ShadowReportError::SourceMismatch)?;
     validate_graph_topology(source.graph())?;
     validate_legacy_snapshot(source, legacy)?;
-    let canonical =
-        build_upstream_shadow_oracle(source_owned).map_err(ShadowReportError::UpstreamOracle)?;
+    // The plan's projection, not a second one: `validate_source` above has
+    // already proven it is what this source produces, and the oracle's
+    // independence is from the plan's decisions rather than from its arena.
+    let canonical = build_upstream_shadow_oracle(source_owned, plan.machine_projection())
+        .map_err(ShadowReportError::UpstreamOracle)?;
     let graph = source.graph();
     let classes = value_class_indexes(plan, graph, legacy, &canonical)?;
 
@@ -250,7 +253,7 @@ fn value_class_indexes(
     plan: &BindingPlan,
     graph: &r2ssa::SsaGraph,
     legacy: &LegacyAnalysisSnapshot,
-    canonical: &UpstreamShadowOracle,
+    canonical: &UpstreamShadowOracle<'_>,
 ) -> Result<ValueClassIndexes, ShadowReportError> {
     let mut interner = ValueClassInterner::default();
 
@@ -310,7 +313,7 @@ fn value_class_indexes(
 }
 
 fn normalized_upstream_value(
-    canonical: &UpstreamShadowOracle,
+    canonical: &UpstreamShadowOracle<'_>,
     value: ValueId,
     classes: &ValueClassIndexes,
 ) -> Result<NormalizedValueObservation, ShadowReportError> {
@@ -395,7 +398,7 @@ fn normalized_legacy_value(
 }
 
 fn upstream_value_evidence(
-    canonical: &UpstreamShadowOracle,
+    canonical: &UpstreamShadowOracle<'_>,
     value: ValueId,
 ) -> Result<ShadowEvidenceKey, ShadowReportError> {
     match canonical
