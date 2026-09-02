@@ -4201,6 +4201,27 @@ impl Decompiler {
                 crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
             );
         }
+        // A transfer whose target is not a block of this function cannot be
+        // linearized either. The terminator arm below spells every target as
+        // `goto loc_<addr>`, and a target outside the function has no block to
+        // carry that label: the emitted `goto` names a label the function never
+        // defines. That is a wrong answer twice over -- the C does not compile,
+        // and where it did it would claim a transfer inside this function that
+        // the machine makes into another one. A direct tail call is the common
+        // shape here and it needs a callsite, not a jump.
+        let own_blocks: std::collections::BTreeSet<u64> =
+            blocks.iter().map(|block| block.addr).collect();
+        if blocks.iter().any(|block| {
+            func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
+                Self::linearized_transfer_targets(&cfg_block.terminator)
+                    .iter()
+                    .any(|target| !own_blocks.contains(target))
+            })
+        }) {
+            return Err(
+                crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
+            );
+        }
         let mut labelled = Vec::new();
 
         for block in &blocks {
@@ -4241,6 +4262,41 @@ impl Decompiler {
 
     fn linear_block_label(addr: u64) -> String {
         format!("loc_{addr:x}")
+    }
+
+    /// Every address the linear form would spell as a `goto` for this
+    /// terminator. Kept beside `linearized_terminator_stmt` so the two cannot
+    /// drift: a target that arm turns into a label has to be listed here, or
+    /// the containment check above stops seeing it.
+    fn linearized_transfer_targets(terminator: &BlockTerminator) -> Vec<u64> {
+        match terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } => vec![*true_target, *false_target],
+            BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
+                vec![*target]
+            }
+            BlockTerminator::Call {
+                fallthrough: Some(target),
+                ..
+            }
+            | BlockTerminator::IndirectCall {
+                fallthrough: Some(target),
+            } => vec![*target],
+            BlockTerminator::Switch { cases, default } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(default.iter().copied())
+                .collect(),
+            BlockTerminator::IndirectBranch
+            | BlockTerminator::Call {
+                fallthrough: None, ..
+            }
+            | BlockTerminator::IndirectCall { fallthrough: None }
+            | BlockTerminator::Return
+            | BlockTerminator::None => Vec::new(),
+        }
     }
 
     fn linearized_terminator_stmt(
