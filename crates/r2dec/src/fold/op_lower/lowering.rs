@@ -366,21 +366,14 @@ impl<'a> FoldingContext<'a> {
                 if source == value {
                     return Err(invalid());
                 }
-                // The read moves with the expression, and the observation that
-                // authorises it moves too. The use the defining instruction
-                // recorded belongs to a statement that is no longer emitted, so
-                // the read is marked against the value itself.
                 let rendered = self.planned_value_expr(source)?;
-                // Where the expression is emitted, taken from the value's own
-                // definition rather than from ambient state: the rule that made
-                // this value inlinable requires its definition and its use to
-                // sit in one block, so the definition's block is the block the
-                // expression now lives in, and the materialiser is reached from
-                // places that carry no current block at all.
-                // Only a read of a named object needs authorising. An operand
-                // that is itself rendered where it is read produced an
-                // expression rather than a name, and there is no symbol for the
-                // audit to ask about.
+                // The read is authorised by the use the discharged definition
+                // recorded: this leaf is one of its operands, and that use is
+                // marked on the expression the leaf now sits in. What the leaf
+                // still owes here is the value's own cell, when the leaf names
+                // an object -- a value that is itself rendered where it is read
+                // produced an expression rather than a name, and marked its
+                // cell on the way.
                 let names_a_symbol = self
                     .inputs
                     .binding_names
@@ -391,33 +384,10 @@ impl<'a> FoldingContext<'a> {
                             crate::binding_plan::ValueDisposition::Bound { .. }
                         )
                     });
-                if !names_a_symbol {
-                    return Ok(rendered);
-                }
-                match self
-                    .prepared_ssa()
-                    .and_then(|prepared| prepared.graph().def_inst(value))
-                    .and_then(|inst| self.prepared_ssa()?.inst_op_site(inst))
-                {
-                    Some((block, _)) => {
-                        let read = self.observe_inlined_value_read_expr(source, block, rendered);
-                        // The use the vanished statement recorded, marked where
-                        // the expression that performs it now sits.
-                        match self
-                            .prepared_ssa()
-                            .map(|prepared| prepared.graph().use_sites(source).to_vec())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|site| {
-                                self.prepared_ssa()
-                                    .and_then(|prepared| prepared.graph().def_inst(value))
-                                    == Some(site.inst)
-                            }) {
-                            Some(site) => self.observe_moved_use_expr(site, block, read),
-                            None => read,
-                        }
-                    }
-                    None => rendered,
+                if names_a_symbol {
+                    self.observe_inlined_value_expr(source, rendered)
+                } else {
+                    rendered
                 }
             }
             Kind::Copy { input } => child(*input)?,
@@ -594,16 +564,7 @@ impl<'a> FoldingContext<'a> {
                 let Some(definition) = definition else {
                     return Ok(self.observe_inlined_value_expr(value, rendered));
                 };
-                let marked = self.observe_inlined_definition_expr(value, definition, rendered);
-                // The effects the definition answered for move with it. Nothing
-                // asks a statement that is not emitted for its obligations, and
-                // the ledger scores an obligation nobody asked about as refused.
-                let obligations = self.exact_effect_obligations_for_source_inst(
-                    crate::fold::context::EffectOccurrenceKind::Expression,
-                    definition,
-                    Some(value),
-                );
-                Ok(self.observe_effect_expr(&obligations, marked))
+                Ok(self.observe_discharged_expr(value, &[definition], rendered))
             }
             Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {

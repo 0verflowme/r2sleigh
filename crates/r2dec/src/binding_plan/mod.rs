@@ -693,8 +693,6 @@ pub(super) fn certified_stack_geometry_values(source: &r2ssa::SsaArtifact) -> &B
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PlacementRead {
     Use(UseSite),
-    /// A read from inside an expression moved to its use.
-    Inlined(ValueId),
     CertifiedValue {
         value: ValueId,
         at: InstId,

@@ -355,29 +355,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Mark one exact use at the site a moved expression now occupies.
-    pub(crate) fn observe_moved_use_expr(
-        &self,
-        site: r2ssa::UseSite,
-        block: u64,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let fallback = expr.clone();
-        match journal
-            .borrow_mut()
-            .observe_moved_use_expr(site, block, expr)
-        {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
     /// The obligations a definition carries, asked of the source instruction
     /// rather than of a normalized site.
     ///
@@ -393,27 +370,46 @@ impl<'a> FoldingContext<'a> {
         self.exact_value_obligations(kind, source_inst, value)
     }
 
-    /// Mark every cell a definition rendered at its use still owes.
-    pub(crate) fn observe_inlined_definition_expr(
+    /// Mark every cell the instructions a rendered expression discharges still
+    /// owe, and the effects they answered for.
+    ///
+    /// Nothing asks a statement that is not emitted for its obligations, and
+    /// the ledger scores an obligation nobody asked about as refused; so the
+    /// effects move with the expression, exactly as its cells do.
+    pub(crate) fn observe_discharged_expr(
         &self,
         value: r2ssa::ValueId,
-        definition: r2ssa::InstId,
+        discharged: &[r2ssa::InstId],
         expr: CExpr,
     ) -> CExpr {
         let Some(journal) = self.inputs.observation_journal else {
             return expr;
         };
         let fallback = expr.clone();
-        match journal
+        let marked = match journal
             .borrow_mut()
-            .observe_inlined_definition_expr(value, definition, expr)
+            .observe_discharged_expr(value, discharged, expr)
         {
             Ok(marked) => marked,
             Err(error) => {
                 self.retain_first_observation_error(error);
-                fallback
+                return fallback;
             }
+        };
+        let mut obligations = BTreeSet::new();
+        for definition in discharged {
+            let output = self
+                .inputs
+                .prepared_ssa
+                .and_then(|prepared| prepared.graph().inst(*definition))
+                .and_then(|inst| inst.output);
+            obligations.extend(self.exact_effect_obligations_for_source_inst(
+                EffectOccurrenceKind::Expression,
+                *definition,
+                output,
+            ));
         }
+        self.observe_effect_expr(&obligations, marked)
     }
 
     /// Mark the value an inlined expression produces.
@@ -423,41 +419,6 @@ impl<'a> FoldingContext<'a> {
         };
         let fallback = expr.clone();
         match journal.borrow_mut().observe_inlined_value_expr(value, expr) {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
-    /// Mark a read that sits inside an expression moved to its use.
-    ///
-    /// The use the consuming instruction recorded belongs to a statement that
-    /// is no longer emitted, so the read is marked against the value and the
-    /// symbol that spells it. A value with no symbol is not a read this can
-    /// authorise, and says so rather than passing an unmarked name through.
-    pub(crate) fn observe_inlined_value_read_expr(
-        &self,
-        value: r2ssa::ValueId,
-        block: u64,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let fallback = expr.clone();
-        let Some(symbol) = self
-            .inputs
-            .binding_names
-            .and_then(|names| names.symbol_for_value(value))
-        else {
-            return fallback;
-        };
-        match journal
-            .borrow_mut()
-            .observe_inlined_value_read_expr(value, symbol, block, expr)
-        {
             Ok(marked) => marked,
             Err(error) => {
                 self.retain_first_observation_error(error);
