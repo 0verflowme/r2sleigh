@@ -7780,3 +7780,70 @@ Cost of canonicalisation itself, for the record: about one projection build,
 case 3.4 milliseconds against 2.7 on `xxhash32` at x86-64 -O2, with no budget
 failures anywhere. Against a fold stage that is one per cent of a render, the
 rewriter is not a cost worth designing around.
+
+## Where the cast noise is actually spelled, measured three ways
+
+Step 5 was taken on the evidence that 77 per cent of rendered casts have no
+arena node behind them. That number is right and the conclusion drawn from it
+was too coarse: "not the arena" is not the same as "the projection". Three
+measured attempts, each a full matrix run, locate it.
+
+**The read projection is not the source.** `project_machine_use_of` was made
+type-aware: it takes the type the base is already spelled at, from the plan's
+declaration for the value, and states the type each step needs instead of
+casting unconditionally. On the twenty-nine cells that still rendered, that
+removed 36 of 417 same-type casts and 30 of 363 cast chains, about eight per
+cent of each. The change is semantically sound -- the rendered
+`x64_O2 crc32_bitwise` body was compiled against the differential harness
+beside the old one and agreed on all forty cases -- but it is not the lever.
+
+**It broke twenty-five cells, and both causes are worth keeping.**
+
+1. *The journal classifies a bound value's read by its node shape.*
+   `classify_value_node` returns early on an `Inline` disposition with the
+   comment that shape is not evidence, then falls through for `Bound` and
+   reads the shape anyway: a bare `Var` is classified `Bound`, and a `Cast`
+   over that same `Var` is classified `InlineNonLiteral`. Dropping the last
+   redundant cast turns some reads of one value into bare names and leaves
+   others cast, so one value collects two classifications and the seal
+   refuses with `ConflictingValue`. Twenty-five cells refused this way. The
+   fix is to classify a `Bound` value by its disposition, exactly as `Inline`
+   already is; it needs the binding's symbol inside the classifier, which is
+   why it was not taken here.
+2. *Removing a redundant cast turns a hidden self-assignment into a hard
+   error.* Seventy-five `-Wself-assign` errors appeared, because
+   `x = (uint64_t)x;` compiles and `x = x;` does not. The 296 self-assignments
+   the noise column already counts were being hidden from the compiler by the
+   very cast the policy removes. The cast policy and the self-assignment
+   elimination are therefore one piece of work, not two: whoever removes the
+   cast has to remove the statement.
+
+Also observed: the diagnostic column reported `x64_O2 crc32_bitwise` as wrong
+while the raw rendering was provably equivalent. The diagnostic C is the
+verifier's own rewrite of the rendering -- 139 `local_retype` rewrites on that
+cell -- and it stopped surviving that rewrite once the casts went. The corpus
+verifier rewrites the C it checks, so a diagnostic failure is evidence about
+the verifier as much as about the renderer.
+
+**What did land.** `cast_unless_already` in `projection.rs`: every projection
+step says its conversion once. Same-type casts fall from 792 to 616 over the
+fifty-four cells, a fifth, with every gate green. Cast chains are unchanged at
+751.
+
+**Where the remaining 616 are.** By type: 301 `(uint64_t)(uint64_t)`, 267
+`(uint32_t)(uint32_t)`, 47 `(uint8_t)(uint8_t)`. By shape they are assignment
+and operand boundaries in `implementation.rs`, not projections: `stack_m16 =
+(uint64_t)(uint64_t)RDI_0` on a store, `uint64_t tmp_7100_3 =
+(uint64_t)(uint64_t)tmp_5a00_2` on a declaration initialiser, and
+`(uint32_t)(uint32_t)0x9dc5` on a literal operand. There are 26 direct
+`CExpr::cast` calls in that file; `cast_expr_to` and `cast_expr_if_needed`
+already refuse to double a cast, so the doubling comes from the sites that
+call `CExpr::cast` directly -- the store path in particular, which does not
+go through `assignment_rhs_with_type_policy` at all. That is the next thing to
+measure, and it is a smaller and better-aimed change than retyping the
+projection.
+
+**Ordering that follows.** The journal classification fix comes first, because
+it is what makes any further cast removal safe; self-assignment elimination
+comes with it, because the two are the same piece of work; and only then does
+dropping the outermost redundant cast become landable.
