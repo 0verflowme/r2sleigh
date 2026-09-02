@@ -244,6 +244,132 @@ impl<'a> FoldingContext<'a> {
             .return_for_op(block_addr, op_idx)
     }
 
+    /// Reassemble a return whose ABI register was written in pieces.
+    ///
+    /// The machine wrote a full-width base and then laid ordered
+    /// contained-slice writes over it -- `xor eax, eax` then `sete al` is the
+    /// ordinary way a compiler materialises a boolean -- so the value the
+    /// function returns is not any single definition. It is the base with each
+    /// overlay's bytes replacing it, in the order they were written, which is
+    /// `(base & !mask) | (overlay << shift)` per overlay.
+    ///
+    /// The shift is the overlay's physical byte offset into the return
+    /// storage. That reading is only correct where the low byte sits at offset
+    /// zero, and the certificate is refused at its source on any other byte
+    /// order rather than being spelled wrongly here.
+    ///
+    /// Every value in the composition is read at this one site, so each is
+    /// marked as a certified read of its own: the boundary seeds one
+    /// obligation per value and this expression is where all of them are
+    /// discharged.
+    /// The values a composed return carries, base first then overlays.
+    fn composed_return_values(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        source_inst: r2ssa::InstId,
+    ) -> OpLoweringResult<Vec<r2ssa::ValueId>> {
+        let _ = source_inst;
+        let certified = self
+            .certified_return_for_normalized_op(block_addr, op_idx)
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        Ok(certified.values().collect())
+    }
+
+    fn composed_return_stmt(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        source_inst: r2ssa::InstId,
+    ) -> OpLoweringResult<CStmt> {
+        let prepared = self
+            .prepared_ssa()
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        let (source_block, source_op) = prepared
+            .inst_op_site(source_inst)
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        let certificate = prepared
+            .return_certificate_for_op(source_block, source_op)
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        let certified = self
+            .certified_return_for_normalized_op(block_addr, op_idx)
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        if certificate.at != source_inst
+            || certificate.block_addr != source_block
+            || certificate.op_index != source_op
+            || certified.block_addr != source_block
+            || certified.op_index != source_op
+            || certified.value != certificate.value
+            || certified.width != certificate.width
+            || !certified.values().eq(certificate.values())
+            || !certificate.is_composed()
+        {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
+
+        let width_bits = certificate
+            .width
+            .checked_mul(8)
+            .filter(|bits| *bits <= 64)
+            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+        let composed_ty = CType::machine_bits(width_bits);
+        let read = |value: r2ssa::ValueId| -> OpLoweringResult<CExpr> {
+            let expr = self.planned_value_expr(value).map_err(|error| {
+                self.retain_first_observation_error(error);
+                OpLoweringRefusal::missing_machine_projection()
+            })?;
+            Ok(self.observe_certified_value_read_expr(value, certificate.at, expr))
+        };
+
+        let mut expr = self.cast_expr_to(read(certificate.value)?, composed_ty.clone());
+        for overlay in &certificate.overlays {
+            let overlay_bits = overlay
+                .width
+                .checked_mul(8)
+                .filter(|bits| *bits > 0 && *bits <= width_bits)
+                .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+            let shift = overlay
+                .offset_bytes
+                .checked_mul(8)
+                .filter(|bits| bits.checked_add(overlay_bits) <= Some(width_bits))
+                .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+            // The bits this overlay supplies, in place. Built at the composed
+            // width so the mask cannot be narrower than the value it clears.
+            let span: u64 = if overlay_bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << overlay_bits) - 1
+            };
+            let mask = span
+                .checked_shl(shift)
+                .ok_or_else(OpLoweringRefusal::missing_machine_projection)?;
+            let kept = CExpr::Binary {
+                op: BinaryOp::BitAnd,
+                left: Box::new(CExpr::Paren(Box::new(expr))),
+                right: Box::new(CExpr::UIntLit(!mask)),
+            };
+            let mut laid = self.cast_expr_to(read(overlay.value)?, composed_ty.clone());
+            laid = CExpr::Binary {
+                op: BinaryOp::BitAnd,
+                left: Box::new(CExpr::Paren(Box::new(laid))),
+                right: Box::new(CExpr::UIntLit(span)),
+            };
+            if shift != 0 {
+                laid = CExpr::Binary {
+                    op: BinaryOp::Shl,
+                    left: Box::new(CExpr::Paren(Box::new(laid))),
+                    right: Box::new(CExpr::UIntLit(u64::from(shift))),
+                };
+            }
+            expr = CExpr::Binary {
+                op: BinaryOp::BitOr,
+                left: Box::new(CExpr::Paren(Box::new(kept))),
+                right: Box::new(CExpr::Paren(Box::new(laid))),
+            };
+        }
+        Ok(CStmt::Return(Some(expr)))
+    }
+
     fn source_return_boundary_for_normalized_op(
         &self,
         block_addr: u64,
@@ -2355,10 +2481,7 @@ impl<'a> FoldingContext<'a> {
                 let (source_inst, boundary) = self
                     .source_return_boundary_for_normalized_op(block.addr, op_idx)
                     .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
-                if boundary.at != source_inst
-                    || !boundary.complete
-                    || !boundary.register_compositions.is_empty()
-                {
+                if boundary.at != source_inst || !boundary.complete {
                     r2il::refusal_evidence!(
                         "return-boundary",
                         "at_mismatch={} incomplete={} compositions={} values={}",
@@ -2368,6 +2491,23 @@ impl<'a> FoldingContext<'a> {
                         boundary.values.len()
                     );
                     return Err(OpLoweringRefusal::missing_machine_projection());
+                }
+
+                // A composed return keeps its values out of `boundary.values`,
+                // because a stale full-width definition is not the value at
+                // the boundary. Its certificate carries the base and every
+                // overlay instead.
+                if !boundary.register_compositions.is_empty() {
+                    let carried = self.composed_return_values(block.addr, op_idx, source_inst)?;
+                    let stmt = self.composed_return_stmt(block.addr, op_idx, source_inst)?;
+                    let obligations = self.exact_effect_obligations_for_normalized_values(
+                        EffectOccurrenceKind::Return,
+                        block.addr,
+                        op_idx,
+                        &carried,
+                    );
+                    stmts.push(self.observe_effect_stmt(&obligations, stmt));
+                    break;
                 }
 
                 let (return_value, stmt) = match boundary.values.as_slice() {

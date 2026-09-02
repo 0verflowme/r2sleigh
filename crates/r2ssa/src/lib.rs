@@ -153,7 +153,7 @@ pub use semantic::{
     ObjectId, ObjectKind, ObjectModel, ObjectSpaceId, ParameterObjectKey, PredicateFact,
     PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
     PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
-    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate,
+    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate, ReturnValueOverlay,
     SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId, SourceBoundaryFacts,
     SourceCallArgumentFact, SourceCallArgumentValue, SourceCallBoundaryFact,
     SourceFormalParameterFact, SourceReturnAddressFact, SourceReturnBoundaryFact,

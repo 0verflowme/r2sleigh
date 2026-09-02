@@ -1272,6 +1272,19 @@ pub struct StackReloadSourceCertificate {
     pub load_inst: InstId,
 }
 
+/// One contained-slice write laid over a composed return's base.
+///
+/// `offset_bytes` is a physical offset from the start of the ABI return
+/// storage. Reading it as a shift is only correct where the low byte of the
+/// storage is at offset zero, so the certificate is refused outright on a
+/// target whose byte order does not say that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnValueOverlay {
+    pub value: ValueId,
+    pub width: u32,
+    pub offset_bytes: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnValueCertificate {
     pub at: InstId,
@@ -1279,11 +1292,32 @@ pub struct ReturnValueCertificate {
     pub op_index: usize,
     pub value: ValueId,
     pub width: u32,
+    /// Ordered contained-slice writes over `value`, empty for an ordinary
+    /// return.
+    ///
+    /// When this is not empty, `value` is the full-width base the overlays are
+    /// laid over rather than the whole returned value: the boundary's value is
+    /// the base with each overlay's bytes replacing it in order. Every reader
+    /// that asks which values a return carries must ask `values`, not `value`.
+    pub overlays: Vec<ReturnValueOverlay>,
     pub carrier: Option<ReturnCarrier>,
     /// Exact logical return projection declared by the immutable source
     /// interface. `None` preserves the physical ABI-carrier behavior for
     /// interfaces that carry no logical type graph.
     pub source_logical_value: Option<SourceLogicalValue>,
+}
+
+impl ReturnValueCertificate {
+    /// Every value this return carries, base first and overlays in the order
+    /// they are laid down. One value for an ordinary return.
+    pub fn values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        std::iter::once(self.value).chain(self.overlays.iter().map(|overlay| overlay.value))
+    }
+
+    /// Whether this return is assembled from more than one definition.
+    pub fn is_composed(&self) -> bool {
+        !self.overlays.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5488,16 +5522,9 @@ fn collect_return_value_certificates(
     let mut returns_by_inst = BTreeMap::new();
 
     for (boundary_at, boundary) in &boundaries.returns {
-        if boundary.at != *boundary_at
-            || !boundary.complete
-            || !boundary.register_compositions.is_empty()
-        {
+        if boundary.at != *boundary_at || !boundary.complete {
             continue;
         }
-        let [boundary_value] = boundary.values.as_slice() else {
-            // A complete void boundary is authoritative, but it owns no value.
-            continue;
-        };
         let Some((block_addr, op_index)) = graph.op_site_for_inst(boundary.at) else {
             continue;
         };
@@ -5507,25 +5534,123 @@ fn collect_return_value_certificates(
         if !matches!(inst.payload, InstPayload::Op(SSAOp::Return { .. })) {
             continue;
         }
-        let Some((value, width, source_logical_value)) =
-            exact_logical_return_projection(graph, machine_context, boundary_value)
-        else {
-            continue;
+        let certificate = if boundary.register_compositions.is_empty() {
+            let [boundary_value] = boundary.values.as_slice() else {
+                // A complete void boundary is authoritative, but it owns no value.
+                continue;
+            };
+            let Some((value, width, source_logical_value)) =
+                exact_logical_return_projection(graph, machine_context, boundary_value)
+            else {
+                continue;
+            };
+            ReturnValueCertificate {
+                at: boundary.at,
+                block_addr,
+                op_index,
+                value,
+                width,
+                overlays: Vec::new(),
+                carrier: return_carrier_for_boundary_value(boundary_value, stack_reloads),
+                source_logical_value,
+            }
+        } else {
+            let Some(certificate) =
+                composed_return_certificate(boundary, graph, machine_context, block_addr, op_index)
+            else {
+                continue;
+            };
+            certificate
         };
-        let carrier = return_carrier_for_boundary_value(boundary_value, stack_reloads);
         returns_by_inst.insert(boundary.at, returns.len());
-        returns.push(ReturnValueCertificate {
-            at: boundary.at,
-            block_addr,
-            op_index,
-            value,
-            width,
-            carrier,
-            source_logical_value,
-        });
+        returns.push(certificate);
     }
 
     (returns, returns_by_inst)
+}
+
+/// The certificate for a return whose ABI register is assembled rather than
+/// written whole.
+///
+/// The boundary deliberately keeps a composition out of `values`, because a
+/// single stale full-width definition is not the value at the boundary. What
+/// is at the boundary is the base with each overlay's bytes laid over it, so
+/// the certificate carries all of them in that order and the renderer
+/// reassembles them.
+///
+/// Refused rather than guessed in three cases. More than one composition on
+/// one boundary has no defined order between them. A composition beside
+/// ordinary boundary values would mean two answers for one register. And an
+/// overlay's `offset_bytes` is a physical offset into the return storage,
+/// which is only a shift amount where the storage's low byte sits at offset
+/// zero; on any other byte order the arithmetic below would be wrong rather
+/// than merely unproven.
+fn composed_return_certificate(
+    boundary: &SourceReturnBoundaryFact,
+    graph: &SsaGraph,
+    machine_context: Option<&SourceMachineContext>,
+    block_addr: u64,
+    op_index: usize,
+) -> Option<ReturnValueCertificate> {
+    let [composition] = boundary.register_compositions.as_slice() else {
+        return None;
+    };
+    if !boundary.values.is_empty() {
+        return None;
+    }
+    let machine_context = machine_context?;
+    if machine_context.memory_model().default_endianness()
+        != crate::machine_context::MachineMemoryEndianness::Little
+    {
+        return None;
+    }
+    let CallBoundarySlot::Register {
+        storage: return_storage,
+        ..
+    } = composition.slot
+    else {
+        return None;
+    };
+    let base = graph.value(composition.base.value)?;
+    if base.canonical_storage != Some(composition.base.storage)
+        || composition.base.storage != return_storage
+        || base.var.size != return_storage.size
+        || return_storage.size == 0
+    {
+        return None;
+    }
+    let mut overlays = Vec::with_capacity(composition.overlays.len());
+    for overlay in &composition.overlays {
+        let value = graph.value(overlay.definition.value)?;
+        let width = value.var.size;
+        if value.canonical_storage != Some(overlay.definition.storage)
+            || overlay.definition.storage.size != width
+            || width == 0
+            || overlay.offset_bytes.checked_add(width)? > return_storage.size
+        {
+            return None;
+        }
+        overlays.push(ReturnValueOverlay {
+            value: overlay.definition.value,
+            width,
+            offset_bytes: overlay.offset_bytes,
+        });
+    }
+    Some(ReturnValueCertificate {
+        at: boundary.at,
+        block_addr,
+        op_index,
+        value: composition.base.value,
+        width: return_storage.size,
+        overlays,
+        // A composed register is written in place by its own overlays; it is
+        // not reloaded from a stack home, which is what a carrier records.
+        carrier: None,
+        // The logical projection describes one definition of the return
+        // storage. A composition has several, and nothing has said which the
+        // declared type applies to.
+        source_logical_value: None,
+    })
 }
 
 fn exact_logical_return_projection(

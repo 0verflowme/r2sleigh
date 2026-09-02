@@ -1886,7 +1886,10 @@ pub(crate) fn certified_boundary_read(
         .and_then(|index| certificates.returns.get(*index))
         .is_some_and(|certificate| {
             certificate.at == at
-                && certificate.value == value
+                // Any value the return carries, not only its base. A composed
+                // return reads its base and every overlay at this one site, so
+                // asking about the base alone refuses the overlays' reads.
+                && certificate.values().any(|carried| carried == value)
                 && (certificate.block_addr, certificate.op_index) == site
                 && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
         });
