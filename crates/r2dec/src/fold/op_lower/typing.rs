@@ -19,7 +19,15 @@ impl FoldingContext<'_> {
         Some(self.inputs.binding_names?.plan().typed_boundaries())
     }
 
-    /// The width of an address on the target.
+    /// The width of an address on the target, in bits.
+    ///
+    /// From the memory model, which is the source-owned answer. The fold
+    /// configuration's `ptr_size` is the fallback for a context built
+    /// without prepared SSA, and it is already a width in bits -- 64 or 32,
+    /// as `FoldArchConfig::for_ptr_size` and `DecompilerConfig` both spell
+    /// it. Two callers used to multiply it by eight on their way to a bit
+    /// width, which made a sixty-four bit target's addresses five hundred
+    /// and twelve bits wide wherever that fallback was reached.
     pub(super) fn pointer_bits(&self) -> u32 {
         self.inputs
             .prepared_ssa
@@ -29,7 +37,7 @@ impl FoldingContext<'_> {
                     .memory_model()
                     .default_address_bits()
             })
-            .unwrap_or_else(|| self.inputs.arch.ptr_size.saturating_mul(8))
+            .unwrap_or(self.inputs.arch.ptr_size)
     }
 
     /// Convert `expr`, which has `from`, to `to`. The one emitter.
