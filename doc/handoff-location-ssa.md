@@ -7345,3 +7345,40 @@ an access into a frame object, so there is no object to name, size or declare.
 The pointer parameter's pointee, by contrast, is already
 `ObjectKind::Parameter { index: 0 }`, which is why indexing through a parameter
 is the reachable half and the stack buffer is not.
+
+### Correction: array indexing is not one folding decision away
+
+The section above is wrong about what blocks `src[i]`, and the measurement that
+corrects it is worth keeping so nobody repeats the search.
+
+`inlinable_values` is not the obstacle. Every one of the eighty-eight load
+addresses in `fnv1a32` passes all seven of its tests, and none is lost to an
+earlier disposition -- only stack-geometry bases and unobserved values are, both
+correctly. The address the byte load actually uses is `ValueId(85)`, and it is
+`Bound` for a good reason: it has **two** uses, the load and a phi. It is the
+loop's pointer, advanced each iteration and carried round the back edge, so
+folding it would evaluate the address computation twice.
+
+That means the rendering is already right for what the machine does. The source
+wrote `data[i]`; the compiler at -O0 walks a pointer, and the decompiler
+faithfully shows a pointer walked:
+
+```c
+uint8_t *tmp_4a00_2 = (uint8_t *)((uint64_t)RAX_3 + (uint64_t)tmp_4900_2);
+uint8_t tmp_11e00_2 = *tmp_4a00_2;
+```
+
+Recovering `data[i]` from that is induction-variable analysis -- recognising a
+pointer whose every definition is the same base plus a monotonically stepped
+index, and rewriting its dereferences in terms of the base and the index. That
+is a real decompiler feature and a much larger one than "render a subscript
+where the address is a base plus an index", which is all the reverted renderer
+change did.
+
+So component 4's aggregate half has two independent pieces, and neither is
+small. Induction-variable recovery is one. The stack buffer is the other, and
+it is blocked earlier still: `uint8_t buf[16]` written at `buf[i]` resolves to
+`ObjectKind::EscapedUnknown { space: Ram }`, so no object exists to name, size
+or declare, and the object resolver has to learn that a frame base plus a
+constant plus a variable index is an access into a frame object before anything
+downstream can help.
