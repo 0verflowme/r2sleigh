@@ -11,6 +11,38 @@ use serde::{Deserialize, Serialize};
 /// catch it. It is now the shared model, so there is one set of variants and
 /// one spelling for each of them.
 pub use r2types::CTypeLike as CType;
+/// Why a cast is in the rendered tree.
+///
+/// The distinction cannot be recovered from the types: a pointer converted to
+/// a `uint64_t` and a `uint32_t` widened to a `uint64_t` are the same cast to
+/// look at, and only the site that emitted one knows which it made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CastRole {
+    /// A conversion the program performs.
+    Conversion,
+    /// The address-width step C requires between a pointer and an integer
+    /// that is not the pointer's own width.
+    PointerWidthStep,
+}
+
+/// The width of an integer cast target, or `None` for anything else.
+fn integer_cast_width(ty: &CType) -> Option<u32> {
+    match ty {
+        CType::Int { bits, .. } => Some(*bits),
+        CType::Bool => Some(8),
+        _ => None,
+    }
+}
+
+fn is_signed_integer(ty: &CType) -> bool {
+    matches!(
+        ty,
+        CType::Int {
+            signedness: r2types::Signedness::Signed,
+            ..
+        }
+    )
+}
 
 /// A C expression.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,7 +94,11 @@ pub enum CExpr {
         else_expr: Box<CExpr>,
     },
     /// Type cast: (type)expr.
-    Cast { ty: CType, expr: Box<CExpr> },
+    Cast {
+        ty: CType,
+        expr: Box<CExpr>,
+        role: CastRole,
+    },
     /// Function call.
     /// A call, and the site that makes it when one is known.
     ///
@@ -243,10 +279,12 @@ impl CExpr {
                 Self::Cast {
                     ty: left_ty,
                     expr: left_expr,
+                    ..
                 },
                 Self::Cast {
                     ty: right_ty,
                     expr: right_expr,
+                    ..
                 },
             ) => left_ty == right_ty && left_expr.transparently_eq(right_expr),
             (
@@ -385,17 +423,113 @@ impl CExpr {
     /// a narrowing inside a widening, or the pointer-width step before a
     /// pointer becomes a smaller integer -- is between two *different* types
     /// and is untouched.
+    /// Create a conversion the program performs.
+    ///
+    /// Adjacent conversions that say one thing twice are said once; see
+    /// [`CExpr::cast_with_role`] for the rules and their side conditions.
     pub fn cast(ty: CType, expr: CExpr) -> Self {
+        Self::cast_with_role(ty, expr, CastRole::Conversion)
+    }
+
+    /// Create the address-width step C requires beside a pointer conversion.
+    ///
+    /// Only a site that is converting a pointer to or from its own
+    /// address-width integer calls this, and it knows that at the moment it
+    /// emits. Nothing downstream can tell such a step from an ordinary
+    /// widening by looking at the types, which is exactly why it is recorded
+    /// here rather than re-derived later by inspecting the expression.
+    pub fn pointer_width_cast(ty: CType, expr: CExpr) -> Self {
+        Self::cast_with_role(ty, expr, CastRole::PointerWidthStep)
+    }
+
+    /// The collapse rules for adjacent casts.
+    ///
+    /// Each rule is an equality between two spellings of one conversion, and
+    /// each is stated over the cast types alone, never over the operand's
+    /// text. `w(T)` is T's width in bits.
+    ///
+    /// - **Same type.** `(T)(T)e` is `(T)e`. Converting to a type a value has
+    ///   already been converted to converts nothing.
+    /// - **A narrowing absorbs the conversion beneath it.** `(A)(B)e` is
+    ///   `(A)e` when both are integers and `w(A) <= w(B)`: `(B)e` has the low
+    ///   `w(B)` bits of `e`, and the low `w(A) <= w(B)` of those are the low
+    ///   `w(A)` bits of `e`. B's signedness cannot matter because only the bit
+    ///   pattern survives the second truncation.
+    /// - **Transitive widening.** `(A)(B)(C)e` is `(A)(C)e` when
+    ///   `w(C) <= w(B) <= w(A)` and C's signedness implies B's: widening a
+    ///   value twice widens it once. The signedness condition is load-bearing.
+    ///   `(uint64_t)(uint32_t)(int8_t)e` is **not** `(uint64_t)(int8_t)e`,
+    ///   because the first stops sign-extending at thirty-two bits.
+    /// - **Pointer round trip.** `(P)(I)(P)e` is `(P)e` when `I` is a recorded
+    ///   address-width step: a pointer converted to its own address integer
+    ///   and back is the pointer.
+    ///
+    /// The middle two never look through a recorded address-width step.
+    /// `(uint32_t)(uint64_t)p` is a pointer narrowed to a smaller integer
+    /// through its own width, and dropping the step leaves
+    /// `-Wpointer-to-int-cast`, which is a hard error under the corpus flags.
+    /// That is the whole reason the step is recorded.
+    pub fn cast_with_role(ty: CType, expr: CExpr, role: CastRole) -> Self {
         // Through the render markers, which are metadata: the cast the
-        // renderer already spelled is the one under them.
-        if let CExpr::Cast { ty: inner, .. } = expr.unobserved()
-            && *inner == ty
+        // renderer already spelled is the one under them. A marker on a cast
+        // that goes away moves onto what replaces it, at the same depth, so
+        // the occurrence it records is still in the sealed tree.
+        let (carried, bare) = peel_observations(&expr);
+        if let CExpr::Cast {
+            ty: inner_ty,
+            expr: inner_expr,
+            role: inner_role,
+        } = bare
         {
-            return expr;
+            if *inner_ty == ty {
+                return expr;
+            }
+            let surviving = |inner: &CExpr| rewrap_observations(&carried, inner.clone());
+            // A conversion sitting directly on a pointer is the address-width
+            // step whether or not the site that emitted it said so, and
+            // dropping it leaves a pointer converted straight to a narrower
+            // integer. The recorded role catches the step over a pointer the
+            // AST cannot see into, such as a bare name; this catches the step
+            // over a pointer the AST can.
+            let over_a_pointer = matches!(
+                inner_expr.unobserved(),
+                CExpr::Cast {
+                    ty: CType::Pointer(_),
+                    ..
+                }
+            );
+            if *inner_role == CastRole::Conversion
+                && !over_a_pointer
+                && let (Some(outer_bits), Some(inner_bits)) =
+                    (integer_cast_width(&ty), integer_cast_width(inner_ty))
+            {
+                if outer_bits <= inner_bits {
+                    return Self::cast_with_role(ty, surviving(inner_expr), role);
+                }
+                if let CExpr::Cast {
+                    ty: innermost_ty, ..
+                } = inner_expr.unobserved()
+                    && let Some(innermost_bits) = integer_cast_width(innermost_ty)
+                    && innermost_bits <= inner_bits
+                    && (!is_signed_integer(innermost_ty) || is_signed_integer(inner_ty))
+                {
+                    return Self::cast_with_role(ty, surviving(inner_expr), role);
+                }
+            }
+            if matches!(ty, CType::Pointer(_))
+                && *inner_role == CastRole::PointerWidthStep
+                && let CExpr::Cast {
+                    ty: innermost_ty, ..
+                } = inner_expr.unobserved()
+                && *innermost_ty == ty
+            {
+                return surviving(inner_expr);
+            }
         }
         Self::Cast {
             ty,
             expr: Box::new(expr),
+            role,
         }
     }
 
@@ -520,9 +654,10 @@ impl CExpr {
                 then_expr: Box::new(f(*then_expr)),
                 else_expr: Box::new(f(*else_expr)),
             },
-            Self::Cast { ty, expr } => Self::Cast {
+            Self::Cast { ty, expr, role } => Self::Cast {
                 ty,
                 expr: Box::new(f(*expr)),
+                role,
             },
             Self::Call { func, args, site } => Self::Call {
                 func: Box::new(f(*func)),
@@ -1874,6 +2009,34 @@ pub(crate) fn carry_outer_expr_observations(source: &CExpr, mut replacement: CEx
 /// The replacement renders everything the source rendered, so it owns every
 /// occurrence the source owned. Order is preserved outermost-first so the
 /// rebuilt chain reads the same way round as the one it replaces.
+/// Strip the render markers wrapping an expression, keeping their ids in the
+/// order they were nested so they can be put back.
+fn peel_observations(
+    expr: &CExpr,
+) -> (Vec<crate::observation_journal::RenderObservationId>, &CExpr) {
+    let mut ids = Vec::new();
+    let mut cursor = expr;
+    while let CExpr::Observed { id, expr } = cursor {
+        ids.push(*id);
+        cursor = expr;
+    }
+    (ids, cursor)
+}
+
+/// Put peeled markers back, outermost last peeled.
+fn rewrap_observations(
+    ids: &[crate::observation_journal::RenderObservationId],
+    mut expr: CExpr,
+) -> CExpr {
+    for id in ids.iter().rev() {
+        expr = CExpr::Observed {
+            id: *id,
+            expr: Box::new(expr),
+        };
+    }
+    expr
+}
+
 pub(crate) fn carry_all_expr_observations(source: &CExpr, mut replacement: CExpr) -> CExpr {
     fn collect(expr: &CExpr, ids: &mut Vec<crate::observation_journal::RenderObservationId>) {
         if let CExpr::Observed { id, expr } = expr {
@@ -2294,5 +2457,276 @@ mod tests {
         let wrapped = CExpr::binary(BinaryOp::Add, nested, CExpr::IntLit(2));
         assert!(plain.transparently_eq(&wrapped));
         assert!(wrapped.transparently_eq(&plain));
+    }
+}
+
+#[cfg(test)]
+mod cast_collapse {
+    use super::*;
+
+    fn u(bits: u32) -> CType {
+        CType::Int {
+            bits,
+            signedness: r2types::Signedness::Unsigned,
+        }
+    }
+
+    fn i(bits: u32) -> CType {
+        CType::Int {
+            bits,
+            signedness: r2types::Signedness::Signed,
+        }
+    }
+
+    fn ptr() -> CType {
+        CType::Pointer(Box::new(u(8)))
+    }
+
+    fn leaf() -> CExpr {
+        CExpr::UIntLit(0)
+    }
+
+    /// Build a chain without any collapsing, outermost type first.
+    fn raw(types: &[(CType, CastRole)]) -> CExpr {
+        types
+            .iter()
+            .rev()
+            .fold(leaf(), |acc, (ty, role)| CExpr::Cast {
+                ty: ty.clone(),
+                expr: Box::new(acc),
+                role: *role,
+            })
+    }
+
+    /// Build a chain through the constructor, outermost type last applied.
+    fn built(types: &[(CType, CastRole)]) -> CExpr {
+        types.iter().rev().fold(leaf(), |acc, (ty, role)| {
+            CExpr::cast_with_role(ty.clone(), acc, *role)
+        })
+    }
+
+    /// The cast types of a chain, outermost first.
+    fn spine(expr: &CExpr) -> Vec<CType> {
+        let mut out = Vec::new();
+        let mut cursor = expr;
+        while let CExpr::Cast {
+            ty, expr: inner, ..
+        } = cursor.unobserved()
+        {
+            out.push(ty.clone());
+            cursor = inner;
+        }
+        out
+    }
+
+    fn conv(types: &[CType]) -> Vec<(CType, CastRole)> {
+        types
+            .iter()
+            .cloned()
+            .map(|t| (t, CastRole::Conversion))
+            .collect()
+    }
+
+    /// Apply one C conversion to a value held at `width` bits with `signed`
+    /// interpretation, returning the new bits and type.
+    fn convert(bits: u128, width: u32, signed: bool, to: &CType) -> (u128, u32, bool) {
+        let (to_bits, to_signed) = match to {
+            CType::Int { bits, signedness } => (*bits, *signedness == r2types::Signedness::Signed),
+            _ => unreachable!("only integer conversions are evaluated"),
+        };
+        let mask = |w: u32| {
+            if w >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << w) - 1
+            }
+        };
+        let value = if to_bits <= width {
+            bits & mask(to_bits)
+        } else if signed && (bits >> (width - 1)) & 1 == 1 {
+            (bits | !mask(width)) & mask(to_bits)
+        } else {
+            bits & mask(width)
+        };
+        (value, to_bits, to_signed)
+    }
+
+    /// Evaluate a chain over one input, innermost cast first.
+    fn eval(chain: &[CType], input: u128, source: &CType) -> u128 {
+        let (mut bits, mut width, mut signed) = match source {
+            CType::Int {
+                bits: w,
+                signedness,
+            } => (input, *w, *signedness == r2types::Signedness::Signed),
+            _ => unreachable!(),
+        };
+        for ty in chain.iter().rev() {
+            let (b, w, s) = convert(bits, width, signed, ty);
+            bits = b;
+            width = w;
+            signed = s;
+        }
+        bits
+    }
+
+    /// Every input of the source width agrees between the two chains.
+    fn agrees(before: &[CType], after: &[CType], source: &CType) {
+        let width = match source {
+            CType::Int { bits, .. } => *bits,
+            _ => unreachable!(),
+        };
+        for input in 0..(1u128 << width) {
+            let a = eval(before, input, source);
+            let b = eval(after, input, source);
+            assert_eq!(
+                a, b,
+                "chains disagree on input {input:#x} of {source:?}: {before:?} gave {a:#x}, {after:?} gave {b:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_type_says_it_once() {
+        let collapsed = built(&conv(&[u(32), u(32)]));
+        assert_eq!(spine(&collapsed), vec![u(32)]);
+    }
+
+    #[test]
+    fn a_narrowing_absorbs_the_conversion_beneath_it() {
+        for (outer, inner) in [
+            (u(32), u(64)),
+            (u(16), u(32)),
+            (u(32), u(32)),
+            (i(32), u(32)),
+            (u(32), i(64)),
+            (u(8), u(64)),
+        ] {
+            let collapsed = built(&conv(&[outer.clone(), inner.clone()]));
+            assert_eq!(
+                spine(&collapsed),
+                vec![outer.clone()],
+                "({outer:?})({inner:?}) should be one conversion"
+            );
+            for source in [u(8), i(8)] {
+                agrees(&[outer.clone(), inner.clone()], &[outer.clone()], &source);
+            }
+        }
+    }
+
+    #[test]
+    fn widening_is_transitive() {
+        let before = [u(64), u(32), u(8)];
+        let collapsed = built(&conv(&before));
+        assert_eq!(spine(&collapsed), vec![u(64), u(8)]);
+        for source in [u(8), i(8)] {
+            agrees(&before, &[u(64), u(8)], &source);
+        }
+        let signed = [i(64), i(32), i(8)];
+        assert_eq!(spine(&built(&conv(&signed))), vec![i(64), i(8)]);
+        for source in [u(8), i(8)] {
+            agrees(&signed, &[i(64), i(8)], &source);
+        }
+    }
+
+    #[test]
+    fn a_pointer_round_trip_is_the_pointer() {
+        let chain = built(&[
+            (ptr(), CastRole::PointerWidthStep),
+            (u(64), CastRole::PointerWidthStep),
+            (ptr(), CastRole::PointerWidthStep),
+        ]);
+        assert_eq!(spine(&chain), vec![ptr()]);
+    }
+
+    // ---- the shapes that must not collapse ----
+
+    #[test]
+    fn a_widening_of_a_narrowing_stays_two() {
+        // `(uint64_t)(uint32_t)x` truncates and then widens. It is not
+        // `(uint64_t)x`, and it is how a thirty-two bit machine write reaches
+        // the C.
+        let before = [u(64), u(32)];
+        assert_eq!(spine(&built(&conv(&before))), vec![u(64), u(32)]);
+        // A signed source exhibits it: `(uint32_t)` of a negative `int16_t`
+        // keeps the sign bits only up to thirty-two, and the widening then
+        // zero-fills, where converting straight to `uint64_t` sign-fills.
+        let mut differs = false;
+        for input in 0..(1u128 << 16) {
+            if eval(&before, input, &i(16)) != eval(&[u(64)], input, &i(16)) {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "the rule would have been sound after all");
+        // With an unsigned source narrower than the inner cast the two do
+        // agree, which is why the collapse needs the operand's type and is
+        // not stated on the cast types alone.
+        agrees(&before, &[u(64)], &u(8));
+    }
+
+    #[test]
+    fn a_widening_over_a_signed_narrowing_keeps_its_middle_step() {
+        // `(uint64_t)(uint32_t)(int8_t)e` is not `(uint64_t)(int8_t)e`: the
+        // first stops sign-extending at thirty-two bits.
+        let before = [u(64), u(32), i(8)];
+        assert_eq!(spine(&built(&conv(&before))), vec![u(64), u(32), i(8)]);
+        let mut differs = false;
+        for input in 0..(1u128 << 8) {
+            if eval(&before, input, &u(8)) != eval(&[u(64), i(8)], input, &u(8)) {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "the signedness condition would have been unnecessary"
+        );
+    }
+
+    #[test]
+    fn a_recorded_address_width_step_is_never_dropped() {
+        // `(uint32_t)(uint64_t)p` narrows a pointer through its own width.
+        // Dropping the step leaves `-Wpointer-to-int-cast`, a hard error under
+        // the corpus flags, which is the whole reason the step is recorded.
+        let chain = built(&[
+            (u(32), CastRole::Conversion),
+            (u(64), CastRole::PointerWidthStep),
+            (ptr(), CastRole::PointerWidthStep),
+        ]);
+        assert_eq!(spine(&chain), vec![u(32), u(64), ptr()]);
+        // The same widths with an ordinary conversion in the middle do
+        // collapse, so it is the recording that makes the difference.
+        let unmarked = built(&[
+            (u(32), CastRole::Conversion),
+            (u(64), CastRole::Conversion),
+            (u(32), CastRole::Conversion),
+        ]);
+        assert_eq!(spine(&unmarked), vec![u(32)]);
+    }
+
+    #[test]
+    fn collapsing_is_idempotent() {
+        for types in [
+            vec![u(64), u(32), u(64), u(32)],
+            vec![u(64), u(32), u(8)],
+            vec![u(64), i(64), i(32), u(32)],
+        ] {
+            let once = built(&conv(&types));
+            let twice = built(&conv(&spine(&once)));
+            assert_eq!(
+                spine(&once),
+                spine(&twice),
+                "{types:?} is not a fixed point"
+            );
+            let raw_chain = raw(&conv(&types));
+            assert_eq!(
+                spine(&raw_chain),
+                types,
+                "the raw builder must not collapse"
+            );
+            for source in [u(8), i(8)] {
+                agrees(&types, &spine(&once), &source);
+            }
+        }
     }
 }

@@ -992,6 +992,7 @@ mod tests {
             CExpr::Cast {
                 ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
                 expr,
+                ..
             } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
 

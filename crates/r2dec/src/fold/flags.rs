@@ -217,13 +217,13 @@ impl<'a> FoldingContext<'a> {
                 op: BinaryOp::Ne, ..
             } => self.reconstruct_signed_lt_from_ne(expr),
             CExpr::Paren(inner) => self.try_reconstruct_condition_semantic(inner),
-            CExpr::Cast { ty, expr: inner } => {
-                self.try_reconstruct_condition_semantic(inner)
-                    .map(|reconstructed| CExpr::Cast {
-                        ty: ty.clone(),
-                        expr: Box::new(reconstructed),
-                    })
-            }
+            CExpr::Cast {
+                ty,
+                expr: inner,
+                role,
+            } => self
+                .try_reconstruct_condition_semantic(inner)
+                .map(|reconstructed| CExpr::cast_with_role(ty.clone(), reconstructed, *role)),
             CExpr::Unary {
                 op: UnaryOp::Not,
                 operand,

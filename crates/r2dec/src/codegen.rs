@@ -655,7 +655,9 @@ impl CodeGenerator {
                 self.output.push_str(" : ");
                 self.emit_expr(else_expr, my_prec);
             }
-            CExpr::Cast { ty, expr: inner } => {
+            CExpr::Cast {
+                ty, expr: inner, ..
+            } => {
                 self.output.push('(');
                 self.emit_type(ty);
                 self.output.push(')');
