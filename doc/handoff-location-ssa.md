@@ -8113,3 +8113,160 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+## Self-assignments, literal-only declarations, and the staging locals
+
+Three columns were the brief; a fourth thing turned out to matter more, and two
+of the three brief items ended as questions rather than answers. Everything
+below is measured on the fifty-four cells with `locked_matrix.sh`, and every
+number that moved is stated with the state it moved from.
+
+    predicate                    before   after   what happened
+    self_assignments               225     205    merge-copy coalescing widened; the
+                                                  carrier zero-extend is still open
+    literal_only_declarations      103      80    call arguments now spell their literal
+                                                  where it is read; the rest are open
+    flag_carriers                  192     192    untouched, and still the open question
+    cast_chains                      8       8    untouched
+    comma_conditions                17      17    untouched
+    gotos                          125     125    untouched
+    same_type_casts                  0       0    still zero
+
+54 of 54 on generation, raw, diagnostic, differential, binding audit, effect
+obligations, placement and render refusal. Whole-binary coverage 272 of 449,
+no regressions. Seventeen cells differ from the blessed snapshot and want a
+fresh blessing.
+
+**The staging locals were never a single-use question, and that is the finding
+worth carrying.** DecBench scores `byte_match` by recompiling the rendering and
+comparing assembly, and on `bzip2recover` at -O0 r2sleigh sat at 0.11 against
+angr's 0.60. `readError` is four lines of source and rendered as fourteen
+statements, six of which existed only to stage call arguments. The obvious
+reading is that the inlining guard counts elided readers, and it is wrong.
+`SSAOp::Call` takes only the callee as an operand: a value staged in `rdi` is
+consumed by the call boundary and has **no `UseSite` in the graph at all**. The
+SSA dump says so directly -- `RDI_1 ... uses=[]`. `inlinable_values` turned
+those values away at its first gate, "no readers", before any question about
+single use could be asked. The callsite certificate is the source's record that
+the read happens, the renderer already consults it and already accepts an
+argument the plan inlines; only the plan did not know the reader existed. It
+counts them now. `readError` renders as eight statements, and the literal-only
+column falls by 23.
+
+`RDI_1 = (FILE*)RAX_1` still survives, because a register-to-register copy
+roots at `Source` and `Source` is not among the shapes that render inline.
+Whether it belongs there is the next thing to try on this path, and it is
+cheap to test.
+
+### Three things that were tried, measured, and reverted
+
+Each looked right, each is recorded with the evidence, and none should be
+retried without reading the reason.
+
+**Counting only rendered readers is unsound as `inlinable_values` stands.**
+Discounting a reader whose instruction a certificate elides is what the brief
+asked for and it is what the staging locals appeared to need. It widens what
+may be folded without widening the window the interference test looks at: that
+test spans the definition and the one reader the guard then believes in.
+`fnv1a64` at x86-64 -O2 renders `R8_1 = byte3;` and then
+`R8_1 = (R8_1 ^ (... ^ R8_1) * k) * k`, reading the accumulator after the byte
+load overwrote it -- a wrong hash under a proof line reading `0 refused`. Three
+cells compute wrong answers and five more refuse. If this is wanted, the
+interference test has to cover every reader's window, not the surviving one's.
+
+**Discharging an absorbed carrier extension on the write that absorbed it
+refuses ten cells.** This was the plan for the 149 self-assignments of the form
+`EAX_2 = (uint64_t)(uint32_t)EAX_2`, and the machine half of it landed:
+`MachineProjection::absorbed_extensions` and `absorbing_write` now report which
+extensions a `ZeroExtend` projection consumed, with tests, including the nested
+case where a byte is widened twice. The accounting half is where it stops, and
+the cause was bisected to one cell rather than guessed: the extension reads the
+very binding the fused statement defines, so recording that operand as a
+rendered use puts a *read* of the object on the statement that first assigns
+it, and placement refuses with `read_before_assignment`. Dropping just the
+operand targets changes the refusal to `ExactUseRequiresRenderedOccurrence`,
+which is the proof that the operand cell is the one at fault.
+
+That is a question, not a bug, and it is the fork this work stopped at. What is
+the honest cell for an operand read that a write projection absorbed?
+
+- *Elide it*, with a reason of its own. Truthful -- the read does not appear in
+  the text -- and it is the mechanism the codebase already uses for the
+  analogous case, `account_materialized_phi_occurrences`. It contradicts the
+  brief's expectation that no new elision reason would be needed.
+- *Keep it exact and teach placement that a discharged operand read at the
+  statement that defines it is not an occurrence.* Preserves the "rendered by
+  equivalence" story and splits the journal's notion of an occurrence from
+  placement's, which is exactly the two-answerers-that-drift shape this
+  codebase keeps warning about.
+- *Narrow the discharge* to extensions whose operand is not in the absorbing
+  write's binding. This disables the feature: same-binding is its precondition.
+
+The first looks right and none of it was landed, because it decides what
+"rendered by equivalence" means for two ledgers at once.
+
+**Coalescing the program's own copies, merge edges whose source is version 0,
+and literals held in registers all delete an object's only definition.** A
+copy normalization made for a merge is safe to drop when both sides are one
+binding, because nothing can have touched the object between an edge's two
+ends. A program copy has a position, and the object can be written between its
+source's definition and it -- a save and restore around a clobber is that
+shape. A live-in register that is not a parameter has no declaration to be
+rendered by. And `RAX_1 = 0xcbf29ce484222325` initialises an accumulator it
+shares a binding with, so spelling the constant at each reader deletes the
+definition and the loop header reads it unassigned.
+
+The literal case is the one with a clean statement of what would be correct,
+and it is blocked on ordering rather than on evidence: the honest test is
+whether the value is coalesced with anything, and that cannot be asked where
+inlining is decided, because the partition is computed *from* the inlining
+answer. Admitting register literals needs a two-pass partition -- provisional
+components first, inlining decided against them, then the real partition -- and
+that is a structural change, not a predicate change. Until then the
+lowering-temporary restriction stands, and the comment beside it now says so
+with the reason rather than the storage class.
+
+What did survive from that direction: a copy relocated ahead of a certified
+carrier's entry edges is coalesced like any other merge copy, which is most of
+the 20 self-assignments that went.
+
+### Two defects found on the way, both fixed
+
+`expression_renders_inline` is the list of shapes the materialiser can build,
+and `Constant` was missing from it. Every literal the duplicable rule admitted
+was then asked whether a constant renders inline and told no, which is why that
+column had not moved in a previous session either. A computation *over*
+constants is still not a constant: `machine_expr_is_literal` is true of
+`popcount(0xf0f0)` because it asks only whether every leaf is constant, and the
+materialiser has no form for a population count. Two pipeline tests were
+quietly asserting exactly that distinction and caught the first attempt.
+
+The parameter-slot candidate rules were written twice, in `construction` and in
+`seal`, and they disagreed about a slot claimed three times: one overwrote the
+refusal reason, the other kept it, so the seal would reject a plan that was
+right. They are one statement in `rules` now.
+
+### Probes added
+
+`R2SLEIGH_TRACE_INLINE=<display name>` or `=all` prints, for each value,
+which gate in `inlinable_values` turned it away and why. This is what turned
+"the guard counts elided readers" into "a call argument has no `UseSite`", and
+it is the probe the previous session asked for when it recorded the flag
+carriers as needing one. `R2SLEIGH_DUMP_SSA=1` prints the prepared and
+normalized functions, every value with its storage, definition and use sites,
+and every instruction; between them the two answer most "why is this value
+bound" questions without a rebuild.
+
+### A hazard that cost two measurements here
+
+Syncing a worktree to the benchmark host with `rsync` carried macOS `.o` files
+into `r2plugin/`, the host linker rejected them, `make install` aborted *before*
+copying the library, and DecBench then scored the previously installed plugin.
+The run looked completely normal and the numbers were identical to the
+baseline, which is exactly what a real "no effect" result looks like. On a
+second run the Makefile copied a library that was not the one just built. Both
+are the shared-plugin hazard wearing a different coat, and the answer is the
+same one this document already gives for the corpus: verify the artifact you
+measured is the artifact you built. `run-placement.sh` on the host now copies
+the freshly built library itself and prints whether a string only this tree
+contains is present in the installed one.
