@@ -693,8 +693,6 @@ pub(super) fn certified_stack_geometry_values(source: &r2ssa::SsaArtifact) -> &B
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PlacementRead {
     Use(UseSite),
-    /// A read from inside an expression moved to its use.
-    Inlined(ValueId),
     CertifiedValue {
         value: ValueId,
         at: InstId,
@@ -999,6 +997,9 @@ mod seal;
 pub(crate) use name_resolution::{
     BindingNameResolution, BindingNameResolutionError, PlannedParameterSymbol, PlannedStackSymbol,
     PlannedValueSymbol, RenderedIdentityRefusal,
+};
+pub(crate) use rules::{
+    CertificateElidedCells, CertificateElidedCellsError, certificate_elided_cells,
 };
 pub(crate) use seal::build_upstream_shadow_oracle;
 

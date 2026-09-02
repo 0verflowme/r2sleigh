@@ -350,7 +350,20 @@ fn normalized_candidate_value(
             .copied()
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::InvalidPlanValue { value }),
-        ValueDisposition::Inline { .. } => Ok(NormalizedValueObservation::InlineConstant),
+        // The plan inlines two kinds of value and the oracle tells them apart:
+        // a constant, and a computed value rendered where it is read. Calling
+        // both a constant here disagreed with the oracle on every function
+        // that folded anything, which is nearly all of them.
+        ValueDisposition::Inline { expr, .. } => Ok(
+            match plan.machine_projection().expr(*expr).map(|node| node.kind()) {
+                Some(r2ssa::MachineExprKind::Constant { binding, .. })
+                    if binding.value() == value =>
+                {
+                    NormalizedValueObservation::InlineConstant
+                }
+                _ => NormalizedValueObservation::InlineNonLiteral,
+            },
+        ),
         ValueDisposition::Elided { reason, .. } => Ok(NormalizedValueObservation::Elided(*reason)),
         ValueDisposition::Refused { reason } => Ok(NormalizedValueObservation::Refused(*reason)),
     }
