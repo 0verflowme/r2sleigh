@@ -2055,15 +2055,33 @@ impl<'a> FoldingContext<'a> {
         {
             return expr;
         }
-        // A pointer narrowed straight to a smaller integer is
-        // `-Wpointer-to-int-cast`: address bits are lost and the compiler will
-        // not let that be implicit. Converting at the pointer's own width
-        // first makes the narrowing the program's own statement.
+        // Converting a pointer to an integer is the address-width step, or it
+        // goes through one. At the pointer's own width the conversion *is* the
+        // step and says so, which is what lets a round trip back to the
+        // pointer collapse. Narrower is `-Wpointer-to-int-cast`, because
+        // address bits are lost and the compiler will not let that be
+        // implicit, so the full-width step is spelled first and the narrowing
+        // becomes the program's own statement.
+        //
+        // The width comes from the memory model rather than from a literal 64,
+        // which is what this read before: a thirty-two bit target has no
+        // sixty-four bit address step and would have been given one.
         if self.looks_like_pointer(&expr)
             && let CType::Int { bits, .. } = &target
-            && *bits < 64
+            && let Some(pointer_bits) = self
+                .inputs
+                .prepared_ssa
+                .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
         {
-            return CExpr::cast(target, CExpr::pointer_width_cast(CType::uint(64), expr));
+            if *bits == pointer_bits {
+                return CExpr::pointer_width_cast(target, expr);
+            }
+            if *bits < pointer_bits {
+                return CExpr::cast(
+                    target,
+                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
+                );
+            }
         }
         CExpr::cast(target, expr)
     }
@@ -2132,12 +2150,18 @@ impl<'a> FoldingContext<'a> {
                     .inputs
                     .prepared_ssa
                     .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
-                && bits < pointer_bits
             {
-                return CExpr::cast(
-                    target,
-                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
-                );
+                // At the pointer's own width the conversion is the step; below
+                // it, the step is spelled first and the narrowing follows.
+                if bits == pointer_bits {
+                    return CExpr::pointer_width_cast(target, expr);
+                }
+                if bits < pointer_bits {
+                    return CExpr::cast(
+                        target,
+                        CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
+                    );
+                }
             }
             CExpr::cast(target, expr)
         } else {
