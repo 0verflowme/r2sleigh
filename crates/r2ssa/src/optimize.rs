@@ -18,10 +18,8 @@ use crate::{
 pub struct OptimizationConfig {
     pub max_iterations: usize,
     pub enable_sccp: bool,
-    pub enable_const_prop: bool,
     pub enable_inst_combine: bool,
     pub enable_copy_prop: bool,
-    pub enable_cse: bool,
     pub enable_dce: bool,
     pub preserve_memory_reads: bool,
 }
@@ -35,7 +33,6 @@ pub struct OptimizationConfig {
 pub struct DecompilePrepConfig {
     pub max_iterations: usize,
     pub enable_inst_combine: bool,
-    pub enable_cse: bool,
 }
 
 impl Default for OptimizationConfig {
@@ -43,10 +40,8 @@ impl Default for OptimizationConfig {
         Self {
             max_iterations: 4,
             enable_sccp: true,
-            enable_const_prop: true,
             enable_inst_combine: true,
             enable_copy_prop: true,
-            enable_cse: true,
             enable_dce: true,
             preserve_memory_reads: false,
         }
@@ -58,7 +53,6 @@ impl Default for DecompilePrepConfig {
         Self {
             max_iterations: 1,
             enable_inst_combine: true,
-            enable_cse: false,
         }
     }
 }
@@ -68,10 +62,8 @@ impl From<&DecompilePrepConfig> for OptimizationConfig {
         Self {
             max_iterations: value.max_iterations.max(1),
             enable_sccp: false,
-            enable_const_prop: false,
             enable_inst_combine: value.enable_inst_combine,
             enable_copy_prop: false,
-            enable_cse: value.enable_cse,
             enable_dce: false,
             preserve_memory_reads: true,
         }
@@ -89,7 +81,6 @@ pub struct OptimizationStats {
     pub ops_simplified: usize,
     pub copies_propagated: usize,
     pub phis_simplified: usize,
-    pub cse_replacements: usize,
     pub dce_removed_ops: usize,
     pub dce_removed_phis: usize,
 }
@@ -134,20 +125,7 @@ pub(crate) fn optimize_function_with_interface_and_control<C: SsaWorkControl + ?
         control.poll()?;
         let mut changed = false;
 
-        if config.enable_const_prop && !config.enable_sccp {
-            let consts = compute_constants_with_control(func, max_iters, control)?;
-            control.poll()?;
-            if replace_sources_with_constants(func, &consts, function_interface, &mut stats) {
-                changed = true;
-            }
-        }
-
         if config.enable_inst_combine && inst_combine(func, &mut stats) {
-            changed = true;
-        }
-
-        control.poll()?;
-        if config.enable_cse && common_subexpr_elim(func, &mut stats) {
             changed = true;
         }
 
@@ -557,58 +535,6 @@ fn const_for_var(var: &SSAVar, consts: &HashMap<VarKey, u64>) -> Option<u64> {
         return Some(val);
     }
     consts.get(&VarKey::from_var(var)).copied()
-}
-
-fn compute_constants_with_control<C: SsaWorkControl + ?Sized>(
-    func: &SSAFunction,
-    max_iters: usize,
-    control: &C,
-) -> Result<HashMap<VarKey, u64>, SsaExecutionStopReason> {
-    let mut consts = HashMap::new();
-
-    for _ in 0..max_iters {
-        control.poll()?;
-        let mut changed = false;
-
-        for phi in func.all_phis() {
-            control.poll()?;
-            let dst_key = VarKey::from_var(&phi.dst);
-            if consts.contains_key(&dst_key) {
-                continue;
-            }
-            let mut iter = phi.sources.iter();
-            let Some((_, first)) = iter.next() else {
-                continue;
-            };
-            let Some(first_val) = const_for_var(first, &consts) else {
-                continue;
-            };
-            if iter.all(|(_, src)| const_for_var(src, &consts) == Some(first_val)) {
-                consts.insert(dst_key, first_val);
-                changed = true;
-            }
-        }
-
-        for op in func.all_ops() {
-            control.poll()?;
-            let Some(dst) = op.dst() else { continue };
-            let dst_key = VarKey::from_var(dst);
-            if consts.contains_key(&dst_key) {
-                continue;
-            }
-            if let Some(val) = eval_const_op(op, &consts) {
-                consts.insert(dst_key, val);
-                changed = true;
-            }
-        }
-
-        if !changed {
-            break;
-        }
-    }
-
-    control.poll()?;
-    Ok(consts)
 }
 
 fn eval_const_op(op: &SSAOp, consts: &HashMap<VarKey, u64>) -> Option<u64> {
@@ -1399,201 +1325,6 @@ fn apply_replacements(
                 }
                 *op = new_op;
                 changed = true;
-            }
-        }
-    }
-
-    changed
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ExprKind {
-    Unary(&'static str),
-    Binary(&'static str),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExprKey {
-    kind: ExprKind,
-    dst_size: u32,
-    args: Vec<VarKey>,
-}
-
-fn expr_key(op: &SSAOp) -> Option<ExprKey> {
-    use SSAOp::*;
-    let dst = op.dst()?;
-    let key = match op {
-        IntNegate { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntNegate"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntNot { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntNot"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        BoolNot { src, .. } => ExprKey {
-            kind: ExprKind::Unary("BoolNot"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntZExt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntZExt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntSExt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntSExt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Trunc { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Trunc"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatNeg { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatNeg"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatAbs { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatAbs"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatSqrt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatSqrt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Int2Float { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Int2Float"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Float2Int { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Float2Int"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatFloat { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatFloat"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntAdd { a, b, .. }
-        | IntMult { a, b, .. }
-        | IntAnd { a, b, .. }
-        | IntOr { a, b, .. }
-        | IntXor { a, b, .. }
-        | IntEqual { a, b, .. }
-        | IntNotEqual { a, b, .. }
-        | BoolAnd { a, b, .. }
-        | BoolOr { a, b, .. }
-        | BoolXor { a, b, .. }
-        | FloatAdd { a, b, .. }
-        | FloatMult { a, b, .. }
-        | FloatEqual { a, b, .. }
-        | FloatNotEqual { a, b, .. } => {
-            let mut args = vec![VarKey::from_var(a), VarKey::from_var(b)];
-            args.sort();
-            let kind = match op {
-                IntAdd { .. } => ExprKind::Binary("IntAdd"),
-                IntMult { .. } => ExprKind::Binary("IntMult"),
-                IntAnd { .. } => ExprKind::Binary("IntAnd"),
-                IntOr { .. } => ExprKind::Binary("IntOr"),
-                IntXor { .. } => ExprKind::Binary("IntXor"),
-                IntEqual { .. } => ExprKind::Binary("IntEqual"),
-                IntNotEqual { .. } => ExprKind::Binary("IntNotEqual"),
-                BoolAnd { .. } => ExprKind::Binary("BoolAnd"),
-                BoolOr { .. } => ExprKind::Binary("BoolOr"),
-                BoolXor { .. } => ExprKind::Binary("BoolXor"),
-                FloatAdd { .. } => ExprKind::Binary("FloatAdd"),
-                FloatMult { .. } => ExprKind::Binary("FloatMult"),
-                FloatEqual { .. } => ExprKind::Binary("FloatEqual"),
-                FloatNotEqual { .. } => ExprKind::Binary("FloatNotEqual"),
-                _ => return None,
-            };
-            ExprKey {
-                kind,
-                dst_size: dst.size,
-                args,
-            }
-        }
-        IntSub { a, b, .. }
-        | IntDiv { a, b, .. }
-        | IntSDiv { a, b, .. }
-        | IntRem { a, b, .. }
-        | IntSRem { a, b, .. }
-        | IntLeft { a, b, .. }
-        | IntRight { a, b, .. }
-        | IntSRight { a, b, .. }
-        | IntLess { a, b, .. }
-        | IntLessEqual { a, b, .. }
-        | IntSLess { a, b, .. }
-        | IntSLessEqual { a, b, .. }
-        | FloatSub { a, b, .. }
-        | FloatDiv { a, b, .. }
-        | FloatLess { a, b, .. }
-        | FloatLessEqual { a, b, .. } => {
-            let args = vec![VarKey::from_var(a), VarKey::from_var(b)];
-            let kind = match op {
-                IntSub { .. } => ExprKind::Binary("IntSub"),
-                IntDiv { .. } => ExprKind::Binary("IntDiv"),
-                IntSDiv { .. } => ExprKind::Binary("IntSDiv"),
-                IntRem { .. } => ExprKind::Binary("IntRem"),
-                IntSRem { .. } => ExprKind::Binary("IntSRem"),
-                IntLeft { .. } => ExprKind::Binary("IntLeft"),
-                IntRight { .. } => ExprKind::Binary("IntRight"),
-                IntSRight { .. } => ExprKind::Binary("IntSRight"),
-                IntLess { .. } => ExprKind::Binary("IntLess"),
-                IntLessEqual { .. } => ExprKind::Binary("IntLessEqual"),
-                IntSLess { .. } => ExprKind::Binary("IntSLess"),
-                IntSLessEqual { .. } => ExprKind::Binary("IntSLessEqual"),
-                FloatSub { .. } => ExprKind::Binary("FloatSub"),
-                FloatDiv { .. } => ExprKind::Binary("FloatDiv"),
-                FloatLess { .. } => ExprKind::Binary("FloatLess"),
-                FloatLessEqual { .. } => ExprKind::Binary("FloatLessEqual"),
-                _ => return None,
-            };
-            ExprKey {
-                kind,
-                dst_size: dst.size,
-                args,
-            }
-        }
-        _ => return None,
-    };
-
-    Some(key)
-}
-
-fn common_subexpr_elim(func: &mut SSAFunction, stats: &mut OptimizationStats) -> bool {
-    let mut changed = false;
-    let block_addrs = func.block_addrs().to_vec();
-
-    for addr in block_addrs {
-        let Some(block) = func.get_block_mut(addr) else {
-            continue;
-        };
-        let mut available: HashMap<ExprKey, SSAVar> = HashMap::new();
-
-        for op in &mut block.ops {
-            let Some(dst) = op.dst().cloned() else {
-                continue;
-            };
-            let Some(key) = expr_key(op) else { continue };
-
-            if let Some(existing) = available.get(&key).cloned() {
-                if existing.size == dst.size {
-                    *op = SSAOp::Copy { dst, src: existing };
-                    stats.cse_replacements += 1;
-                    changed = true;
-                }
-            } else {
-                available.insert(key, dst);
             }
         }
     }
@@ -3265,10 +2996,8 @@ mod sccp_tests {
         let config = OptimizationConfig {
             max_iterations: 1,
             enable_sccp: false,
-            enable_const_prop: false,
             enable_inst_combine: false,
             enable_copy_prop: true,
-            enable_cse: false,
             enable_dce: false,
             preserve_memory_reads: false,
         };

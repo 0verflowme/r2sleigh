@@ -256,7 +256,6 @@ struct SSAOptStatsJson {
     ops_simplified: usize,
     copies_propagated: usize,
     phis_simplified: usize,
-    cse_replacements: usize,
     dce_removed_ops: usize,
     dce_removed_phis: usize,
 }
@@ -302,7 +301,6 @@ pub(crate) fn r2ssa_function_opt_json(
             ops_simplified: stats.ops_simplified,
             copies_propagated: stats.copies_propagated,
             phis_simplified: stats.phis_simplified,
-            cse_replacements: stats.cse_replacements,
             dce_removed_ops: stats.dce_removed_ops,
             dce_removed_phis: stats.dce_removed_phis,
         },
@@ -786,7 +784,6 @@ mod tests {
                 ops_simplified: 0,
                 copies_propagated: 0,
                 phis_simplified: 0,
-                cse_replacements: 0,
                 dce_removed_ops: 0,
                 dce_removed_phis: 0,
             },
