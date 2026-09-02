@@ -7708,3 +7708,30 @@ after, and nothing about the emitted program moved. The candidate side mapped
 every inline disposition to `InlineConstant` while the oracle distinguishes a
 constant from an expression, so every function that folds anything reported a
 mismatch. The column had been measuring its own classification.
+
+**Caching a lifted callee needs an identity radare2 does not currently give
+it.** The measurement above says four callees cost about 45 milliseconds each
+and every `pdd` pays again, so a per-binary cache is worth real time on any
+sweep. The obstacle is the key, and it is exact rather than vague.
+
+`OwnedFunctionSnapshot::source_revision_identity` looks like the right key and
+is documented in radare2 as the "stable diagnostic/cache identity of the owned
+payload". For the root it is `function_snapshot_hash(snapshot)`, a content
+hash, which is what a cache wants. For a callee it is not:
+`libr/anal/function.c:6403` assigns `callee_snapshot->revision_identity =
+snapshot->revision_identity`, so every callee inherits the *caller's* identity.
+The same callee reached from two callers therefore carries two identities,
+which is the one case a callee cache exists to serve. Keying on it is safe but
+never hits.
+
+Two ways out, and neither is a small change to be slipped into other work. A
+callee's identity could be its own content hash, computed the same way the root
+is, which is an upstream radare2 change and belongs in its own pull request
+under the rule this project already follows. Or the plugin can derive a key
+itself from the callee's address together with a hash of everything the lift
+and the preparation actually consume -- the image bytes, the architecture
+triple, the recovered interface, the stack slots and the type graph -- which is
+sound only if the hash covers every input, and a hash that misses one renders
+the wrong body. Whichever is taken, the identity has to be proven complete
+before the cache is switched on, because a stale hit here is not a slow answer
+but a wrong one.
