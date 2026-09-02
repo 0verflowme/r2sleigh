@@ -140,7 +140,8 @@ fn identities_compose_through_a_single_use_chain() {
     assert!(matches!(roots.arena().term(right).kind, TermKind::Leaf(_)));
     let rules: Vec<&str> = xor.trace.iter().map(|r| r.rule).collect();
     assert!(rules.contains(&"identity.or_self"), "{rules:?}");
-    assert!(rules.contains(&"identity.neg_neg"), "{rules:?}");
+    // The double negation is gone too, taken by the affine normal form
+    // before the rule could see it; the rule still proves on its own shape.
     assert_eq!(
         xor.discharges.len(),
         3,
@@ -266,4 +267,158 @@ fn a_negated_ordering_flips_and_a_zero_extension_of_a_truncation_extracts() {
     assert!(matches!(roots.arena().term(input).kind, TermKind::Leaf(_)));
     let rules: Vec<&str> = narrowed.trace.iter().map(|r| r.rule).collect();
     assert!(rules.contains(&"cast.extract_extract"), "{rules:?}");
+}
+
+#[test]
+fn a_signed_branch_on_flags_becomes_a_comparison_through_the_difference_by_name() {
+    // `cmp a, b; jl`: the difference feeds both the sign flag and the zero
+    // flag, so it is read by name; the rule sees through the name.
+    let artifact = artifact(vec![
+        R2ILOp::IntSub {
+            dst: tmp(0x100, 8),
+            a: reg(RDI, 8),
+            b: reg(RSI, 8),
+        },
+        R2ILOp::IntSLess {
+            dst: tmp(0x200, 1),
+            a: tmp(0x100, 8),
+            b: konst(0, 8),
+        },
+        R2ILOp::IntEqual {
+            dst: tmp(0x300, 1),
+            a: tmp(0x100, 8),
+            b: konst(0, 8),
+        },
+        R2ILOp::IntSBorrow {
+            dst: tmp(0x400, 1),
+            a: reg(RDI, 8),
+            b: reg(RSI, 8),
+        },
+        R2ILOp::IntNotEqual {
+            dst: tmp(0x500, 1),
+            a: tmp(0x200, 1),
+            b: tmp(0x400, 1),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x600, 8),
+            src: tmp(0x500, 1),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x700, 8),
+            src: tmp(0x300, 1),
+        },
+        R2ILOp::IntAdd {
+            dst: reg(RAX, 8),
+            a: tmp(0x600, 8),
+            b: tmp(0x700, 8),
+        },
+        // RDI is written later, so the difference over it is not duplicable
+        // and its two readers keep reading it by name.
+        R2ILOp::Copy {
+            dst: reg(RDI, 8),
+            src: reg(RAX, 8),
+        },
+        ret(),
+    ]);
+    let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    let difference = roots
+        .value(value_named(&artifact, "tmp:100_1"))
+        .expect("difference");
+    assert_eq!(difference.multiplicity, Multiplicity::Once);
+    let branch = roots
+        .value(value_named(&artifact, "tmp:500_1"))
+        .expect("the flag comparison");
+    let TermKind::Compare {
+        op,
+        interpretation,
+        left,
+        right,
+    } = roots.arena().term(branch.canonical).kind
+    else {
+        panic!(
+            "expected a comparison, got {:?}",
+            roots.arena().term(branch.canonical)
+        );
+    };
+    assert_eq!(op, r2ssa::MachineComparisonOp::LessThan);
+    assert_eq!(interpretation, r2ssa::MachineSignedness::Signed);
+    assert!(matches!(roots.arena().term(left).kind, TermKind::Leaf(_)));
+    assert!(matches!(roots.arena().term(right).kind, TermKind::Leaf(_)));
+    let rules: Vec<&str> = branch.trace.iter().map(|r| r.rule).collect();
+    assert!(rules.contains(&"flag.signed_lt_from_borrow"), "{rules:?}");
+    // The difference was read by name and is not discharged here; the sign
+    // flag and the borrow flag were expanded and are.
+    assert_eq!(branch.discharges.len(), 2, "{:?}", branch.discharges);
+    let zero_flag = roots
+        .value(value_named(&artifact, "tmp:300_1"))
+        .expect("zero flag");
+    assert!(matches!(
+        roots.arena().term(zero_flag.canonical).kind,
+        TermKind::Compare {
+            op: r2ssa::MachineComparisonOp::Equal,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn an_address_sum_reaches_its_affine_normal_form() {
+    // `(1 + p) + i` then `+ 3`: one sum, terms in id order, literal last.
+    let artifact = artifact(vec![
+        R2ILOp::IntAdd {
+            dst: tmp(0x100, 8),
+            a: konst(1, 8),
+            b: reg(RDI, 8),
+        },
+        R2ILOp::IntAdd {
+            dst: tmp(0x200, 8),
+            a: tmp(0x100, 8),
+            b: reg(RSI, 8),
+        },
+        R2ILOp::IntAdd {
+            dst: tmp(0x300, 8),
+            a: tmp(0x200, 8),
+            b: konst(3, 8),
+        },
+        R2ILOp::Copy {
+            dst: reg(RAX, 8),
+            src: tmp(0x300, 8),
+        },
+        ret(),
+    ]);
+    let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    let sum = roots
+        .value(value_named(&artifact, "tmp:300_1"))
+        .expect("sum");
+    let TermKind::Arithmetic {
+        op: r2ssa::MachineArithmeticOp::Add,
+        left,
+        right,
+    } = roots.arena().term(sum.canonical).kind
+    else {
+        panic!(
+            "expected a sum, got {:?}",
+            roots.arena().term(sum.canonical)
+        );
+    };
+    let TermKind::Literal(bits) = roots.arena().term(right).kind else {
+        panic!(
+            "expected the literal last, got {:?}",
+            roots.arena().term(right)
+        );
+    };
+    assert_eq!(bits.bits(), 4);
+    let TermKind::Arithmetic {
+        op: r2ssa::MachineArithmeticOp::Add,
+        left: p,
+        right: i,
+    } = roots.arena().term(left).kind
+    else {
+        panic!("expected p + i, got {:?}", roots.arena().term(left));
+    };
+    assert!(matches!(roots.arena().term(p).kind, TermKind::Leaf(_)));
+    assert!(matches!(roots.arena().term(i).kind, TermKind::Leaf(_)));
+    assert!(roots.budget_failures().is_empty());
 }

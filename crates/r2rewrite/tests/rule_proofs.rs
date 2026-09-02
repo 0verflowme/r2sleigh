@@ -101,10 +101,37 @@ fn exhaustive_agrees(
             assignment.insert(*variable, domain[rest % domain.len()]);
             rest /= domain.len();
         }
-        let mut leaf = |leaf: LeafRef, ty: &MachineType| match leaf {
-            LeafRef::Variable(index) => assignment[&(index, *ty)],
-            LeafRef::Expr(_) => panic!("templates have no base leaves"),
-        };
+        let defined: HashMap<(u32, MachineType), r2rewrite::TermId> = variables
+            .iter()
+            .filter_map(|(index, ty)| {
+                let mut probe = TermArena::new();
+                let _ = &mut probe;
+                arena
+                    .iter()
+                    .find(|(_, term)| term.kind == TermKind::Variable(*index) && term.ty == *ty)
+                    .and_then(|(id, _)| arena.definition(id))
+                    .map(|definition| ((*index, *ty), definition))
+            })
+            .collect();
+        fn value_of(
+            arena: &TermArena,
+            defined: &HashMap<(u32, MachineType), r2rewrite::TermId>,
+            assignment: &HashMap<(u32, MachineType), u128>,
+            leaf: LeafRef,
+            ty: &MachineType,
+        ) -> u128 {
+            match leaf {
+                LeafRef::Variable(index) => match defined.get(&(index, *ty)) {
+                    Some(definition) => eval(arena, *definition, &mut |l, t| {
+                        value_of(arena, defined, assignment, l, t)
+                    }),
+                    None => assignment[&(index, *ty)],
+                },
+                LeafRef::Expr(_) => panic!("templates have no base leaves"),
+            }
+        }
+        let mut leaf =
+            |leaf: LeafRef, ty: &MachineType| value_of(arena, &defined, &assignment, leaf, ty);
         let l = eval(arena, before, &mut leaf);
         let r = eval(arena, after, &mut leaf);
         if l != r {
@@ -169,6 +196,9 @@ fn every_rule_is_a_proven_equivalence() {
                 let lhs = encoder.encode(before);
                 let rhs = encoder.encode(after);
                 let solver = Solver::new();
+                for hypothesis in encoder.hypotheses() {
+                    solver.assert(hypothesis.clone());
+                }
                 solver.assert(lhs.eq(rhs.clone()).not());
                 let verdict = solver.check();
                 if verdict != SatResult::Unsat {
@@ -296,6 +326,121 @@ fn truncation_and_shift_clamp_are_idempotent_equivalences() {
         },
     ];
     check_normaliser(shapes, canon::normalize);
+}
+
+/// The affine normal form over a family of shapes: like terms, literals in
+/// several places, subtraction and negation, a scaled atom, and nested sums.
+#[test]
+fn affine_normal_form_is_an_idempotent_equivalence() {
+    use r2ssa::MachineArithmeticOp::{Add, Multiply, Subtract};
+    fn arith(
+        arena: &mut TermArena,
+        op: r2ssa::MachineArithmeticOp,
+        l: r2rewrite::TermId,
+        r: r2rewrite::TermId,
+    ) -> r2rewrite::TermId {
+        let ty = arena.term(l).ty;
+        arena.intern(
+            ty,
+            TermKind::Arithmetic {
+                op,
+                left: l,
+                right: r,
+            },
+        )
+    }
+    fn literal(arena: &mut TermArena, w: u32, v: u64) -> r2rewrite::TermId {
+        arena.intern(
+            unsigned(w),
+            TermKind::Literal(r2ssa::MachineBitVector::new(w, v).unwrap()),
+        )
+    }
+    let shapes: &[r2rewrite::rules::Template] = &[
+        |a, _, l| {
+            let s = arith(a, Add, l[0], l[1]);
+            arith(a, Add, s, l[0])
+        },
+        |a, _, l| {
+            let s = arith(a, Subtract, l[0], l[0]);
+            arith(a, Add, s, l[1])
+        },
+        |a, w, l| {
+            let three = literal(a, w, 3);
+            let five = literal(a, w, 5);
+            let x3 = arith(a, Multiply, l[0], three);
+            let x5 = arith(a, Multiply, l[0], five);
+            arith(a, Add, x3, x5)
+        },
+        |a, w, l| {
+            let one = literal(a, w, 1);
+            let two = literal(a, w, 2);
+            let s1 = arith(a, Add, l[0], one);
+            let s2 = arith(a, Add, l[1], two);
+            arith(a, Add, s1, s2)
+        },
+        |a, _, l| {
+            let inner = arith(a, Subtract, l[1], l[0]);
+            arith(a, Subtract, l[0], inner)
+        },
+        |a, w, l| {
+            let neg = a.intern(unsigned(w), TermKind::Negate(l[0]));
+            arith(a, Add, neg, l[0])
+        },
+        |a, w, l| {
+            let three = literal(a, w, 3);
+            let four = literal(a, w, 4);
+            let s = arith(a, Subtract, l[0], three);
+            arith(a, Subtract, s, four)
+        },
+        |a, _, l| {
+            let s = arith(a, Subtract, l[1], l[0]);
+            arith(a, Add, s, l[1])
+        },
+        |a, w, l| {
+            let three = literal(a, w, 3);
+            let s = arith(a, Add, l[0], l[1]);
+            arith(a, Multiply, s, three)
+        },
+        |a, w, l| {
+            let seven = literal(a, w, 7);
+            let neg = a.intern(unsigned(w), TermKind::Negate(l[1]));
+            let s = arith(a, Add, seven, neg);
+            arith(a, Subtract, s, l[0])
+        },
+    ];
+    for (index, shape) in shapes.iter().enumerate() {
+        for width in [8u32, 16, 32, 64] {
+            let mut arena = TermArena::new();
+            let leaves = fresh_leaves(&mut arena, width);
+            let before = shape(&mut arena, width, &leaves);
+            let once = canon::affine_normalize(&mut arena, before);
+            let twice = canon::affine_normalize(&mut arena, once);
+            assert_eq!(
+                once, twice,
+                "affine shape {index} at {width}: not idempotent"
+            );
+            assert!(
+                arena.tree_measure(once) <= arena.tree_measure(before),
+                "affine shape {index} at {width}: grew"
+            );
+            if let Some(agrees) = exhaustive_agrees(&arena, before, once) {
+                assert!(
+                    agrees,
+                    "affine shape {index} at {width}: evaluator disagrees"
+                );
+            }
+            let mut encoder = Encoder::new(&arena);
+            let lhs = encoder.encode(before);
+            let rhs = encoder.encode(once);
+            let solver = Solver::new();
+            solver.assert(lhs.eq(rhs).not());
+            assert_eq!(
+                solver.check(),
+                SatResult::Unsat,
+                "affine shape {index} at {width}"
+            );
+        }
+    }
 }
 
 fn check_normaliser(

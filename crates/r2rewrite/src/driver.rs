@@ -196,6 +196,15 @@ impl Driver<'_> {
         }
         let term = self.arena.term(id);
         if term.kind.is_nullary() {
+            // A leaf's definition was imported before the leaf was interned,
+            // so its nodes precede the leaf and are canonical by now. Point
+            // the leaf at the canonical form so rules that match through it
+            // see the same shapes they see everywhere else.
+            if let Some(definition) = self.arena.definition(id)
+                && let Some(canonical) = self.canonical.get(&definition).copied()
+            {
+                self.arena.define(id, canonical);
+            }
             self.canonical.insert(id, id);
             return Ok(id);
         }

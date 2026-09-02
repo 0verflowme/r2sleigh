@@ -251,6 +251,12 @@ impl Term {
 pub struct TermArena {
     nodes: Vec<Term>,
     interned: HashMap<Term, TermId>,
+    /// What a leaf stands for: the term of the instruction that defines the
+    /// value the leaf reads, when that instruction is modelled. A rule may
+    /// match through it -- in SSA a value is its definition -- without the
+    /// leaf being expanded, so the rewritten term still reads the value by
+    /// name and nothing new is discharged.
+    definitions: HashMap<TermId, TermId>,
 }
 
 impl TermArena {
@@ -271,6 +277,21 @@ impl TermArena {
 
     pub fn term(&self, id: TermId) -> Term {
         self.nodes[id.index()]
+    }
+
+    /// Record that `leaf` stands for `definition`.
+    pub fn define(&mut self, leaf: TermId, definition: TermId) {
+        self.definitions.insert(leaf, definition);
+    }
+
+    /// The term `leaf` stands for, if its defining instruction is modelled.
+    pub fn definition(&self, leaf: TermId) -> Option<TermId> {
+        self.definitions.get(&leaf).copied()
+    }
+
+    /// `id`, or what it stands for when it is a leaf with a definition.
+    pub fn unfold(&self, id: TermId) -> TermId {
+        self.definition(id).unwrap_or(id)
     }
 
     pub fn len(&self) -> usize {

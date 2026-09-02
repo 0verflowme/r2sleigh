@@ -47,6 +47,9 @@ pub enum Measure {
     CastWidth,
     /// Commutative nodes whose literal operand is not the last one.
     LiteralPosition,
+    /// Leaves that stand for a modelled definition: a rule that matches
+    /// through a definition and no longer reads the value removes one.
+    DefinedLeaves,
 }
 
 /// Lexicographic measure of a term as a tree.
@@ -56,6 +59,7 @@ pub struct MeasureVector {
     pub selections: u64,
     pub cast_width: u64,
     pub literals_not_last: u64,
+    pub defined_leaves: u64,
 }
 
 impl MeasureVector {
@@ -65,6 +69,7 @@ impl MeasureVector {
             Measure::Selections => self.selections,
             Measure::CastWidth => self.cast_width,
             Measure::LiteralPosition => self.literals_not_last,
+            Measure::DefinedLeaves => self.defined_leaves,
         }
     }
 }
@@ -88,8 +93,15 @@ fn measure_memo(
         selections: 0,
         cast_width: 0,
         literals_not_last: 0,
+        defined_leaves: 0,
     };
-    if !term.kind.is_nullary() {
+    if term.kind.is_nullary() {
+        if matches!(term.kind, TermKind::Leaf(_) | TermKind::Variable(_))
+            && arena.definition(id).is_some()
+        {
+            m.defined_leaves = 1;
+        }
+    } else {
         m.non_leaf_nodes = 1;
         if matches!(
             term.kind,
@@ -114,6 +126,7 @@ fn measure_memo(
             m.selections = m.selections.saturating_add(c.selections);
             m.cast_width = m.cast_width.saturating_add(c.cast_width);
             m.literals_not_last = m.literals_not_last.saturating_add(c.literals_not_last);
+            m.defined_leaves = m.defined_leaves.saturating_add(c.defined_leaves);
         }
     }
     memo.insert(id, m);
@@ -141,8 +154,10 @@ pub struct Rule {
 
 pub const DEFAULT_PROOF_WIDTHS: &[u32] = &[8, 16, 32, 64];
 
+pub mod affine;
 pub mod boolean;
 pub mod cast;
+pub mod flag;
 pub mod identity;
 pub mod literal;
 pub mod mask;
@@ -241,6 +256,18 @@ pub static RULES: &[&Rule] = &[
     &mask::OR_OR,
     &mask::XOR_XOR,
     &mask::AND_OF_ZEXT,
+    &flag::BOOL_NE_IS_XOR,
+    &flag::NOT_XOR_IS_EQ,
+    &flag::SIGNED_LT_FROM_BORROW,
+    &flag::SIGNED_GE_FROM_BORROW,
+    &flag::LE_AND_NE_IS_LT,
+    &flag::EQ_OR_LT_IS_LE,
+    &affine::ADD_ADD_LITERAL,
+    &affine::SUB_SUB_LITERAL,
+    &affine::MUL_MUL_LITERAL,
+    &affine::ADD_NEG,
+    &affine::SUB_NEG,
+    &affine::NEG_SUB,
 ];
 
 pub fn rule(id: RuleId) -> Option<&'static Rule> {

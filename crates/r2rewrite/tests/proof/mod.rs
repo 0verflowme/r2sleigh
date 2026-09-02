@@ -22,6 +22,10 @@ pub struct Encoder<'a> {
     arena: &'a TermArena,
     variables: HashMap<(u32, MachineType), BV>,
     memo: HashMap<TermId, BV>,
+    /// `leaf == definition` for every defined leaf the encoding met: the
+    /// hypotheses under which a definition-aware rule is an equivalence, to
+    /// be asserted beside the negated equation.
+    hypotheses: Vec<Bool>,
 }
 
 fn zero(width: u32) -> BV {
@@ -57,7 +61,12 @@ impl<'a> Encoder<'a> {
             arena,
             variables: HashMap::new(),
             memo: HashMap::new(),
+            hypotheses: Vec::new(),
         }
+    }
+
+    pub fn hypotheses(&self) -> &[Bool] {
+        &self.hypotheses
     }
 
     pub fn variables(&self) -> &HashMap<(u32, MachineType), BV> {
@@ -87,7 +96,14 @@ impl<'a> Encoder<'a> {
         let term = self.arena.term(id);
         let width = term.width_bits();
         let bv = match term.kind {
-            TermKind::Variable(index) => self.variable(index, term.ty),
+            TermKind::Variable(index) => {
+                let bv = self.variable(index, term.ty);
+                if let Some(definition) = self.arena.definition(id) {
+                    let defined = self.encode(definition);
+                    self.hypotheses.push(bv.eq(defined));
+                }
+                bv
+            }
             TermKind::Leaf(expr) | TermKind::Opaque(expr) => {
                 // A base node in a proof term is a free variable keyed by
                 // its id; templates do not build these, but nothing forbids

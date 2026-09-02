@@ -335,7 +335,15 @@ impl Importer<'_> {
         match kind {
             MachineExprKind::Source { binding, .. } => match self.try_substitute(binding.value()) {
                 Some(substituted) => Some(substituted),
-                None => leaf(self.arena),
+                None => {
+                    let leaf = leaf(self.arena);
+                    if let Some((leaf_id, _, _)) = &leaf
+                        && let Some(definition) = self.definition_of(binding.value())
+                    {
+                        self.arena.define(*leaf_id, definition);
+                    }
+                    leaf
+                }
             },
             MachineExprKind::Constant { value, .. } => {
                 match MachineBitVector::new(value.width_bits(), value.bits()) {
@@ -616,6 +624,20 @@ impl Importer<'_> {
 
     fn width_of(&self, id: TermId) -> u32 {
         self.arena.term(id).width_bits()
+    }
+
+    /// The producer's term, when it is modelled, for a leaf that keeps
+    /// reading the value by name.
+    fn definition_of(&mut self, value: ValueId) -> Option<TermId> {
+        let graph = self.artifact.graph();
+        let entity = self.projection.entity_for_output(value)?;
+        let root = entity.root();
+        let inst = graph.def_inst(value)?;
+        if self.in_progress.contains(&root) {
+            return None;
+        }
+        let imported = self.import_root(root, inst);
+        (!imported.opaque).then_some(imported.term)
     }
 
     /// The producer's term in place of a read of `value`, under the policy in
