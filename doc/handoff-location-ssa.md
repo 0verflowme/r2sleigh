@@ -7735,3 +7735,48 @@ sound only if the hash covers every input, and a hash that misses one renders
 the wrong body. Whichever is taken, the identity has to be proven complete
 before the cache is switched on, because a stale hit here is not a slow answer
 but a wrong one.
+
+**Most of the cast noise is spelled by the renderer, not present in the arena,
+and that decides what the rewriting layer can and cannot fix.** Measured by
+running canonicalisation over the corpus functions and counting rewrites by
+rule identity, against the `machine_noise` column's counts of the emitted C:
+
+    over the 54 cells                                  count
+    rendered casts                                     10346
+    same-type casts                                      731
+    arena Cast and Extract nodes                        2338
+    casts spelled with no arena node behind them        8008   (77%)
+    cast terms the rules actually remove                 379
+    share of rendered casts the rules can reach                (3.7%)
+
+A representative site is `R10D_1 = (uint64_t)(uint32_t)(uint64_t)(uint32_t)R10D_1;`,
+which is a copy. No arena cast node exists anywhere in it: all four casts come
+from operand projection alternating between the carrier's width and the value's
+width. So the cast work is a renderer policy change -- one conversion at each
+type boundary -- and not a rule, and the ninety proven rules will not move the
+`same_type_casts` or `cast_chains` columns on their own. Zero of the 731
+same-type casts are two arena nodes, because an arena cast always changes width
+except for a same-width reinterpretation, and that rule fired zero times across
+all sixty renders.
+
+**The flag carriers are a binding decision, not flag arithmetic.** Group E, the
+eight flag-to-comparison rules, removes none of the 192 carriers, and the
+reason is worth keeping: the carriers already hold comparisons. `x64_O0_djb2`
+renders `CF_2 = (uint8_t)((uint64_t)RAX_2 < (uint64_t)tmp_3f800_2)`, because the
+lifter emits the comparison directly rather than emitting flag arithmetic for
+the renderer to reconstruct. The rule group fired seven times across the corpus
+against forty for the boolean group. What keeps `CF_2` on the page is that the
+value is bound, which is the binding plan's decision, so the carriers fall to
+widened inlining rather than to any rule.
+
+Two consequences for the order of the remaining work. The cast policy moves
+ahead of the deletion pass, because it is the only thing that reaches 8008 of
+the counted casts. And widened inlining is what clears the flag carriers, the
+self-assignments and the literal-only temporaries, so it and the cast policy
+are the two changes the noise columns are actually waiting on.
+
+Cost of canonicalisation itself, for the record: about one projection build,
+636 microseconds mean per function against 595 to build the projection, worst
+case 3.4 milliseconds against 2.7 on `xxhash32` at x86-64 -O2, with no budget
+failures anywhere. Against a fold stage that is one per cent of a render, the
+rewriter is not a cost worth designing around.
