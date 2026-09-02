@@ -660,6 +660,9 @@ pub(crate) struct EffectOccurrences {
 struct CoalescedCarrierEffectElisions {
     coalesced_carrier_uses: BTreeSet<UseSite>,
     coalesced_carrier_phis: BTreeSet<InstId>,
+    /// The program's own copies whose two sides are one binding; see
+    /// [`LegacyObservationJournal::coalesced_copy_insts`].
+    coalesced_copies: BTreeSet<InstId>,
 }
 
 impl SurvivingEffectObservations {
@@ -703,6 +706,13 @@ impl SurvivingEffectObservations {
             .contains(&inst)
     }
 
+    /// Whether this instruction is one of the program's own copies that
+    /// spells `x = x` once both sides are one binding, and so has no
+    /// statement to answer for its effects.
+    pub(crate) fn is_coalesced_copy(&self, inst: InstId) -> bool {
+        self.coalesced_carriers.coalesced_copies.contains(&inst)
+    }
+
     #[cfg(test)]
     pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences.iter().filter_map(|(id, occurrences)| {
@@ -726,6 +736,15 @@ pub(crate) struct LegacyObservationJournal {
     /// Removed carrier phis for which every incoming edge is already accounted
     /// by SSA identity or one of `coalesced_carrier_copy_sites`.
     coalesced_carrier_phi_writes: BTreeSet<InstId>,
+    /// Sources of coalesced copies that no instruction defines: a parameter,
+    /// or a register the function entered holding. Their one occurrence may
+    /// have been the copy, so the seal closes their cell from the binding.
+    coalesced_entry_sources: BTreeSet<ValueId>,
+    /// The program's own copies whose two sides are one binding, whole. They
+    /// have no statement; their write is elided beside their read, and their
+    /// output is rendered by whatever wrote the binding.
+    coalesced_copy_insts: BTreeSet<InstId>,
+    coalesced_copy_outputs: BTreeSet<ValueId>,
     /// Merges normalization removed by materializing every incoming edge, so
     /// the copies on those edges are what write them.
     materialized_removed_phis: BTreeSet<InstId>,
@@ -1458,6 +1477,9 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let mut coalesced_carrier_copy_sites = BTreeSet::new();
+        let mut coalesced_entry_sources = BTreeSet::new();
+        let mut coalesced_copy_insts = BTreeSet::new();
+        let mut coalesced_copy_outputs = BTreeSet::new();
         for block_id in graph.block_order.iter().copied() {
             let Some(block) = graph
                 .block(block_id)
@@ -1472,30 +1494,84 @@ impl LegacyObservationJournal {
                     block: block_id,
                     op_idx,
                 };
-                let Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) = origins.origin(site) else {
-                    continue;
-                };
-                // Any materialised merge edge, not only a certified loop
-                // carrier's. What makes the copy say nothing is that both
-                // sides resolve to one binding, which is tested below; the
-                // carrier is where the case was found, not the reason it
-                // holds. A version-0 source stays excluded because it has no
-                // defining statement of its own, so its edge copy is the only
-                // place that value is written.
-                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
+                // Any copy normalization made for a merge: the copy on each
+                // materialised edge, and the initializer a certified carrier
+                // relocates ahead of its entry edges. What makes the copy say
+                // nothing is that both sides resolve to one binding, which is
+                // tested below; the loop carrier is where the case was found,
+                // not the reason it holds, and the source's SSA version is
+                // not the reason either. A version-0 source -- a parameter,
+                // or a register the function entered holding -- has no
+                // defining statement, and its copy used to be kept on the
+                // ground that the copy was the only place the value was
+                // written. But `x = x` writes nothing: the value is rendered
+                // under the binding's name by the declaration that binding
+                // already has, and its cell is closed at the seal on that
+                // ground, beside the identity merge's.
+                //
+                // And the program's own copies. `subs x1, x1, #1` lifts to a
+                // subtraction into a temporary and a copy of the temporary
+                // into `x1`; once the carrier certificate puts the temporary
+                // and the register in one object, that copy is `x = x` for
+                // exactly the reason the edge copies are. It keeps its
+                // statement only where the copy does something the name does
+                // not: a write projection narrower than the object, or a read
+                // that converts, is a real operation whatever the two sides
+                // are called.
+                if !matches!(op, r2ssa::SSAOp::Copy { .. }) {
                     continue;
                 }
+                let (incoming, original) = match origins.origin(site) {
+                    Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => (Some(origin.incoming), None),
+                    Some(NormalizedOpOrigin::RelocatedInitializer(_)) => (None, None),
+                    Some(NormalizedOpOrigin::Original(inst)) => {
+                        let is_copy = graph.inst(*inst).is_some_and(|inst| {
+                            matches!(
+                                inst.payload,
+                                r2ssa::InstPayload::Op(r2ssa::SSAOp::Copy { .. })
+                            ) && inst.inputs.len() == 1
+                        });
+                        if !is_copy {
+                            continue;
+                        }
+                        (None, Some(*inst))
+                    }
+                    None => continue,
+                };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
                 let Some(output) = projection.output else {
                     continue;
                 };
-                let Some(input) = projection
-                    .inputs
-                    .iter()
-                    .find(|input| input.uses.contains(&origin.incoming))
-                else {
+                let input = match incoming {
+                    Some(incoming) => projection
+                        .inputs
+                        .iter()
+                        .find(|input| input.uses.contains(&incoming)),
+                    None => projection.inputs.first(),
+                };
+                let Some(input) = input else {
                     continue;
                 };
+                if let Some(inst) = original {
+                    let whole_write = matches!(
+                        plan.machine_projection().write_disposition(inst),
+                        Some(MachineWriteDisposition::Exact(
+                            r2ssa::MachineWriteProjection::Full
+                        ))
+                    );
+                    let whole_read = input.uses.iter().all(|site| {
+                        matches!(
+                            plan.machine_projection().use_disposition(*site),
+                            Some(MachineUseDisposition::Exact(slice))
+                                if slice.bit_offset() == 0
+                                    && slice.width_bits() == slice.carrier_width_bits()
+                                    && slice.conversion().is_none()
+                        )
+                    });
+                    if !whole_write || !whole_read {
+                        continue;
+                    }
+                }
                 if matches!(
                     (plan.disposition(input.value), plan.disposition(output.value)),
                     (
@@ -1504,6 +1580,13 @@ impl LegacyObservationJournal {
                     ) if input == output
                 ) {
                     coalesced_carrier_copy_sites.insert(site);
+                    if graph.def_inst(input.value).is_none() {
+                        coalesced_entry_sources.insert(input.value);
+                    }
+                    if let Some(inst) = original {
+                        coalesced_copy_insts.insert(inst);
+                        coalesced_copy_outputs.insert(output.value);
+                    }
                 }
             }
         }
@@ -1577,6 +1660,9 @@ impl LegacyObservationJournal {
             coalesced_carrier_copy_sites,
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
+            coalesced_entry_sources,
+            coalesced_copy_insts,
+            coalesced_copy_outputs,
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
             placement_elided_observations: BTreeSet::new(),
@@ -1640,8 +1726,8 @@ impl LegacyObservationJournal {
             .copied()
             .collect::<Vec<_>>();
         for site in coalesced_carrier_uses {
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) {
-                Some(r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) | None => {}
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
@@ -1651,11 +1737,23 @@ impl LegacyObservationJournal {
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
             }
         }
+        for inst in self.coalesced_copy_insts.iter().copied() {
+            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+            }
+        }
         let removed_phis = origins
             .removed_phis()
             .iter()
             .map(|origin| origin.definition.inst)
             .collect::<BTreeSet<_>>();
+        // A merge normalization left in place whose every input is its own
+        // binding performs nothing. Which merges those are is the plan's
+        // statement, `identity_merges`, and the seal fills their value cells
+        // from the same statement; asking it twice in two spellings is how
+        // the value cell and the write cell came to disagree about one merge.
+        let identity_merges = self.plan.identity_merges(graph);
         for inst in &graph.insts {
             if removed_phis.contains(&inst.id)
                 || !matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
@@ -1665,18 +1763,7 @@ impl LegacyObservationJournal {
             let Some(output) = inst.output else {
                 return Err(LegacyObservationJournalError::InvalidWrite(inst.id));
             };
-            let Some(ValueDisposition::Bound {
-                binding: output_binding,
-            }) = self.plan.disposition(output)
-            else {
-                continue;
-            };
-            if !inst.inputs.iter().all(|input| {
-                matches!(
-                    self.plan.disposition(*input),
-                    Some(ValueDisposition::Bound { binding }) if binding == output_binding
-                )
-            }) {
+            if !identity_merges.contains(&output) {
                 continue;
             }
             for input_idx in 0..inst.inputs.len() {
@@ -1945,6 +2032,48 @@ impl LegacyObservationJournal {
     ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
+        targets.extend(self.discharged_instruction_targets(Some(value), discharged)?);
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// Mark every cell the instructions a rendered statement discharges.
+    ///
+    /// The statement twin of [`Self::observe_discharged_expr`], for a
+    /// definition whose write projection stands for other instructions: a
+    /// write the machine projection certified as a zero-extension into its
+    /// carrier has spoken for the extensions that certified it, and those have
+    /// no statement of their own. The statement already carries its own value
+    /// and write markers from [`Self::observe_normalized_output_stmt`]; this
+    /// adds the discharged instructions' writes, operands and outputs, exact,
+    /// on the one occurrence that now renders them. Their outputs classify by
+    /// the statement's assigned symbol, which is why the markers hang on the
+    /// statement and not on its right-hand side.
+    pub(crate) fn observe_discharged_stmt(
+        &mut self,
+        discharged: &[InstId],
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let targets = self.discharged_instruction_targets(None, discharged)?;
+        let mut marked = stmt;
+        for id in self.allocate_many(targets)? {
+            marked = CStmt::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// The cells each discharged instruction still owes, in canonical order:
+    /// its write, the value it produced unless that is the `rendered` value
+    /// the caller has already marked, and every operand it read.
+    fn discharged_instruction_targets(
+        &mut self,
+        rendered: Option<ValueId>,
+        discharged: &[InstId],
+    ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
+        let mut targets = Vec::new();
         let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
@@ -1968,7 +2097,7 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                if output != value {
+                if Some(output) != rendered {
                     self.value_slot(output)?;
                     targets.push(ObservationTarget::Value(output));
                 }
@@ -1987,11 +2116,7 @@ impl LegacyObservationJournal {
                 });
             }
         }
-        let mut marked = expr;
-        for id in self.allocate_many(targets)? {
-            marked = CExpr::observed(id, marked);
-        }
-        Ok(marked)
+        Ok(targets)
     }
 
     /// Mark the value an inlined expression produces, where it is rendered.
@@ -2137,12 +2262,33 @@ impl LegacyObservationJournal {
     /// stands in its place -- so its cell is closed here, at the seal, in the
     /// same way `account_materialized_phi_occurrences` closes the cells of
     /// definitions placement dropped.
-    fn account_identity_merge_values(
+    ///
+    /// The same closure serves a value no instruction defines whose copy into
+    /// a merge was coalesced away: a parameter, or a register the function
+    /// entered holding, bound to the merge it flows into. The copy was `x = x`
+    /// and may have been the value's only occurrence; the value is rendered
+    /// all the same, under the binding's name, by the declaration the binding
+    /// has -- the signature, or the entry declaration of a caller-supplied
+    /// object. A source with a definition is not closed here: its statement
+    /// renders it, and if that statement is missing the write cell says so.
+    ///
+    /// And it serves the output of one of the program's own copies whose two
+    /// sides are one binding. That copy has no statement, so nothing marks
+    /// its output; the output is rendered under the binding's name by the
+    /// statement that wrote the binding, which is the copy's source.
+    fn account_values_rendered_by_binding(
         &mut self,
         symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
     ) -> Result<(), LegacyObservationJournalError> {
         let graph = self.source.graph();
-        for value in self.plan.identity_merges(graph) {
+        let rendered_by_binding = self
+            .plan
+            .identity_merges(graph)
+            .into_iter()
+            .chain(self.coalesced_entry_sources.iter().copied())
+            .chain(self.coalesced_copy_outputs.iter().copied())
+            .collect::<BTreeSet<_>>();
+        for value in rendered_by_binding {
             let Some(slot) = self.values.get(value.0 as usize) else {
                 continue;
             };
@@ -2692,6 +2838,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: self.coalesced_carrier_uses,
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
+                coalesced_copies: self.coalesced_copy_insts,
             }),
         })
     }
@@ -2876,7 +3023,7 @@ impl LegacyObservationJournal {
         }
         self.effect_occurrence_regions = effect_occurrence_regions;
         self.account_materialized_phi_occurrences();
-        self.account_identity_merge_values(&symbol_bindings)?;
+        self.account_values_rendered_by_binding(&symbol_bindings)?;
         if let Some(error) = self.first_unaccounted_render_observation() {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
@@ -3058,6 +3205,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
+                coalesced_copies: std::mem::take(&mut self.coalesced_copy_insts),
             }),
         };
         let snapshot = self.into_snapshot(source);
@@ -4044,10 +4192,17 @@ mod tests {
             cond: Varnode::constant(1, 1),
             target: Varnode::constant(0x1008, 8),
         });
+        // Each edge copies a register the function entered holding, not a
+        // constant. A fixture built from constants stops having a subject
+        // every time the plan gets better at spelling one: every value in it
+        // folds into its reader, and a test about a *bound* merge input then
+        // asserts about values the plan no longer binds. This is the third
+        // time that has been corrected here, so the reason is written down
+        // rather than the shape merely repaired.
         let mut left = R2ILBlock::new(0x1004, 4);
         left.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(11, 8),
+            src: Varnode::register(0x38, 8),
         });
         left.push(R2ILOp::Branch {
             target: Varnode::constant(0x100c, 8),
@@ -4055,7 +4210,7 @@ mod tests {
         let mut right = R2ILBlock::new(0x1008, 4);
         right.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(12, 8),
+            src: Varnode::register(0x20, 8),
         });
         right.push(R2ILOp::Branch {
             target: Varnode::constant(0x100c, 8),
@@ -4131,10 +4286,15 @@ mod tests {
 
     #[test]
     fn normalized_identity_phi_edge_is_a_precise_elision_not_an_absence() {
+        // The carrier enters holding a register rather than a constant, for
+        // the reason given in the immutable-phi fixture above: a constant
+        // initialiser folds into its readers, the entry edge is then not a
+        // copy between two bound values, and the coalescing this test is
+        // about has nothing to coalesce.
         let mut entry = R2ILBlock::new(0x2000, 4);
         entry.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(1, 8),
+            src: Varnode::register(0x38, 8),
         });
         entry.push(R2ILOp::Branch {
             target: Varnode::constant(0x2004, 8),
@@ -4216,7 +4376,7 @@ mod tests {
                 assert_eq!(
                     journal.uses[source_use.inst.0 as usize][source_use.input_idx],
                     Some(LegacyUseObservation::Elided(
-                        r2ssa::ledger::ElisionReason::CoalescedEdgeCopy
+                        r2ssa::ledger::ElisionReason::CoalescedCopy
                     ))
                 );
             }

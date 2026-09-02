@@ -1059,6 +1059,15 @@ fn overlapping_parameter_and_span_certificates_close_transitively_in_canonical_o
             addr: Varnode::constant(0x2008, 8),
             val: Varnode::register(0x38, 8),
         },
+        // And a second rendered reader for the last version. The copy above
+        // is never read, so it is unobserved and its read does not count:
+        // the single-reader rule counts the readers that render, and with
+        // one store the last version would fold into it and leave the span.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2018, 8),
+            val: Varnode::register(0x38, 8),
+        },
     ]);
     let parameter = BindingCertificateSource::CertifiedEntity(SemanticId::Parameter(0));
     let constructed = binding_components(&source_owned, &test_projection(&source_owned))

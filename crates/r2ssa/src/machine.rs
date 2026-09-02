@@ -1061,6 +1061,15 @@ pub struct MachineProjection {
     use_dispositions: Box<[Box<[MachineUseDisposition]>]>,
     /// Dense by `InstId`; `None` is reserved for graph instructions with no output.
     write_dispositions: Box<[Option<MachineWriteDisposition>]>,
+    /// Dense by `InstId`: the carrier extensions each write's projection
+    /// absorbed, in the order the clearing chain consumed them. Empty for every
+    /// write that speaks only for itself.
+    absorbed_extensions: Box<[Box<[InstId]>]>,
+    /// Dense by `InstId`: for an absorbed extension, the write whose projection
+    /// stands for it. Where a chain nests -- a byte write widened twice, so the
+    /// first widening absorbs the second and the byte write absorbs both --
+    /// the outermost write answers, because it is the one with a statement.
+    absorbing_writes: Box<[Option<InstId>]>,
     /// Values no read reaches outside of; see [`self_contained_values`].
     self_contained: BTreeSet<ValueId>,
     /// The subset of those a lane write actually defined; see
@@ -1131,6 +1140,7 @@ impl MachineProjection {
         // Now that every operand read is known, decide which values hold
         // exactly themselves, and settle the deferred writes against that.
         let self_contained = self_contained_values(artifact, &builder.use_dispositions);
+        let mut absorbed_extensions = vec![Vec::new(); graph.insts.len()];
         for (inst_index, inst) in graph.insts.iter().enumerate() {
             let Some(root) = pending_roots[inst_index] else {
                 continue;
@@ -1139,13 +1149,11 @@ impl MachineProjection {
                 .nodes
                 .get(root.index())
                 .ok_or(MachineBuildError::MissingWriteDisposition(inst.id))?;
-            write_dispositions[inst_index] = Some(machine_write_disposition(
-                artifact,
-                inst,
-                root_expr,
-                &self_contained,
-            ));
+            let decision = machine_write_disposition(artifact, inst, root_expr, &self_contained);
+            write_dispositions[inst_index] = Some(decision.disposition);
+            absorbed_extensions[inst_index] = decision.absorbed;
         }
+        let absorbing_writes = absorbing_writes(&absorbed_extensions);
 
         // Only a value a lane write actually defined is read as itself. A
         // sub-register the function merely reads is a window onto machine state
@@ -1173,6 +1181,12 @@ impl MachineProjection {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             write_dispositions: write_dispositions.into_boxed_slice(),
+            absorbed_extensions: absorbed_extensions
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            absorbing_writes: absorbing_writes.into_boxed_slice(),
             self_contained,
             read_as_themselves,
         };
@@ -1222,6 +1236,33 @@ impl MachineProjection {
     /// Dense rows indexed by `InstId`; `None` means the instruction has no output.
     pub const fn write_dispositions(&self) -> &[Option<MachineWriteDisposition>] {
         &self.write_dispositions
+    }
+
+    /// The carrier extensions this write's projection stands for, in the order
+    /// the clearing chain consumed them.
+    ///
+    /// A `ZeroExtend` certified by an adjacent chain -- `EAX = x` followed by
+    /// `RAX = zext(EAX)` -- already says everything the extension says, so the
+    /// extension has no statement of its own once the write is rendered that
+    /// way. This is a machine fact about which instructions the projection
+    /// consumed; whether the two definitions are one rendered object is the
+    /// binding plan's question, asked of this answer.
+    pub fn absorbed_extensions(&self, inst: InstId) -> &[InstId] {
+        self.absorbed_extensions
+            .get(inst.0 as usize)
+            .map_or(&[], Box::as_ref)
+    }
+
+    /// The write whose projection absorbed this extension, if any.
+    ///
+    /// The outermost such write: where a byte write is widened twice, the
+    /// first widening absorbs the second and the byte write absorbs both, and
+    /// the byte write is the one with a statement.
+    pub fn absorbing_write(&self, inst: InstId) -> Option<InstId> {
+        self.absorbing_writes
+            .get(inst.0 as usize)
+            .copied()
+            .flatten()
     }
 
     pub fn expr(&self, id: MachineExprId) -> Option<&MachineExpr> {
@@ -1404,13 +1445,24 @@ impl MachineProjection {
                     .ok_or(MachineBuildError::WriteDispositionMismatch(inst.id))?;
                 machine_write_disposition(artifact, inst, root, &self.self_contained)
             } else if let Some(failure) = failures.get(&output) {
-                MachineWriteDisposition::Refused(write_refusal_for_error(failure.error()))
+                MachineWriteDecision::own(MachineWriteDisposition::Refused(
+                    write_refusal_for_error(failure.error()),
+                ))
             } else {
                 return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
             };
-            if *actual != Some(expected) {
+            if *actual != Some(expected.disposition) {
                 return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
             }
+            if self.absorbed_extensions(inst.id) != expected.absorbed.as_slice() {
+                return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
+            }
+        }
+        if self.absorbing_writes.len() != graph.insts.len()
+            || self.absorbing_writes
+                != absorbing_writes(&self.absorbed_extensions).into_boxed_slice()
+        {
+            return Err(MachineBuildError::TopologyMismatch);
         }
         Ok(())
     }
@@ -1994,12 +2046,18 @@ fn exact_zero_extend_write(
 /// So the question asked here is the one actually meant: before anything reads
 /// the carrier, does the block define it as a zero-extension of what this write
 /// left in its slice?
+///
+/// The instructions that certify the chain are returned beside the projection,
+/// in the order they were consumed. The projection stands for them: once the
+/// write is rendered as a zero-extension into the carrier, the extension
+/// itself has nothing left to say, and whoever renders the write has to know
+/// which instructions it has spoken for.
 fn exact_adjacent_cleared_carrier_write(
     artifact: &SsaArtifact,
     inst: &GraphInst,
     root: &MachineExpr,
     output: ExactRegisterGeometry,
-) -> Option<MachineWriteProjection> {
+) -> Option<(MachineWriteProjection, Vec<InstId>)> {
     if output.bit_offset != 0
         || output.width_bits >= output.carrier_bits
         || root.ty.width_bits() != output.width_bits
@@ -2054,6 +2112,7 @@ fn exact_adjacent_cleared_carrier_write(
             && candidate.offset.saturating_add(u64::from(candidate.size)) <= carrier_end
     };
     let mut covered_bytes = u64::from(slice.size);
+    let mut absorbed = Vec::new();
 
     for next in following {
         // A read of the carrier before it is cleared means the carrier still
@@ -2094,11 +2153,15 @@ fn exact_adjacent_cleared_carrier_write(
         if !written.contains(extended) {
             return None;
         }
+        absorbed.push(next.id);
         if defined == carrier {
-            return Some(MachineWriteProjection::ZeroExtend {
-                from_width_bits: output.width_bits,
-                to_width_bits: output.carrier_bits,
-            });
+            return Some((
+                MachineWriteProjection::ZeroExtend {
+                    from_width_bits: output.width_bits,
+                    to_width_bits: output.carrier_bits,
+                },
+                absorbed,
+            ));
         }
         let widened = next.output?;
         written.push(widened);
@@ -2107,14 +2170,63 @@ fn exact_adjacent_cleared_carrier_write(
     None
 }
 
+/// For each absorbed extension, the outermost write that absorbed it.
+///
+/// Chains nest: a byte write widened twice is absorbed by the byte write, and
+/// the first widening absorbs the second on its own account. Only a write
+/// nothing else absorbed has a statement, so only such a write answers.
+fn absorbing_writes<T: AsRef<[InstId]>>(absorbed_extensions: &[T]) -> Vec<Option<InstId>> {
+    let absorbed_somewhere = absorbed_extensions
+        .iter()
+        .flat_map(|chain| chain.as_ref().iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut absorbing = vec![None; absorbed_extensions.len()];
+    for (index, chain) in absorbed_extensions.iter().enumerate() {
+        let head = InstId(index as u32);
+        if absorbed_somewhere.contains(&head) {
+            continue;
+        }
+        for member in chain.as_ref() {
+            if let Some(slot) = absorbing.get_mut(member.0 as usize)
+                && slot.is_none()
+            {
+                *slot = Some(head);
+            }
+        }
+    }
+    absorbing
+}
+
+/// One settled write: how the definition writes its carrier, and which
+/// instructions that statement has taken over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MachineWriteDecision {
+    disposition: MachineWriteDisposition,
+    /// The carrier extensions a `ZeroExtend` certified by an adjacent clearing
+    /// chain absorbed, in the order the chain consumed them. Empty for every
+    /// other projection: nothing else speaks for another instruction.
+    absorbed: Vec<InstId>,
+}
+
+impl MachineWriteDecision {
+    const fn own(disposition: MachineWriteDisposition) -> Self {
+        Self {
+            disposition,
+            absorbed: Vec::new(),
+        }
+    }
+}
+
 fn machine_write_disposition(
     artifact: &SsaArtifact,
     inst: &GraphInst,
     root: &MachineExpr,
     self_contained: &BTreeSet<ValueId>,
-) -> MachineWriteDisposition {
+) -> MachineWriteDecision {
     let Some(output) = inst.output else {
-        return MachineWriteDisposition::Refused(MachineWriteRefusal::IncoherentOperation);
+        return MachineWriteDecision::own(MachineWriteDisposition::Refused(
+            MachineWriteRefusal::IncoherentOperation,
+        ));
     };
     // A phi is not a machine event. It merges the values reaching a point; no
     // instruction there writes a slice of a register and preserves the rest.
@@ -2124,7 +2236,9 @@ fn machine_write_disposition(
     // nor could. Where the carrier is live across the merge it has a phi of
     // its own, and that phi is what answers for it.
     if matches!(inst.payload, InstPayload::Phi { .. }) {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Full,
+        ));
     }
     // A call's definition of a register preserves nothing. The callee wrote
     // that register, so whatever sits outside the lane the prototype names is
@@ -2137,33 +2251,47 @@ fn machine_write_disposition(
         inst.payload,
         InstPayload::Op(crate::op::SSAOp::CallDefine { .. })
     ) {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Full,
+        ));
     }
     let Some(storage) = artifact
         .graph()
         .value(output)
         .and_then(|value| value.canonical_storage)
     else {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Full,
+        ));
     };
     if storage.space != CanonicalStorageSpace::Register {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Full,
+        ));
     }
     let geometry = match exact_register_geometry(artifact, storage) {
         Ok(geometry) => geometry,
         Err(reason) => {
-            return MachineWriteDisposition::Refused(write_refusal_for_register_geometry(reason));
+            return MachineWriteDecision::own(MachineWriteDisposition::Refused(
+                write_refusal_for_register_geometry(reason),
+            ));
         }
     };
-    if let Some(zero_extend) = exact_adjacent_cleared_carrier_write(artifact, inst, root, geometry)
+    if let Some((zero_extend, absorbed)) =
+        exact_adjacent_cleared_carrier_write(artifact, inst, root, geometry)
     {
-        return MachineWriteDisposition::Exact(zero_extend);
+        return MachineWriteDecision {
+            disposition: MachineWriteDisposition::Exact(zero_extend),
+            absorbed,
+        };
     }
     if let Some(zero_extend) = exact_zero_extend_write(artifact, inst, root, geometry) {
-        return MachineWriteDisposition::Exact(zero_extend);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(zero_extend));
     }
     if geometry.bit_offset == 0 && geometry.width_bits == geometry.carrier_bits {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Full);
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Full,
+        ));
     }
     // An insert keeps the carrier's other bits, so the instruction has to have
     // them, and in SSA it has a value only by taking it as an input. Where no
@@ -2181,17 +2309,21 @@ fn machine_write_disposition(
     if instruction_carries_wider_value_at(artifact, inst, storage)
         || (geometry.bit_offset != 0 && !self_contained.contains(&output))
     {
-        return MachineWriteDisposition::Exact(MachineWriteProjection::Insert {
+        return MachineWriteDecision::own(MachineWriteDisposition::Exact(
+            MachineWriteProjection::Insert {
+                bit_offset: geometry.bit_offset,
+                width_bits: geometry.width_bits,
+                carrier_width_bits: geometry.carrier_bits,
+            },
+        ));
+    }
+    MachineWriteDecision::own(MachineWriteDisposition::Exact(
+        MachineWriteProjection::Lane {
             bit_offset: geometry.bit_offset,
             width_bits: geometry.width_bits,
             carrier_width_bits: geometry.carrier_bits,
-        });
-    }
-    MachineWriteDisposition::Exact(MachineWriteProjection::Lane {
-        bit_offset: geometry.bit_offset,
-        width_bits: geometry.width_bits,
-        carrier_width_bits: geometry.carrier_bits,
-    })
+        },
+    ))
 }
 
 /// Whether some operand of this instruction holds the bits an insert would
@@ -6021,6 +6153,76 @@ mod tests {
             },
             "the adjacent source-owned full-carrier extension certifies the narrow write"
         );
+        // The projection names the extension it absorbed, and the extension
+        // names the write that absorbed it: whoever renders the write as the
+        // zero-extension has to know which instruction it has spoken for.
+        let narrow_write = clearing_low
+            .graph()
+            .inst_id_for_op_site(0x1000, 0)
+            .expect("narrow write");
+        let extension = clearing_low
+            .graph()
+            .inst_id_for_op_site(0x1000, 1)
+            .expect("carrier extension");
+        assert_eq!(
+            clearing_projection.absorbed_extensions(narrow_write),
+            &[extension]
+        );
+        assert_eq!(
+            clearing_projection.absorbing_write(extension),
+            Some(narrow_write)
+        );
+        assert!(
+            clearing_projection
+                .absorbed_extensions(extension)
+                .is_empty()
+        );
+        assert_eq!(clearing_projection.absorbing_write(narrow_write), None);
+
+        // A byte written and widened twice: the byte write absorbs both
+        // widenings, the first widening absorbs the second on its own
+        // account, and the byte write is the one that answers for both,
+        // because it is the one with a statement.
+        let widened_twice = artifact_with_arch(
+            [
+                R2ILOp::IntAdd {
+                    dst: Varnode::register(0, 1),
+                    a: Varnode::register(0, 1),
+                    b: Varnode::constant(7, 1),
+                },
+                R2ILOp::IntZExt {
+                    dst: Varnode::register(0, 4),
+                    src: Varnode::register(0, 1),
+                },
+                R2ILOp::IntZExt {
+                    dst: Varnode::register(0, 8),
+                    src: Varnode::register(0, 4),
+                },
+            ],
+            &arch,
+        );
+        let widened_projection =
+            MachineProjection::from_artifact(&widened_twice).expect("widened projection");
+        let at = |op_index: usize| {
+            widened_twice
+                .graph()
+                .inst_id_for_op_site(0x1000, op_index)
+                .expect("operation instruction")
+        };
+        assert_eq!(
+            exact_write(&widened_projection, &widened_twice, 0),
+            MachineWriteProjection::ZeroExtend {
+                from_width_bits: 8,
+                to_width_bits: 64,
+            }
+        );
+        assert_eq!(
+            widened_projection.absorbed_extensions(at(0)),
+            &[at(1), at(2)]
+        );
+        assert_eq!(widened_projection.absorbed_extensions(at(1)), &[at(2)]);
+        assert_eq!(widened_projection.absorbing_write(at(1)), Some(at(0)));
+        assert_eq!(widened_projection.absorbing_write(at(2)), Some(at(0)));
 
         let high = artifact_with_arch(
             [R2ILOp::Copy {

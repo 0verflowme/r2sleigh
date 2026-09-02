@@ -412,6 +412,105 @@ impl<'a> FoldingContext<'a> {
         self.observe_effect_expr(&obligations, marked)
     }
 
+    /// Statement twin of [`Self::observe_discharged_expr`]: the cells and the
+    /// effects of the instructions a rendered definition's projection stands
+    /// for, on that definition's statement.
+    pub(crate) fn observe_discharged_stmt(
+        &self,
+        discharged: &[r2ssa::InstId],
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let marked = match journal
+            .borrow_mut()
+            .observe_discharged_stmt(discharged, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return fallback;
+            }
+        };
+        let mut obligations = BTreeSet::new();
+        for definition in discharged {
+            let output = self
+                .inputs
+                .prepared_ssa
+                .and_then(|prepared| prepared.graph().inst(*definition))
+                .and_then(|inst| inst.output);
+            obligations.extend(self.exact_effect_obligations_for_source_inst(
+                EffectOccurrenceKind::Expression,
+                *definition,
+                output,
+            ));
+        }
+        self.observe_effect_stmt(&obligations, marked)
+    }
+
+    /// The carrier extensions a definition's statement speaks for.
+    ///
+    /// The machine projection says which extensions certified a write as a
+    /// zero-extension into its carrier -- `EAX = x` followed by
+    /// `RAX = zext(EAX)` -- and that is a fact about the machine. Whether the
+    /// extension then has anything left to say is the plan's question: where
+    /// the write and the extension are one rendered object, the statement
+    /// `x = (uint64_t)(uint32_t)...` has already performed the extension, and
+    /// rendering it again spells `x = (uint64_t)(uint32_t)x`. Where they are
+    /// two objects the extension is a real assignment from one to the other
+    /// and keeps its statement. The chain is taken as a prefix: an extension
+    /// that lands in another object ends what this statement can stand for.
+    pub(crate) fn absorbed_extensions_discharged_by(
+        &self,
+        inst: r2ssa::InstId,
+    ) -> Vec<r2ssa::InstId> {
+        let (Some(names), Some(prepared)) = (self.inputs.binding_names, self.inputs.prepared_ssa)
+        else {
+            return Vec::new();
+        };
+        let graph = prepared.graph();
+        let projection = names.plan().machine_projection();
+        let Some(crate::binding_plan::ValueDisposition::Bound { binding }) = graph
+            .inst(inst)
+            .and_then(|inst| inst.output)
+            .and_then(|output| names.disposition_for_value(output))
+        else {
+            return Vec::new();
+        };
+        let mut discharged = Vec::new();
+        for member in projection.absorbed_extensions(inst) {
+            let same_object = graph
+                .inst(*member)
+                .and_then(|inst| inst.output)
+                .and_then(|output| names.disposition_for_value(output))
+                .is_some_and(|disposition| {
+                    matches!(disposition, crate::binding_plan::ValueDisposition::Bound { binding: other } if other == binding)
+                });
+            if !same_object {
+                break;
+            }
+            discharged.push(*member);
+        }
+        discharged
+    }
+
+    /// Whether this instruction's statement is spoken for by the write whose
+    /// projection absorbed it. The same question as
+    /// [`Self::absorbed_extensions_discharged_by`], asked from the other side,
+    /// so the two cannot disagree.
+    pub(crate) fn write_is_discharged_by_absorbing_write(&self, inst: r2ssa::InstId) -> bool {
+        let Some(head) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.plan().machine_projection().absorbing_write(inst))
+        else {
+            return false;
+        };
+        self.absorbed_extensions_discharged_by(head).contains(&inst)
+    }
+
     /// Mark the value an inlined expression produces.
     pub(crate) fn observe_inlined_value_expr(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
         let Some(journal) = self.inputs.observation_journal else {

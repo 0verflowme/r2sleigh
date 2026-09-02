@@ -4489,6 +4489,43 @@ impl Decompiler {
                 }
             }
         }
+        // The graph and the normalized function, verbatim, so a rendered
+        // statement can be read back to the instruction that produced it.
+        // Every other probe answers one question; this one is for the
+        // question nobody has asked yet.
+        if std::env::var_os("R2SLEIGH_DUMP_SSA").is_some() {
+            let graph = prepared.graph();
+            eprintln!("SSADUMP prepared\n{}", func.dump());
+            eprintln!("SSADUMP normalized\n{}", normalized_func.dump());
+            for value in &graph.values {
+                eprintln!(
+                    "SSAVALUE {:?} {} storage={:?} def={:?} uses={:?}",
+                    value.id,
+                    value.var,
+                    value.canonical_storage.map(|storage| (
+                        storage.space,
+                        storage.offset,
+                        storage.size
+                    )),
+                    graph.def_inst(value.id),
+                    graph.use_sites(value.id)
+                );
+            }
+            for inst in &graph.insts {
+                eprintln!(
+                    "SSAINST {:?} block={:?} ordinal={} out={:?} in={:?} {}",
+                    inst.id,
+                    inst.block,
+                    inst.ordinal,
+                    inst.output,
+                    inst.inputs,
+                    format!("{:?}", inst.payload)
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                );
+            }
+        }
         if let Err(error) = normalization_origins.validate(
             &normalized_func,
             prepared,

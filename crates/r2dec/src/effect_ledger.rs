@@ -172,7 +172,13 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|obligation| obligation.edge_use)
             .is_some_and(|site| effects.is_coalesced_carrier_use(site))
     {
-        return Outcome::Elided(ElisionReason::CoalescedEdgeCopy);
+        return Outcome::Elided(ElisionReason::CoalescedCopy);
+    }
+    // One of the program's own copies whose two sides are one binding. It
+    // has no statement: whatever wrote the binding has already written it,
+    // and every effect it carries is that write's.
+    if source_inst.is_some_and(|inst| effects.is_coalesced_copy(inst)) {
+        return Outcome::Elided(ElisionReason::CoalescedCopy);
     }
 
     if let Some(inst) = source_inst

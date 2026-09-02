@@ -925,7 +925,9 @@ mod tests {
         // A narrow register write as the lift states it: the arithmetic write,
         // then Sleigh's own extension of the whole carrier. An arithmetic write
         // rather than a copy so the narrow value survives as its own
-        // definition instead of being folded into its uses.
+        // definition instead of being folded into its uses -- and each of the
+        // extra readers below is itself read, because a reader nothing
+        // observes is elided and no longer counts against folding.
         entry.push(R2ILOp::IntAdd {
             dst: Varnode::register(0, 4),
             a: Varnode::register(0, 4),
@@ -935,11 +937,16 @@ mod tests {
             dst: Varnode::register(0, 8),
             src: Varnode::register(0, 4),
         });
-        for offset in [0x20, 0x28] {
+        for (offset, address) in [(0x20, 0x2010), (0x28, 0x2018)] {
             entry.push(R2ILOp::IntAdd {
                 dst: Varnode::unique(offset, 4),
                 a: Varnode::register(0, 4),
                 b: Varnode::constant(1, 4),
+            });
+            entry.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(address, 8),
+                val: Varnode::unique(offset, 4),
             });
         }
         entry.push(R2ILOp::Store {
@@ -995,6 +1002,23 @@ mod tests {
                 ..
             } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
         ));
+
+        // The extension that certified the projection has been spoken for by
+        // that statement: rendering it as well would spell
+        // `x = (uint64_t)(uint32_t)x`. Its cells travel with the statement
+        // above, so nothing is left unaccounted by its absence.
+        let extension_idx = copy_idx + 1;
+        assert!(matches!(
+            block.ops[extension_idx],
+            SSAOp::IntZExt { .. }
+        ));
+        enter_exact_test_site(&ctx, block.addr, extension_idx);
+        assert!(
+            ctx.op_to_stmt_with_args(&block.ops[extension_idx], block.addr, extension_idx)
+                .expect("supported extension lowering")
+                .is_none(),
+            "the absorbed carrier extension has no statement of its own"
+        );
 
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
