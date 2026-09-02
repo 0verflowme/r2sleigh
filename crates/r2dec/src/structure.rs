@@ -3201,7 +3201,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 then_body,
                 else_body,
             } => {
-                let cond = Self::normalize_condition_addr_artifacts(cond);
                 let then_body = Box::new(Self::cleanup_recurse(symbols, *then_body));
                 let else_body = else_body
                     .map(|e| Box::new(Self::cleanup_recurse(symbols, *e)))
@@ -3211,14 +3210,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     then_body,
                     else_body,
                 };
-                let stmt = Self::rewrite_constant_condition_stmt(stmt);
                 let stmt = Self::rewrite_if_short_circuit(stmt);
-                let stmt = Self::rewrite_if_condition_inversion(stmt);
                 let stmt = Self::rewrite_empty_if_bodies(stmt);
                 Self::rewrite_guarded_switch_with_trailing_return(stmt)
             }
             CStmt::While { cond, body } => {
-                let cond = Self::normalize_condition_addr_artifacts(cond);
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
                 CStmt::While {
                     cond,
@@ -3227,7 +3223,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
             CStmt::DoWhile { body, cond } => {
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
-                let cond = Self::normalize_condition_addr_artifacts(cond);
                 // Fix C: do { if (c) break; rest } while(1) -> while(!c) { rest }
                 Self::try_convert_do_while_to_while(body, cond)
             }
@@ -3237,7 +3232,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 update,
                 body,
             } => {
-                let cond = cond.map(Self::normalize_condition_addr_artifacts);
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
                 let body = update
                     .as_ref()
@@ -3383,32 +3377,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         matches!(expr.unobserved(), CExpr::Var(name) if *name == target)
     }
 
-    fn rewrite_constant_condition_stmt(stmt: CStmt) -> CStmt {
-        match stmt {
-            CStmt::If {
-                cond,
-                then_body,
-                else_body: _,
-            } if Self::is_const_true_expr(&cond) => *then_body,
-            CStmt::If {
-                cond,
-                then_body: _,
-                else_body,
-            } if Self::is_const_false_expr(&cond) => {
-                else_body.map(|stmt| *stmt).unwrap_or(CStmt::Empty)
-            }
-            other => other,
-        }
-    }
-
-    fn is_const_true_expr(expr: &CExpr) -> bool {
-        matches!(expr.unobserved(), CExpr::IntLit(1) | CExpr::UIntLit(1))
-    }
-
-    fn is_const_false_expr(expr: &CExpr) -> bool {
-        matches!(expr.unobserved(), CExpr::IntLit(0) | CExpr::UIntLit(0))
-    }
-
     fn rewrite_if_short_circuit(stmt: CStmt) -> CStmt {
         let (semantic, observations) = stmt.into_semantic_with_observations();
         let CStmt::If {
@@ -3496,40 +3464,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             then_body,
             else_body,
         })
-    }
-
-    fn rewrite_if_condition_inversion(stmt: CStmt) -> CStmt {
-        let CStmt::If {
-            cond,
-            then_body,
-            else_body: Some(else_body),
-        } = stmt
-        else {
-            return stmt;
-        };
-
-        let then_terminator = Self::single_terminator_stmt(then_body.as_ref());
-        let else_terminator = Self::single_terminator_stmt(else_body.as_ref());
-        let (guard_cond, guard_terminator, hoisted_body) = match (then_terminator, else_terminator)
-        {
-            (Some(_), Some(_)) | (None, None) => {
-                return CStmt::If {
-                    cond,
-                    then_body,
-                    else_body: Some(else_body),
-                };
-            }
-            (None, Some(terminator)) => (Self::negate_condition(cond), terminator, *then_body),
-            (Some(terminator), None) => (cond, terminator, *else_body),
-        };
-
-        let mut rewritten = vec![CStmt::If {
-            cond: guard_cond,
-            then_body: Box::new(guard_terminator),
-            else_body: None,
-        }];
-        Self::append_stmt_body_flat(&mut rewritten, hoisted_body);
-        CStmt::Block(rewritten)
     }
 
     fn append_stmt_body_flat(out: &mut Vec<CStmt>, stmt: CStmt) {
@@ -4783,86 +4717,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 _ => expr,
             },
             _ => expr,
-        }
-    }
-
-    fn normalize_condition_addr_artifacts(expr: CExpr) -> CExpr {
-        match expr {
-            CExpr::Observed { id, expr } => {
-                CExpr::observed(id, Self::normalize_condition_addr_artifacts(*expr))
-            }
-            // A SymbolId is already the binding identity. Reinterpreting its
-            // spelling as another identifier would mint a second binding.
-            CExpr::Var(name) => CExpr::Var(name),
-            CExpr::Unary { op, operand } => CExpr::Unary {
-                op,
-                operand: Box::new(Self::normalize_condition_addr_artifacts(*operand)),
-            },
-            CExpr::Binary { op, left, right } => CExpr::Binary {
-                op,
-                left: Box::new(Self::normalize_condition_addr_artifacts(*left)),
-                right: Box::new(Self::normalize_condition_addr_artifacts(*right)),
-            },
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => CExpr::Ternary {
-                cond: Box::new(Self::normalize_condition_addr_artifacts(*cond)),
-                then_expr: Box::new(Self::normalize_condition_addr_artifacts(*then_expr)),
-                else_expr: Box::new(Self::normalize_condition_addr_artifacts(*else_expr)),
-            },
-            CExpr::Cast { ty, expr, role } => {
-                CExpr::cast_with_role(ty, Self::normalize_condition_addr_artifacts(*expr), role)
-            }
-            CExpr::Call { func, args, site } => CExpr::Call {
-                site,
-                func: Box::new(Self::normalize_condition_addr_artifacts(*func)),
-                args: args
-                    .into_iter()
-                    .map(Self::normalize_condition_addr_artifacts)
-                    .collect(),
-            },
-            CExpr::Subscript { base, index } => CExpr::Subscript {
-                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
-                index: Box::new(Self::normalize_condition_addr_artifacts(*index)),
-            },
-            CExpr::Member { base, member } => CExpr::Member {
-                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
-                member,
-            },
-            CExpr::PtrMember { base, member } => CExpr::PtrMember {
-                base: Box::new(Self::normalize_condition_addr_artifacts(*base)),
-                member,
-            },
-            CExpr::Sizeof(inner) => {
-                CExpr::Sizeof(Box::new(Self::normalize_condition_addr_artifacts(*inner)))
-            }
-            CExpr::AddrOf(inner) => {
-                let normalized = Self::normalize_condition_addr_artifacts(*inner);
-                match normalized {
-                    CExpr::Deref(inner2) => *inner2,
-                    CExpr::Var(name) => CExpr::Var(name),
-                    other => CExpr::AddrOf(Box::new(other)),
-                }
-            }
-            CExpr::Deref(inner) => {
-                let normalized = Self::normalize_condition_addr_artifacts(*inner);
-                match normalized {
-                    CExpr::AddrOf(inner2) => *inner2,
-                    other => CExpr::Deref(Box::new(other)),
-                }
-            }
-            CExpr::Comma(values) => CExpr::Comma(
-                values
-                    .into_iter()
-                    .map(Self::normalize_condition_addr_artifacts)
-                    .collect(),
-            ),
-            CExpr::Paren(inner) => {
-                CExpr::Paren(Box::new(Self::normalize_condition_addr_artifacts(*inner)))
-            }
-            other => other,
         }
     }
 
@@ -6648,54 +6502,6 @@ mod tests {
     }
 
     #[test]
-    fn split_hoisted_block_observations_remain_unaccounted_without_shape_changes() {
-        let symbols = test_table();
-        let first = assign(&symbols, "x", CExpr::IntLit(1));
-        let second = assign(&symbols, "y", CExpr::IntLit(2));
-        let plain_input = CStmt::if_stmt(
-            v(&symbols, "ready"),
-            CStmt::Block(vec![first.clone(), second.clone()]),
-            Some(CStmt::ret(Some(CExpr::IntLit(0)))),
-        );
-        let plain = ControlFlowStructurer::cleanup(&symbols, plain_input);
-
-        let mut owner = RenderObservationOwner::new();
-        let (first_id, first) = owner
-            .observe_stmt(first)
-            .expect("first hoisted statement observation");
-        let (second_id, second) = owner
-            .observe_stmt(second)
-            .expect("second hoisted statement observation");
-        let (inner_block_id, body) = owner
-            .observe_stmt(CStmt::Block(vec![first, second]))
-            .expect("inner body observation");
-        let (outer_block_id, body) = owner.observe_stmt(body).expect("outer body observation");
-        let marked = ControlFlowStructurer::cleanup(
-            &symbols,
-            CStmt::if_stmt(
-                v(&symbols, "ready"),
-                body,
-                Some(CStmt::ret(Some(CExpr::IntLit(0)))),
-            ),
-        );
-
-        let (stripped, reachable) = strip_test_observations(&owner, marked);
-        for id in [first_id, second_id] {
-            assert!(reachable.contains(id));
-        }
-        for id in [inner_block_id, outer_block_id] {
-            assert!(
-                !reachable.contains(id),
-                "a split block has no exact child occurrence that can inherit its marker"
-            );
-        }
-        assert_eq!(
-            stripped, plain,
-            "outer metadata must not turn a flattened hoisted body back into a nested block"
-        );
-    }
-
-    #[test]
     fn for_body_observations_track_only_actual_body_splits() {
         let symbols = test_table();
         let update = CExpr::assign(
@@ -7343,92 +7149,6 @@ mod tests {
     }
 
     #[test]
-    fn inverts_if_else_terminator_and_flattens_then_block() {
-        let symbols = test_table();
-        let input = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
-            CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "sum"),
-                    v(&symbols, "x"),
-                )),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "x"),
-                    CExpr::IntLit(1),
-                )),
-            ]),
-            Some(CStmt::ret(Some(CExpr::IntLit(0)))),
-        );
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(
-            cleaned,
-            CStmt::Block(vec![
-                CStmt::if_stmt(
-                    CExpr::binary(BinaryOp::Ge, v(&symbols, "x"), v(&symbols, "limit")),
-                    CStmt::ret(Some(CExpr::IntLit(0))),
-                    None
-                ),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "sum"),
-                    v(&symbols, "x")
-                )),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "x"),
-                    CExpr::IntLit(1),
-                )),
-            ])
-        );
-    }
-
-    #[test]
-    fn inverts_if_then_terminator_and_flattens_else_block() {
-        let symbols = test_table();
-        let input = CStmt::if_stmt(
-            v(&symbols, "is_error"),
-            CStmt::ret(Some(CExpr::IntLit(-1))),
-            Some(CStmt::Block(vec![
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "sum"),
-                    v(&symbols, "x"),
-                )),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "x"),
-                    CExpr::IntLit(1),
-                )),
-            ])),
-        );
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(
-            cleaned,
-            CStmt::Block(vec![
-                CStmt::if_stmt(
-                    v(&symbols, "is_error"),
-                    CStmt::ret(Some(CExpr::IntLit(-1))),
-                    None
-                ),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "sum"),
-                    v(&symbols, "x")
-                )),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "x"),
-                    CExpr::IntLit(1),
-                )),
-            ])
-        );
-    }
-
-    #[test]
     fn trailing_return_is_not_duplicated_into_a_guard() {
         let symbols = test_table();
         let input = CStmt::Block(vec![
@@ -7569,33 +7289,6 @@ mod tests {
     }
 
     #[test]
-    fn inverts_if_when_else_is_single_terminator() {
-        let symbols = test_table();
-        let input = CStmt::if_stmt(
-            CExpr::binary(BinaryOp::Lt, v(&symbols, "x"), v(&symbols, "limit")),
-            assign(
-                &symbols,
-                "sum",
-                CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "x")),
-            ),
-            Some(CStmt::ret(Some(CExpr::IntLit(0)))),
-        );
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected condition inversion to emit block sequence");
-        };
-        assert_eq!(
-            stmts[0],
-            CStmt::if_stmt(
-                CExpr::binary(BinaryOp::Ge, v(&symbols, "x"), v(&symbols, "limit")),
-                CStmt::ret(Some(CExpr::IntLit(0))),
-                None
-            )
-        );
-    }
-
-    #[test]
     fn removes_empty_else_branch() {
         let symbols = test_table();
         let input = CStmt::if_stmt(
@@ -7620,55 +7313,6 @@ mod tests {
         let input = CStmt::if_stmt(v(&symbols, "a"), CStmt::Empty, None);
         let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         assert_eq!(cleaned, CStmt::Empty);
-    }
-
-    #[test]
-    fn constant_true_if_collapses_to_then_body() {
-        let symbols = test_table();
-        let input = CStmt::if_stmt(
-            CExpr::IntLit(1),
-            assign(&symbols, "x", CExpr::IntLit(7)),
-            None,
-        );
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(7)));
-    }
-
-    #[test]
-    fn observed_constant_condition_collapses_and_drops_only_deleted_occurrences() {
-        let symbols = test_table();
-        let mut owner = RenderObservationOwner::new();
-        let (cond_id, cond) = owner
-            .observe_expr(CExpr::IntLit(1))
-            .expect("constant condition observation");
-        let (then_id, then_stmt) = owner
-            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(7)))
-            .expect("surviving branch observation");
-        let (else_id, else_stmt) = owner
-            .observe_stmt(assign(&symbols, "x", CExpr::IntLit(9)))
-            .expect("deleted branch observation");
-
-        let cleaned = ControlFlowStructurer::cleanup(
-            &symbols,
-            CStmt::if_stmt(cond, then_stmt, Some(else_stmt)),
-        );
-        let (plain, reachable) = strip_test_observations(&owner, cleaned);
-        assert!(!reachable.contains(cond_id));
-        assert!(reachable.contains(then_id));
-        assert!(!reachable.contains(else_id));
-        assert_eq!(plain, assign(&symbols, "x", CExpr::IntLit(7)));
-    }
-
-    #[test]
-    fn constant_false_if_collapses_to_else_body() {
-        let symbols = test_table();
-        let input = CStmt::if_stmt(
-            CExpr::IntLit(0),
-            assign(&symbols, "x", CExpr::IntLit(7)),
-            Some(assign(&symbols, "x", CExpr::IntLit(9))),
-        );
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert_eq!(cleaned, assign(&symbols, "x", CExpr::IntLit(9)));
     }
 
     #[test]
@@ -7750,46 +7394,6 @@ mod tests {
             matches!(cleaned, CStmt::For { .. }),
             "Address-wrapped induction variable should still allow for-loop rewrite"
         );
-    }
-
-    #[test]
-    fn normalizes_addrof_var_artifact_in_while_condition_without_rewrite() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(
-                    BinaryOp::Lt,
-                    CExpr::AddrOf(Box::new(v(&symbols, "local"))),
-                    v(&symbols, "n"),
-                ),
-                CStmt::Block(vec![assign(
-                    &symbols,
-                    "sum",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected unmatched loop to remain a block");
-        };
-        let Some(CStmt::While { cond, .. }) = stmts.get(1) else {
-            panic!("Expected second statement to remain a while-loop");
-        };
-        match cond {
-            CExpr::Binary { left, .. } => {
-                assert!(
-                    matches!(left.as_ref(), CExpr::Var(name) if &*crate::symbol::spelling(&symbols, *name) == "local"),
-                    "Address-of local artifact should normalize to plain variable in condition"
-                );
-            }
-            other => panic!(
-                "Unexpected condition shape after normalization: {:?}",
-                other
-            ),
-        }
     }
 
     #[test]

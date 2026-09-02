@@ -1043,17 +1043,6 @@ impl CStmt {
         stmt
     }
 
-    /// Mutably borrow the semantic statement beneath leading observation metadata.
-    pub(crate) fn unobserved_mut(&mut self) -> &mut Self {
-        let mut stmt = self;
-        loop {
-            match stmt {
-                Self::Observed { stmt: inner, .. } => stmt = inner,
-                semantic => return semantic,
-            }
-        }
-    }
-
     /// Clone semantic statement data while omitting every observation wrapper.
     pub(crate) fn clone_without_render_observations(&self) -> Self {
         let mut clone = self.clone();
