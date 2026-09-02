@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 5;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 6;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -1985,6 +1985,7 @@ pub fn encode_snapshot_set(
         write_call_site(&mut writer, site)?;
     }
     writer.bytes(snapshot.source_revision_identity())?;
+    writer.bytes(snapshot.source_content_identity())?;
     match snapshot.function_interface() {
         Some(interface) => {
             writer.bool(true);
@@ -2064,6 +2065,11 @@ fn decode_snapshot_inner(
         advisory_calls.push(read_call_site(&mut reader)?);
     }
     let source_revision_identity: Box<[u8]> = Box::from(reader.bytes()?);
+    let source_content_identity: Option<Box<[u8]>> = if reader.format_version() >= 6 {
+        Some(Box::from(reader.bytes()?))
+    } else {
+        None
+    };
     let (function_interface, legacy_stack_allocation) = if reader.bool()? {
         let (interface, contract) = read_interface_record(&mut reader)?;
         (Some(interface), contract)
@@ -2107,6 +2113,13 @@ fn decode_snapshot_inner(
         diagnostics,
     )
     .map_err(SnapshotDecodeError::Validation)?;
+    // The mint defaults the content identity to the revision, which is right
+    // for a root and wrong for a callee: the capture overwrote the callee's
+    // revision with the root's, and only the wire carries what its own was.
+    let snapshot = match source_content_identity {
+        Some(identity) => snapshot.with_source_content_identity(identity),
+        None => snapshot,
+    };
     Ok((snapshot, callees))
 }
 
@@ -3466,5 +3479,33 @@ mod tests {
         assert_eq!(reader.string().expect("rbp"), "rbp");
         assert_eq!(reader.optional_string().expect("absent"), None);
         reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn a_callee_keeps_its_own_content_identity_across_the_wire() {
+        // The capture gives every callee the root's revision so a consumer can
+        // tell the bodies were read together. That is what makes the content
+        // identity necessary: without it the same callee under two callers is
+        // two identities and a cache keyed on the revision never hits.
+        let root = sample_snapshot(None);
+        let callee =
+            sample_snapshot(None).with_source_content_identity(Box::from(&b"callee-own"[..]));
+        assert_ne!(
+            callee.source_content_identity(),
+            callee.source_revision_identity(),
+            "the fixture must make the two differ or it proves nothing"
+        );
+        let encoded = encode_snapshot_set(&root, std::slice::from_ref(&callee))
+            .expect("encode a root and one callee");
+        let (decoded_root, decoded_callees) =
+            decode_snapshot_set(&encoded).expect("decode the set");
+        assert_eq!(
+            decoded_root.source_content_identity(),
+            root.source_content_identity()
+        );
+        let [decoded_callee] = decoded_callees.as_slice() else {
+            panic!("one callee");
+        };
+        assert_eq!(decoded_callee.source_content_identity(), &b"callee-own"[..]);
     }
 }
