@@ -145,6 +145,29 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// An argument spelled as the machine word the declaration says it is.
+    ///
+    /// A call and the declaration it is made through have to agree, and the
+    /// declaration says machine words -- deliberately, for the reason above.
+    /// The rendering may still have typed the value something else: a string
+    /// literal's address is a `char *`, and passing one where the declaration
+    /// says `uint64_t` is a constraint violation that no strict compiler
+    /// accepts. The conversion is exact and says nothing new, because a
+    /// machine word is what the call passes either way.
+    ///
+    /// Only where the two differ. A cast from a type to itself is noise, and
+    /// every argument this rendering already types as its declared width would
+    /// grow one.
+    fn call_argument_as_machine_word(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
+        let Some(declared) = self.machine_value_width_bits(value).map(CType::uint) else {
+            return expr;
+        };
+        if self.expr_type_hint(&expr) == Some(declared.clone()) {
+            return expr;
+        }
+        CExpr::cast(declared, expr)
+    }
+
     /// The width a value occupies in machine storage, in bits.
     fn machine_value_width_bits(&self, value: r2ssa::ValueId) -> Option<u32> {
         let graph = self.inputs.prepared_ssa?.graph();
@@ -279,6 +302,7 @@ impl<'a> FoldingContext<'a> {
                     value,
                     render_plan.as_ref(),
                 )
+                .map(|expr| self.call_argument_as_machine_word(value, expr))
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;

@@ -1998,7 +1998,7 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
+    pub(super) fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr.unobserved() {
             // A name's type is the declaration the plan gave the object it
             // names. Answering `None` here was true while every object was an
