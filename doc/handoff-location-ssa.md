@@ -7420,3 +7420,37 @@ declaration side is already prepared for it:
 `rules::declaration_type_for_stack_object` asks the evidence and admits what
 describes the storage, and would need `CTypeLike::Array` admitted beside the
 scalars it admits today.
+
+### The cleanest array shape to build the subscript rule against
+
+`arr_sum(const uint32_t *a, uint64_t n)` at x86-64 -O0 is the fixture to work
+from, because the machine writes the index and the stride out in the open:
+
+```c
+uint64_t tmp_4900_2 = (uint64_t)RCX_2 * (uint64_t)4;
+uint32_t *tmp_4a00_2 = (uint32_t *)((uint64_t)RAX_3 + (uint64_t)tmp_4900_2);
+uint32_t tmp_11f00_2 = *tmp_4a00_2;
+```
+
+Everything a subscript needs is present and typed: a base, an index multiplied
+by a stride that equals the pointee width, and a dereference of the result. The
+rule is that an address which is a pointer plus an index whose stride equals the
+pointee width is that pointer subscripted by the index divided by the stride,
+and `typed_subscript_access::index_in_elements` already performs that division
+for the case it handles today.
+
+Two things stand between the shape above and `a[i]`. The address value
+`tmp_4a00_2` is bound rather than inlined, so `certified_memory_address_expr`
+asks the plan for it and gets a name instead of the sum -- and the reason is not
+`inlinable_values`, whose seven tests it passes; it is the `[use_site]` guard at
+the top, which skips any value with a use count other than one. Counting those
+uses for this exact value is the first thing to do, and the second is
+`certified_pointer_base_expr`, which decides which operand is the base by
+looking for a parameter role or a loop carrier and would not recognise `RAX_3`,
+a copy of the parameter through its stack home, even though the sum is declared
+`uint32_t *`.
+
+Both are small. Neither was landed, because a subscript rule that fires nowhere
+is worse than none, and the corpus has no case where the address folds -- its
+byte loops carry a pointer round a phi, which is a use the fold must not
+duplicate and which needs induction-variable recovery rather than a subscript.
