@@ -1884,9 +1884,24 @@ impl<'a> FoldingContext<'a> {
     /// what `malloc` handed back, and the slot then reads as a plain integer,
     /// which is enough to lose which side of `buf + len` is the pointer.
     /// The aggregate a type names, through any pointer or array wrapping it.
+    /// The declared type of the object a rendered name stands for.
+    fn declaration_type_for_symbol(&self, symbol: crate::symbol::SymbolId) -> Option<CType> {
+        let names = self.inputs.binding_names?;
+        names.plan().bindings().find_map(|(binding, fact)| {
+            (names.symbol_for_binding(binding) == Some(symbol))
+                .then(|| fact.declaration_type().clone())
+        })
+    }
+
     fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
         match expr.unobserved() {
-            CExpr::Var(_) => None,
+            // A name's type is the declaration the plan gave the object it
+            // names. Answering `None` here was true while every object was an
+            // unsigned machine word and every rule that asks this question got
+            // the same answer anyway; it stopped being true when the evidence
+            // was allowed to declare a pointer, and left the pointer-aware
+            // conversions blind to the one expression that names an object.
+            CExpr::Var(symbol) => self.declaration_type_for_symbol(*symbol),
             CExpr::Call {
                 site: Some((block_addr, op_idx)),
                 ..
@@ -2034,7 +2049,7 @@ impl<'a> FoldingContext<'a> {
     /// Unlike `cast_expr_if_needed` this does not consult a source hint: it is
     /// for a type the operation requires rather than one the renderer is free
     /// to leave implicit.
-    fn cast_expr_to(expr: CExpr, target: CType) -> CExpr {
+    fn cast_expr_to(&self, expr: CExpr, target: CType) -> CExpr {
         if let CExpr::Cast { ty, .. } = expr.unobserved()
             && *ty == target
         {
@@ -2044,10 +2059,7 @@ impl<'a> FoldingContext<'a> {
         // `-Wpointer-to-int-cast`: address bits are lost and the compiler will
         // not let that be implicit. Converting at the pointer's own width
         // first makes the narrowing the program's own statement.
-        if let CExpr::Cast {
-            ty: CType::Pointer(_),
-            ..
-        } = expr.unobserved()
+        if self.looks_like_pointer(&expr)
             && let CType::Int { bits, .. } = &target
             && *bits < 64
         {
@@ -2072,18 +2084,37 @@ impl<'a> FoldingContext<'a> {
         // the conversion spelled exactly as the other direction does, and
         // asking only the recorded type meant `uint64_t n = p + i;` went out
         // unconverted.
+        // What the expression is spelled as, not only what the source was
+        // recorded as. The two are the same object and can still disagree
+        // about the rendering: a pointer value already converted to an integer
+        // by an operand projection is an integer in the C, and assigning it
+        // back to the pointer the object is declared as needs the conversion
+        // said again. `cast_needed` compares recorded types, so it saw
+        // `int8_t *` on both sides and asked for nothing while the text read
+        // `stack_m16 = (uint64_t)(int8_t *)RDI_0;`.
+        let spelled_as_integer = matches!(
+            expr.unobserved(),
+            CExpr::Cast {
+                ty: CType::Int { .. },
+                ..
+            }
+        );
         let pointer_valued = source.is_none()
             && !matches!(target, CType::Pointer(_))
             && self.int_meta(&target).is_some()
             && self.looks_like_pointer(&expr);
-        if pointer_valued || self.cast_needed(&target, source) {
+        let integer_valued = matches!(target, CType::Pointer(_)) && spelled_as_integer;
+        if pointer_valued || integer_valued || self.cast_needed(&target, source) {
             // A pointer converts to an integer of its own width; converting it
             // straight to a narrower one is a diagnostic in its own right
             // (`-Wpointer-to-int-cast`) because the conversion loses address
             // bits silently. Spelling the full-width step makes the narrowing
             // the program's statement rather than the compiler's guess.
             if let CType::Pointer(_) = &target
-                && let Some((_, bits)) = self.expr_type_hint(&expr).and_then(|ty| self.int_meta(&ty))
+                && let Some((_, bits)) = source
+                    .map(RecordedType::get)
+                    .and_then(|ty| self.int_meta(ty))
+                    .or_else(|| self.expr_type_hint(&expr).and_then(|ty| self.int_meta(&ty)))
                 && let Some(pointer_bits) = self
                     .inputs
                     .prepared_ssa
@@ -2176,6 +2207,20 @@ impl<'a> FoldingContext<'a> {
             return rhs;
         };
 
+        // A pointer destination is reached at the pointer's own width. Where
+        // the expression's own type is not recorded, the object being written
+        // still has a width, and converting through it makes the narrowing or
+        // widening the program's statement instead of leaving the compiler to
+        // reject `(int8_t *)(some 32-bit expression)`.
+        let rhs = if matches!(dst_ty, CType::Pointer(_))
+            && !self.looks_like_pointer(&rhs)
+            && src_ty.is_none()
+            && dst.size > 0
+        {
+            CExpr::cast(uint_type_from_size(dst.size), rhs)
+        } else {
+            rhs
+        };
         let rhs = self.cast_expr_if_needed(rhs, dst_ty.clone(), src_ty.as_ref());
         self.rewrite_typed_assignment_literal_expr(rhs, &dst_ty)
     }
@@ -2845,13 +2890,13 @@ impl<'a> FoldingContext<'a> {
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
                 } else if *offset == 0 {
-                    Self::cast_expr_to(src_expr, uint_type_from_size(dst.size))
+                    self.cast_expr_to(src_expr, uint_type_from_size(dst.size))
                 } else {
                     let shift_bits = offset.saturating_mul(8);
-                    let src_cast = Self::cast_expr_to(src_expr, uint_type_from_size(src.size));
+                    let src_cast = self.cast_expr_to(src_expr, uint_type_from_size(src.size));
                     let shifted =
                         CExpr::binary(BinaryOp::Shr, src_cast, CExpr::IntLit(shift_bits as i64));
-                    Self::cast_expr_to(shifted, uint_type_from_size(dst.size))
+                    self.cast_expr_to(shifted, uint_type_from_size(dst.size))
                 };
                 self.assign_stmt(lhs, rhs)
             }
@@ -3238,19 +3283,33 @@ impl<'a> FoldingContext<'a> {
         // sum is still one base and one offset. The left operand keeps the
         // pointer and the right becomes the offset it is being used as, which
         // is what the machine addition computes either way.
-        // Machine address arithmetic counts bytes; C pointer arithmetic counts
-        // elements. `(int32_t *)p + 4` moves sixteen bytes where the
+        // Arithmetic on an address is arithmetic on a number. C has exactly
+        // one operator that accepts a pointer operand and means something by
+        // it -- addition and subtraction of an integer -- and it counts
+        // elements where the machine counted bytes: `(int32_t *)p + 4` moves
+        // sixteen bytes where the instruction moved four, and `xxhash32` at
+        // arm64 -O1 computed the wrong hash from exactly that. Every other
+        // operator rejects a pointer outright, a shift included. Comparisons
+        // are the exception in the other direction: comparing two pointers is
+        // both legal and what the program meant. `(int32_t *)p + 4` moves sixteen bytes where the
         // instruction moved four, and `xxhash32` at arm64 -O1 computed the
         // wrong hash from exactly that. Neither operand stays a pointer here:
         // the addition is done on the addresses as numbers, which is what the
         // machine did, and the destination's own declaration puts the pointer
         // back. It also settles the cases C rejects outright -- a pointer
         // added to a pointer, and a pointer subtracted from an integer.
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
-            && (self.looks_like_pointer(&lhs_expr) || self.looks_like_pointer(&rhs_expr))
+        if !matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+        ) && (self.looks_like_pointer(&lhs_expr) || self.looks_like_pointer(&rhs_expr))
         {
-            lhs_expr = Self::cast_expr_to(lhs_expr, uint_type_from_size(a.size));
-            rhs_expr = Self::cast_expr_to(rhs_expr, uint_type_from_size(b.size));
+            lhs_expr = self.cast_expr_to(lhs_expr, uint_type_from_size(a.size));
+            rhs_expr = self.cast_expr_to(rhs_expr, uint_type_from_size(b.size));
         }
         let produced_ty = operand_ty.clone();
         if let Some(ty) = operand_ty {
@@ -3265,8 +3324,8 @@ impl<'a> FoldingContext<'a> {
             // rendered as `(uint32_t)result < (uint32_t)0`: false for every
             // input. `cmp k, 8; jge` then exited on entry and the CRC inner
             // loop never ran once.
-            lhs_expr = Self::cast_expr_to(lhs_expr, ty.clone());
-            rhs_expr = Self::cast_expr_to(rhs_expr, ty);
+            lhs_expr = self.cast_expr_to(lhs_expr, ty.clone());
+            rhs_expr = self.cast_expr_to(rhs_expr, ty);
         }
         let rhs_raw = self.identity_simplify_binary(
             op,

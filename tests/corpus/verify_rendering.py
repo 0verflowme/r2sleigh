@@ -1385,7 +1385,24 @@ def diagnostic_repair(source: str, name: str) -> tuple[str, list[dict[str, Any]]
         # types on purpose; it must not rename anything.
         declared_names = rendered_parameter_names(repaired)
         if declared_names is not None and len(declared_names) == parameter_count:
-            replacement = ", ".join(f"long {declared}" for declared in declared_names)
+            # Widen the integers and leave the pointers alone. Retyping every
+            # parameter to `long` was safe while the decompiler declared them
+            # all as unsigned machine words; a recovered pointer parameter
+            # retyped to `long` makes the body's own `p = (int8_t *)p` an
+            # assignment of a pointer to an integer, which is the harness
+            # breaking the program it is checking rather than the decompiler
+            # emitting a bad one.
+            declared_types = [
+                part.strip() for part in split_top_level_commas(params)
+            ]
+            replacement = ", ".join(
+                declaration
+                if index < len(declared_types) and "*" in declared_types[index]
+                else f"long {declared}"
+                for index, (declared, declaration) in enumerate(
+                    zip(declared_names, declared_types + [""] * parameter_count)
+                )
+            )
         else:
             replacement = ", ".join(
                 f"long arg{index}" for index in range(parameter_count)
@@ -1546,6 +1563,25 @@ def certified_image_literals(
                 }
             )
     return certified
+
+
+def split_top_level_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for character in text:
+        if character in "([":
+            depth += 1
+        elif character in ")]":
+            depth -= 1
+        if character == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    if current.strip():
+        parts.append(current)
+    return parts
 
 
 def map_image_data(
@@ -1721,8 +1757,25 @@ def runner_source(
         if spec.arity == 3:
             args.append(f"UINT32_C({case['seed']})")
         if diagnostic:
-            args = [f"(long)(uintptr_t){args[0]}", f"(long){args[1]}"] + [
-                f"(long){arg}" for arg in args[2:]
+            # The diagnostic path widens on purpose, but a parameter the
+            # rendering declared a pointer stays one -- the signature keeps it,
+            # so the call has to pass one. Only the integers become `long`.
+            def diagnostic_argument(index: int, argument: str) -> str:
+                declared = (
+                    declared_parameters[index]
+                    if declared_parameters is not None
+                    and index < len(declared_parameters)
+                    else ""
+                )
+                if "*" in declared:
+                    return f"({declared})(uintptr_t){argument}"
+                if index == 0:
+                    return f"(long)(uintptr_t){argument}"
+                return f"(long){argument}"
+
+            args = [
+                diagnostic_argument(index, argument)
+                for index, argument in enumerate(args)
             ]
         elif declared_parameters is not None and len(declared_parameters) >= len(args):
             # Call through the signature the rendering declares. The pointer is
@@ -2026,6 +2079,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 cases,
                 diagnostic=True,
                 callee_sources=callee_definitions(sections, diagnostic_mapped)[0],
+                declared_parameters=declared_parameters,
             )
             diagnostic_compile = compile_runner(
                 diagnostic_program,

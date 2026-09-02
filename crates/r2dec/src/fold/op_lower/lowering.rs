@@ -1034,6 +1034,18 @@ impl<'a> FoldingContext<'a> {
         if let Some(owner) =
             self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
         {
+            // The object the result is assigned to decides the conversion,
+            // exactly as it does everywhere else. A call site that owns its
+            // result assigns it directly, and where the plan declared that
+            // object a pointer the callee's integer return has to be
+            // converted or the assignment does not compile.
+            let call = match self
+                .certified_call_result_value((block_addr, op_idx))
+                .and_then(|value| self.value_declaration_type(value))
+            {
+                Some(declared @ CType::Pointer(_)) => CExpr::cast(declared, call),
+                _ => call,
+            };
             return LoweredOp::Assign {
                 lhs: owner,
                 rhs: call,
