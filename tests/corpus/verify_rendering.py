@@ -1013,6 +1013,35 @@ def parenthesized_conditions(source: str) -> list[str]:
     return conditions
 
 
+ADDRESS_WIDTH_TYPES = frozenset({"uint64_t", "uintptr_t", "uint32_t", "size_t"})
+
+
+def cast_is_pointer(cast: str) -> bool:
+    return cast.endswith("*")
+
+
+def run_is_required(run: list[str]) -> bool:
+    """Whether a run of adjacent conversions is as short as C allows.
+
+    One or two are always accepted; the pairs that are genuinely required are
+    covered in the comment at the call site. Three are accepted only as the
+    pointer-carrying shape: an address-width integer with the pointer outside
+    it, which is a narrowing carried at the address width and then made a
+    pointer. Anything longer, and any three whose innermost conversion is the
+    pointer, is a run a shorter one could replace.
+    """
+    if len(run) <= 2:
+        return True
+    if len(run) != 3:
+        return False
+    outermost, middle, innermost = run
+    return (
+        cast_is_pointer(outermost)
+        and middle in ADDRESS_WIDTH_TYPES
+        and not cast_is_pointer(innermost)
+    )
+
+
 def _score_machine_noise(source: str, config: str) -> dict[str, Any]:
     runs = cast_runs(source)
     same_type_cast = sum(
@@ -1026,14 +1055,22 @@ def _score_machine_noise(source: str, config: str) -> dict[str, Any]:
         "self_assignments": len(SELF_ASSIGN_RE.findall(source)),
         "literal_only_declarations": len(LITERAL_ONLY_DECL_RE.findall(source)),
         "same_type_casts": same_type_cast,
-        # Two adjacent casts can be required and the comment here used to name
-        # only one reason for it, the pointer-width step a pointer takes on the
-        # way to a smaller integer.  There is a second: `(uint64_t)(uint32_t)x`
-        # truncates and then widens, which is two conversions and not a
-        # redundant one, and it is how a sub-register read reaches the C.  The
-        # code always allowed any pair; it was the comment that was too narrow.
-        # Three adjacent conversions have no such reading.
-        "cast_chains": sum(1 for run in runs if len(run) >= 3),
+        # A run of adjacent conversions is machine detail when a shorter run
+        # says the same thing.  Two are often required: a pointer takes the
+        # address-width step on its way to a smaller integer, and
+        # `(uint64_t)(uint32_t)x` truncates and then widens, which is how a
+        # sub-register read reaches the C.
+        #
+        # Three was assumed to have no such reading and that was wrong.
+        # `(uint8_t *)(uint64_t)(uint8_t)e` narrows the value, carries it at
+        # the address width, and makes it a pointer, and every step of that
+        # does something C cannot skip.  What the shape has in common with the
+        # legitimate pairs is the address-width step in the middle with the
+        # pointer outside it, so that is what is allowed rather than a bare
+        # length.  A run whose innermost conversion is the pointer is not this
+        # shape: converting a pointer to the type it already has is redundant
+        # however long the run around it.
+        "cast_chains": sum(1 for run in runs if not run_is_required(run)),
         "comma_conditions": sum(
             1
             for condition in parenthesized_conditions(source)

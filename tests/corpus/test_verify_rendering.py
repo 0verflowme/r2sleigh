@@ -1193,6 +1193,32 @@ class MachineNoiseTests(unittest.TestCase):
             self.score("y = (uint32_t)(uint64_t)p;")["counts"]["cast_chains"], 0
         )
 
+    def test_three_is_allowed_only_as_the_pointer_carrying_shape(self) -> None:
+        # Narrow the value, carry it at the address width, make it a pointer.
+        # Every step does something C cannot skip.
+        self.assertEqual(
+            self.score("p = (uint8_t *)(uint64_t)(uint8_t)e;")["counts"][
+                "cast_chains"
+            ],
+            0,
+        )
+        # The same three widths with the pointer innermost is not that shape:
+        # converting a pointer to the type it already has is redundant however
+        # long the run around it.
+        self.assertEqual(
+            self.score("y = (uint32_t)(uint64_t)(uint8_t *)p;")["counts"][
+                "cast_chains"
+            ],
+            1,
+        )
+        # Four is never the shape.
+        self.assertEqual(
+            self.score("p = (uint8_t *)(uint64_t)(uint32_t)(uint8_t)e;")["counts"][
+                "cast_chains"
+            ],
+            1,
+        )
+
     def test_comma_condition_is_counted_and_a_two_argument_call_is_not(self) -> None:
         self.assertEqual(
             self.score("while (t = stack_m40, RAX_2 = t, !CF_2) { }")["counts"][
