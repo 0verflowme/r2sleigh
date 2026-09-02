@@ -2970,9 +2970,11 @@ fn collect_structured_dataflow_facts(
 /// evidence for a *named* parameter, where the callee's prototype says the
 /// argument exists and the value is simply the one this function was entered
 /// with; for a tail slot there is no such statement, and an untouched register
-/// is no evidence at all. The tail therefore stops at the first slot without a
-/// definition rather than skipping it, because arguments fill the convention's
-/// registers in order and a gap cannot be resolved.
+/// is no evidence at all. Neither is a merge of two different definitions: it
+/// says the register holds something, which every register does. The tail
+/// stops at the first slot without one definition reaching the call rather
+/// than skipping it, because arguments fill the convention's registers in
+/// order and a gap cannot be resolved.
 ///
 /// Where the evidence over-reaches it does so in the harmless direction: an
 /// extra argument to a variadic function is well-defined C that the callee
@@ -3017,7 +3019,7 @@ fn variadic_call_tail_arguments(
         let Ok(index) = u32::try_from(position) else {
             break;
         };
-        let Some(SourceCallArgumentValue::Value(value)) = reaching_abi_argument_in_block(
+        let Some(value) = reaching_variadic_tail_argument_in_block(
             function,
             graph,
             machine_context,
@@ -3541,6 +3543,39 @@ fn reaching_abi_value_in_block(
         boundary_op_index,
         storage,
         true,
+    )
+    .and_then(|state| match state {
+        ReachingAbiState::PreservedEntry => None,
+        ReachingAbiState::Value(value) => Some(value),
+    })
+}
+
+/// Resolve one variadic tail carrier, which must be the same on every path.
+///
+/// A named parameter may be answered by a merge of two definitions: the
+/// prototype says the argument exists, so which of them reaches the call is a
+/// question about the value and not about whether there is one. A tail slot
+/// has no prototype behind it, and a merge whose inputs differ says only that
+/// the register holds something -- which every register does. Admitting one
+/// claimed an argument the machine had not set for this call, and the
+/// placement audit then refused two `/bin/ls` functions for reading a value no
+/// path had assigned.
+fn reaching_variadic_tail_argument_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+) -> Option<ValueId> {
+    reaching_abi_value_in_block_with_policy(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        storage,
+        false,
     )
     .and_then(|state| match state {
         ReachingAbiState::PreservedEntry => None,
