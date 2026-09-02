@@ -60,6 +60,30 @@ for index in "${!configs[@]}"; do
     done
 done
 
+# A binary this project did not compile.
+#
+# The two sources above are ours, and a gate over input we generate cannot say
+# how we do on input we did not: `/bin/ls` fell from 22 rendered functions to
+# 11 somewhere in this branch while this harness reported 243 of 313 unchanged
+# throughout, because it never looked. That is the corpus-as-specification
+# mistake moved from correctness to coverage.
+#
+# The dump name carries a short hash of the binary, so another machine's
+# `/bin/ls` is a different cell rather than a silent comparison against a
+# program it does not have: the report says `appeared` and `vanished` instead
+# of inventing a regression. A binary that is not present is skipped and said
+# so, because a gate that quietly measures less is the thing being fixed here.
+system_binaries=(${R2SLEIGH_COVERAGE_SYSTEM_BINARIES:-/bin/ls})
+for binary in "${system_binaries[@]}"; do
+    if [[ ! -r $binary ]]; then
+        echo "skipping absent system binary: $binary" >&2
+        continue
+    fi
+    digest=$(shasum -a 256 "$binary" | cut -c1-8)
+    name="system_$(basename "$binary")_$digest"
+    "$script_dir/sweep_binary.sh" "$binary" > "$artifact_root/dumps/${name}.txt"
+done
+
 python3 "$script_dir/report_coverage.py" \
     --artifact-root "$artifact_root" \
     --baseline "$baseline_path" \
