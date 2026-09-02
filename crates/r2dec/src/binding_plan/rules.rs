@@ -182,7 +182,7 @@ pub(super) fn component_eligible_values(
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
-    let inlinable = inlinable_values(source, projection);
+    let inlinable = inlinable_values(source_owned, projection);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
@@ -503,10 +503,37 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
 /// derived from the artifact and is the same object either way; deriving it
 /// again is not a second opinion, only the same answer at a cost.
 pub(super) fn inlinable_values(
-    source: &r2ssa::SsaArtifact,
+    source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> BTreeSet<ValueId> {
+    let source = source_owned.source();
     let graph = source.graph();
+    // A call's arguments are readers the graph does not record. `SSAOp::Call`
+    // takes only the callee as an operand, so the value staged in `rdi` is
+    // consumed by the call boundary and has no `UseSite` at all: the callsite
+    // certificate is the source's record that the read happens, and it is the
+    // same record the renderer consults to spell the argument.
+    //
+    // Asked of the graph alone, such a value has no readers, and this function
+    // turned it away at the first gate -- so every argument a call stages
+    // stayed on the page as a local, whatever the single-use rule did. That is
+    // six statements of the fourteen `readError` renders for four lines of
+    // source, and it is the difference between naming a value and spelling it
+    // where it is used.
+    let mut call_arg_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    if let Some(callsites) = source_owned.report().callsites() {
+        for (site, facts) in &callsites.by_callsite {
+            let Some(inst) = graph.inst_id_for_op_site(site.block_addr, site.op_index) else {
+                continue;
+            };
+            for argument in &facts.argument_values {
+                call_arg_readers
+                    .entry(argument.value)
+                    .or_default()
+                    .push(inst);
+            }
+        }
+    }
     let mut expr_by_value = std::collections::BTreeMap::new();
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
@@ -538,7 +565,12 @@ pub(super) fn inlinable_values(
             }
         };
         let use_sites = graph.use_sites(value.id);
-        if use_sites.is_empty() {
+        let arg_readers = call_arg_readers
+            .get(&value.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let reader_count = use_sites.len() + arg_readers.len();
+        if reader_count == 0 {
             rejected("no readers");
             continue;
         }
@@ -589,10 +621,11 @@ pub(super) fn inlinable_values(
         // accumulator after the byte load has overwritten it, and computes a
         // wrong hash under a proof line claiming nothing was refused. Three
         // corpus cells do this and five more refuse. See the handoff.
-        if !literal_only && use_sites.len() != 1 {
+        if !literal_only && reader_count != 1 {
             rejected(&format!(
-                "{} readers, of which {} sit in a certificate-elided instruction; root {root_kind}",
-                use_sites.len(),
+                "{reader_count} readers ({} of them call arguments), of which {} sit in a \
+                 certificate-elided instruction; root {root_kind}",
+                arg_readers.len(),
                 use_sites
                     .iter()
                     .filter(|site| elided_reads.contains(&site.inst))
@@ -655,6 +688,7 @@ pub(super) fn inlinable_values(
         if use_sites
             .iter()
             .any(|site| elided_reads.contains(&site.inst))
+            || arg_readers.iter().any(|inst| elided_reads.contains(inst))
         {
             rejected("a reader sits in a certificate-elided instruction");
             continue;
@@ -666,10 +700,15 @@ pub(super) fn inlinable_values(
             inlinable.insert(value.id);
             continue;
         }
-        let [use_site] = use_sites else {
-            unreachable!("a value that is not literal-only was required to have one reader")
+        // The one reader, whether the graph recorded it or the callsite
+        // certificate did. Only its position is wanted from here on: which
+        // block it sits in, and what runs between the definition and it.
+        let reader = match (use_sites, arg_readers) {
+            ([site], []) => site.inst,
+            ([], [inst]) => *inst,
+            _ => unreachable!("a value that is not literal-only was required to have one reader"),
         };
-        let Some(use_inst) = graph.inst(use_site.inst) else {
+        let Some(use_inst) = graph.inst(reader) else {
             rejected("reading instruction missing from the graph");
             continue;
         };

@@ -384,7 +384,7 @@ impl BindingPlan {
         for entity in machine_projection.entities() {
             expr_by_value.insert(entity.output().value(), entity.root());
         }
-        let inlinable = super::rules::inlinable_values(source, &machine_projection);
+        let inlinable = super::rules::inlinable_values(source_owned, &machine_projection);
         let mut dispositions = graph
             .values
             .iter()
@@ -929,7 +929,8 @@ impl BindingPlan {
         // rendered without a local" are one answer rather than two that agree
         // today. `inlinable_values` is computed once from the same projection
         // and the closure only tests membership.
-        let inlinable_for_expansion = super::rules::inlinable_values(source, &machine_projection);
+        let inlinable_for_expansion =
+            super::rules::inlinable_values(source_owned, &machine_projection);
         let canonical = r2rewrite::canonicalize_with(
             source,
             &machine_projection,

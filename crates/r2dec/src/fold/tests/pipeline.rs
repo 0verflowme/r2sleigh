@@ -1485,6 +1485,18 @@ mod tests {
             {
                 continue;
             }
+            // What `fold_block` does before it lowers anything: a definition
+            // the plan inlines has no statement, and asking for one requests
+            // the name the plan deliberately withheld. A call's arguments are
+            // now foldable -- the callsite certificate is a reader even though
+            // the graph records none -- so the staging writes reach this and
+            // the loop has to skip them exactly as the folder does.
+            if block.ops[prefix_idx]
+                .dst()
+                .is_some_and(|dst| ctx.should_inline(dst))
+            {
+                continue;
+            }
             enter_exact_test_site(&ctx, block.addr, prefix_idx);
             if let Some(prefix) = ctx
                 .op_to_stmt_with_args(&block.ops[prefix_idx], block.addr, prefix_idx)
@@ -2593,7 +2605,16 @@ mod tests {
         let expected = ctx
             .planned_value_expr(arg_value)
             .expect("the plan spells every certified argument value");
-        assert_eq!(argument.unobserved(), &expected);
+        // Through the markers, not around them. Asking the plan a second time
+        // allocates fresh observation ids, so two spellings of one value are
+        // equal as expressions and unequal as trees; `unobserved` strips only
+        // the outermost marker, which was enough while an argument was always
+        // a bound name and is not now that it can be a folded expression
+        // carrying the cells of the definition it replaced.
+        assert!(
+            argument.transparently_eq(&expected),
+            "argument {argument:?} is not the plan's spelling {expected:?}"
+        );
         assert!(
             matches!(argument, CExpr::Observed { .. }),
             "a call argument is a read and must carry its read marker: {argument:?}"

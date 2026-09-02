@@ -304,7 +304,7 @@ pub(crate) fn build_upstream_shadow_oracle(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let inlinable = super::rules::inlinable_values(source, &machine_projection);
+    let inlinable = super::rules::inlinable_values(source_owned, &machine_projection);
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
         if return_controls.contains(&graph_value.id) {
@@ -472,7 +472,8 @@ impl BindingPlan {
         // derives the canonical terms again and requires the same answer.
         // Sharing the plan's would prove nothing: a rewriter that varied with
         // hash order or with a stale budget would agree with itself.
-        let sealed_inlinable = super::rules::inlinable_values(source, &self.machine_projection);
+        let sealed_inlinable =
+            super::rules::inlinable_values(source_owned, &self.machine_projection);
         let sealed_canonical = r2rewrite::canonicalize_with(
             source,
             &self.machine_projection,
@@ -507,7 +508,7 @@ impl BindingPlan {
         }
         // Once per seal, not once per inlined value: this walks the whole
         // machine arena.
-        let inlinable = super::rules::inlinable_values(source, &self.machine_projection);
+        let inlinable = super::rules::inlinable_values(source_owned, &self.machine_projection);
         let ptr_bits = source
             .machine_context()
             .memory_model()
