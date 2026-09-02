@@ -74,6 +74,38 @@ def collect(artifact_root: Path) -> list[dict]:
     return entries
 
 
+POPULATIONS = (("pinned_", "pinned"), ("system_", "system"))
+
+
+def population_of_cell(cell: str) -> str:
+    """Which of the three populations a swept binary belongs to.
+
+    `pinned` is a program the repository ships as bytes, so the cell names the
+    same program on every machine and can be gated on anywhere. `compiled` is
+    built here by whichever clang this machine has, so the cell only means what
+    the baseline recorded while the compiler string matches. `system` is
+    whatever the machine happened to have at that path, so it is measured and
+    reported and never gates.
+    """
+    for prefix, name in POPULATIONS:
+        if cell.startswith(prefix):
+            return name
+    return "compiled"
+
+
+def population(key: str) -> str:
+    return population_of_cell(key.split("::", 1)[0])
+
+
+def gates(key: str, compiler_moved: bool) -> bool:
+    name = population(key)
+    if name == "system":
+        return False
+    if name == "compiled":
+        return not compiler_moved
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", type=Path, required=True)
@@ -120,13 +152,14 @@ def main() -> int:
         return 65
 
     baseline = json.loads(args.baseline.read_text())
-    if baseline.get("clang") != args.clang:
+    compiler_moved = baseline.get("clang") != args.clang
+    if compiler_moved:
         print(
-            "baseline was recorded with a different compiler, so the binaries are "
-            f"not the same program:\n  baseline: {baseline.get('clang')}\n  here:     {args.clang}",
-            file=sys.stderr,
+            "the compiler moved, so the compiled cells are not the same programs "
+            f"the baseline recorded:\n  baseline: {baseline.get('clang')}\n  here:     {args.clang}\n"
+            "compiled cells are reported below and not gated; the pinned cells "
+            "still gate, because the repository ships those as bytes."
         )
-        return 65
 
     before = baseline["entries"]
     after = measured["entries"]
@@ -149,16 +182,28 @@ def main() -> int:
 
     failed = False
     for key in lost:
-        print(f"REGRESSION: {key} rendered in the baseline and now refuses: {after[key]}", file=sys.stderr)
-        failed = True
+        if gates(key, compiler_moved):
+            print(f"REGRESSION: {key} rendered in the baseline and now refuses: {after[key]}", file=sys.stderr)
+            failed = True
+        else:
+            print(f"not gated, {population(key)}: {key} rendered in the baseline and now refuses: {after[key]}")
     for key in vanished:
-        print(f"MISSING: {key} is in the baseline and was not swept", file=sys.stderr)
-        failed = True
+        if gates(key, compiler_moved):
+            print(f"MISSING: {key} is in the baseline and was not swept", file=sys.stderr)
+            failed = True
+        else:
+            print(f"not measured here, {population(key)}: {key}")
     if failed:
         return 1
 
     if gained or appeared:
         print("coverage improved; re-bless with --accept-baseline to record it")
+    for name in ("pinned", "compiled", "system"):
+        cells = [entry for entry in entries if population_of_cell(entry["cell"]) == name]
+        if cells:
+            hit = sum(1 for entry in cells if entry["rendered"])
+            gated = "gates" if (name == "pinned" or (name == "compiled" and not compiler_moved)) else "reported"
+            print(f"  {name:9} {hit}/{len(cells)} rendered ({gated})")
     print(f"coverage gate: {rendered}/{len(entries)} rendered, no regressions")
     return 0
 
