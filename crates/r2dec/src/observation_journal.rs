@@ -2757,6 +2757,7 @@ impl LegacyObservationJournal {
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
         let plan = &self.plan;
+        let names = &self.names;
         let symbol_bindings = declared_legacy_bindings(function);
         let mut binding_failure = None;
         inspect_render_observations(
@@ -2810,6 +2811,7 @@ impl LegacyObservationJournal {
                             plan.disposition(value),
                             value_is_literal,
                             &symbol_bindings,
+                            names.symbol_for_value(value),
                         )
                         .and_then(|observation| {
                             record_same(&mut values[value.0 as usize], observation).map_err(|()| {
@@ -3204,7 +3206,27 @@ fn classify_value_node(
     disposition: Option<&ValueDisposition>,
     value_is_literal: &[bool],
     symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    planned_symbol: Option<SymbolId>,
 ) -> Result<LegacyValueObservation, LegacyObservationJournalError> {
+    // A value the plan binds is classified by that decision, for the same
+    // reason a value it inlines already is: the shape of what the value was
+    // rendered as is not evidence of which object it is. One value is read
+    // at several places and the renderer is free to spell each read
+    // differently -- `x`, `(uint64_t)x`, `!x` inside a condition the
+    // structurer negated -- and reading the identity back off each spelling
+    // makes the value's identity a function of the C, which is the thing
+    // being decided. Two spellings then give one value two identities and
+    // the seal refuses with `ConflictingValue`, which is what removing a
+    // redundant cast used to cause.
+    //
+    // The rendered name is still checked to own a declaration, below, for
+    // every occurrence that names one. What it no longer does is decide
+    // *which* value that occurrence is.
+    if let Some(ValueDisposition::Bound { .. }) = disposition
+        && let Some(symbol) = planned_symbol
+    {
+        return classify_symbol(value, symbol, symbol_bindings);
+    }
     // A value the plan renders where it is read is classified by that
     // decision, not by the shape of what it was rendered as. The shape is not
     // evidence: a copy folded into its reader is spelled as the name it

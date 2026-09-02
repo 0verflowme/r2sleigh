@@ -5273,8 +5273,16 @@ fn fold_constant_arithmetic_in_function(
     used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
     pointer_bits: u32,
 ) {
+    let symbol_table = std::rc::Rc::clone(&func.symbols);
     for stmt in &mut func.body {
-        fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits);
+        fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            Some(&symbol_table),
+        );
     }
 }
 
@@ -5291,40 +5299,103 @@ fn fold_constant_arithmetic_in_function(
 /// what the string is to what the outermost conversion required, spelled by
 /// the one emitter. Where the two are the same the chain disappears, which is
 /// the common case -- a string reaches a `char *` parameter as itself.
-/// The string literal a chain of conversions is wrapped around, if it is one.
-fn string_literal_under_conversions(expr: &CExpr) -> Option<&CExpr> {
+/// The C type of `char`, which is what an unqualified `char` renders as.
+fn plain_char_type() -> CType {
+    CType::Int {
+        bits: 8,
+        signedness: r2types::Signedness::Signed,
+    }
+}
+
+/// The address a chain of conversions is wrapped around, and what it is.
+///
+/// Two substitutions put an address where a number was. A string literal is
+/// an array of `char` that decays to a `char *` wherever a value is wanted.
+/// The address of a named object is a pointer to the object, and the object
+/// is declared `extern char name[]`, so `&name` is a pointer to an array of
+/// `char` -- not a `char *`, which is why converting it to one is a cast
+/// that C requires rather than noise.
+fn substituted_address_under_conversions(expr: &CExpr) -> Option<(&CExpr, CType)> {
     match expr {
-        CExpr::StringLit(_) => Some(expr),
+        CExpr::StringLit(_) => Some((expr, CType::ptr(plain_char_type()))),
+        CExpr::AddrOf(inner)
+            if matches!(
+                inner.unobserved(),
+                CExpr::External {
+                    kind: crate::symbol::ExternalKind::Global,
+                    ..
+                }
+            ) =>
+        {
+            Some((
+                expr,
+                CType::ptr(CType::Array(Box::new(plain_char_type()), None)),
+            ))
+        }
         CExpr::Observed { expr, .. } | CExpr::Paren(expr) | CExpr::Cast { expr, .. } => {
-            string_literal_under_conversions(expr)
+            substituted_address_under_conversions(expr)
         }
         _ => None,
     }
 }
 
-fn restate_string_conversions_in_expr(expr: &mut CExpr, pointer_bits: u32) {
-    if let CExpr::Cast { ty, .. } = expr.unobserved()
-        && let Some(literal) = string_literal_under_conversions(expr)
-    {
-        // A string literal is an array of `char` that decays to a `char *`
-        // wherever a value is wanted, so that is what the conversion starts
-        // from.
+/// Restate the conversions around a substituted address.
+///
+/// `required` is what the place this expression sits in asks of it, for the
+/// places that ask without spelling a cast -- a declaration's initialiser
+/// asks for the declared type, an assignment's right-hand side for the type
+/// of what it is assigned to. Inside an expression the enclosing conversion
+/// is the ask, and the outermost one is what the whole chain amounted to.
+///
+/// The distinction matters because the conversion around a constant address
+/// is often *nothing*: a `uint64_t` constant initialising a `uint64_t` needs
+/// no cast, so after `&progName` is substituted there is no chain to notice
+/// and the rendering assigns a pointer to an integer. That is not noise but
+/// a type error, and `-Wint-conversion` in the corpus's own compile is what
+/// found it.
+fn restate_string_conversions_in_expr(
+    expr: &mut CExpr,
+    pointer_bits: u32,
+    required: Option<&CType>,
+    symbols: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
+) {
+    if let Some((address, from)) = substituted_address_under_conversions(expr) {
+        let required = match expr.unobserved() {
+            CExpr::Cast { ty, .. } => Some(ty.clone()),
+            _ => required.cloned(),
+        };
+        let Some(required) = required else {
+            return;
+        };
         let restated = crate::fold::op_lower::convert::convert(
-            literal.clone(),
-            &r2rewrite::CValue::Typed(CType::ptr(CType::Int {
-                bits: 8,
-                signedness: r2types::Signedness::Signed,
-            })),
-            &ty.clone(),
+            address.clone(),
+            &r2rewrite::CValue::Typed(from),
+            &required,
             pointer_bits,
         );
         let source = std::mem::replace(expr, CExpr::IntLit(0));
         *expr = crate::ast::carry_all_expr_observations(&source, restated);
         return;
     }
+    // An assignment tells its right-hand side what is wanted: the type of
+    // the object being written.
+    if let CExpr::Binary {
+        op: BinaryOp::Assign,
+        left,
+        right,
+    } = expr
+    {
+        let target = match left.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        restate_string_conversions_in_expr(left, pointer_bits, None, symbols);
+        restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols);
+        return;
+    }
     let taken = std::mem::replace(expr, CExpr::IntLit(0));
     *expr = taken.map_children(&mut |mut child| {
-        restate_string_conversions_in_expr(&mut child, pointer_bits);
+        restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols);
         child
     });
 }
@@ -5335,21 +5406,32 @@ fn fold_constant_arithmetic_in_stmt(
     symbols: &std::collections::BTreeMap<u64, String>,
     used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
     pointer_bits: u32,
+    symbol_table: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
 ) {
     // The substitution and the restatement of what it changed are one visit
     // of one expression: a conversion can only be restated once the string
     // it converts is there to be seen.
     let fold_expr = |expr: &mut CExpr| {
         fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
-        restate_string_conversions_in_expr(expr, pointer_bits);
+        restate_string_conversions_in_expr(expr, pointer_bits, None, symbol_table);
     };
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } => {
-            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits)
-        }
-        CStmt::Observed { stmt, .. } => {
-            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits)
-        }
+        CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
+        CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5357,9 +5439,10 @@ fn fold_constant_arithmetic_in_stmt(
         | CStmt::Label(_)
         | CStmt::Comment(_) => {}
         CStmt::Expr(expr) => fold_expr(expr),
-        CStmt::Decl { init, .. } => {
+        CStmt::Decl { ty, init, .. } => {
             if let Some(init) = init {
-                fold_expr(init);
+                fold_constant_arithmetic_in_expr(init, strings, symbols, used);
+                restate_string_conversions_in_expr(init, pointer_bits, Some(ty), symbol_table);
             }
         }
         CStmt::Return(expr) => {
@@ -5369,7 +5452,14 @@ fn fold_constant_arithmetic_in_stmt(
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits);
+                fold_constant_arithmetic_in_stmt(
+                    stmt,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
         CStmt::If {
@@ -5378,14 +5468,35 @@ fn fold_constant_arithmetic_in_stmt(
             else_body,
         } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(then_body, strings, symbols, used, pointer_bits);
+            fold_constant_arithmetic_in_stmt(
+                then_body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
             if let Some(else_body) = else_body {
-                fold_constant_arithmetic_in_stmt(else_body, strings, symbols, used, pointer_bits);
+                fold_constant_arithmetic_in_stmt(
+                    else_body,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
         CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(body, strings, symbols, used, pointer_bits);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::For {
             init,
@@ -5394,7 +5505,14 @@ fn fold_constant_arithmetic_in_stmt(
             body,
         } => {
             if let Some(init) = init {
-                fold_constant_arithmetic_in_stmt(init, strings, symbols, used, pointer_bits);
+                fold_constant_arithmetic_in_stmt(
+                    init,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
             if let Some(cond) = cond {
                 fold_expr(cond);
@@ -5402,7 +5520,14 @@ fn fold_constant_arithmetic_in_stmt(
             if let Some(update) = update {
                 fold_expr(update);
             }
-            fold_constant_arithmetic_in_stmt(body, strings, symbols, used, pointer_bits);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::Switch {
             expr,
@@ -5412,12 +5537,26 @@ fn fold_constant_arithmetic_in_stmt(
             fold_expr(expr);
             for case in cases {
                 for stmt in &mut case.body {
-                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used, pointer_bits);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
             }
         }
