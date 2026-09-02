@@ -78,6 +78,17 @@ pub struct DecompilePrepFacts {
     /// dataflow. Unlike `stack_address_roots`, these roots are never rebased
     /// to a source-declared frame-pointer coordinate system.
     pub entry_stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
+    /// Addresses that lie inside a stack object at an offset the machine
+    /// computes rather than states.
+    ///
+    /// `stack_address_roots` records an exact offset from a base, which is what
+    /// a scalar slot needs and what an array element cannot have: `buf[i]` is
+    /// `frame_base + (-0x20) + i`, and the second addition has no constant to
+    /// fold, so the address gets no root at all and its object escapes. The
+    /// root recorded here names the object the index is into -- the base and
+    /// the constant part -- and says nothing about which element, which is
+    /// exactly what is known.
+    pub indexed_stack_address_roots: BTreeMap<SSAVar, StackAddressRoot>,
     /// Entry SSA values bound to canonical ABI parameter slots.
     pub formal_parameters: BTreeMap<SSAVar, usize>,
     /// Full-width entry ABI values that may serve as parameter address bases.
@@ -1493,6 +1504,10 @@ impl Deref for SsaArtifact {
 impl DecompilePrepFacts {
     pub fn canonical_root_of(&self, var: &SSAVar) -> Option<&SSAVar> {
         self.canonical_value_roots.get(var)
+    }
+
+    pub fn indexed_stack_address_root_of(&self, var: &SSAVar) -> Option<&StackAddressRoot> {
+        self.indexed_stack_address_roots.get(var)
     }
 
     pub fn stack_address_root_of(&self, var: &SSAVar) -> Option<&StackAddressRoot> {
@@ -3230,6 +3245,26 @@ impl SSAFunction {
                             );
                         }
                         SSAOp::IntAdd { dst, a, b } => {
+                            // An exact root is preferred; this records the
+                            // object an address is inside when the offset
+                            // within it is computed rather than stated.
+                            if !facts.stack_address_roots.contains_key(dst)
+                                && let Some(root) = indexed_stack_address_root_from_add(
+                                    a,
+                                    b,
+                                    &facts.canonical_value_roots,
+                                    &facts.stack_address_roots,
+                                    &facts.indexed_stack_address_roots,
+                                    &family_state,
+                                    family_info,
+                                )
+                            {
+                                changed |= insert_stack_root(
+                                    &mut facts.indexed_stack_address_roots,
+                                    dst.clone(),
+                                    root,
+                                );
+                            }
                             if let Some(root) = stack_address_root_from_add(
                                 a,
                                 b,
@@ -4897,6 +4932,45 @@ fn stack_address_root_from_add(
             base: base.base,
             offset: base.offset.checked_add(delta)?,
         });
+    }
+    None
+}
+
+/// The stack object an address is inside when its offset within it is not a
+/// constant.
+///
+/// One operand carries a stack root -- exact, or itself already indexed -- and
+/// the other is not a constant the analysis can fold. The sum is therefore
+/// inside the same object at an offset nobody knows, which is what an element
+/// of an array on the stack is. An operand that *is* a foldable constant is
+/// left to `stack_address_root_from_add`, whose answer is stronger.
+fn indexed_stack_address_root_from_add(
+    a: &SSAVar,
+    b: &SSAVar,
+    roots: &BTreeMap<SSAVar, SSAVar>,
+    stack_roots: &BTreeMap<SSAVar, StackAddressRoot>,
+    indexed_roots: &BTreeMap<SSAVar, StackAddressRoot>,
+    family_state: &FamilyRootState,
+    family_info: &RegisterFamilyInfo,
+) -> Option<StackAddressRoot> {
+    let base_of = |var: &SSAVar| {
+        stack_root_from_operand(var, roots, stack_roots, family_state, family_info).or_else(|| {
+            stack_root_from_operand(var, roots, indexed_roots, family_state, family_info)
+        })
+    };
+    let index_is_opaque = |var: &SSAVar| {
+        signed_stack_delta_through_roots(var, roots, family_state, family_info).is_none()
+            && base_of(var).is_none()
+    };
+    if let Some(base) = base_of(a)
+        && index_is_opaque(b)
+    {
+        return Some(base);
+    }
+    if let Some(base) = base_of(b)
+        && index_is_opaque(a)
+    {
+        return Some(base);
     }
     None
 }

@@ -1813,6 +1813,13 @@ impl<'a> ObjectModelBuilder<'a> {
                     self.record_entry_stack_root(object, entry_root);
                 }
                 object
+            } else if let Some(root) = resolve_indexed_stack_root(self.facts, value) {
+                // An address inside a stack object at an offset the machine
+                // computes. It is the same object a constant offset from that
+                // base would reach -- `buf[i]` and `buf[0]` are one buffer --
+                // so it resolves to that object rather than escaping, which is
+                // what left an indexed local with no identity at all.
+                self.ensure_stack_object(root)
             } else if let Some(expression) = self.addresses.parameter_expression(value_id) {
                 self.ensure_parameter_object(expression.parameter)
             } else if let Some(address) = resolve_const_value(self.facts, value) {
@@ -8752,6 +8759,18 @@ fn resolve_stack_root(
         .stack_address_root_of(var)
         .copied()
         .or_else(|| facts.stack_address_root_of(root).copied())
+}
+
+fn resolve_indexed_stack_root(
+    facts: Option<&DecompilePrepFacts>,
+    var: &SSAVar,
+) -> Option<StackAddressRoot> {
+    let facts = facts?;
+    let root = canonical_value_root(Some(facts), var);
+    facts
+        .indexed_stack_address_root_of(var)
+        .copied()
+        .or_else(|| facts.indexed_stack_address_root_of(root).copied())
 }
 
 fn resolve_entry_stack_root(
