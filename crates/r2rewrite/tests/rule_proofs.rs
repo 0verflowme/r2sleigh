@@ -197,7 +197,7 @@ fn every_rule_is_a_proven_equivalence() {
 #[test]
 fn operand_ordering_is_an_idempotent_equivalence() {
     use r2ssa::{MachineArithmeticOp, MachineBitwiseOp, MachineComparisonOp};
-    let shapes: &[fn(&mut TermArena, u32, &[r2rewrite::TermId]) -> r2rewrite::TermId] = &[
+    let shapes: &[r2rewrite::rules::Template] = &[
         |arena, w, l| {
             let five = arena.intern(
                 unsigned(w),
@@ -260,14 +260,56 @@ fn operand_ordering_is_an_idempotent_equivalence() {
             )
         },
     ];
+    check_normaliser(shapes, canon::order_operands);
+}
+
+/// A truncation is an extract at offset zero; an arithmetic right shift by a
+/// literal count at or past the width shifts by the width minus one.
+#[test]
+fn truncation_and_shift_clamp_are_idempotent_equivalences() {
+    use r2ssa::{MachineCastKind, MachineOvershiftBehavior, MachineShiftKind};
+    let shapes: &[r2rewrite::rules::Template] = &[
+        |arena, w, _| {
+            let wide = arena.intern(unsigned((w * 2).min(64).max(w + 4)), TermKind::Variable(7));
+            arena.intern(
+                unsigned(w),
+                TermKind::Cast {
+                    kind: MachineCastKind::Truncate,
+                    input: wide,
+                },
+            )
+        },
+        |arena, w, l| {
+            let count = arena.intern(
+                unsigned(8),
+                TermKind::Literal(r2ssa::MachineBitVector::new(8, u64::from(w) + 5).unwrap()),
+            );
+            arena.intern(
+                unsigned(w),
+                TermKind::Shift {
+                    kind: MachineShiftKind::ArithmeticRight,
+                    overshift: MachineOvershiftBehavior::SignFill,
+                    value: l[0],
+                    count,
+                },
+            )
+        },
+    ];
+    check_normaliser(shapes, canon::normalize);
+}
+
+fn check_normaliser(
+    shapes: &[r2rewrite::rules::Template],
+    normaliser: fn(&mut TermArena, r2rewrite::TermId) -> r2rewrite::TermId,
+) {
     for (index, shape) in shapes.iter().enumerate() {
         for width in [8u32, 16, 32, 64] {
             let mut arena = TermArena::new();
             let leaves = fresh_leaves(&mut arena, width);
             let before = shape(&mut arena, width, &leaves);
-            let once = canon::normalize(&mut arena, before);
+            let once = normaliser(&mut arena, before);
             assert_ne!(before, once, "shape {index} at {width} was already ordered");
-            let twice = canon::normalize(&mut arena, once);
+            let twice = normaliser(&mut arena, once);
             assert_eq!(once, twice, "shape {index} at {width}: not idempotent");
             assert!(measure(&arena, once) <= measure(&arena, before));
             if let Some(agrees) = exhaustive_agrees(&arena, before, once) {

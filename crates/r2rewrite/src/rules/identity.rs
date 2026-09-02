@@ -22,12 +22,6 @@ fn all_ones(width: u32) -> u64 {
     mask(width) as u64
 }
 
-fn literal_of(arena: &mut TermArena, like: TermId, value: u64) -> TermId {
-    let term = arena.term(like);
-    let bits = MachineBitVector::new(term.width_bits(), value).expect("term width fits a literal");
-    arena.intern(term.ty, TermKind::Literal(bits))
-}
-
 macro_rules! identity_rule {
     ($name:ident, $id:literal, $apply:expr, $templates:expr) => {
         pub static $name: Rule = Rule {
@@ -125,7 +119,7 @@ identity_rule!(
                 ..
             },
             _,
-        ) => Some(literal_of(arena, id, 0)),
+        ) => Some(super::literal_like(arena, id, 0)),
         _ => None,
     },
     &[|arena, w, l| arena.intern(
@@ -157,7 +151,7 @@ identity_rule!(
     MUL_ZERO,
     "identity.mul_zero",
     |arena, id| arith_right_literal(arena, id, MachineArithmeticOp::Multiply, 0)
-        .map(|_| literal_of(arena, id, 0)),
+        .map(|_| super::literal_like(arena, id, 0)),
     &[|arena, w, l| {
         let z = lit(arena, w, 0);
         arena.intern(
@@ -174,7 +168,7 @@ identity_rule!(
     AND_ZERO,
     "identity.and_zero",
     |arena, id| bitwise_right_literal(arena, id, MachineBitwiseOp::And, 0)
-        .map(|_| literal_of(arena, id, 0)),
+        .map(|_| super::literal_like(arena, id, 0)),
     &[|arena, w, l| {
         let z = lit(arena, w, 0);
         arena.intern(
@@ -272,7 +266,7 @@ identity_rule!(
     |arena, id| {
         let width = arena.term(id).width_bits();
         bitwise_right_literal(arena, id, MachineBitwiseOp::Or, all_ones(width))
-            .map(|_| literal_of(arena, id, all_ones(width)))
+            .map(|_| super::literal_like(arena, id, all_ones(width)))
     },
     &[|arena, w, l| {
         let ones = lit(arena, w, all_ones(w));
@@ -312,7 +306,7 @@ identity_rule!(
                 ..
             },
             _,
-        ) => Some(literal_of(arena, id, 0)),
+        ) => Some(super::literal_like(arena, id, 0)),
         _ => None,
     },
     &[|arena, w, l| arena.intern(

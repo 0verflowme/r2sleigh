@@ -62,7 +62,59 @@ pub fn literal_bits(arena: &TermArena, id: TermId) -> Option<u64> {
     }
 }
 
+/// A truncation is the extraction of the low bits, and the extract rules
+/// compose where two spellings of one operation would not. Same node count,
+/// same width, idempotent.
+pub fn truncate_as_extract(arena: &mut TermArena, id: TermId) -> TermId {
+    let term = arena.term(id);
+    match term.kind {
+        TermKind::Cast {
+            kind: r2ssa::MachineCastKind::Truncate,
+            input,
+        } => arena.intern(term.ty, TermKind::Extract { input, lsb_bits: 0 }),
+        _ => id,
+    }
+}
+
+/// An arithmetic right shift that sign-fills on overshift shifts by at most
+/// width minus one: a literal count beyond that is the same operation with
+/// the count clamped. Same node count, idempotent.
+pub fn clamp_arithmetic_shift_count(arena: &mut TermArena, id: TermId) -> TermId {
+    let term = arena.term(id);
+    let TermKind::Shift {
+        kind: r2ssa::MachineShiftKind::ArithmeticRight,
+        overshift: r2ssa::MachineOvershiftBehavior::SignFill,
+        value,
+        count,
+    } = term.kind
+    else {
+        return id;
+    };
+    let width = u64::from(term.width_bits());
+    let Some(bits) = literal_bits(arena, count) else {
+        return id;
+    };
+    if bits < width {
+        return id;
+    }
+    let count_term = arena.term(count);
+    let clamped = r2ssa::MachineBitVector::new(count_term.width_bits(), width - 1)
+        .expect("count width fits a literal");
+    let count = arena.intern(count_term.ty, TermKind::Literal(clamped));
+    arena.intern(
+        term.ty,
+        TermKind::Shift {
+            kind: r2ssa::MachineShiftKind::ArithmeticRight,
+            overshift: r2ssa::MachineOvershiftBehavior::SignFill,
+            value,
+            count,
+        },
+    )
+}
+
 /// Every normaliser, in the order the driver applies them.
 pub fn normalize(arena: &mut TermArena, id: TermId) -> TermId {
+    let id = truncate_as_extract(arena, id);
+    let id = clamp_arithmetic_shift_count(arena, id);
     order_operands(arena, id)
 }

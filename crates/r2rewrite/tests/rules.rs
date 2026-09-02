@@ -148,3 +148,122 @@ fn identities_compose_through_a_single_use_chain() {
     );
     assert!(roots.budget_failures().is_empty());
 }
+
+#[test]
+fn a_difference_compared_with_zero_compares_its_operands() {
+    // `ZF = (a - b) == 0; if (!ZF)` is the flag shape; the rules take it to
+    // `a != b` with the difference discharged.
+    let artifact = artifact(vec![
+        R2ILOp::IntSub {
+            dst: tmp(0x100, 8),
+            a: reg(RDI, 8),
+            b: reg(RSI, 8),
+        },
+        R2ILOp::IntEqual {
+            dst: tmp(0x200, 1),
+            a: tmp(0x100, 8),
+            b: konst(0, 8),
+        },
+        R2ILOp::BoolNot {
+            dst: tmp(0x300, 1),
+            src: tmp(0x200, 1),
+        },
+        R2ILOp::IntZExt {
+            dst: reg(RAX, 8),
+            src: tmp(0x300, 1),
+        },
+        ret(),
+    ]);
+    let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    let not = roots
+        .value(value_named(&artifact, "tmp:300_1"))
+        .expect("the negation");
+    let TermKind::Compare {
+        op, left, right, ..
+    } = roots.arena().term(not.canonical).kind
+    else {
+        panic!(
+            "expected a comparison, got {:?}",
+            roots.arena().term(not.canonical)
+        );
+    };
+    assert_eq!(op, r2ssa::MachineComparisonOp::NotEqual);
+    assert!(matches!(roots.arena().term(left).kind, TermKind::Leaf(_)));
+    assert!(matches!(roots.arena().term(right).kind, TermKind::Leaf(_)));
+    let rules: Vec<&str> = not.trace.iter().map(|r| r.rule).collect();
+    assert!(rules.contains(&"boolean.sub_eq_zero"), "{rules:?}");
+    assert!(rules.contains(&"boolean.not_eq"), "{rules:?}");
+    assert_eq!(
+        not.discharges.len(),
+        2,
+        "the subtraction and the equality render here"
+    );
+    assert!(roots.budget_failures().is_empty());
+}
+
+#[test]
+fn a_negated_ordering_flips_and_a_zero_extension_of_a_truncation_extracts() {
+    let artifact = artifact(vec![
+        R2ILOp::IntSLess {
+            dst: tmp(0x100, 1),
+            a: reg(RDI, 8),
+            b: reg(RSI, 8),
+        },
+        R2ILOp::BoolNot {
+            dst: tmp(0x200, 1),
+            src: tmp(0x100, 1),
+        },
+        R2ILOp::Trunc {
+            dst: tmp(0x300, 4),
+            src: reg(RDI, 8),
+        },
+        R2ILOp::Trunc {
+            dst: tmp(0x400, 2),
+            src: tmp(0x300, 4),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x500, 8),
+            src: tmp(0x400, 2),
+        },
+        R2ILOp::IntZExt {
+            dst: tmp(0x600, 8),
+            src: tmp(0x200, 1),
+        },
+        R2ILOp::IntAdd {
+            dst: reg(RAX, 8),
+            a: tmp(0x500, 8),
+            b: tmp(0x600, 8),
+        },
+        ret(),
+    ]);
+    let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    let flipped = roots
+        .value(value_named(&artifact, "tmp:200_1"))
+        .expect("negated ordering");
+    let TermKind::Compare {
+        op, interpretation, ..
+    } = roots.arena().term(flipped.canonical).kind
+    else {
+        panic!(
+            "expected a comparison, got {:?}",
+            roots.arena().term(flipped.canonical)
+        );
+    };
+    assert_eq!(op, r2ssa::MachineComparisonOp::LessThanOrEqual);
+    assert_eq!(interpretation, r2ssa::MachineSignedness::Signed);
+    let narrowed = roots
+        .value(value_named(&artifact, "tmp:400_1"))
+        .expect("double truncation");
+    let TermKind::Extract { input, lsb_bits } = roots.arena().term(narrowed.canonical).kind else {
+        panic!(
+            "expected one extract, got {:?}",
+            roots.arena().term(narrowed.canonical)
+        );
+    };
+    assert_eq!(lsb_bits, 0);
+    assert!(matches!(roots.arena().term(input).kind, TermKind::Leaf(_)));
+    let rules: Vec<&str> = narrowed.trace.iter().map(|r| r.rule).collect();
+    assert!(rules.contains(&"cast.extract_extract"), "{rules:?}");
+}

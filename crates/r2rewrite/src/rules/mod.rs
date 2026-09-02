@@ -40,6 +40,9 @@ pub enum RuleGroup {
 pub enum Measure {
     /// Non-leaf nodes of the term, counted as a tree.
     NonLeafNodes,
+    /// Select and compare nodes: the ones a boolean normal form removes
+    /// without changing the node count.
+    Selections,
     /// Sum of the widths of every cast and extract in the term.
     CastWidth,
     /// Commutative nodes whose literal operand is not the last one.
@@ -50,6 +53,7 @@ pub enum Measure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MeasureVector {
     pub non_leaf_nodes: u64,
+    pub selections: u64,
     pub cast_width: u64,
     pub literals_not_last: u64,
 }
@@ -58,6 +62,7 @@ impl MeasureVector {
     pub fn component(&self, measure: Measure) -> u64 {
         match measure {
             Measure::NonLeafNodes => self.non_leaf_nodes,
+            Measure::Selections => self.selections,
             Measure::CastWidth => self.cast_width,
             Measure::LiteralPosition => self.literals_not_last,
         }
@@ -80,11 +85,18 @@ fn measure_memo(
     let term = arena.term(id);
     let mut m = MeasureVector {
         non_leaf_nodes: 0,
+        selections: 0,
         cast_width: 0,
         literals_not_last: 0,
     };
     if !term.kind.is_nullary() {
         m.non_leaf_nodes = 1;
+        if matches!(
+            term.kind,
+            TermKind::Select { .. } | TermKind::Compare { .. }
+        ) {
+            m.selections = 1;
+        }
         if matches!(term.kind, TermKind::Cast { .. } | TermKind::Extract { .. }) {
             m.cast_width = u64::from(term.width_bits());
         }
@@ -99,6 +111,7 @@ fn measure_memo(
         for child in children {
             let c = measure_memo(arena, child, memo);
             m.non_leaf_nodes = m.non_leaf_nodes.saturating_add(c.non_leaf_nodes);
+            m.selections = m.selections.saturating_add(c.selections);
             m.cast_width = m.cast_width.saturating_add(c.cast_width);
             m.literals_not_last = m.literals_not_last.saturating_add(c.literals_not_last);
         }
@@ -128,8 +141,25 @@ pub struct Rule {
 
 pub const DEFAULT_PROOF_WIDTHS: &[u32] = &[8, 16, 32, 64];
 
+pub mod boolean;
+pub mod cast;
 pub mod identity;
 pub mod literal;
+pub mod mask;
+pub mod shift;
+
+/// A literal of `value` at the type of `like`.
+pub(crate) fn literal_like(arena: &mut TermArena, like: TermId, value: u64) -> TermId {
+    let term = arena.term(like);
+    let bits = r2ssa::MachineBitVector::new(term.width_bits(), value)
+        .expect("a term width fits a literal");
+    arena.intern(term.ty, TermKind::Literal(bits))
+}
+
+/// The literal a term is, if it is one.
+pub(crate) fn literal_of(arena: &TermArena, id: TermId) -> Option<u64> {
+    crate::canon::literal_bits(arena, id)
+}
 
 /// Every rule, in the order the driver tries them. Literal folding first, so
 /// a term over literals is a literal before any identity looks at it.
@@ -174,6 +204,43 @@ pub static RULES: &[&Rule] = &[
     &identity::BOOLOR_SELF,
     &identity::BOOLAND_TRUE,
     &identity::BOOLOR_FALSE,
+    &cast::ZEXT_ZEXT,
+    &cast::SEXT_SEXT,
+    &cast::EXTRACT_EXTRACT,
+    &cast::EXTRACT_FULL,
+    &cast::EXTRACT_OF_EXTEND_WHOLE,
+    &cast::EXTRACT_OF_EXTEND_WITHIN,
+    &cast::EXTRACT_OF_ZEXT_ABOVE,
+    &cast::REINTERPRET_SAME_WIDTH,
+    &cast::EXTRACT_LOW_OF_CONCAT,
+    &cast::EXTRACT_HIGH_OF_CONCAT,
+    &cast::CONCAT_OF_EXTRACTS,
+    &boolean::NOT_EQ,
+    &boolean::NOT_NE,
+    &boolean::NOT_LT,
+    &boolean::NOT_LE,
+    &boolean::EQ_SELF,
+    &boolean::LT_SELF,
+    &boolean::LE_SELF,
+    &boolean::SUB_EQ_ZERO,
+    &boolean::SUB_NE_ZERO,
+    &boolean::XOR_EQ_ZERO,
+    &boolean::BOOL_EQ_ZERO,
+    &boolean::BOOL_NE_ZERO,
+    &boolean::BOOL_EQ_ONE,
+    &boolean::BOOL_NE_ONE,
+    &boolean::SELECT_SAME,
+    &boolean::SELECT_TRUE_FALSE,
+    &boolean::SELECT_FALSE_TRUE,
+    &shift::SHL_SHL,
+    &shift::LSHR_LSHR,
+    &shift::ASHR_ASHR,
+    &shift::SHL_OVERWIDTH,
+    &shift::LSHR_OVERWIDTH,
+    &mask::AND_AND,
+    &mask::OR_OR,
+    &mask::XOR_XOR,
+    &mask::AND_OF_ZEXT,
 ];
 
 pub fn rule(id: RuleId) -> Option<&'static Rule> {
