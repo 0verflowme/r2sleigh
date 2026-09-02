@@ -6980,3 +6980,84 @@ ids that reach the AST need to be matched against the ids the seal reports
 missing rather than assumed to be the same ones -- or the walk in
 `inspect_render_observations` does not reach them. Check the id sets against
 each other before touching either the plan or the renderer again.
+
+## Component 3, type inference: measured, started, and where it stops
+
+The baseline is exact and worth stating plainly. Across the fifty-four corpus
+cells the typed-recovery score is **zero parameter matches and six return
+matches**. Every object is declared `CType::machine_bits(width)` -- the
+unsigned integer of its storage's width -- and `lib.rs` says why in a comment
+at the parameter site: asserting an inferred type made `-Werror` reject the
+function as a signedness-changing conversion on its own argument, so the
+contract became "a parameter is an unsigned integer of the register's own
+width, and signedness, pointer-ness and names are never asserted".
+
+The engine to replace that with is already there. `r2types::evidence` runs a
+real constraint solver -- a type arena, union-find equality classes, callee
+prototypes, memory widths, allocation element widths, and up to four
+refinement rounds that use a solved pointer to decide which operand of an
+address computation is the base. What is missing is not inference. It is the
+wiring from the solved types to the declarations, and the rendering that has
+to follow once a declaration is no longer an unsigned machine word.
+
+Two slices were built and measured. Both work, both are saved as patches, and
+both are blocked on the same thing.
+
+**Declarations from the evidence** -- `doc/wip/typed-declarations.patch`, 376
+lines. A shared `rules::declaration_type_for_binding` asks the evidence for
+the type its members agree on and admits it only when its width matches the
+storage, with a pointer admitted at the pointer width; both construction and
+the seal call it, and the seal's five `declaration_type == machine_bits(width)`
+checks become width checks, since the width is the part a second derivation of
+the *plan* can confirm and the evidence's meaning is not. Parameters then
+declare `int8_t* X0_0` where they used to declare `uint64_t`, which is real
+pointer recovery reaching the emitted C.
+
+It exposed two genuine defects, both fixed in the patch. `cast_needed`
+returned `false` when the source type was unknown, which is a conclusion drawn
+from not knowing, and for a pointer target it is exactly the case where C
+requires the cast. And `project_machine_use` casts a use to the unsigned
+integer of its carrier width even when the slice is the whole carrier at
+offset zero -- nothing is being projected -- which spells `(uint64_t)p` for a
+pointer object; a whole read of a pointer is now spelled at the declared type,
+which also keeps the identity copy `p = (int8_t*)p` legal where `p = p` would
+trip `-Wself-assign`.
+
+Eleven cells still do not compile, and the shape names what is left:
+`(int8_t*)X0_0 + (int8_t*)tmp_12380_1`. Once a declaration is a pointer, an
+address computation has to render as pointer arithmetic with an integer index,
+not as both operands cast to pointers -- only one operand of an address is the
+pointer, and the evidence solver already knows which. That is the next piece,
+and it is the same work component 4 needs for array indexing.
+
+**Return width** -- `doc/wip/return-width-recovery.patch`, 185 lines. A
+function returning `uint32_t` on x86-64 leaves its result in `eax`, which the
+lift models as a zero-extension into the `rax` the ABI returns in, so reading
+the declaration off the carrier says `uint64_t` for everything.
+`semantic_return_bits` follows the returned value back through zero-extensions
+and whole-width copies to the value the function actually computed, and
+`narrowed_return_type` narrows an unsigned return to it. Note that
+`ReturnValueCertificate::width` is **bytes**, not bits, and is the carrier's
+width either way -- it is not the fact wanted here.
+
+That takes return matches from **six to thirty-five of fifty-four**, and the
+corpus differential stays at fifty of fifty-four with nothing wrong. It costs
+four cells to one precisely located inconsistency: the callee declaration the
+*caller* emits is built from the call result's machine width, deliberately, so
+that caller and callee agree when both are decompiled into one translation
+unit -- and narrowing the callee's own definition breaks that agreement.
+`uint32_t sym__rotl32(...)` against `uint64_t sym__rotl32(uint64_t, uint64_t);`
+is a hard `conflicting types` error.
+
+Measuring the same thing from the caller's side does not work: the call result
+value has no use sites at all in the graph -- it reaches its readers through
+another value -- so `use_sites(result)` is empty and there is nothing to
+narrow by. The resolution is cross-function and belongs with component 1: the
+callee's recovered return width has to reach its call sites, either through
+the type writeback that already exists or by measuring the callee's own
+`semantic_return_bits` when its analysis is available. Until then the two
+answers disagree, which is exactly the duplicated-predicate shape this project
+resolves by making one answer rather than by choosing a winner.
+
+Both patches are off the tree, which is green: fifty-four of fifty-four on
+every corpus gate and 2236 of 2236 tests.
