@@ -3751,6 +3751,8 @@ mod tests {
                             .enumerate()
                             .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
                             .collect(),
+                        variadic: cert.variadic,
+                        fixed_argument_count: cert.fixed_argument_count,
                         register_argument_locations,
                         stack_argument_locations,
                     },
@@ -4049,8 +4051,13 @@ mod tests {
         );
     }
 
+    /// The callee's recovered signature names one parameter and the call site
+    /// certificate carries two arguments. Two is the answer: how many
+    /// arguments a call passes is a fact about the call, and cutting the list
+    /// down to what the callee is declared to take is how every call to a
+    /// variadic callee came out with the same arity.
     #[test]
-    fn prepared_call_arity_prefers_typed_callee_signature_over_summary_hint() {
+    fn prepared_call_arity_comes_from_the_call_site_not_the_callee_signature() {
         let symbols = test_table();
         let prepared = test_prepared_two_arg_call_artifact();
         let typed_function_names = HashMap::from([(0x401000, "sym.imp.one_arg".to_string())]);
@@ -4117,7 +4124,10 @@ mod tests {
                 .and_then(CalleeIdentity::non_variadic_known_arity),
             Some(1)
         );
-        assert_eq!(call_view.authoritative_args, vec![CExpr::IntLit(7)]);
+        assert_eq!(
+            call_view.authoritative_args,
+            vec![CExpr::IntLit(7), CExpr::IntLit(9)]
+        );
     }
 
     #[test]

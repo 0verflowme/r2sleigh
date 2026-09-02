@@ -410,6 +410,8 @@ mod indexed_argument_tests {
                         value: r2ssa::ValueId(*value),
                     })
                     .collect(),
+                variadic: false,
+                fixed_argument_count: None,
                 register_argument_locations: Vec::new(),
                 stack_argument_locations: Vec::new(),
             },

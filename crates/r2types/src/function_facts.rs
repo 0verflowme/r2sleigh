@@ -5235,6 +5235,8 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
@@ -5391,6 +5393,8 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
                     register_argument_locations: Vec::new(),
                     stack_argument_locations: Vec::new(),
                 },
@@ -5508,6 +5512,8 @@ mod tests {
                 index: 0,
                 value: register_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
@@ -5739,6 +5745,8 @@ mod tests {
                 index: 0,
                 value: sentinel_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
             register_argument_locations: Vec::new(),
             stack_argument_locations: Vec::new(),
         };
