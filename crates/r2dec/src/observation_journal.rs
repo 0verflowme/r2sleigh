@@ -3208,25 +3208,6 @@ fn classify_value_node(
     symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
     planned_symbol: Option<SymbolId>,
 ) -> Result<LegacyValueObservation, LegacyObservationJournalError> {
-    // A value the plan binds is classified by that decision, for the same
-    // reason a value it inlines already is: the shape of what the value was
-    // rendered as is not evidence of which object it is. One value is read
-    // at several places and the renderer is free to spell each read
-    // differently -- `x`, `(uint64_t)x`, `!x` inside a condition the
-    // structurer negated -- and reading the identity back off each spelling
-    // makes the value's identity a function of the C, which is the thing
-    // being decided. Two spellings then give one value two identities and
-    // the seal refuses with `ConflictingValue`, which is what removing a
-    // redundant cast used to cause.
-    //
-    // The rendered name is still checked to own a declaration, below, for
-    // every occurrence that names one. What it no longer does is decide
-    // *which* value that occurrence is.
-    if let Some(ValueDisposition::Bound { .. }) = disposition
-        && let Some(symbol) = planned_symbol
-    {
-        return classify_symbol(value, symbol, symbol_bindings);
-    }
     // A value the plan renders where it is read is classified by that
     // decision, not by the shape of what it was rendered as. The shape is not
     // evidence: a copy folded into its reader is spelled as the name it
@@ -3259,32 +3240,61 @@ fn classify_value_node(
     // and the seal refused with `ConflictingValue` -- which is what a
     // redundant cast disappearing would otherwise cause.
     //
-    // The symbol still comes from the rendering rather than from the plan.
-    // This classification is also the check that a rendered name owns a
-    // declaration, and asking the plan for the name it intended would answer
-    // about a rendering that never happened.
-    if let Some(symbol) = named_object_of(expr) {
-        return classify_symbol(value, symbol, symbol_bindings);
-    }
-    if let CExpr::Binary { op, left, .. } = expr
-        && (*op == BinaryOp::Assign
-            || (statement_level
-                && matches!(
-                    op,
-                    BinaryOp::AddAssign
-                        | BinaryOp::SubAssign
-                        | BinaryOp::MulAssign
-                        | BinaryOp::DivAssign
-                        | BinaryOp::ModAssign
-                        | BinaryOp::BitAndAssign
-                        | BinaryOp::BitOrAssign
-                        | BinaryOp::BitXorAssign
-                        | BinaryOp::ShlAssign
-                        | BinaryOp::ShrAssign
-                )))
-        && let CExpr::Var(symbol) = left.unobserved()
+    // The name this occurrence renders the value as, where it renders one.
+    let rendered_symbol = named_object_of(expr).or_else(|| match expr {
+        CExpr::Binary { op, left, .. }
+            if *op == BinaryOp::Assign
+                || (statement_level
+                    && matches!(
+                        op,
+                        BinaryOp::AddAssign
+                            | BinaryOp::SubAssign
+                            | BinaryOp::MulAssign
+                            | BinaryOp::DivAssign
+                            | BinaryOp::ModAssign
+                            | BinaryOp::BitAndAssign
+                            | BinaryOp::BitOrAssign
+                            | BinaryOp::BitXorAssign
+                            | BinaryOp::ShlAssign
+                            | BinaryOp::ShrAssign
+                    )) =>
+        {
+            match left.unobserved() {
+                CExpr::Var(symbol) => Some(*symbol),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    // A rendered name must own a declaration wherever one is rendered. That
+    // is a statement about the C a reader gets, it is what
+    // `UnownedBindingSymbol` answers, and it is asked of every occurrence
+    // that names something.
+    let rendered = rendered_symbol
+        .map(|symbol| classify_symbol(value, symbol, symbol_bindings))
+        .transpose()?;
+    // Which value an occurrence *is* is the plan's answer and not the
+    // rendering's, for the same reason a value the plan inlines is already
+    // exempt above: the shape is not evidence. One value is read at several
+    // places and the renderer spells each read as that place requires -- `x`
+    // here, `!x` inside a condition the structurer negated -- so recovering
+    // the identity from each spelling makes it a function of the C, which is
+    // the thing being decided. Two spellings then give one value two
+    // identities and the seal refuses with `ConflictingValue`.
+    //
+    // The occurrence must still *mention* the name the plan gave the value.
+    // That is the difference between a marker sitting one node out from the
+    // name it marks, which says nothing about identity, and a rendering that
+    // contradicts the plan by spelling a bound value as a constant. The
+    // second is a defect and stays a conflict.
+    if let Some(ValueDisposition::Bound { .. }) = disposition
+        && let Some(planned) = planned_symbol
+        && expr_mentions_symbol(expr, planned)
     {
-        return classify_symbol(value, *symbol, symbol_bindings);
+        return classify_symbol(value, planned, symbol_bindings);
+    }
+    if let Some(rendered) = rendered {
+        return Ok(rendered);
     }
     let source_literal = value_is_literal
         .get(value.0 as usize)
@@ -3304,6 +3314,17 @@ fn classify_value_node(
     } else {
         Ok(LegacyValueObservation::InlineNonLiteral)
     }
+}
+
+/// Whether this expression reads `symbol` anywhere inside it.
+fn expr_mentions_symbol(expr: &CExpr, symbol: SymbolId) -> bool {
+    let mut found = false;
+    expr.visit(&mut |node| {
+        if !found && matches!(node, CExpr::Var(named) if *named == symbol) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// The object a rendered expression names, seen through conversions that do

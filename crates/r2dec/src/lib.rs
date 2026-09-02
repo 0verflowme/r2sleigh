@@ -5949,7 +5949,7 @@ mod tests {
                 text.clone(),
             ),
         );
-        restate_string_conversions_in_expr(&mut expr, 64);
+        restate_string_conversions_in_expr(&mut expr, 64, None, None);
         assert_eq!(expr, text, "got {expr:?}");
 
         // Converted to a number, the string is still an address, so the
@@ -5962,7 +5962,7 @@ mod tests {
             },
             text.clone(),
         );
-        restate_string_conversions_in_expr(&mut as_number, 64);
+        restate_string_conversions_in_expr(&mut as_number, 64, None, None);
         assert!(
             matches!(
                 &as_number,
