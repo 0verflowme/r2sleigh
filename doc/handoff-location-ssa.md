@@ -8237,3 +8237,134 @@ refutation, left fifty standing. The ones that change the ordering:
    recovery win and is unblocked.
 7. The register-identity collapse, which removes four live wrong-answer paths.
 8. The deletions.
+
+## What is actually blocking us, measured
+
+The GED-only reading in the previous section was too kind, and this section
+corrects it. DecBench now runs all three of its metrics on `bzip2recover`,
+built by GCC at `-O0`, sixteen functions:
+
+| metric | what it measures | angr | r2sleigh |
+| --- | --- | --- | --- |
+| ged | control-flow graph edit distance from source | 5.54 mean, 4 of 13 perfect | 5.43 mean, 4 of 13 perfect |
+| byte_match | assembly of the recompiled output against the original | 0.60 mean, 0.75 median | 0.11 mean, 0.12 median |
+| type_match | recovered types against DWARF | 0.59 mean, 3 of 11 perfect | 0.10 mean, 0 of 11 perfect |
+
+**Control-flow shape is competitive and nothing else is.** `byte_match` is the
+closest thing to a semantic correctness score this project has ever had, and it
+is not refusals dragging the mean: on the functions r2sleigh renders it scores
+0.00 to 0.21 where angr scores 0.35 to 0.93 on the same functions.
+
+### Why, in one function
+
+`readError` in `bzip2recover` is four source statements. Its rendered
+control-flow graph is a perfect match, GED 0.0. Its `byte_match` is 0.21
+against angr's 0.91, and the rendering shows every reason:
+
+```c
+FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;
+uint64_t RDX_2 = (uint64_t)&progName;
+char* RSI_1 = (char*)(uint64_t)"%s: I/O error reading `%s'...\n";
+FILE* RDI_1 = (FILE*)RAX_1;
+uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);
+```
+
+Fourteen statements for four. Six of them stage arguments into register-named
+locals that are read once. Every value carries a cast it does not need.
+`stderr` is declared `extern char stderr[]` and read through a pointer cast,
+because a global has no recovered type. So the noise columns are not measuring
+cosmetics: they are measuring the score.
+
+**And the call is wrong.** The source passes four arguments; r2sleigh renders
+three, dropping `&inFileName`, which the machine plainly loads into `rcx`. In
+`tooManyBlocks` the same declaration serves three `fprintf` callsites of five,
+three and three source arguments, and all three render as three. The argument
+count is being decided once per callee rather than once per callsite, which for
+a variadic callee is wrong by construction. The proof line above the function
+says `0 refused`. This is a wrong answer rendered confidently, which is the one
+outcome this project treats as worse than refusing, and no existing gate can
+see it: the corpus is nine hash functions with no variadic calls, the coverage
+sweep only asks whether a function rendered, and graph edit distance never
+looks at an argument list.
+
+### The refusal population, split properly
+
+The headline coverage numbers are dominated by import thunks. Across the 449
+functions in the coverage baseline:
+
+| population | rendered |
+| --- | --- |
+| import thunks | 0 of 105 |
+| real functions | 272 of 344 |
+
+Every one of the 105 thunks refuses with `RenderedValueRequired`, and they are
+the transfer-through-a-value item. Of the 117 `RenderedValueRequired` refusals
+in total, 105 are thunks and 12 are real functions, so the duplicated
+identity-merge predicate is worth twelve functions rather than a hundred.
+
+The 72 real refusals, by cause:
+
+| count | cause |
+| --- | --- |
+| 20 | effect obligations refused |
+| 12 | observation journal: RenderedValueRequired |
+| 6 | placement: missing_definition |
+| 6 | placement: unobserved_binding_write |
+| 6 | unrepresentable control flow |
+| 4 | placement: preserved_carrier_read_before_assignment |
+| 4 | projection authorization, memory renderer |
+| 4 | observation journal: ConflictingUse |
+| 3 | placement: unobserved_binding_read |
+| 7 | singletons |
+
+**Fifty-six of the seventy-two are the accounting machinery refusing its own
+output**: twenty from the effect ledger, twenty from placement, sixteen from
+the journal. Control flow accounts for seven and type recovery for none. The
+proof accounting is the coverage blocker on real code, not the decompiler's
+understanding of the program.
+
+### Performance, profiled rather than guessed
+
+Nothing is cached. Decompiling one function three times in one radare2 session
+costs the same every time, and the same three callees are lifted from scratch
+on each call. `crates/r2engine/src/lib.rs` holds no cache, and
+`crates/r2ssa/src/fingerprint.rs` exists but is not used as a cache key.
+
+| function | capture | decode | callee lift | root lift |
+| --- | --- | --- | --- | --- |
+| readError | 513 ms | 0.06 ms | 382 ms, 3 callees | 131 ms |
+| bsGetBit | 618 ms | 0.05 ms | 450 ms, 3 callees | 168 ms |
+| main | 1725 ms | 0.11 ms | 1139 ms, 4 callees | 586 ms |
+
+Instruction decoding is nothing. Callee lifting is about eighty per cent of
+capture, and it is repeated per caller. The r2dec side is small except in the
+structurer, which is superlinear: `main` spends 2.27 seconds there and then
+refuses, against a total of 2.77 seconds for every other r2dec stage combined.
+That is the BDD safety budget, computed as blocks times 128 and consumed in
+whatever order the proofs happen to run.
+
+Whole-binary, after the eligibility-filter fix, with the plugin's directory
+moved aside and back:
+
+| binary | plugin absent | plugin present |
+| --- | --- | --- |
+| bzip2recover, 38 functions | 1.12 s | 7.50 s |
+| bzip2, 154 functions | 18.38 s | 29.93 s |
+
+### What we cannot see, which is the deepest problem
+
+Every defect above was invisible to the gates until the benchmark ran.
+
+- The **differential column** is the only semantic check, and it covers nine
+  hash functions of one shape, a loop over bytes accumulating an integer, with
+  eighteen to twenty-three fixed inputs each. No struct, no array of structs,
+  no float, no recursion, no varargs, no signed division, no union, no
+  multi-word return, no pointer to pointer.
+- The **coverage sweep** asks only whether a function rendered.
+- **GED** measures graph shape and is blind to the body.
+- **byte_match** and **type_match** had never been run before today.
+
+So the project's correctness evidence covers one program shape, and its two
+quality metrics were unmeasured. Making `byte_match` a gate, and widening the
+differential corpus past hash functions, is the work that lets every other item
+be judged.
