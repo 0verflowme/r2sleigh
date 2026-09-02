@@ -2100,6 +2100,15 @@ pub(crate) struct PlacementDecisions {
 }
 
 impl PlacementDecisions {
+    /// A decision set stated directly, for tests that need one specific
+    /// decision rather than whatever the derivation would choose.
+    #[cfg(test)]
+    pub(crate) fn from_decisions_for_test(decisions: Vec<Option<PlacementDecision>>) -> Self {
+        Self {
+            decisions: decisions.into_boxed_slice(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn decision(&self, binding: BindingId) -> Option<PlacementDecision> {
         self.decisions.get(binding.index()).copied().flatten()

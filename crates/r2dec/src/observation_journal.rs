@@ -3562,6 +3562,87 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_placement_leaves_the_emitted_function_exactly_as_it_was() {
+        // `finish_enforcing` records a placement refusal and then goes on to
+        // inspect the same function, so a half-applied tree would reach the
+        // emitter on the refusal path. Nothing else covers it: the corpus
+        // passes `placement_audit` on all fifty-four cells, so no cell takes
+        // this path, and the guarantee is only visible as a snapshot restore
+        // in one error arm. This is the test that fails if that restore is
+        // ever simplified away.
+        let (source, plan, mut function, _journal) = journal_fixture();
+        let plan = Rc::new(plan);
+        let names = test_binding_names(&source, Rc::clone(&plan), Rc::clone(&function.symbols));
+
+        // A region artifact that is well formed but describes a body this
+        // function does not have, so the declarations cannot be inserted and
+        // the application refuses at its last step -- after every mutation the
+        // decision loop makes.
+        let sealed = seal_structured_body(
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+                CStmt::structured_region(
+                    StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::Block),
+                    CStmt::Return(None),
+                ),
+            ),
+            source.source().authority(),
+        )
+        .expect("sealed region artifact");
+        let (_statement, regions) = sealed.into_marked_parts();
+
+        // One binding that owns a declared local and is named by the body, so
+        // the lexical-declaration arm removes its local -- the mutation this
+        // test is looking for -- and the transitive-deadness pass leaves it
+        // alone.
+        let (binding, symbol) = plan
+            .bindings()
+            .find_map(|(binding, _)| {
+                names
+                    .symbol_for_binding(binding)
+                    .map(|symbol| (binding, symbol))
+            })
+            .expect("a planned binding with a name");
+        function.locals.push(CLocal {
+            ty: CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            },
+            name: symbol,
+            stack_offset: None,
+        });
+        function.body = vec![CStmt::Return(Some(CExpr::Var(symbol)))];
+
+        let mut decisions = vec![None; plan.binding_count()];
+        decisions[binding.index()] =
+            Some(crate::placement::PlacementDecision::LexicalDeclaration {
+                region: regions.source_root(),
+            });
+        let decisions = crate::placement::PlacementDecisions::from_decisions_for_test(decisions);
+
+        let before = function.clone();
+        let refusal = crate::placement::apply_placement_decisions(
+            &mut function,
+            &regions,
+            &names,
+            &decisions,
+            &[],
+        );
+
+        assert!(
+            refusal.is_err(),
+            "the region is absent from this body, so applying the decisions must refuse"
+        );
+        // The whole tree, not a symptom: any surviving mutation fails this,
+        // including the removed local the lexical-declaration arm takes out
+        // before the refusal is reached.
+        assert_eq!(
+            function, before,
+            "a refused placement must leave the emitted function untouched"
+        );
+    }
+
+    #[test]
     fn effect_observations_count_only_final_ast_occurrences() {
         let (source, _plan, mut function, mut journal) = journal_fixture();
         let obligation = *source

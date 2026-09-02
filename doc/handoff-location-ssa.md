@@ -7644,6 +7644,13 @@ install. The dumps are captured against whatever is installed at that moment,
 and this project has already voided four conclusions to that exact class of
 error.
 
+`tests/corpus/locked_matrix.sh` is that protocol written down. It builds the
+plugin first and takes the lock only for the install and the capture, because
+`run_matrix.sh` begins with `make install`, which builds before it installs --
+so taking the lock and then calling it holds the lock through a cold release
+build, minutes in which nobody measures and nobody else can start. The lock is
+released from a trap, so an interrupted run does not strand the queue.
+
 **The machine detail is now a measured column.** `machine_noise` counts seven
 exact predicates on the extracted raw function of every cell, and `--gate
 noise` requires all of them to be zero. Exact rather than a threshold, because
