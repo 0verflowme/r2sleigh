@@ -7107,3 +7107,45 @@ the pointee's signedness, which the zero-extension on every loaded byte
 decides, and `const`, which is exactly "no store through this pointer
 anywhere in the function". Both are local and derivable, and neither is worth
 starting before the eight cast errors are gone.
+
+### Typed declarations: six of eight cast placements fixed, eight cells left
+
+The patch is 1438 lines and holds at eight blocked cells out of fifty-four,
+with forty-six agreeing with the oracle. Three more rules were added and each
+is right independently of type recovery:
+
+*A store converts to the declared type of the object it writes*, found by the
+access fact for the current op rather than by matching the address value,
+which never matched.
+
+*A pointer is cast to its carrier's integer before it is sliced.*
+`project_machine_use_of` takes a flag saying the object is a pointer and
+converts first; slicing a pointer directly is `-Wpointer-to-int-cast`, and the
+width comes from the memory model's `default_address_bits` rather than from
+`FoldArchConfig::ptr_size`, whose units are ambiguous enough that reading them
+wrong produced casts to `struct r2sleigh_bits_512`.
+
+*A pointer narrowed to a smaller integer goes through the pointer's own
+width*, in both `cast_expr_if_needed` and `cast_expr_to`.
+
+What is left is two shapes and neither is inference:
+
+`uint32_t tmp_regalias_..._4_0_1 = (uint32_t)(int8_t*)X1_0;` -- a register
+alias, minted in `r2ssa::function` around line 4344 as
+`tmp:regalias:{block}:{op}:{source}`, narrowing a pointer. The narrowing cast
+is emitted by neither `cast_expr_if_needed` nor `cast_expr_to`, both of which
+now insert the pointer-width step and neither of which fires here, so the
+alias has a lowering path of its own that has to be found before it can be
+fixed.
+
+`int8_t* X11_6 = (uint64_t)(uint8_t)...(uint8_t)tmp_25500_5;` and
+`stack_m24 = (uint64_t)(int8_t*)RSI_0;` -- a load result and a store whose
+conversion to a pointer-declared destination is still missing. Applying
+`assignment_rhs_with_type_policy` to the load's result was tried and is wrong:
+`source_type_for_var` answers with the carrier's 512-bit vector for these
+temporaries and every cell then fails. The destination's *binding declaration*
+is the thing to convert to, not whatever `source_type_for_var` reports.
+
+Neither shape needs a new fact. Both are the same rule the Copy path already
+follows -- convert to what the destination is declared as -- applied at the
+two sites that still do not.
