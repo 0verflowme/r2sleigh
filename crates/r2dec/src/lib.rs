@@ -5386,9 +5386,11 @@ fn restate_string_conversions_in_expr(
         && crate::fold::op_lower::convert::literal_renders_as_signed(expr)
         && crate::fold::op_lower::convert::is_unsigned_integer(required, pointer_bits)
     {
+        // The cast is built around the literal as it stands, markers and
+        // all, so every occurrence it records is still in the tree exactly
+        // once. Carrying them again would put each one in twice.
         let source = std::mem::replace(expr, CExpr::IntLit(0));
-        let restated = CExpr::cast(required.clone(), source.clone());
-        *expr = crate::ast::carry_all_expr_observations(&source, restated);
+        *expr = CExpr::cast(required.clone(), source);
         return;
     }
     // An assignment tells its right-hand side what is wanted: the type of
