@@ -2178,13 +2178,24 @@ pub(crate) fn apply_placement_decisions(
     // any inline the check reports to the lexical declaration it carries as its
     // fallback. A demotion can only ever turn an inline into a declaration, so
     // the loop terminates.
+    // One copy, kept because a demotion has to start again from the tree as it
+    // was and because an application that refuses must leave the emitted
+    // function untouched -- `finish_enforcing` goes on to inspect it. The
+    // decisions are applied to the real tree rather than to a second copy of
+    // this one, so the common case, where nothing is demoted, pays for this
+    // snapshot and nothing else.
     let original = function.clone();
     let mut demoted = BTreeMap::<BindingId, PlacementDecision>::new();
     loop {
-        let mut candidate = original.clone();
         let removals =
-            apply_decisions_once(&mut candidate, regions, names, decisions, writes, &demoted)?;
-        let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&candidate);
+            match apply_decisions_once(function, regions, names, decisions, writes, &demoted) {
+                Ok(removals) => removals,
+                Err(error) => {
+                    *function = original;
+                    return Err(error);
+                }
+            };
+        let undeclared = crate::unrendered::names_mentioned_without_a_declaration(function);
         let mut progressed = false;
         for symbol in undeclared {
             let Some((binding, region)) =
@@ -2208,9 +2219,9 @@ pub(crate) fn apply_placement_decisions(
             progressed = true;
         }
         if !progressed {
-            *function = candidate;
             return Ok(removals);
         }
+        *function = original.clone();
     }
 }
 
