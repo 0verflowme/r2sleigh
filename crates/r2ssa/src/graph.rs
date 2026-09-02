@@ -24,7 +24,88 @@ pub struct UseSite {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstId, UseSite};
+    use super::{InstId, InstPayload, SsaGraph, UseSite};
+    use crate::function::SSAFunction;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn reg(offset: u64, size: u32) -> Varnode {
+        Varnode::new(SpaceId::Register, offset, size)
+    }
+
+    /// Two registers written on both arms of a branch, merged.
+    fn two_phi_merge() -> SSAFunction {
+        let mut arch = ArchSpec::new("two-phi-merge");
+        arch.add_register(RegisterDef::new("first", 0, 8));
+        arch.add_register(RegisterDef::new("second", 8, 8));
+        arch.add_register(RegisterDef::new("cond", 32, 1));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: reg(32, 1),
+        });
+        let arm = |addr: u64, first: u64, second: u64| {
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(R2ILOp::Copy {
+                dst: reg(0, 8),
+                src: Varnode::constant(first, 8),
+            });
+            block.push(R2ILOp::Copy {
+                dst: reg(8, 8),
+                src: Varnode::constant(second, 8),
+            });
+            block.push(R2ILOp::Branch {
+                target: Varnode::constant(0x100c, 8),
+            });
+            block
+        };
+        let left = arm(0x1004, 0, 1);
+        let right = arm(0x1008, 2, 3);
+        let mut merge = R2ILBlock::new(0x100c, 4);
+        merge.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[entry, left, right, merge], Some(&arch))
+            .expect("two phi merge SSA")
+    }
+
+    /// A merge's storage belongs to the merge, not to its position in the block.
+    ///
+    /// This arrived with copy propagation, which asserted it by collapsing one
+    /// of two phis and checking the survivor. Removing a phi is what exercises
+    /// the property and the pass was only one way to do it, so the removal is
+    /// done directly here and the pass is gone.
+    #[test]
+    fn phi_storage_identity_survives_removing_preceding_phi() {
+        let mut func = two_phi_merge();
+        let merge = func.get_block(0x100c).expect("merge block");
+        assert_eq!(merge.phis.len(), 2, "the fixture must merge two registers");
+        let retained_storage = merge.phis[1]
+            .canonical_storage
+            .expect("second merge storage");
+        let retained_dst = merge.phis[1].dst.clone();
+        assert_ne!(retained_storage, merge.phis[0].canonical_storage.unwrap());
+
+        let merge = func.get_block_mut(0x100c).expect("merge block");
+        merge.phis.remove(0);
+
+        let merge = func.get_block(0x100c).expect("merge block");
+        assert_eq!(merge.phis.len(), 1);
+        assert_eq!(merge.phis[0].dst, retained_dst);
+        assert_eq!(merge.phis[0].canonical_storage, Some(retained_storage));
+
+        let graph = SsaGraph::from_function(&func);
+        let graph_phi = graph
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.payload, InstPayload::Phi { .. }))
+            .expect("retained graph phi");
+        assert_eq!(
+            graph_phi.canonical_storage,
+            Some(retained_storage),
+            "the graph must carry the surviving merge's own storage"
+        );
+    }
 
     #[test]
     fn use_sites_have_stable_instruction_then_input_order() {

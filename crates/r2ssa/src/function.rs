@@ -2064,8 +2064,6 @@ impl SSAFunction {
             max_iterations: 1,
             enable_sccp: true,
             enable_inst_combine: false,
-            enable_copy_prop: false,
-            enable_dce: false,
             preserve_memory_reads: false,
         };
         func.optimize(&cfg);
@@ -2145,8 +2143,6 @@ impl SSAFunction {
             max_iterations: 1,
             enable_sccp: true,
             enable_inst_combine: false,
-            enable_copy_prop: false,
-            enable_dce: false,
             preserve_memory_reads: true,
         };
         func.decompile_prep_facts = None;
@@ -2172,8 +2168,6 @@ impl SSAFunction {
             max_iterations: 1,
             enable_sccp: true,
             enable_inst_combine: false,
-            enable_copy_prop: false,
-            enable_dce: false,
             preserve_memory_reads: true,
         };
         func.optimize(&cfg);

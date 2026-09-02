@@ -440,4 +440,390 @@ mod tests {
             "live-out must widen what counts as read, not make everything read"
         );
     }
+    // The facts below arrived with dead code elimination, which asserted them by
+    // running and checking what survived. The pass is gone; the facts are not.
+    // Each is a property of the liveness this module computes -- which writes the
+    // caller reads out of a return register, and which a later write shadows --
+    // so each now asks that question directly instead of through a transformation
+    // nobody runs.
+
+    fn storage(offset: u64, size: u32) -> CanonicalStorageId {
+        CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset,
+            size,
+        }
+    }
+
+    /// A body writing the whole return register and then its low byte.
+    fn return_alias_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("return-alias-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 1),
+            src: Varnode::constant(1, 1),
+        });
+        block.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("return alias SSA")
+    }
+
+    /// A body writing only the low half of the return register.
+    fn narrow_return_function() -> SSAFunction {
+        let mut arch = ArchSpec::new("narrow-return-test");
+        arch.add_register(RegisterDef::new("carrier", 0, 8));
+        arch.add_register(RegisterDef::sub("logical_result", 0, 4, "carrier"));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 4),
+            src: Varnode::constant(7, 4),
+        });
+        block.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("narrow return SSA")
+    }
+
+    /// Two arms writing the whole register, merging, then a low overlay.
+    fn return_phi_overlay_function() -> SSAFunction {
+        let mut arch = ArchSpec::new("return-phi-overlay-test");
+        arch.add_register(RegisterDef::new("carrier", 0, 8));
+        arch.add_register(RegisterDef::sub("low_lane", 0, 1, "carrier"));
+        arch.add_register(RegisterDef::new("cond", 0x40, 1));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: reg(0x40, 1),
+        });
+        let mut left = R2ILBlock::new(0x1004, 4);
+        left.push(R2ILOp::Copy {
+            dst: reg(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        left.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut right = R2ILBlock::new(0x1008, 4);
+        right.push(R2ILOp::Copy {
+            dst: reg(0, 8),
+            src: Varnode::constant(2, 8),
+        });
+        right.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut merge = R2ILBlock::new(0x100c, 4);
+        merge.push(R2ILOp::Copy {
+            dst: reg(0, 1),
+            src: Varnode::constant(3, 1),
+        });
+        merge.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[entry, left, right, merge], Some(&arch))
+            .expect("return phi overlay SSA")
+    }
+
+    /// A body writing the low byte twice, so the first is shadowed.
+    fn shadowed_overlay_function(whole_name: &str, low_name: &str) -> SSAFunction {
+        let mut arch = ArchSpec::new("shadowed-return-overlay-test");
+        arch.add_register(RegisterDef::new(whole_name, 0, 8));
+        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 8),
+            src: Varnode::constant(0, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 1),
+            src: Varnode::constant(1, 1),
+        });
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 1),
+            src: Varnode::constant(2, 1),
+        });
+        block.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("shadowed overlay SSA")
+    }
+
+    /// A frame pointer restored from the stack before returning.
+    fn frame_pop_function(frame_name: &str, frame_offset: u64) -> SSAFunction {
+        let mut arch = ArchSpec::new("frame-pop-test");
+        arch.add_register(RegisterDef::new(frame_name, frame_offset, 8));
+        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Load {
+            dst: Varnode::new(SpaceId::Unique, 0x100, 8),
+            space: SpaceId::Ram,
+            addr: reg(0x40, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: reg(frame_offset, 8),
+            src: Varnode::new(SpaceId::Unique, 0x100, 8),
+        });
+        // A non-register destination may share the frame pointer's numeric
+        // offset, and must not be mistaken for it.
+        block.push(R2ILOp::Copy {
+            dst: Varnode::new(SpaceId::Unique, frame_offset, 8),
+            src: Varnode::constant(0x55, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: reg(0x40, 8),
+            a: reg(0x40, 8),
+            b: Varnode::constant(16, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("frame pop SSA")
+    }
+
+    /// A frame pointer restored in a block that then branches to its returns.
+    fn predecessor_frame_restore_function(frame_offset: u64, split: bool) -> SSAFunction {
+        let mut arch = ArchSpec::new("predecessor-frame-restore-test");
+        arch.add_register(RegisterDef::new("frame_carrier", frame_offset, 8));
+        arch.add_register(RegisterDef::new("condition", 0x20, 1));
+        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut restore = R2ILBlock::new(0x1000, 4);
+        restore.push(R2ILOp::Load {
+            dst: Varnode::new(SpaceId::Unique, 0x100, 8),
+            space: SpaceId::Ram,
+            addr: reg(0x40, 8),
+        });
+        restore.push(R2ILOp::Copy {
+            dst: reg(frame_offset, 8),
+            src: Varnode::new(SpaceId::Unique, 0x100, 8),
+        });
+        if split {
+            restore.push(R2ILOp::CBranch {
+                target: Varnode::constant(0x1008, 8),
+                cond: reg(0x20, 1),
+            });
+        } else {
+            restore.push(R2ILOp::Branch {
+                target: Varnode::constant(0x1004, 8),
+            });
+        }
+        let mut first_return = R2ILBlock::new(0x1004, 4);
+        first_return.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        let mut blocks = vec![restore, first_return];
+        if split {
+            let mut second_return = R2ILBlock::new(0x1008, 4);
+            second_return.push(R2ILOp::Return {
+                target: reg(0x80, 8),
+            });
+            blocks.push(second_return);
+        }
+        SSAFunction::from_blocks_raw(&blocks, Some(&arch)).expect("predecessor frame restore SSA")
+    }
+
+    /// The storages of the values the caller reads, in graph order.
+    fn live_storages(func: &SSAFunction, read: &[CanonicalStorageId]) -> Vec<CanonicalStorageId> {
+        let graph = SsaGraph::from_function(func);
+        let live = FunctionLiveOut::compute(func, &graph, read);
+        let mut storages = live
+            .iter()
+            .filter_map(|value| graph.value(value))
+            .filter_map(|value| value.canonical_storage)
+            .collect::<Vec<_>>();
+        storages.sort_by_key(|s| (s.offset, s.size));
+        storages
+    }
+
+    #[test]
+    fn wide_return_base_and_low_overlay_are_both_live() {
+        // `xor eax, eax; sete al` -- the caller reads a composition, so the
+        // full-width base and the byte laid over it are both what it reads.
+        let func = return_alias_function("carrier", "low_lane");
+        assert_eq!(
+            live_storages(&func, &[storage(0, 8)]),
+            vec![storage(0, 1), storage(0, 8)]
+        );
+    }
+
+    #[test]
+    fn a_narrow_write_covering_the_logical_return_is_live() {
+        let func = narrow_return_function();
+        assert_eq!(live_storages(&func, &[storage(0, 8)]), vec![storage(0, 4)]);
+    }
+
+    #[test]
+    fn a_return_merge_beneath_a_later_overlay_stays_live() {
+        // The overlay does not cover the whole register, so the merge under it
+        // still supplies the remaining bytes, and each arm still supplies the
+        // merge.
+        let func = return_phi_overlay_function();
+        assert_eq!(
+            live_storages(&func, &[storage(0, 8)]),
+            vec![storage(0, 1), storage(0, 8)],
+            "the overlay and the merge beneath it"
+        );
+        // The arms are not live *out*: the merge is the definition the caller
+        // reaches, and the walk stops there. They stay alive because the merge
+        // reads them, which is an ordinary use, and `is_read` is the question
+        // that covers both reasons a value survives.
+        let graph = SsaGraph::from_function(&func);
+        let live = FunctionLiveOut::compute(&func, &graph, &[storage(0, 8)]);
+        for arm in [0x1004, 0x1008] {
+            let defined = func
+                .get_block(arm)
+                .expect("arm block")
+                .ops
+                .iter()
+                .filter_map(|op| op.dst())
+                .filter(|dst| func.canonical_storage_for_var(dst) == Some(storage(0, 8)))
+                .filter_map(|dst| graph.value_id_for_var(dst))
+                .collect::<Vec<_>>();
+            assert_eq!(defined.len(), 1, "arm {arm:#x}");
+            assert!(is_read(&graph, &live, defined[0]), "arm {arm:#x}");
+        }
+    }
+
+    #[test]
+    fn a_shadowed_overlay_is_reported_live_although_the_caller_cannot_read_it() {
+        // Two writes to the low byte. The caller reads only the second, so the
+        // first supplies nothing, and dead code elimination used to say so.
+        // This walk does not: it stops only on a write that covers the whole
+        // return storage, so a narrower write never ends the search and every
+        // write to the location on the way is reported.
+        //
+        // The imprecision is in the safe direction -- a value called live is
+        // kept, and keeping one that is dead costs a statement rather than an
+        // answer -- which is why it is recorded here rather than fixed under a
+        // deletion. Making it exact means tracking which bytes a later write
+        // has already supplied, the way the removed pass did with its
+        // uncovered-range list, and that is a change to what every consumer of
+        // `FunctionLiveOut` sees.
+        for (whole, low) in [("whole_a", "slice_a"), ("whole_b", "slice_b")] {
+            let func = shadowed_overlay_function(whole, low);
+            let graph = SsaGraph::from_function(&func);
+            let live = FunctionLiveOut::compute(&func, &graph, &[storage(0, 8)]);
+            let overlays = func
+                .get_block(0x1000)
+                .expect("return block")
+                .ops
+                .iter()
+                .filter_map(|op| op.dst())
+                .filter(|dst| func.canonical_storage_for_var(dst) == Some(storage(0, 1)))
+                .filter_map(|dst| graph.value_id_for_var(dst))
+                .collect::<Vec<_>>();
+            assert_eq!(overlays.len(), 2, "{whole}");
+            assert!(live.contains(overlays[1]), "the surviving write, {whole}");
+            assert!(
+                live.contains(overlays[0]),
+                "the shadowed write is over-approximated as live, {whole}"
+            );
+        }
+    }
+
+    #[test]
+    fn return_liveness_is_carrier_name_independent() {
+        assert_eq!(
+            live_storages(
+                &return_alias_function("whole_a", "slice_a"),
+                &[storage(0, 8)]
+            ),
+            live_storages(
+                &return_alias_function("whole_b", "slice_b"),
+                &[storage(0, 8)]
+            )
+        );
+    }
+
+    #[test]
+    fn a_register_named_like_a_return_but_outside_it_is_not_live() {
+        // `rax` at an offset the source-owned return storage does not name
+        // earns nothing from its spelling.
+        let mut arch = ArchSpec::new("spoofed-return-name-test");
+        arch.add_register(RegisterDef::new("actual_carrier", 0, 8));
+        arch.add_register(RegisterDef::new("rax", 0x40, 8));
+        arch.add_register(RegisterDef::new("pc", 0x80, 8));
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: reg(0, 8),
+            src: Varnode::constant(7, 8),
+        });
+        block.push(R2ILOp::Copy {
+            dst: reg(0x40, 8),
+            src: Varnode::constant(9, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: reg(0x80, 8),
+        });
+        let func = SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("spoofed SSA");
+        assert_eq!(live_storages(&func, &[storage(0, 8)]), vec![storage(0, 8)]);
+    }
+
+    #[test]
+    fn nothing_is_live_out_when_no_storage_is_named() {
+        // Without a source-owned return storage there is no register the caller
+        // is entitled to read, and no name in the body may stand in for one.
+        let func = return_alias_function("rax", "al");
+        assert!(live_storages(&func, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_frame_pointer_restore_reaching_a_return_is_live() {
+        // A callee-saved register put back before returning is read by the
+        // caller in exactly the sense a return value is, so the same walk
+        // answers for it once the frame storage is named as one the caller
+        // reads. Whether it may be named is the interface's question, and
+        // `SourceFunctionInterface::exact_frame_pointer_storage` answers it --
+        // see the tests beside it in `r2source`.
+        let func = frame_pop_function("callee_frame_carrier", 0);
+        assert_eq!(live_storages(&func, &[storage(0, 8)]), vec![storage(0, 8)]);
+    }
+
+    #[test]
+    fn a_frame_pointer_restore_is_live_from_each_return_it_reaches() {
+        for split in [false, true] {
+            let func = predecessor_frame_restore_function(0, split);
+            assert_eq!(
+                live_storages(&func, &[storage(0, 8)]),
+                vec![storage(0, 8)],
+                "one restore in a predecessor answers every return below it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_pointer_restore_at_another_storage_is_not_live() {
+        // The chain exists but writes a different register, so the storage the
+        // interface named has no definition and the block is unresolved.
+        let func = frame_pop_function("frame_pointer", 0x20);
+        let graph = SsaGraph::from_function(&func);
+        let live = FunctionLiveOut::compute(&func, &graph, &[storage(0, 8)]);
+        assert!(live.is_empty(), "{live:?}");
+        assert_eq!(live.unresolved_blocks().collect::<Vec<_>>(), vec![0x1000]);
+    }
+
+    #[test]
+    fn frame_pointer_liveness_is_carrier_name_independent() {
+        assert_eq!(
+            live_storages(
+                &frame_pop_function("ordinary_saved_base", 0),
+                &[storage(0, 8)]
+            ),
+            live_storages(
+                &frame_pop_function("unrelated_display_name", 0),
+                &[storage(0, 8)]
+            )
+        );
+    }
 }

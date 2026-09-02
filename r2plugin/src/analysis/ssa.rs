@@ -254,10 +254,6 @@ struct SSAOptStatsJson {
     sccp_blocks_removed: usize,
     constants_propagated: usize,
     ops_simplified: usize,
-    copies_propagated: usize,
-    phis_simplified: usize,
-    dce_removed_ops: usize,
-    dce_removed_phis: usize,
 }
 
 #[derive(Serialize)]
@@ -299,10 +295,6 @@ pub(crate) fn r2ssa_function_opt_json(
             sccp_blocks_removed: stats.sccp_blocks_removed,
             constants_propagated: stats.constants_propagated,
             ops_simplified: stats.ops_simplified,
-            copies_propagated: stats.copies_propagated,
-            phis_simplified: stats.phis_simplified,
-            dce_removed_ops: stats.dce_removed_ops,
-            dce_removed_phis: stats.dce_removed_phis,
         },
         function: build_ssa_function_json(&ssa_func),
     };
@@ -782,10 +774,6 @@ mod tests {
                 sccp_blocks_removed: 0,
                 constants_propagated: 0,
                 ops_simplified: 0,
-                copies_propagated: 0,
-                phis_simplified: 0,
-                dce_removed_ops: 0,
-                dce_removed_phis: 0,
             },
             function: function_body_with_one_op(),
         })
