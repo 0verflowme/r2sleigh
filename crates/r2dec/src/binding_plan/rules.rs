@@ -14,9 +14,10 @@
 //! rejects a plan that is correct. So the rules live here, once, and both
 //! derivations call them while keeping their own traversals.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use r2ssa::{SsaGraph, ValueId};
+use r2ssa::ledger::ElisionReason;
+use r2ssa::{InstId, SsaGraph, UseSite, ValueId};
 use r2types::SourceOwnedFunctionFacts;
 
 use super::{
@@ -361,7 +362,13 @@ pub(super) fn inlinable_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId>
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
     }
-    let elided_reads = certified_elided_read_instructions(source);
+    // One statement of which reads the certificates elide, shared with the
+    // observation journal. A certificate the cells cannot be built from is a
+    // function the journal will refuse, so there is nothing to fold for.
+    let Ok(cells) = certificate_elided_cells(source, &projection) else {
+        return BTreeSet::new();
+    };
+    let elided_reads = cells.read_elided_instructions;
     let mut inlinable = BTreeSet::new();
     for value in &graph.values {
         let [use_site] = graph.use_sites(value.id) else {
@@ -497,4 +504,282 @@ fn expression_renders_inline(kind: &r2ssa::MachineExprKind) -> bool {
             | Kind::Select { .. }
             | Kind::Shift { .. }
     )
+}
+
+/// The use and write cells the upstream certificates answer for before any
+/// statement is rendered.
+///
+/// This is one statement of the rule, read by every consumer that has to agree
+/// with it: the observation journal seeds its cells from `uses` and `writes`
+/// and refuses a rendered marker that contradicts them; the binding plan
+/// refuses to fold a value into a read listed in `read_elided_instructions`,
+/// because a value folded into a read that never appears loses its rendered
+/// occurrence; and a rewrite must leave an instruction alone when a
+/// certificate has already said what it renders. Two independently written
+/// statements of which cells a certificate elides were two answerers that could
+/// drift, and when they drift the seal rejects a plan that is correct.
+///
+/// The two views are deliberately not one set. The journal needs the reason
+/// per use, and is exact per operand: a machine return control certificate
+/// elides only the operand sites it names, and a stack-geometry operand that is
+/// also a memory address keeps its rendered occurrence. The binding plan needs
+/// only to know that an instruction's reads are not rendered, and it is asked
+/// per instruction, including instructions -- a dead frame-slot store -- whose
+/// cells the effect ledger answers for rather than these maps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CertificateElidedCells {
+    pub(crate) uses: BTreeMap<UseSite, ElisionReason>,
+    pub(crate) writes: BTreeMap<InstId, ElisionReason>,
+    pub(crate) read_elided_instructions: BTreeSet<InstId>,
+}
+
+/// Why the certificates could not be turned into cells.
+///
+/// Each variant names the same condition the observation journal reports for
+/// it; the journal maps these onto its own error type without reinterpreting
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertificateElidedCellsError {
+    InvalidWrite(InstId),
+    InvalidValue(ValueId),
+    ConflictingUse(UseSite),
+    ConflictingWrite(InstId),
+}
+
+fn insert_elided_use(
+    uses: &mut BTreeMap<UseSite, ElisionReason>,
+    site: UseSite,
+    reason: ElisionReason,
+) -> Result<(), CertificateElidedCellsError> {
+    match uses.insert(site, reason) {
+        Some(existing) if existing != reason => {
+            Err(CertificateElidedCellsError::ConflictingUse(site))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn insert_elided_write(
+    writes: &mut BTreeMap<InstId, ElisionReason>,
+    inst: InstId,
+    reason: ElisionReason,
+) -> Result<(), CertificateElidedCellsError> {
+    match writes.insert(inst, reason) {
+        Some(existing) if existing != reason => {
+            Err(CertificateElidedCellsError::ConflictingWrite(inst))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The cells the certificates of `source` elide, in the order the certificates
+/// are consulted.
+///
+/// Order matters where domains overlap: an earlier machine or frame
+/// certificate wins deterministically, and the unobserved-value domain only
+/// fills cells nothing earlier has claimed. The `projection` is the machine
+/// projection the plan was built from; it decides which stack-geometry
+/// operands are memory addresses that keep their own rendered occurrence.
+pub(crate) fn certificate_elided_cells(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+) -> Result<CertificateElidedCells, CertificateElidedCellsError> {
+    let graph = source.graph();
+    let certificates = source.certificates();
+    let mut uses = BTreeMap::new();
+    let mut writes = BTreeMap::new();
+    for certificate in certificates.stack_frame_round_trips.values() {
+        for inst in &certificate.insts {
+            let definition = graph
+                .inst(*inst)
+                .ok_or(CertificateElidedCellsError::InvalidWrite(*inst))?;
+            for input_idx in 0..definition.inputs.len() {
+                let site = UseSite {
+                    inst: *inst,
+                    input_idx,
+                };
+                insert_elided_use(&mut uses, site, ElisionReason::StackFrame)?;
+            }
+            if definition.output.is_some() {
+                insert_elided_write(&mut writes, *inst, ElisionReason::StackFrame)?;
+            }
+        }
+    }
+    for certificate in certificates.machine_return_controls.values() {
+        for site in &certificate.uses {
+            insert_elided_use(&mut uses, *site, ElisionReason::ReturnControl)?;
+        }
+        for inst in &certificate.insts {
+            let definition = graph
+                .inst(*inst)
+                .ok_or(CertificateElidedCellsError::InvalidWrite(*inst))?;
+            if definition.output.is_some() {
+                insert_elided_write(&mut writes, *inst, ElisionReason::ReturnControl)?;
+            }
+        }
+    }
+    for site in &certificates.stack_geometry.uses {
+        // A stack-root value has no standalone C occurrence, but an exact
+        // stack-object address operand still has its own contextual per-use
+        // projection. The value and use ledgers are independent: seed only
+        // geometry uses that disappear with their defining operation, and let
+        // the rendered memory-address marker account for the surviving
+        // operand.
+        if matches!(
+            projection.use_disposition(*site),
+            Some(r2ssa::MachineUseDisposition::MemoryAddress(_))
+        ) {
+            continue;
+        }
+        insert_elided_use(&mut uses, *site, ElisionReason::DeadStackBase)?;
+    }
+    for inst in &certificates.stack_geometry.insts {
+        let definition = graph
+            .inst(*inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(*inst))?;
+        if definition.output.is_some() {
+            insert_elided_write(&mut writes, *inst, ElisionReason::DeadStackBase)?;
+        }
+    }
+    // The SSA liveness owner publishes the complete pure domain outside the
+    // transitive observation slice. Seed non-phi operations here; dead merges
+    // keep their more specific reason below. Earlier machine/frame
+    // certificates win deterministically when domains overlap.
+    let unobserved = source.unobserved_merges();
+    for site in unobserved.unobserved_uses() {
+        if graph
+            .inst(site.inst)
+            .is_some_and(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+        {
+            continue;
+        }
+        uses.entry(*site).or_insert(ElisionReason::UnobservedValue);
+    }
+    for inst in unobserved.unobserved_insts() {
+        let definition = graph
+            .inst(*inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(*inst))?;
+        if matches!(definition.payload, r2ssa::InstPayload::Phi { .. }) {
+            continue;
+        }
+        if definition.output.is_some() {
+            writes
+                .entry(*inst)
+                .or_insert(ElisionReason::UnobservedValue);
+        }
+    }
+    for value in unobserved.iter() {
+        let inst = graph
+            .def_inst(value)
+            .ok_or(CertificateElidedCellsError::InvalidValue(value))?;
+        let definition = graph
+            .inst(inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(inst))?;
+        if !matches!(definition.payload, r2ssa::InstPayload::Phi { .. })
+            || definition.output != Some(value)
+        {
+            return Err(CertificateElidedCellsError::InvalidWrite(inst));
+        }
+        writes.insert(inst, ElisionReason::UnobservedMerge);
+        for input_idx in 0..definition.inputs.len() {
+            uses.insert(UseSite { inst, input_idx }, ElisionReason::UnobservedMerge);
+        }
+    }
+    for site in super::certified_return_control_sites(source) {
+        // A merge the analysis already answered for keeps its answer. The link
+        // register reaches a return through phis that merge it with itself,
+        // and once the certificate covers the register those phi operands are
+        // named twice -- as an unobserved merge and as return control. Both
+        // say the same thing, and calling that a conflict refused every
+        // function whose return address survives a branch.
+        if uses.get(&site) == Some(&ElisionReason::UnobservedMerge) {
+            continue;
+        }
+        insert_elided_use(&mut uses, site, ElisionReason::ReturnControl)?;
+    }
+    // Instructions the certificate took over from the prologue are shared with
+    // whatever else describes them: one `stp x29, x30` is the frame's setup and
+    // the return address's save at once, and one save serves every return.
+    // Where such an instruction is already accounted for, that account stands;
+    // both say it renders nothing, and treating the second one as a
+    // contradiction refused the whole function.
+    let shared = super::certified_return_control_absorbed_insts(source);
+    for inst in super::certified_return_control_insts(source) {
+        let definition = graph
+            .inst(inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(inst))?;
+        if shared.contains(&inst) {
+            if definition.output.is_some() {
+                writes.entry(inst).or_insert(ElisionReason::ReturnControl);
+            }
+            for input_idx in 0..definition.inputs.len() {
+                uses.entry(UseSite { inst, input_idx })
+                    .or_insert(ElisionReason::ReturnControl);
+            }
+            continue;
+        }
+        if definition.output.is_some() {
+            insert_elided_write(&mut writes, inst, ElisionReason::ReturnControl)?;
+        }
+        // The instruction renders nothing, so it reads nothing. Its write was
+        // already accounted on that ground and its operands stand on the same
+        // one: an occurrence inside a statement no structured form emits is
+        // not a read. On AArch64 the return address arrives through a copy of
+        // the link register and the copy's operand is control-only in its own
+        // right, so this was never needed; on amd64 `ret` lifts to a load of
+        // the return address through the stack pointer, and the stack pointer
+        // is read elsewhere for ordinary reasons, so nothing else could ever
+        // close that cell.
+        for input_idx in 0..definition.inputs.len() {
+            insert_elided_use(
+                &mut uses,
+                UseSite { inst, input_idx },
+                ElisionReason::ReturnControl,
+            )?;
+        }
+    }
+    for site in super::certified_direct_control_target_sites(source) {
+        insert_elided_use(&mut uses, site, ElisionReason::DirectControlTarget)?;
+    }
+    // A direct call names its callee. The name comes from the symbol table,
+    // not from any object the function holds, so the operand's occurrence is
+    // not a read and the value it names is elided beside it.
+    for site in super::certified_direct_call_target_sites(source) {
+        insert_elided_use(&mut uses, site, ElisionReason::DirectCallTarget)?;
+    }
+    for inst in super::certified_call_return_address_insts(source) {
+        let definition = graph
+            .inst(inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(inst))?;
+        if definition.output.is_some() {
+            insert_elided_write(&mut writes, inst, ElisionReason::CallReturnAddress)?;
+        }
+        for input_idx in 0..definition.inputs.len() {
+            insert_elided_use(
+                &mut uses,
+                UseSite { inst, input_idx },
+                ElisionReason::CallReturnAddress,
+            )?;
+        }
+    }
+    for inst in super::certified_direct_call_target_insts(source) {
+        let definition = graph
+            .inst(inst)
+            .ok_or(CertificateElidedCellsError::InvalidWrite(inst))?;
+        if definition.output.is_some() {
+            insert_elided_write(&mut writes, inst, ElisionReason::DirectCallTarget)?;
+        }
+        for input_idx in 0..definition.inputs.len() {
+            insert_elided_use(
+                &mut uses,
+                UseSite { inst, input_idx },
+                ElisionReason::DirectCallTarget,
+            )?;
+        }
+    }
+    Ok(CertificateElidedCells {
+        uses,
+        writes,
+        read_elided_instructions: certified_elided_read_instructions(source),
+    })
 }

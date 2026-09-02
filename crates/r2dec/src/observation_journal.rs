@@ -179,6 +179,18 @@ pub(crate) enum LegacyObservationJournalError {
     Markers(RenderObservationStripError),
 }
 
+impl From<crate::binding_plan::CertificateElidedCellsError> for LegacyObservationJournalError {
+    fn from(error: crate::binding_plan::CertificateElidedCellsError) -> Self {
+        use crate::binding_plan::CertificateElidedCellsError as Cells;
+        match error {
+            Cells::InvalidWrite(inst) => Self::InvalidWrite(inst),
+            Cells::InvalidValue(value) => Self::InvalidValue(value),
+            Cells::ConflictingUse(site) => Self::ConflictingUse(site),
+            Cells::ConflictingWrite(inst) => Self::ConflictingWrite(inst),
+        }
+    }
+}
+
 impl From<&r2ssa::MachineBuildError> for BindingMachineProjectionFailure {
     fn from(error: &r2ssa::MachineBuildError) -> Self {
         use r2ssa::MachineBuildError as Error;
@@ -1617,265 +1629,20 @@ impl LegacyObservationJournal {
                 .then_some(value)
             })
             .collect::<Vec<_>>();
-        let mut elided_uses =
-            std::collections::BTreeMap::<UseSite, r2ssa::ledger::ElisionReason>::new();
-        let mut elided_writes =
-            std::collections::BTreeMap::<InstId, r2ssa::ledger::ElisionReason>::new();
-        for certificate in source
-            .source()
-            .certificates()
-            .stack_frame_round_trips
-            .values()
-        {
-            for inst in &certificate.insts {
-                let Some(definition) = graph.inst(*inst) else {
-                    return Err(LegacyObservationJournalError::InvalidWrite(*inst));
-                };
-                for input_idx in 0..definition.inputs.len() {
-                    let site = UseSite {
-                        inst: *inst,
-                        input_idx,
-                    };
-                    match elided_uses.insert(site, r2ssa::ledger::ElisionReason::StackFrame) {
-                        Some(r2ssa::ledger::ElisionReason::StackFrame) | None => {}
-                        Some(_) => {
-                            return Err(LegacyObservationJournalError::ConflictingUse(site));
-                        }
-                    }
-                }
-                if definition.output.is_some() {
-                    match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::StackFrame) {
-                        Some(r2ssa::ledger::ElisionReason::StackFrame) | None => {}
-                        Some(_) => {
-                            return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
-                        }
-                    }
-                }
-            }
-        }
-        for certificate in source
-            .source()
-            .certificates()
-            .machine_return_controls
-            .values()
-        {
-            for site in &certificate.uses {
-                match elided_uses.insert(*site, r2ssa::ledger::ElisionReason::ReturnControl) {
-                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
-                    Some(_) => {
-                        return Err(LegacyObservationJournalError::ConflictingUse(*site));
-                    }
-                }
-            }
-            for inst in &certificate.insts {
-                let Some(definition) = graph.inst(*inst) else {
-                    return Err(LegacyObservationJournalError::InvalidWrite(*inst));
-                };
-                if definition.output.is_some() {
-                    match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::ReturnControl) {
-                        Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
-                        Some(_) => {
-                            return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
-                        }
-                    }
-                }
-            }
-        }
-        for site in &source.source().certificates().stack_geometry.uses {
-            // A stack-root value has no standalone C occurrence, but an exact
-            // stack-object address operand still has its own contextual
-            // per-use projection.  The value and use ledgers are independent:
-            // seed only geometry uses that disappear with their defining
-            // operation, and let the rendered memory-address marker account
-            // for the surviving operand.
-            if matches!(
-                self.plan.use_disposition(*site),
-                Some(MachineUseDisposition::MemoryAddress(_))
-            ) {
-                continue;
-            }
-            match elided_uses.insert(*site, r2ssa::ledger::ElisionReason::DeadStackBase) {
-                Some(r2ssa::ledger::ElisionReason::DeadStackBase) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(*site)),
-            }
-        }
-        for inst in &source.source().certificates().stack_geometry.insts {
-            let Some(definition) = graph.inst(*inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(*inst));
-            };
-            if definition.output.is_some() {
-                match elided_writes.insert(*inst, r2ssa::ledger::ElisionReason::DeadStackBase) {
-                    Some(r2ssa::ledger::ElisionReason::DeadStackBase) | None => {}
-                    Some(_) => {
-                        return Err(LegacyObservationJournalError::ConflictingWrite(*inst));
-                    }
-                }
-            }
-        }
-        // The SSA liveness owner publishes the complete pure domain outside
-        // the transitive observation slice.  Seed non-phi operations here;
-        // dead merges retain their more specific reason below.  Earlier
-        // machine/frame certificates win deterministically when domains
-        // overlap.
-        for site in source.source().unobserved_merges().unobserved_uses() {
-            if source
-                .source()
-                .graph()
-                .inst(site.inst)
-                .is_some_and(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
-            {
-                continue;
-            }
-            elided_uses
-                .entry(*site)
-                .or_insert(r2ssa::ledger::ElisionReason::UnobservedValue);
-        }
-        for inst in source.source().unobserved_merges().unobserved_insts() {
-            let Some(definition) = graph.inst(*inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(*inst));
-            };
-            if matches!(definition.payload, r2ssa::InstPayload::Phi { .. }) {
-                continue;
-            }
-            if definition.output.is_some() {
-                elided_writes
-                    .entry(*inst)
-                    .or_insert(r2ssa::ledger::ElisionReason::UnobservedValue);
-            }
-        }
-        for value in source.source().unobserved_merges().iter() {
-            let Some(inst) = graph.def_inst(value) else {
-                return Err(LegacyObservationJournalError::InvalidValue(value));
-            };
-            let Some(definition) = graph.inst(inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(inst));
-            };
-            if !matches!(definition.payload, r2ssa::InstPayload::Phi { .. })
-                || definition.output != Some(value)
-            {
-                return Err(LegacyObservationJournalError::InvalidWrite(inst));
-            }
-            elided_writes.insert(inst, r2ssa::ledger::ElisionReason::UnobservedMerge);
-            for input_idx in 0..definition.inputs.len() {
-                elided_uses.insert(
-                    UseSite { inst, input_idx },
-                    r2ssa::ledger::ElisionReason::UnobservedMerge,
-                );
-            }
-        }
-        for site in crate::binding_plan::certified_return_control_sites(source.source()) {
-            // A merge the analysis already answered for keeps its answer. The
-            // link register reaches a return through phis that merge it with
-            // itself, and once the certificate covers the register those phi
-            // operands are named twice -- as an unobserved merge and as return
-            // control. Both say the same thing, and calling that a conflict
-            // refused every function whose return address survives a branch.
-            if elided_uses.get(&site) == Some(&r2ssa::ledger::ElisionReason::UnobservedMerge) {
-                continue;
-            }
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::ReturnControl) {
-                Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-            }
-        }
-        // Instructions the certificate took over from the prologue are shared
-        // with whatever else describes them: one `stp x29, x30` is the frame's
-        // setup and the return address's save at once, and one save serves
-        // every return. Where such an instruction is already accounted for,
-        // that account stands; both say it renders nothing, and treating the
-        // second one as a contradiction refused the whole function.
-        let shared = crate::binding_plan::certified_return_control_absorbed_insts(source.source());
-        for inst in crate::binding_plan::certified_return_control_insts(source.source()) {
-            let Some(definition) = graph.inst(inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(inst));
-            };
-            if shared.contains(&inst) {
-                if definition.output.is_some() {
-                    elided_writes
-                        .entry(inst)
-                        .or_insert(r2ssa::ledger::ElisionReason::ReturnControl);
-                }
-                for input_idx in 0..definition.inputs.len() {
-                    elided_uses
-                        .entry(UseSite { inst, input_idx })
-                        .or_insert(r2ssa::ledger::ElisionReason::ReturnControl);
-                }
-                continue;
-            }
-            if definition.output.is_some() {
-                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::ReturnControl) {
-                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
-                }
-            }
-            // The instruction renders nothing, so it reads nothing. Its write
-            // was already accounted on that ground and its operands stand on
-            // the same one: an occurrence inside a statement no structured
-            // form emits is not a read. On AArch64 the return address arrives
-            // through a copy of the link register and the copy's operand is
-            // control-only in its own right, so this was never needed; on
-            // amd64 `ret` lifts to a load of the return address through the
-            // stack pointer, and the stack pointer is read elsewhere for
-            // ordinary reasons, so nothing else could ever close that cell.
-            for input_idx in 0..definition.inputs.len() {
-                let site = UseSite { inst, input_idx };
-                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::ReturnControl) {
-                    Some(r2ssa::ledger::ElisionReason::ReturnControl) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-                }
-            }
-        }
-        for site in crate::binding_plan::certified_direct_control_target_sites(source.source()) {
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectControlTarget) {
-                Some(r2ssa::ledger::ElisionReason::DirectControlTarget) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-            }
-        }
-        // A direct call names its callee. The name comes from the symbol
-        // table, not from any object the function holds, so the operand's
-        // occurrence is not a read and the value it names is elided beside it.
-        for site in crate::binding_plan::certified_direct_call_target_sites(source.source()) {
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectCallTarget) {
-                Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-            }
-        }
-        for inst in crate::binding_plan::certified_call_return_address_insts(source.source()) {
-            let Some(definition) = graph.inst(inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(inst));
-            };
-            if definition.output.is_some() {
-                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CallReturnAddress) {
-                    Some(r2ssa::ledger::ElisionReason::CallReturnAddress) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
-                }
-            }
-            for input_idx in 0..definition.inputs.len() {
-                let site = UseSite { inst, input_idx };
-                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CallReturnAddress) {
-                    Some(r2ssa::ledger::ElisionReason::CallReturnAddress) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-                }
-            }
-        }
-        for inst in crate::binding_plan::certified_direct_call_target_insts(source.source()) {
-            let Some(definition) = graph.inst(inst) else {
-                return Err(LegacyObservationJournalError::InvalidWrite(inst));
-            };
-            if definition.output.is_some() {
-                match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::DirectCallTarget) {
-                    Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
-                }
-            }
-            for input_idx in 0..definition.inputs.len() {
-                let site = UseSite { inst, input_idx };
-                match elided_uses.insert(site, r2ssa::ledger::ElisionReason::DirectCallTarget) {
-                    Some(r2ssa::ledger::ElisionReason::DirectCallTarget) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
-                }
-            }
-        }
+        // The cells the certificates elide are one statement, shared with the
+        // binding plan: `binding_plan::certificate_elided_cells`. What follows
+        // are the cells only this journal can answer for -- the
+        // normalization's own phi-edge copies, the carriers the plan
+        // coalesced, the merges the plan made immutable, and the dispositions
+        // the plan refused.
+        let crate::binding_plan::CertificateElidedCells {
+            uses: mut elided_uses,
+            writes: mut elided_writes,
+            ..
+        } = crate::binding_plan::certificate_elided_cells(
+            source.source(),
+            self.plan.machine_projection(),
+        )?;
         for site in origins.noop_sites() {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge) {
                 Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}

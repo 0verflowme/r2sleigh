@@ -1000,6 +1000,9 @@ pub(crate) use name_resolution::{
     BindingNameResolution, BindingNameResolutionError, PlannedParameterSymbol, PlannedStackSymbol,
     PlannedValueSymbol, RenderedIdentityRefusal,
 };
+pub(crate) use rules::{
+    CertificateElidedCells, CertificateElidedCellsError, certificate_elided_cells,
+};
 pub(crate) use seal::build_upstream_shadow_oracle;
 
 #[cfg(test)]
