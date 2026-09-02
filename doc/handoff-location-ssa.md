@@ -7913,3 +7913,42 @@ regrow to that size within about forty minutes of active building, and deleting
 `target/*/incremental` in each tree reclaims twenty gigabytes in a second and
 costs only a slower next build. ENOSPC killed every tool in this session once
 before that was understood.
+
+**Where the machine-detail columns stand, and what each remaining one is
+waiting on.** All 54 cells pass raw, diagnostic, differential, binding audit,
+effect obligations, placement and render refusal throughout.
+
+    predicate                    start    now    what it waits on
+    same_type_casts               792       0    done
+    cast_chains                   752      27    four pointer round trips whose middle step is
+                                                 emitted by a site not yet calling
+                                                 `pointer_width_cast`
+    self_assignments              296     225    the rest are not merge edges; unmeasured which
+    literal_only_declarations     292     292    duplicable constants inlined at every reader,
+                                                 which needs the multiplicity rule
+    flag_carriers                 192     192    the carriers hold comparisons and are bound;
+                                                 widened inlining, not a rule
+    gotos (-O0)                   125     125    structuring, untouched this stretch
+    comma_conditions               17      17    loop-header collapse, which follows the
+                                                 inlining above
+
+Three facts worth carrying, each of which cost a measurement to learn.
+
+The cast noise was never in the arena. Ninety proven rewrite rules reach 3.7
+per cent of rendered casts, because 8008 of 10346 have no arena node behind
+them. They are spelled at the assignment and operand boundaries, and the fix
+was two rules in `CExpr::cast` -- one refusing to nest a cast inside an
+identical one, one collapsing adjacent conversions -- plus recording the
+address-width step as a `CastRole` at the four sites that spell it
+deliberately. A pointer converted to `uint64_t` and a `uint32_t` widened to
+`uint64_t` are indistinguishable afterwards, so the emitting site is the only
+honest source.
+
+The flag carriers are not flag arithmetic. The lifter emits the comparison
+directly, so `CF_2` holds `RAX_2 < tmp_3f800_2` and the eight flag-to-
+comparison rules fired seven times across the whole corpus. What keeps the
+carrier on the page is that the value is bound.
+
+`ElisionReason::CoalescedImmutablePhi` fires zero times in production, against
+65 for the carrier path, measured across all 54 cells. It is live only in its
+own unit test, so it is not a precedent for anything.
