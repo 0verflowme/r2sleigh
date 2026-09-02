@@ -5377,10 +5377,36 @@ fn restate_string_conversions_in_expr(
         *expr = crate::ast::carry_all_expr_observations(&source, restated);
         return;
     }
+    // A literal that the fold above rewrote, or that the renderer will spell
+    // as the negative it stands for, carries no type of its own. `-0x4` is an
+    // `int` whatever value it denotes, so reading it as a `uint64_t` is a
+    // signedness-changing conversion; the constant fold produces exactly that
+    // when it collapses a mask, after every conversion has been decided.
+    if let Some(required) = required
+        && crate::fold::op_lower::convert::literal_renders_as_signed(expr)
+        && crate::fold::op_lower::convert::is_unsigned_integer(required, pointer_bits)
+    {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        let restated = CExpr::cast(required.clone(), source.clone());
+        *expr = crate::ast::carry_all_expr_observations(&source, restated);
+        return;
+    }
     // An assignment tells its right-hand side what is wanted: the type of
-    // the object being written.
+    // the object being written. A compound assignment says the same thing:
+    // `x &= m` converts `m` to x's type exactly as `x = x & m` would.
     if let CExpr::Binary {
-        op: BinaryOp::Assign,
+        op:
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+            | BinaryOp::ShlAssign
+            | BinaryOp::ShrAssign,
         left,
         right,
     } = expr
@@ -5413,9 +5439,18 @@ fn restate_string_conversions_in_expr(
                 | BinaryOp::BitXor
         )
     {
+        // Only an address is given a requirement here. The operator's own
+        // operand rule was settled when the expression was built, and
+        // restating it from this pass -- which knows the address width and
+        // nothing else -- would widen a narrow computation to the address
+        // width and change what it computes.
         let address = CType::uint(pointer_bits);
-        restate_string_conversions_in_expr(left, pointer_bits, Some(&address), symbols);
-        restate_string_conversions_in_expr(right, pointer_bits, Some(&address), symbols);
+        for operand in [left, right] {
+            let wanted = substituted_address_under_conversions(operand)
+                .is_some()
+                .then_some(&address);
+            restate_string_conversions_in_expr(operand, pointer_bits, wanted, symbols);
+        }
         return;
     }
     let taken = std::mem::replace(expr, CExpr::IntLit(0));

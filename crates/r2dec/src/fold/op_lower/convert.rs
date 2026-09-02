@@ -137,6 +137,16 @@ fn spell_constant(expr: CExpr, to: &CType, pointer_bits: u32) -> CExpr {
     respelled
 }
 
+/// Whether this expression is a literal whose rendering is a signed constant.
+pub(crate) fn literal_renders_as_signed(expr: &CExpr) -> bool {
+    renders_as_signed(expr)
+}
+
+/// Whether a type is an unsigned integer C would convert to.
+pub(crate) fn is_unsigned_integer(ty: &CType, pointer_bits: u32) -> bool {
+    matches!(integer_meta(ty, pointer_bits), Some((false, _)))
+}
+
 /// Whether the rendered form of this literal is a signed constant.
 ///
 /// `codegen` prints a high unsigned value as the negative it stands for,
