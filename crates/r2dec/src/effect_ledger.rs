@@ -162,7 +162,7 @@ fn upstream_zero_occurrence_outcome(
             SemanticObligationKind::LoopCarriedState | SemanticObligationKind::LiveValueProducer
         )
     {
-        return Outcome::Elided(ElisionReason::CoalescedCarrierPhi);
+        return Outcome::Elided(ElisionReason::CoalescedIdentityPhi);
     }
     if id.kind == SemanticObligationKind::LiveStateTransition
         && prepared
@@ -172,7 +172,7 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|obligation| obligation.edge_use)
             .is_some_and(|site| effects.is_coalesced_carrier_use(site))
     {
-        return Outcome::Elided(ElisionReason::CoalescedCarrierEdge);
+        return Outcome::Elided(ElisionReason::CoalescedEdgeCopy);
     }
 
     if let Some(inst) = source_inst

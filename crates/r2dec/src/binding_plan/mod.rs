@@ -1026,6 +1026,18 @@ pub(crate) use name_resolution::{
 pub(crate) use rules::{
     CertificateElidedCells, CertificateElidedCellsError, certificate_elided_cells,
 };
+
+impl BindingPlan {
+    /// Merges that perform nothing because every edge carries their own
+    /// binding. Named by the plan, because a merge's identity is a plan fact,
+    /// and re-derived by the seal from its own components.
+    pub(crate) fn identity_merges(&self, graph: &r2ssa::SsaGraph) -> BTreeSet<ValueId> {
+        rules::identity_merge_values(graph, |value| match self.disposition(value) {
+            Some(ValueDisposition::Bound { binding }) => Some(binding.0),
+            _ => None,
+        })
+    }
+}
 pub(crate) use seal::build_upstream_shadow_oracle;
 
 #[cfg(test)]

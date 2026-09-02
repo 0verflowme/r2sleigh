@@ -791,3 +791,53 @@ pub(crate) fn certificate_elided_cells(
         read_elided_instructions: certified_elided_read_instructions(source),
     })
 }
+
+/// Merges that have no C operation of their own because every edge is an
+/// identity.
+///
+/// A materialised merge edge whose incoming value and the merge's output are
+/// one renderer binding renders as `x = x`. When every edge of a merge is like
+/// that, the merge performs nothing: whatever wrote the binding has already
+/// written it.
+///
+/// The merge's value stays `Bound` all the same, because its readers need a
+/// name and the plan is what promises one. What the merge loses is a statement
+/// of its own, not an object. Saying it were elided would make the ledger
+/// claim the opposite of what happens: the value is rendered, under the
+/// binding's name, by whatever wrote that binding.
+///
+/// `group_of` names whichever object a value belongs to on the caller's side --
+/// the plan passes its `BindingId`, the seal its own component index. The
+/// question is whether two values share one object, not what that object is
+/// called, so neither derivation has to agree with the other about names in
+/// order to agree about the answer.
+///
+/// A version-0 input is excluded, mirroring the journal's own exclusion: such
+/// an input has no defining statement, so its edge copy is the only place the
+/// value is written and is therefore rendered.
+pub(super) fn identity_merge_values(
+    graph: &SsaGraph,
+    group_of: impl Fn(ValueId) -> Option<u32>,
+) -> BTreeSet<ValueId> {
+    let mut merges = BTreeSet::new();
+    for inst in &graph.insts {
+        if !matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) || inst.inputs.is_empty() {
+            continue;
+        }
+        let Some(output) = inst.output else {
+            continue;
+        };
+        let Some(output_group) = group_of(output) else {
+            continue;
+        };
+        if inst.inputs.iter().all(|input| {
+            group_of(*input) == Some(output_group)
+                && graph
+                    .value(*input)
+                    .is_some_and(|value| value.var.version != 0)
+        }) {
+            merges.insert(output);
+        }
+    }
+    merges
+}
