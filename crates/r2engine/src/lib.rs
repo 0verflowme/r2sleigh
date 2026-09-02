@@ -4145,6 +4145,7 @@ impl EngineSession {
                 None,
             );
         }
+        let output = with_phase_timing_comment(output, &metrics);
         EngineDecompileResponse {
             output,
             binding_audit,
@@ -5099,6 +5100,67 @@ fn decompiler_input_for_engine_request(request: &EngineDecompileRequest) -> r2de
     r2dec::DecompilerInput::new(request.source_owned_facts.clone())
 }
 
+/// The measured cost of one decompile, per phase, appended to the rendered
+/// output when `R2SLEIGH_TIMING` is set.
+///
+/// The engine has recorded a complete phase inventory since it was written and
+/// no reachable command printed it, so a decompile could be timed only from
+/// outside the process, which measures radare2's analysis and the plugin load
+/// along with it. A refusal is timed too: refusing has to be cheaper than
+/// rendering, and a four-second refusal is exactly the case that measurement
+/// from outside could not distinguish from a slow render.
+///
+/// A phase the boundary did not execute is omitted; `folded` says the phase ran
+/// inside another phase's span, which is not the same as free.
+fn phase_timing_comment(metrics: &EngineMetrics) -> Option<String> {
+    std::env::var_os("R2SLEIGH_TIMING")?;
+    Some(format_phase_timing(metrics))
+}
+
+/// The comment's text, separate from the decision to emit it, so the format is
+/// testable without a process-global environment variable.
+fn format_phase_timing(metrics: &EngineMetrics) -> String {
+    let mut measured = String::new();
+    let mut total_us = 0u64;
+    // `EnginePhase::ALL` order, so two runs of one function print one line.
+    for timing in &metrics.phase_timings {
+        match timing.status {
+            EnginePhaseStatus::NotExecuted => continue,
+            EnginePhaseStatus::Executed => {
+                total_us = total_us.saturating_add(timing.elapsed_us);
+                measured.push_str(&format!(
+                    " {}={}us",
+                    timing.phase.as_str(),
+                    timing.elapsed_us
+                ));
+            }
+            EnginePhaseStatus::Folded => {
+                measured.push_str(&format!(" {}=folded", timing.phase.as_str()));
+            }
+            EnginePhaseStatus::Refused => {
+                measured.push_str(&format!(" {}=refused", timing.phase.as_str()));
+            }
+        }
+    }
+    format!("/* r2dec timing: measured={total_us}us{measured} */")
+}
+
+/// Append the timing comment to a rendered body, or leave it exactly as it was.
+fn with_phase_timing_comment(output: String, metrics: &EngineMetrics) -> String {
+    match phase_timing_comment(metrics) {
+        Some(comment) => {
+            let mut output = output;
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&comment);
+            output.push('\n');
+            output
+        }
+        None => output,
+    }
+}
+
 fn refused_decompile_response(
     function_name: &str,
     reason: &str,
@@ -5167,6 +5229,7 @@ fn refused_decompile_response_with_metrics_and_audits(
     diagnostics.plan = route_diagnostics.plan;
     diagnostics.route_reason = route_diagnostics.route_reason;
     diagnostics.refusal = route_diagnostics.refusal;
+    let output = with_phase_timing_comment(output, &metrics);
     EngineDecompileResponse {
         output,
         binding_audit,
@@ -10988,5 +11051,59 @@ mod tests {
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
+    }
+
+    #[test]
+    fn phase_timing_reports_executed_phases_and_omits_the_rest() {
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Ssa,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(4_000),
+        );
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(11_500),
+        );
+        metrics.record_phase(
+            EnginePhase::Types,
+            EnginePhaseStatus::Folded,
+            Duration::default(),
+        );
+        let comment = format_phase_timing(&metrics);
+        assert_eq!(
+            comment,
+            "/* r2dec timing: measured=15500us ssa=4000us types=folded rendering=11500us */"
+        );
+        // A phase this boundary never ran says nothing, rather than claiming
+        // it cost nothing.
+        assert!(!comment.contains("symbolic"));
+    }
+
+    #[test]
+    fn phase_timing_survives_a_refusal_so_refusing_can_be_compared_with_rendering() {
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::SnapshotContext,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(120),
+        );
+        metrics.refuse_from(EnginePhase::LiftNormalize);
+        let comment = format_phase_timing(&metrics);
+        assert!(
+            comment.starts_with("/* r2dec timing: measured=120us"),
+            "{comment}"
+        );
+        assert!(comment.contains("lift_normalize=refused"), "{comment}");
+    }
+
+    #[test]
+    fn a_body_without_the_switch_is_returned_byte_for_byte() {
+        // The comment is opt-in, and every corpus gate compares bytes.
+        let body = "uint64_t sym__f(void)\n{\n    return 0;\n}\n".to_string();
+        let metrics = EngineMetrics::default();
+        unsafe { std::env::remove_var("R2SLEIGH_TIMING") };
+        assert_eq!(with_phase_timing_comment(body.clone(), &metrics), body);
     }
 }
