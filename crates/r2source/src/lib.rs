@@ -491,6 +491,22 @@ impl OwnedFunctionImage {
     }
 }
 
+/// How control reaches the callee at an advisory call site.
+///
+/// A call comes back; a tail transfer does not, and the callee's return is
+/// the caller's. The two tail forms differ in what names the callee. A jump
+/// names its target directly, and the source's function map says the target
+/// is where a function starts. A jump through a loaded value is licensed by
+/// the relocation on the slot the value was loaded from, so the site's target
+/// address is then that slot rather than any code address, and the machine
+/// still has to show that the jump reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdvisoryCallTransfer {
+    Call,
+    TailJump,
+    TailSlot,
+}
+
 /// Advisory call metadata copied from the source snapshot. This projection
 /// does not claim exact call-site identity, so it cannot create a call
 /// certificate. It is retained only for diagnostics and future comparison
@@ -499,6 +515,7 @@ impl OwnedFunctionImage {
 pub struct AdvisoryCallSite {
     instruction_address: u64,
     target_address: u64,
+    transfer: AdvisoryCallTransfer,
     /// What radare2 calls the target. Absent when it has no name for it.
     ///
     /// This spells the call in rendered output and nothing more: it is not
@@ -537,6 +554,12 @@ impl AdvisoryCallSite {
 
     pub const fn target_address(&self) -> u64 {
         self.target_address
+    }
+
+    /// How control reaches the callee: by a call, or by a jump that never
+    /// comes back.
+    pub const fn transfer(&self) -> AdvisoryCallTransfer {
+        self.transfer
     }
 
     /// What radare2 calls the target, when it has a name for it.
