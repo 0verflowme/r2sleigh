@@ -1026,8 +1026,13 @@ def _score_machine_noise(source: str, config: str) -> dict[str, Any]:
         "self_assignments": len(SELF_ASSIGN_RE.findall(source)),
         "literal_only_declarations": len(LITERAL_ONLY_DECL_RE.findall(source)),
         "same_type_casts": same_type_cast,
-        # Two adjacent casts can be required: a pointer narrowed to a smaller
-        # integer goes through the pointer's own width.  Three cannot.
+        # Two adjacent casts can be required and the comment here used to name
+        # only one reason for it, the pointer-width step a pointer takes on the
+        # way to a smaller integer.  There is a second: `(uint64_t)(uint32_t)x`
+        # truncates and then widens, which is two conversions and not a
+        # redundant one, and it is how a sub-register read reaches the C.  The
+        # code always allowed any pair; it was the comment that was too narrow.
+        # Three adjacent conversions have no such reading.
         "cast_chains": sum(1 for run in runs if len(run) >= 3),
         "comma_conditions": sum(
             1

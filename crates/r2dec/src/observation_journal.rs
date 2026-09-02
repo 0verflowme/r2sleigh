@@ -4709,10 +4709,7 @@ mod tests {
             .observe_normalized_input_expr(
                 site,
                 input_idx,
-                CExpr::Cast {
-                    ty: crate::ast::CType::machine_bits(64),
-                    expr: Box::new(CExpr::Var(symbol)),
-                },
+                CExpr::cast(crate::ast::CType::machine_bits(64), CExpr::Var(symbol)),
             )
             .expect("converted value marker");
         // The classification is also the check that a rendered name owns a
