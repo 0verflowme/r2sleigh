@@ -8113,3 +8113,207 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+
+## One conversion per type boundary: the types are stated once now
+
+**What was wrong.** Seven sites in the renderer each decided locally whether a
+cast was needed, and five of them decided it by looking at the text they had
+just produced -- whether a name `looks_like_pointer`, what type an
+`expr_type_hint` reads off an expression. Reading a type off the rendering is
+a defect rather than a style, because the rendering is the thing being
+decided: the answer changes with the spelling. It is also the mechanism behind
+the 3,395 same-type casts the new predicate found -- the read projection
+converted, then the assignment policy converted what the projection had
+spelled, then the next operand projection converted that.
+
+**What replaced it.** `r2rewrite::typed_boundaries` states, for every node of
+the machine arena, two things: what the expression that node renders *has*,
+and what the node *requires* of each operand. The operand rule is the
+operator's own -- the signedness a comparison, a shift or a division states,
+the unsigned width every other integer operator works in, the pointee for an
+address, the promoted `int` C computes narrow operands in. Signedness comes
+from the `interpretation` at a `Compare` and the `kind` at a `Shift`, never
+from the C operator about to be spelled. A leaf reads at the type the plan
+declared its object with, or at the type of the expression an inlined value
+stands for, so a value's declaration and its uses cannot disagree.
+
+`FoldingContext::convert` is the only emitter. It spells nothing where the two
+types are one, spells at most two casts -- the address-width step and the
+target -- and respells a constant in the type that reads it rather than
+casting it, because C types a constant by its value.
+`looks_like_pointer`, `expr_type_hint`, `cast_needed`, `cast_expr_to`,
+`cast_expr_if_needed`, both assignment policies and `RecordedType` are gone.
+
+**Measured, all fifty-four cells, against the new `same_type_casts`
+predicate.**
+
+    predicate                    before    after
+    same_type_casts               3395      185
+    cast_chains                      8        1
+    self_assignments               225      174
+    flag_carriers                  192      192
+    literal_only_declarations      103      103
+    comma_conditions                17       17
+    gotos                          125      125
+
+By configuration, the remaining 185 are `arm64_O0` 67, `x64_O0` 52,
+`arm64_O1` 38, `arm64_O2` 28, and **zero** at `x64_O1` and `x64_O2`. The one
+surviving cast chain is at `x64_O0`.
+
+Binding audit, effect obligations, placement audit and render refusal are
+54 of 54. The workspace suite is 2,203 tests green, up from 2,186, and every
+`r2rewrite` rule is still proven.
+
+**Two rules and a rule-side test.** `cast.extend_identity` -- an extension to
+the width its input already has -- is what lets `zext(zext(x))` collapse to
+one, proven at 8/16/32/64 like every other rule. The C sandwich
+`(uint64_t)(uint32_t)(uint64_t)x` needed no new rule: the driver
+canonicalises children first and the existing
+`cast.extract_of_extend_whole` removes the inner truncation, which
+`an_extension_sandwiched_in_its_own_truncation_is_one_extension` now records
+end to end.
+
+**A value's identity is the plan's answer, not the rendering's.** The journal
+classified a value by the shape of the C it was rendered as. A value the plan
+*inlines* was already exempt, with the reason written beside it -- the shape
+is not evidence. The same is true of a value the plan *binds*, and it was not
+exempt: one value is read at several places and the renderer spells each read
+as that place requires, so recovering the identity from each spelling makes it
+a function of the C. Two spellings then give one value two identities and the
+seal refuses with `ConflictingValue`. That refused **26 of 54 cells** the
+moment the redundant conversions went. `x` and `(uint64_t)x` were already
+handled by looking through casts, which is the same fix applied one shape at a
+time; `!x` inside a condition the structurer negated was the shape left over.
+A bound value is now classified by the symbol the plan gave it, provided the
+occurrence mentions that name -- which keeps a rendering that spells a bound
+value as a *constant* a conflict, because that one really does contradict the
+plan.
+
+**A late substitution changes a type, and the conversions above it have to be
+restated.** Two passes put an address where a number was: the string table and
+the object table. Everything above them was decided while the expression was a
+`uint64_t` constant, so `(char *)(uint64_t)"a string"` survived, and
+`uint64_t RDX_2 = &progName;` -- a pointer assigned to an integer with no
+conversion at all, because for a `uint64_t` constant into a `uint64_t` object
+the right answer had been *nothing*. The chain is now restated end to end
+through the one emitter, from what the address is to what the place required,
+and the place is asked even when it spells no cast. The corpus's own
+`-Wint-conversion` is what found the second shape.
+
+**Where the remaining twenty-three raw-compile failures are, and why one of
+them is a fork.**
+
+    error                                   count   status
+    -Wself-assign  (`x = x;`)                  18   design fork, below
+    -Wsign-conversion  int -> uint64_t          3   open, cause known
+    -Wint-conversion  uint64_t -> uint8_t *     2   open, cause known
+    -Wsign-compare  uint64_t vs int             1   open
+
+The three sign-conversion and one sign-compare failures are the same cause as
+the mask literal already fixed -- a constant that reaches the reader with no
+type of its own -- at sites the restatement walk does not reach yet. The two
+`-Wint-conversion` failures are a call result assigned to a pointer-declared
+object at a site where neither the callee's recorded signature nor the
+certificate names the value, so nothing states what the call produced.
+
+**The fork: what elision reason covers a copy whose two sides are one
+binding.** `x = x;` compiles only while a redundant cast hides it, which is
+why removing the casts turned 18 hidden self-assignments into hard errors. The
+statement performs nothing *because the plan bound both values to one object*,
+and the plan is the authority on that. `ElisionReason::CoalescedEdgeCopy`
+already says so in its own documentation -- "This was once restricted to a
+certified loop carrier, which is where the case was found rather than the
+reason it holds: what makes the copy say nothing is that both sides are one
+binding" -- and this stretch already widened it from certified carriers to any
+materialised merge edge, and from non-entry sources to entry ones, which took
+self-assignments from 225 to 174 and rendered `X1_0 = X1_0;` unnecessary in
+the merge cases. What is left is the copies that are not merge edges at all:
+real `Copy` instructions the plan coalesced.
+
+  * *Reuse `CoalescedEdgeCopy`.* Follows the reason the codebase already wrote
+    down, needs no schema change -- and misnames the case, because a plain
+    copy is not an edge, so the audits would report an edge elision where
+    there is no edge.
+  * *Add a reason, `CoalescedCopy`.* Names the case honestly and keeps the two
+    findings distinguishable in the ledger; costs an `ElisionReason` variant,
+    which appears in audit output and in blessed baselines.
+  * *Do not elide, and stop the plan coalescing across a real copy.* Keeps
+    every machine instruction answerable by a statement, at the cost of the
+    coalescing that removes the noise elsewhere -- and it is a bigger change
+    to the plan than to the ledger.
+  * *Do not elide, and keep a cast so `x = (uint64_t)x;` compiles.* Rejected
+    here rather than offered: it is a compensating workaround at the symptom,
+    and it is the thing this whole stretch removed.
+
+The first three are all defensible and the choice is long-lived, so it is put
+here rather than taken. This is the same fork this document has recorded once
+before, under the widening of merge-edge coalescing; it is now load-bearing,
+because it is the only thing between the corpus and a green raw column.
+
+**The benchmark says the casts were not what `byte_match` was measuring.**
+DecBench on `bzip2recover` at `-O0`, per function, r2sleigh before and after
+the typed-boundary work:
+
+    function        byte_match before -> after
+    endsInBz2            0.088 -> 0.085
+    mallocFail           0.161 -> 0.161
+    readError            0.214 -> 0.214
+    tooManyBlocks        0.156 -> 0.156
+    writeError           0.214 -> 0.214
+
+Unmoved. What the rendered C shows is why: the casts were never the bulk. For
+`readError`, four source statements become fourteen, and the fourteen are
+*bindings* -- a register-named local for every argument before the call --
+not conversions:
+
+    FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;
+    uint64_t RDX_2 = &progName;
+    char* RSI_1 = (char*)"%s: I/O error reading `%s' ...";
+    FILE* RDI_1 = RAX_1;
+    uint64_t RAX_3 = (uint64_t)sym_imp_fprintf(RDI_1, RSI_1, RDX_2);
+
+against `fprintf(stderr, "...", progName, inFileName)`. So the lever on
+`byte_match` is the inlining question -- why the plan binds a value with one
+reader instead of spelling it at that reader -- which is the `flag_carriers`
+and `literal_only_declarations` work, not this one. That is a correction to
+the premise this task was given, and it is worth carrying: removing 3,210
+redundant casts moved the semantic-correctness score by nothing.
+
+**The second fork: what type a global object is declared with.** `ast.rs`
+states the present decision beside the field and states it as a deliberate
+one -- "The type is deliberately not claimed: the body only ever takes the
+object's address, so an incomplete array of bytes declares exactly what is
+known". Every global therefore renders as `extern char name[]` and every read
+of one goes through the access width by hand, as `*(uint64_t *)&stderr` above.
+It is a fork rather than a bug because the standing decision that a type may
+be asserted from use evidence was made about *values*, whose scope is one
+function, while a global's scope is the program.
+
+  * *Keep the abstention.* Never asserts a type it cannot prove; costs a cast
+    and a dereference at every global read.
+  * *Declare the global at the width the evidence shows*, as
+    `declaration_type_for_stack_object` already does for stack slots, refusing
+    on disagreement. Reads become `stderr`. But r2sleigh renders one function
+    at a time, so two functions reading one global at two widths emit two
+    contradictory declarations of one name and nothing in a per-function
+    rendering can see the conflict; and the asserted type is knowingly not the
+    real one, since `stderr` is a `FILE *`.
+  * *Assert per rendering rather than per program* -- declare the width only
+    where this function reads the object as a scalar at one width. That is the
+    only scope a per-function decompiler has, and it makes two renderings of
+    one program disagree about a global, which is a new kind of statement for
+    this project.
+
+Worth knowing before choosing: the read compiles to the same load under all
+three, so `byte_match` should not move, and `type_match` is wrong under the
+first two alike because neither says `FILE *`.
+
+**An operational note that cost a measurement.** A corpus run was started
+while the tree was mid-edit; `locked_matrix.sh` built a half-edited tree, the
+build failed, and the matrix on disk was the *previous* run's, which read as
+"no change" rather than as an error. Delete `tests/corpus/artifacts/results/
+matrix.json` before a run, and do not edit the tree between starting
+`locked_matrix.sh` and its completion -- `run_matrix.sh` builds again under the
+lock, so an edit in that window is measured. That is the sixth reading this
+class of hazard has cost.
