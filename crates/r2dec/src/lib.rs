@@ -4887,14 +4887,7 @@ impl Decompiler {
         let used_objects: std::cell::RefCell<std::collections::BTreeSet<(String, u64)>> =
             std::cell::RefCell::new(std::collections::BTreeSet::new());
         crate::stage_timing::mark("structure");
-        if !pass_disabled("fold_constant_arithmetic") {
-            fold_constant_arithmetic_in_function(
-                &mut c_function,
-                strings,
-                data_symbols,
-                &used_objects,
-            );
-        }
+        fold_constant_arithmetic_in_function(&mut c_function, strings, data_symbols, &used_objects);
         c_function.extern_objects = used_objects.into_inner().into_iter().collect();
 
         if let Err(error) =
@@ -5202,30 +5195,6 @@ pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::
 ///
 /// A statement the fold built and the page does not show was removed by one of
 /// the passes that run after structuring, and there are a dozen of them. Naming
-/// Whether one C-tree rewrite pass is disabled for a bisect.
-///
-/// `R2DEC_DISABLE_PASSES` takes a comma-separated list of the names below. It
-/// exists to answer one question and then be deleted with the passes it gates:
-/// the proven rules in `r2rewrite` are meant to have made each of these
-/// unnecessary, and the evidence for that is a corpus whose every cell is
-/// byte-identical with the pass switched off. A pass whose removal moves output
-/// is a pass the rules do not cover, which is a finding rather than a licence
-/// to delete it.
-pub(crate) fn pass_disabled(name: &str) -> bool {
-    static DISABLED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    DISABLED
-        .get_or_init(|| {
-            std::env::var("R2DEC_DISABLE_PASSES")
-                .unwrap_or_default()
-                .split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect()
-        })
-        .iter()
-        .any(|disabled| disabled == name || disabled == "all")
-}
-
 /// Fold arithmetic between integer literals, and name the result when it names
 /// a string.
 ///
