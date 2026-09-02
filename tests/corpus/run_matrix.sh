@@ -15,24 +15,24 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gate)
             if [[ $# -lt 2 ]]; then
-                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, native-admission, or cutover" >&2
+                echo "--gate requires measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, noise, native-admission, or cutover" >&2
                 exit 64
             fi
             gate=$2
             shift 2
             ;;
         *)
-            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission|cutover]" >&2
+            echo "usage: $0 [--accept-baseline] [--gate measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|noise|native-admission|cutover]" >&2
             exit 64
             ;;
     esac
 done
 if [[ -z $gate ]]; then
-    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, native-admission, or cutover" >&2
+    echo "--gate is required: measurement, snapshot, raw, differential, binding-audit, effect-audit, placement-audit, render-audit, noise, native-admission, or cutover" >&2
     exit 64
 fi
 case $gate in
-    measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|native-admission|cutover) ;;
+    measurement|snapshot|raw|differential|binding-audit|effect-audit|placement-audit|render-audit|noise|native-admission|cutover) ;;
     *)
         echo "unsupported gate: $gate" >&2
         exit 64
@@ -241,6 +241,12 @@ for entry in entries:
             f"{key}: placement_audit={placement['status']} "
             f"source={placement.get('source_status')}"
         )
+    if gate in {"noise", "cutover"} and entry["machine_noise"]["status"] != "pass":
+        noise = entry["machine_noise"]
+        detail = " ".join(
+            f"{name}={noise['counts'][name]}" for name in noise.get("failing", ())
+        )
+        failures.append(f"{key}: machine_noise={noise['status']} {detail}".rstrip())
     if gate == "render-audit" and entry["render_refusal"]["status"] != "pass":
         render = entry["render_refusal"]
         failures.append(

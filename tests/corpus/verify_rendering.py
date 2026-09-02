@@ -945,6 +945,110 @@ def _score_binding_audit(envelope: dict[str, Any]) -> dict[str, Any]:
     raise BindingAuditFormatError(f"unsupported binding audit status: {status!r}")
 
 
+# Machine detail that survives into the emitted C.
+#
+# Each predicate below is exact rather than a threshold: the rendering either
+# spells a piece of the machine that the program does not contain, or it does
+# not.  A condition-code carrier, a self-assignment, a temporary that holds
+# only a literal, and a cast that converts a type to itself are all artifacts
+# of rendering one machine operation per C statement; none of them can be
+# justified by a source construct, so the honest target for every one of them
+# is zero.  They are reported for every cell from the moment the column exists
+# and gated separately (`--gate noise`), so the count is visible while the
+# rewriting layer is built and becomes a wall once it is finished.
+_TYPE_WORD = (
+    r"(?:u?int(?:8|16|32|64|128)_t|__u?int128_t|_Bool|void|char|short|int|long"
+    r"|float|double|unsigned|signed|const|struct|[A-Za-z_]\w*_t)"
+)
+CAST_PATTERN = rf"\(\s*{_TYPE_WORD}(?:\s+{_TYPE_WORD})*\s*(?:\*\s*)*\)"
+CAST_RE = re.compile(CAST_PATTERN)
+CAST_RUN_RE = re.compile(rf"(?:{CAST_PATTERN}\s*){{2,}}")
+FLAG_CARRIER_RE = re.compile(r"\b(?:TMP)?(?:ZF|CF|OF|SF|PF|AF|ZR|CY|OV|NG|NZ)_\d+\b")
+SELF_ASSIGN_RE = re.compile(
+    rf"^\s*([A-Za-z_]\w*)\s*=\s*(?:{CAST_PATTERN}\s*)*\1\s*;", re.MULTILINE
+)
+# A name this renderer minted for a machine value: a lowered temporary, or an
+# SSA-versioned machine register.  A program-derived name (`total`) and a named
+# frame slot (`stack_m40`) are locals the source could have written, so a
+# literal initialiser on one of those is ordinary C and not machine detail.
+MINTED_CARRIER = r"(?:tmp_\w+|[A-Z][A-Z0-9]*_\d+)"
+LITERAL_ONLY_DECL_RE = re.compile(
+    rf"^\s*{_TYPE_WORD}(?:\s+{_TYPE_WORD})*\s*\**\s*{MINTED_CARRIER}\s*=\s*"
+    rf"(?:{CAST_PATTERN}\s*)*-?\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*;",
+    re.MULTILINE,
+)
+CONDITION_KEYWORD_RE = re.compile(r"\b(?:if|while|switch)\s*\(")
+UNOPTIMIZED_CONFIGS = frozenset({"x64_O0", "arm64_O0"})
+
+
+def normalize_cast(text: str) -> str:
+    """Spell one cast so two spellings of one type compare equal."""
+    inner = re.sub(r"\s+", " ", text.strip()[1:-1]).strip()
+    return re.sub(r"\s*\*", "*", inner)
+
+
+def cast_runs(source: str) -> list[list[str]]:
+    """Every maximal run of directly adjacent casts, normalized."""
+    return [
+        [normalize_cast(cast.group(0)) for cast in CAST_RE.finditer(run.group(0))]
+        for run in CAST_RUN_RE.finditer(source)
+    ]
+
+
+def parenthesized_conditions(source: str) -> list[str]:
+    """The text inside each `if`/`while`/`switch` control parenthesis."""
+    conditions: list[str] = []
+    for keyword in CONDITION_KEYWORD_RE.finditer(source):
+        opening = source.index("(", keyword.start())
+        depth = 0
+        for index in range(opening, len(source)):
+            character = source[index]
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    conditions.append(source[opening + 1 : index])
+                    break
+    return conditions
+
+
+def _score_machine_noise(source: str, config: str) -> dict[str, Any]:
+    runs = cast_runs(source)
+    same_type_cast = sum(
+        1
+        for run in runs
+        for first, second in zip(run, run[1:])
+        if first == second
+    )
+    counts = {
+        "flag_carriers": len(set(FLAG_CARRIER_RE.findall(source))),
+        "self_assignments": len(SELF_ASSIGN_RE.findall(source)),
+        "literal_only_declarations": len(LITERAL_ONLY_DECL_RE.findall(source)),
+        "same_type_casts": same_type_cast,
+        # Two adjacent casts can be required: a pointer narrowed to a smaller
+        # integer goes through the pointer's own width.  Three cannot.
+        "cast_chains": sum(1 for run in runs if len(run) >= 3),
+        "comma_conditions": sum(
+            1
+            for condition in parenthesized_conditions(source)
+            if len(split_top_level_commas(condition)) > 1
+        ),
+        "gotos": len(re.findall(r"\bgoto\b", source)),
+    }
+    # Structured control is only claimed for unoptimized builds today; an
+    # optimized body may still linearize, so its `goto` count is reported and
+    # not required to be zero.
+    required = set(counts) if config in UNOPTIMIZED_CONFIGS else set(counts) - {"gotos"}
+    failing = sorted(name for name in required if counts[name])
+    return {
+        "status": "pass" if not failing else "non_quality",
+        "counts": counts,
+        "failing": failing,
+        "gated": sorted(required),
+    }
+
+
 def _score_render_refusal(envelope: dict[str, Any]) -> dict[str, Any]:
     refusal = envelope["render_refusal"]
     if not isinstance(refusal, dict):
@@ -1948,6 +2052,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "effect_obligations": {"status": "missing", "marker_count": 0},
             "placement_audit": {"status": "missing", "marker_count": 0},
             "render_refusal": {"status": "missing", "marker_count": 0},
+            "machine_noise": {"status": "missing"},
         }
         found = sections.get(name, [])
         entry["generation"]["section_count"] = len(found)
@@ -2005,6 +2110,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             }
             entries.append(entry)
             continue
+
+        entry["machine_noise"] = _score_machine_noise(raw_source, args.config)
 
         raw_path = raw_dir / f"{args.config}_{name}.c"
         raw_path.write_text(raw_source)
@@ -2204,8 +2311,15 @@ def print_summary(report: dict[str, Any]) -> None:
             f"binding_audit={entry['binding_audit']['status']:<12} "
             f"effect_obligations={entry['effect_obligations']['status']:<12} "
             f"placement_audit={entry['placement_audit']['status']:<12} "
-            f"render_refusal={entry['render_refusal']['status']}"
+            f"render_refusal={entry['render_refusal']['status']:<12} "
+            f"machine_noise={entry['machine_noise']['status']}"
         )
+        noise = entry["machine_noise"]
+        if noise.get("failing"):
+            detail = " ".join(
+                f"{name}={noise['counts'][name]}" for name in noise["failing"]
+            )
+            print(f"    machine_noise: {detail}")
         if entry["raw"].get("status") == "failed":
             print(f"    raw: {first_error(entry['raw'])}")
         if entry["diagnostic"].get("status") in {"failed", "wrong"}:

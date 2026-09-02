@@ -820,7 +820,10 @@ class RewriteTests(unittest.TestCase):
             if item["count"] > 0
         }
 
-        self.assertIn("long dec_fnv1a32(long arg0, long arg1)", repaired)
+        # A recovered pointer parameter keeps its type and its name: retyping
+        # it to `long` was the old repair, and component 3 made the emitted
+        # declaration good enough that the repair no longer applies to it.
+        self.assertIn("long dec_fnv1a32(uint8_t *data, long length)", repaired)
         self.assertIn("long state = 0;", repaired)
         self.assertEqual(assumed_widths, 2)
         for kind in (
@@ -852,12 +855,13 @@ class ImageMappingTests(unittest.TestCase):
             "_json_stdout",
             side_effect=[
                 [{"vaddr": 0x100000000, "vsize": 0x100}],
+                [],
                 [0xAA, 0xBB, 0xCC],
             ],
         ) as json_stdout:
             mapped, blobs, records = verifier.map_image_data(source, Path("unused"))
 
-        self.assertEqual(json_stdout.call_count, 2)
+        self.assertEqual(json_stdout.call_count, 3)
         self.assertIn("*((uint8_t *)((uintptr_t)corpus_blob_0))", mapped)
         self.assertIn("uintptr_t unrelated_constant = 0x100000010;", mapped)
         self.assertEqual(blobs, ["static unsigned char corpus_blob_0[3] = {170,187,204};"])
@@ -1026,6 +1030,7 @@ class VerificationTests(unittest.TestCase):
                         "status": "missing",
                         "marker_count": 0,
                     },
+                    "machine_noise": {"status": "missing"},
                 }
                 for name in verifier.SPECS
             ]
@@ -1092,6 +1097,135 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(entry["placement_audit"]["status"], "pass")
         for stage in ("raw", "diagnostic", "differential"):
             self.assertEqual(entry[stage]["status"], "blocked_generation")
+
+
+
+
+class MachineNoiseTests(unittest.TestCase):
+    """One rendering that spells the machine, one that spells the program.
+
+    Every predicate is exact, so each gets a case that must be counted and a
+    case that must not.  The negative cases are deliberately the shapes a
+    correct rendering does produce -- a real cast, a real assignment, a real
+    call with two arguments -- because a predicate that fires on those would
+    make the gate unlandable rather than strict.
+    """
+
+    def score(self, source: str, config: str = "x64_O0") -> dict:
+        return verifier._score_machine_noise(source, config)
+
+    def test_flag_carrier_is_counted_and_a_named_local_is_not(self) -> None:
+        self.assertEqual(
+            self.score("uint8_t ZF_21 = (uint8_t)(a == b);")["counts"]["flag_carriers"],
+            1,
+        )
+        self.assertEqual(
+            self.score("uint8_t TMPZR_2 = x; uint8_t ZR_2 = TMPZR_2;")["counts"][
+                "flag_carriers"
+            ],
+            2,
+        )
+        self.assertEqual(
+            self.score("uint64_t total_3 = a + b;")["counts"]["flag_carriers"], 0
+        )
+
+    def test_self_assignment_through_casts_is_counted(self) -> None:
+        self.assertEqual(
+            self.score("    X0_7 = (uint64_t)X0_7;")["counts"]["self_assignments"], 1
+        )
+        self.assertEqual(
+            self.score("    RDI_0 = (uint64_t)RDI_0 + (uint64_t)EDX_1;")["counts"][
+                "self_assignments"
+            ],
+            0,
+        )
+
+    def test_literal_only_declaration_is_counted(self) -> None:
+        self.assertEqual(
+            self.score("    uint32_t tmp_6a200_2 = (uint32_t)5;")["counts"][
+                "literal_only_declarations"
+            ],
+            1,
+        )
+        self.assertEqual(
+            self.score("    uint32_t tmp_1 = (uint32_t)(x + 5);")["counts"][
+                "literal_only_declarations"
+            ],
+            0,
+        )
+        # A program-derived local initialised to a literal is ordinary C; only
+        # a carrier this renderer minted for a machine value is machine detail.
+        self.assertEqual(
+            self.score("    uint64_t total = 0;")["counts"][
+                "literal_only_declarations"
+            ],
+            0,
+        )
+        self.assertEqual(
+            self.score("    uint64_t stack_m40 = 0;")["counts"][
+                "literal_only_declarations"
+            ],
+            0,
+        )
+        self.assertEqual(
+            self.score("    uint64_t RAX_15 = (uint64_t)0x1505;")["counts"][
+                "literal_only_declarations"
+            ],
+            1,
+        )
+
+    def test_same_type_cast_is_counted_and_a_widening_pair_is_not(self) -> None:
+        self.assertEqual(
+            self.score("y = (uint64_t)(uint64_t)x;")["counts"]["same_type_casts"], 1
+        )
+        # A pointer narrowed to a smaller integer needs the pointer's own width
+        # first, so two casts of different types are legitimate.
+        self.assertEqual(
+            self.score("y = (uint32_t)(uint64_t)p;")["counts"]["same_type_casts"], 0
+        )
+
+    def test_cast_chain_of_three_is_counted_and_two_is_not(self) -> None:
+        self.assertEqual(
+            self.score("y = (uint64_t)(uint32_t)(uint8_t)x;")["counts"]["cast_chains"],
+            1,
+        )
+        self.assertEqual(
+            self.score("y = (uint32_t)(uint64_t)p;")["counts"]["cast_chains"], 0
+        )
+
+    def test_comma_condition_is_counted_and_a_two_argument_call_is_not(self) -> None:
+        self.assertEqual(
+            self.score("while (t = stack_m40, RAX_2 = t, !CF_2) { }")["counts"][
+                "comma_conditions"
+            ],
+            1,
+        )
+        self.assertEqual(
+            self.score("if (memcmp(a, b) == 0) { }")["counts"]["comma_conditions"], 0
+        )
+
+    def test_goto_is_gated_only_where_structure_is_claimed(self) -> None:
+        unoptimized = self.score("goto loc_100000e40;", "x64_O0")
+        self.assertEqual(unoptimized["counts"]["gotos"], 1)
+        self.assertIn("gotos", unoptimized["failing"])
+        optimized = self.score("goto loc_100000e40;", "x64_O2")
+        self.assertEqual(optimized["counts"]["gotos"], 1)
+        self.assertNotIn("gotos", optimized["failing"])
+        self.assertEqual(optimized["status"], "pass")
+
+    def test_a_clean_rendering_passes_every_predicate(self) -> None:
+        clean = """uint64_t sym__sum(uint8_t *data, uint64_t len)
+{
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        total = total + data[i];
+    }
+    return total;
+}
+"""
+        scored = self.score(clean)
+        self.assertEqual(scored["status"], "pass", scored)
+        self.assertEqual(sum(scored["counts"].values()), 0, scored)
 
 
 if __name__ == "__main__":

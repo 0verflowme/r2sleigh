@@ -235,6 +235,12 @@ run cargo mutants --no-config \
     --no-times \
     --output target/quality-gate/mutants-r2ssa-var
 
+phase "Corpus harness contracts"
+# The verifier decides whether every other corpus phase means anything, and
+# nothing ran its own unit tests: two of them had rotted against the code they
+# check. They are pure Python and cost a fraction of a second.
+run python3 tests/corpus/test_verify_rendering.py
+
 phase "Binding-spine cutover corpus"
 run tests/corpus/run_matrix.sh --gate cutover
 
