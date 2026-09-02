@@ -128,9 +128,54 @@ pub struct Rule {
 
 pub const DEFAULT_PROOF_WIDTHS: &[u32] = &[8, 16, 32, 64];
 
-/// Every rule, in the order the driver tries them.
-pub static RULES: &[Rule] = &[];
+pub mod identity;
+pub mod literal;
+
+/// Every rule, in the order the driver tries them. Literal folding first, so
+/// a term over literals is a literal before any identity looks at it.
+pub static RULES: &[&Rule] = &[
+    &literal::ADD,
+    &literal::SUB,
+    &literal::MUL,
+    &literal::NEG,
+    &literal::AND,
+    &literal::OR,
+    &literal::XOR,
+    &literal::NOT,
+    &literal::SHIFT,
+    &literal::COMPARE,
+    &literal::FLAG,
+    &literal::BOOL,
+    &literal::BOOL_NOT,
+    &literal::CAST,
+    &literal::EXTRACT,
+    &literal::CONCAT,
+    &literal::SELECT,
+    &identity::ADD_ZERO,
+    &identity::SUB_ZERO,
+    &identity::SUB_SELF,
+    &identity::MUL_ONE,
+    &identity::MUL_ZERO,
+    &identity::AND_ZERO,
+    &identity::AND_ONES,
+    &identity::AND_SELF,
+    &identity::OR_ZERO,
+    &identity::OR_SELF,
+    &identity::OR_ONES,
+    &identity::XOR_ZERO,
+    &identity::XOR_SELF,
+    &identity::NOT_NOT,
+    &identity::NEG_NEG,
+    &identity::SHL_ZERO,
+    &identity::LSHR_ZERO,
+    &identity::ASHR_ZERO,
+    &identity::BOOLNOT_BOOLNOT,
+    &identity::BOOLAND_SELF,
+    &identity::BOOLOR_SELF,
+    &identity::BOOLAND_TRUE,
+    &identity::BOOLOR_FALSE,
+];
 
 pub fn rule(id: RuleId) -> Option<&'static Rule> {
-    RULES.iter().find(|rule| rule.id == id)
+    RULES.iter().copied().find(|rule| rule.id == id)
 }

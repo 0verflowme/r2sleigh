@@ -29,18 +29,23 @@ fn and_of_one_value_reads_one_leaf_twice() {
     ]);
     let projection = projection(&artifact);
     let roots = canonicalize(&artifact, &projection).expect("canonical roots");
-    let and = roots
-        .value(value_named(&artifact, "tmp:100_1"))
-        .expect("the and has a term");
-    let TermKind::Bitwise { left, right, .. } = roots.arena().term(and.canonical).kind else {
+    let and_value = value_named(&artifact, "tmp:100_1");
+    let imported = roots.import().value(and_value).expect("the and imports");
+    let TermKind::Bitwise { left, right, .. } = roots.arena().term(imported.term).kind else {
         panic!(
             "expected a bitwise term, got {:?}",
-            roots.arena().term(and.canonical)
+            roots.arena().term(imported.term)
         );
     };
     assert_eq!(left, right, "one value read twice is one leaf");
     assert!(matches!(roots.arena().term(left).kind, TermKind::Leaf(_)));
-    assert!(and.trace.is_empty(), "no rule exists yet");
+    assert!(
+        imported.trace.is_empty(),
+        "import records only copy elisions"
+    );
+    let and = roots
+        .value(and_value)
+        .expect("the and has a canonical term");
     assert!(and.discharges.is_empty());
     assert_eq!(
         and.multiplicity,

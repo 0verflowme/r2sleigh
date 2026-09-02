@@ -210,7 +210,7 @@ impl Driver<'_> {
         let mut fired_here = Vec::new();
         loop {
             let mut fired = None;
-            for rule in RULES {
+            for rule in RULES.iter().copied() {
                 if let Some(to) = (rule.apply)(self.arena, current) {
                     fired = Some((rule.id, to));
                     break;
