@@ -7957,3 +7957,29 @@ carrier on the page is that the value is bound.
 `ElisionReason::CoalescedImmutablePhi` fires zero times in production, against
 65 for the carrier path, measured across all 54 cells. It is live only in its
 own unit test, so it is not a precedent for anything.
+
+**Whole-binary coverage, checked after the expression-engine work: unchanged at
+243 of 313.** The two functions below the blessed baseline of 245 are
+`branchy_arm64_O2::sym._inverted_goto` and `hashes_x64_O1::sym._siphash24`,
+which are the same two this document already recorded as open before any of
+this session's work, with `siphash24`'s two lost markers diagnosed as far as
+the address rebuild. Nothing regressed and nothing newly rendered, across the
+canonical terms, the shared projection, the identity merges, the classifier and
+both cast rules.
+
+The baseline stays at 245 rather than being accepted down to 243. Blessing it
+would record two known refusals as the expected state and remove the only thing
+that keeps them visible.
+
+Fifteen refusals did change their stated cause, from
+`ExactUseRequiresRenderedOccurrence` to `RenderedValueRequired`. They are the
+arm64 import thunks and three `branchy` functions, all of which refused before
+and refuse now, so this is not a coverage change. It is worth knowing which
+work moved them, because a cause is the thing a later session searches on: the
+thunks are the `braa x16, x17` tail-call shape whose refusal has always been
+that nothing in the renderer has a form for a branch through a value, and the
+new cause says the value now reaches the seal without a cell rather than
+without a rendered occurrence. That is consistent with the identity-merge
+accounting, which fills cells for values whose merges no longer render a
+statement, and it means the thunk work described earlier now starts from a
+different symptom than the one recorded against it.
