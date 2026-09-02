@@ -4939,13 +4939,13 @@ impl Decompiler {
         }
         let observation_error = fold_ctx.observation_error.borrow().clone();
         drop(fold_ctx);
-        let mut native = match MarkedNativeDraft::new_with_placement(
+        let draft = MarkedNativeDraft::new_with_placement(
             c_function,
             observation_journal.into_inner(),
             structured_regions,
             Rc::clone(&binding_names),
-        )
-        .finish_enforcing(input.source_owned_facts(), observation_error)
+        );
+        let mut native = match draft.finish_enforcing(input.source_owned_facts(), observation_error)
         {
             Ok(native) => native,
             Err(failure) => {
@@ -4959,7 +4959,7 @@ impl Decompiler {
                 ));
             }
         };
-        crate::stage_timing::mark("placement_seal");
+        crate::stage_timing::mark("seal");
         let ledger = effect_ledger::build_obligation_ledger(
             prepared,
             &normalization_origins,

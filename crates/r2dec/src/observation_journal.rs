@@ -1131,6 +1131,7 @@ impl MarkedNativeDraft {
             .derive_and_apply_placement(source)
             .err()
             .map(crate::PlacementAuditRefusal::from);
+        crate::stage_timing::mark("placement");
         let mut ready = prepare_function_for_emission(&self.function);
         let plan = Rc::clone(&self.journal.plan);
         if let Some(error) = recording_failure {
