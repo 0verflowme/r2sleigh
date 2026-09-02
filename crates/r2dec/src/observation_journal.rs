@@ -3165,8 +3165,19 @@ fn classify_value_node(
             _ => return Ok(LegacyValueObservation::InlineNonLiteral),
         },
     };
-    if let CExpr::Var(symbol) = expr {
-        return classify_symbol(value, *symbol, symbol_bindings);
+    // Through casts and parentheses. Converting a value or bracketing it does
+    // not change which object was named, so `x` and `(uint64_t)x` are one
+    // binding read twice. Classifying the second by its outermost node called
+    // it an inline expression, one value then collected two classifications,
+    // and the seal refused with `ConflictingValue` -- which is what a
+    // redundant cast disappearing would otherwise cause.
+    //
+    // The symbol still comes from the rendering rather than from the plan.
+    // This classification is also the check that a rendered name owns a
+    // declaration, and asking the plan for the name it intended would answer
+    // about a rendering that never happened.
+    if let Some(symbol) = named_object_of(expr) {
+        return classify_symbol(value, symbol, symbol_bindings);
     }
     if let CExpr::Binary { op, left, .. } = expr
         && (*op == BinaryOp::Assign
@@ -3205,6 +3216,16 @@ fn classify_value_node(
         Ok(LegacyValueObservation::InlineConstant)
     } else {
         Ok(LegacyValueObservation::InlineNonLiteral)
+    }
+}
+
+/// The object a rendered expression names, seen through conversions that do
+/// not change which object that is.
+fn named_object_of(expr: &CExpr) -> Option<SymbolId> {
+    match expr {
+        CExpr::Var(symbol) => Some(*symbol),
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => named_object_of(expr.unobserved()),
+        _ => None,
     }
 }
 
@@ -4669,6 +4690,53 @@ mod tests {
             .unwrap_or("candidate_name");
         let symbol = declare_legacy_symbol(&function, &plan, binding, requested);
         assert_eq!(function.symbols.borrow().name(symbol), requested);
+    }
+
+    #[test]
+    fn a_bound_value_read_through_a_cast_is_the_same_binding_as_read_bare() {
+        // Converting a value does not change which object was named. Before
+        // this, the bare read classified as `Bound` and the converted read as
+        // an inline expression, so one value collected two classifications and
+        // the seal refused -- which is what happens the moment a redundant
+        // cast is removed from one of two reads of the same binding.
+        let (source, plan, mut function, mut journal) = journal_fixture();
+        let (value, binding, site, input_idx) = first_bound_rendered_input(&plan, &source);
+        let symbol = declare_legacy_symbol(&function, &plan, binding, "bound_value");
+        let bare = journal
+            .observe_normalized_input_expr(site, input_idx, CExpr::Var(symbol))
+            .expect("bare value marker");
+        let converted = journal
+            .observe_normalized_input_expr(
+                site,
+                input_idx,
+                CExpr::Cast {
+                    ty: crate::ast::CType::machine_bits(64),
+                    expr: Box::new(CExpr::Var(symbol)),
+                },
+            )
+            .expect("converted value marker");
+        // The classification is also the check that a rendered name owns a
+        // declaration, so the fixture has to declare it.
+        function.body = vec![
+            CStmt::Decl {
+                ty: crate::ast::CType::machine_bits(64),
+                name: symbol,
+                init: None,
+            },
+            CStmt::Expr(bare),
+            CStmt::Expr(converted),
+        ];
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        // The property is that the two reads agree, not that this minimal
+        // fixture seals: the seal also requires every other value of the
+        // function to have a cell, and this one marks two. Before the fix the
+        // bare read classified as the binding and the converted read as an
+        // inline expression, and the seal reported exactly this conflict.
+        assert_ne!(
+            journal.seal(&source, &mut ready).err(),
+            Some(LegacyObservationJournalError::ConflictingValue(value)),
+            "reading {value:?} bare and through a cast must be one classification"
+        );
     }
 
     #[test]
