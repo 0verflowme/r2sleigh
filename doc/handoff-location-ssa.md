@@ -8158,6 +8158,26 @@ roots at `Source` and `Source` is not among the shapes that render inline.
 Whether it belongs there is the next thing to try on this path, and it is
 cheap to test.
 
+Measured on the benchmark, `bzip2recover` at -O0, `byte_match`, the eight
+functions r2sleigh renders, before and after this one change:
+
+    function          before    after
+    readError         0.2143   0.4000
+    writeError        0.2143   0.4000
+    mallocFail        0.1607   0.3095
+    tooManyBlocks     0.1558   0.3158
+    endsInBz2         0.0878   0.0887
+    bsPutBit          0.0529   0.0534
+    bsClose           0.0000   0.0000
+    entry.fini0       0.0000   0.0000
+    mean              0.1107   0.1959
+
+Nothing regressed and nothing stopped rendering. angr scores 0.6017 over the
+fifteen it decompiles, so the gap is far from closed, but the four functions
+that are mostly calls roughly doubled, which is what a staging local costs when
+it is spelled as a statement instead of an argument. `bsClose` at 0.0000 and
+`bsPutBit` at 0.05 are not call-shaped and are where the next look belongs.
+
 ### Three things that were tried, measured, and reverted
 
 Each looked right, each is recorded with the evidence, and none should be
