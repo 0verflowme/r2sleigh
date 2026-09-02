@@ -891,6 +891,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2rewrite"
+version = "0.1.0"
+dependencies = [
+ "r2il",
+ "r2ssa",
+ "serde",
+ "z3",
+]
+
+[[package]]
 name = "r2sleigh-cli"
 version = "0.1.0"
 dependencies = [

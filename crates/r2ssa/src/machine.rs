@@ -458,6 +458,29 @@ pub struct MachineBitVector {
 }
 
 impl MachineBitVector {
+    /// The widest constant whose bits this type can hold whole.
+    pub const MAX_LITERAL_BITS: u32 = 64;
+
+    /// A constant of `width_bits` holding `bits`, masked to that width.
+    ///
+    /// Refuses a zero width and anything wider than the bits can hold, so a
+    /// caller that folds arithmetic at a width never spells a value the width
+    /// cannot represent.
+    pub const fn new(width_bits: u32, bits: u64) -> Option<Self> {
+        if width_bits == 0 || width_bits > Self::MAX_LITERAL_BITS {
+            return None;
+        }
+        let mask = if width_bits == Self::MAX_LITERAL_BITS {
+            u64::MAX
+        } else {
+            (1u64 << width_bits) - 1
+        };
+        Some(Self {
+            width_bits,
+            bits: bits & mask,
+        })
+    }
+
     pub const fn zero(width_bits: u32) -> Option<Self> {
         if width_bits == 0 || width_bits > MAX_SPELLABLE_CONSTANT_BITS {
             return None;
@@ -1139,6 +1162,7 @@ impl MachineProjection {
                 arena: MachineExprArena {
                     nodes: builder.nodes.into_boxed_slice(),
                 },
+                entity_index_by_output: entity_index_by_output(&entities, graph.values.len()),
                 entities: entities.into_boxed_slice(),
             },
             failures: failures.into_boxed_slice(),
@@ -2295,6 +2319,25 @@ fn machine_use_slice_for_input(
 pub struct MachineFunction {
     arena: MachineExprArena,
     entities: Box<[MachineEntity]>,
+    /// Dense by `ValueId`: the position in `entities` of the entity whose
+    /// output is that value, or `NO_ENTITY`. Derived from `entities`, so it is
+    /// not serialised and not part of what two functions are compared on.
+    #[serde(skip)]
+    entity_index_by_output: Box<[u32]>,
+}
+
+/// Cell value in `MachineFunction::entity_index_by_output` for a value no
+/// entity produces.
+const NO_ENTITY: u32 = u32::MAX;
+
+fn entity_index_by_output(entities: &[MachineEntity], value_count: usize) -> Box<[u32]> {
+    let mut index = vec![NO_ENTITY; value_count];
+    for (position, entity) in entities.iter().enumerate() {
+        if let Some(cell) = index.get_mut(entity.output.value.0 as usize) {
+            *cell = position as u32;
+        }
+    }
+    index.into_boxed_slice()
 }
 
 impl MachineFunction {
@@ -2326,9 +2369,11 @@ impl MachineFunction {
     }
 
     pub fn entity_for_output(&self, value: ValueId) -> Option<&MachineEntity> {
-        self.entities
-            .iter()
-            .find(|entity| entity.output.value == value)
+        let position = *self.entity_index_by_output.get(value.0 as usize)?;
+        if position == NO_ENTITY {
+            return None;
+        }
+        self.entities.get(position as usize)
     }
 
     pub fn entity_for_producer(&self, producer: CanonicalInstructionId) -> Option<&MachineEntity> {
