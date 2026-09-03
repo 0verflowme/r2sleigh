@@ -5930,7 +5930,8 @@ mod tests {
         );
         assert_eq!(
             parse_external_type("type.IOCPU_VTable.setCPUNumber", 64),
-            Some(ptr_type(r2types::CTypeLike::Void))
+            None,
+            "a dotted member path is not a placeable C type"
         );
     }
 
