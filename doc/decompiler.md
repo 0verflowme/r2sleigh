@@ -179,9 +179,12 @@ switch (x) {
 
 ### Safety Budget
 
-Complex CFGs can cause the structurer to recurse deeply. A configurable
-safety budget limits recursion depth. When exhausted, the structurer falls
-back to a simpler strategy.
+Each block's control-domain proof has its own budget. The proof first removes
+predicates from completed inner loops and takes the reverse CFG slice that can
+reach the block. For `p` remaining Boolean predicates and `f` source/rendered
+formula slots, its BDD may allocate at most `2^p * f` nodes: the size of the
+explicit assignment table the BDD replaces, saturated to the addressable node
+count. The proof refuses if that exact block-local bound is exhausted.
 
 C AST Types (ast.rs)
 --------------------

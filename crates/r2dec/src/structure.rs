@@ -169,9 +169,6 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     region_analyzer: Option<RegionAnalyzer<'a>>,
     control: Option<DecompileWorkControl<'a>>,
     stop_reason: Cell<Option<DecompileExecutionStop>>,
-    /// Safety budget for recursive region structuring.
-    safety_budget_remaining: usize,
-    safety_budget_max: usize,
     safety_reason: Option<String>,
     /// Structured control nodes emitted by this structurer, in render order.
     control_render_proofs: Vec<ControlRenderProof>,
@@ -363,35 +360,6 @@ impl<'a, 's> ControlBdd<'a, 's> {
         self.apply(BddOp::Or, lhs, rhs)
     }
 
-    fn exists(
-        &mut self,
-        value: usize,
-        variables: &BTreeSet<PredicateId>,
-        cache: &mut HashMap<usize, usize>,
-    ) -> Result<usize, String> {
-        self.poll()?;
-        if value == BDD_FALSE || value == BDD_TRUE {
-            return Ok(value);
-        }
-        if let Some(cached) = cache.get(&value).copied() {
-            return Ok(cached);
-        }
-        let node = self
-            .nodes
-            .get(value)
-            .and_then(|node| *node)
-            .ok_or_else(|| format!("invalid control coverage BDD node {value}"))?;
-        let low = self.exists(node.low, variables, cache)?;
-        let high = self.exists(node.high, variables, cache)?;
-        let result = if variables.contains(&node.variable) {
-            self.or(low, high)?
-        } else {
-            self.make_node(node.variable, low, high)?
-        };
-        cache.insert(value, result);
-        Ok(result)
-    }
-
     fn apply(&mut self, op: BddOp, lhs: usize, rhs: usize) -> Result<usize, String> {
         self.poll()?;
         let (lhs, rhs) = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
@@ -447,7 +415,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     #[cfg(test)]
     pub(crate) fn new(func: &'a SSAFunction, fold_ctx: &'o FoldingContext<'o>) -> Self {
         let region_analyzer = RegionAnalyzer::new(func);
-        let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
 
         Self {
             func,
@@ -459,8 +426,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             region_analyzer: Some(region_analyzer),
             control: None,
             stop_reason: Cell::new(None),
-            safety_budget_remaining: safety_budget_max,
-            safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
@@ -484,7 +449,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         control.poll()?;
         let region_analyzer = RegionAnalyzer::new_with_control(func, control.raw())
             .map_err(|reason| DecompileExecutionStop::new(control.phase(), reason))?;
-        let safety_budget_max = Self::compute_safety_budget(func.num_blocks());
         Ok(Self {
             func,
             fold_ctx,
@@ -495,8 +459,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             region_analyzer: Some(region_analyzer),
             control: Some(control),
             stop_reason: Cell::new(None),
-            safety_budget_remaining: safety_budget_max,
-            safety_budget_max,
             safety_reason: None,
             control_render_proofs: Vec::new(),
             deferred_merge_blocks: Vec::new(),
@@ -511,10 +473,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         })
     }
 
-    fn compute_safety_budget(num_blocks: usize) -> usize {
-        num_blocks.saturating_mul(128).max(256)
-    }
-
     fn is_unresolved_indirect_dispatch_block(&self, addr: u64) -> bool {
         let Some(cfg_block) = self.func.cfg().get_block(addr) else {
             return false;
@@ -527,8 +485,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             && self.func.switch_info(addr).is_none()
     }
 
-    fn reset_safety_budget(&mut self) {
-        self.safety_budget_remaining = self.safety_budget_max;
+    fn reset_safety_reason(&mut self) {
         self.safety_reason = None;
     }
 
@@ -544,21 +501,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return false;
         }
         true
-    }
-
-    fn consume_safety_budget(&mut self, units: usize) -> bool {
-        if self.safety_budget_remaining >= units {
-            self.safety_budget_remaining -= units;
-            true
-        } else {
-            if self.safety_reason.is_none() {
-                self.safety_reason = Some(format!(
-                    "structuring budget exceeded (limit: {})",
-                    self.safety_budget_max
-                ));
-            }
-            false
-        }
     }
 
     /// Returns the reason why structuring short-circuited, if any.
@@ -955,7 +897,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     fn structure_preserving_render_proof_identity_impl(
         &mut self,
     ) -> ControlFlowStructureResult<CStmt> {
-        self.reset_safety_budget();
+        self.reset_safety_reason();
         self.control_render_proofs.clear();
         self.active_domains = vec![RenderedBlockDomain::default()];
         self.rendered_block_domains.clear();
@@ -1024,7 +966,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 
     /// Structure a region into C statements.
     fn structure_region(&mut self, region: &Region) -> ControlFlowStructureResult<CStmt> {
-        if !self.poll() || !self.consume_safety_budget(1) {
+        if !self.poll() {
             return Ok(CStmt::Empty);
         }
         let inherited_domains = self.active_domains.clone();
@@ -2920,6 +2862,50 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         })
     }
 
+    /// CFG blocks on a path from the entry to `target` can contribute to the
+    /// target's reachability formula. Intersect the target's reverse slice with
+    /// a forward walk from the entry so disconnected predecessors contribute
+    /// neither variables nor budget.
+    fn blocks_reaching(&self, target: u64) -> BTreeSet<u64> {
+        let mut reverse_slice = BTreeSet::from([target]);
+        let mut pending = VecDeque::from([target]);
+        while let Some(block_addr) = pending.pop_front() {
+            for predecessor in self.func.predecessors(block_addr) {
+                if reverse_slice.insert(predecessor) {
+                    pending.push_back(predecessor);
+                }
+            }
+        }
+        if !reverse_slice.contains(&self.func.entry) {
+            return BTreeSet::new();
+        }
+
+        let mut reaching = BTreeSet::from([self.func.entry]);
+        pending.push_back(self.func.entry);
+        while let Some(block_addr) = pending.pop_front() {
+            for successor in self.func.successors(block_addr) {
+                if reverse_slice.contains(&successor) && reaching.insert(successor) {
+                    pending.push_back(successor);
+                }
+            }
+        }
+        reaching
+    }
+
+    /// Bound the BDD by the explicit table it replaces.  A proof over `p`
+    /// Boolean predicates has `2^p` assignments, and it retains one formula
+    /// for each reverse-slice block plus each rendered alternative, occurrence,
+    /// and their cumulative union.  If the BDD needs more nodes than those
+    /// exact block/assignment cells, it has ceased to be the bounded
+    /// representation for this proof.
+    fn control_coverage_node_limit(predicate_count: usize, formula_slots: usize) -> usize {
+        let assignments = u32::try_from(predicate_count)
+            .ok()
+            .and_then(|shift| 1usize.checked_shl(shift))
+            .unwrap_or(usize::MAX);
+        assignments.saturating_mul(formula_slots)
+    }
+
     fn rendered_branch_occurrences_cover_source(
         &mut self,
         block_addr: u64,
@@ -2973,11 +2959,32 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             })
             .map(|predicate| predicate.id)
             .collect::<BTreeSet<_>>();
+        let reaching_blocks = self.blocks_reaching(block_addr);
+        let reaching_predicates = reaching_blocks
+            .iter()
+            .filter_map(|block_addr| facts.branch_for_block(*block_addr))
+            .map(|predicate| predicate.id)
+            .filter(|predicate| !varying_predicates.contains(predicate))
+            .collect::<BTreeSet<_>>();
+        let rendered_formula_slots = occurrences
+            .iter()
+            .try_fold(1usize, |slots, occurrence| {
+                slots
+                    .checked_add(1)
+                    .and_then(|slots| slots.checked_add(occurrence.alternatives.len()))
+            })
+            .ok_or_else(|| "control coverage rendered formula count overflowed".to_string())?;
+        let formula_slots = reaching_blocks
+            .len()
+            .checked_add(rendered_formula_slots)
+            .ok_or_else(|| "control coverage formula count overflowed".to_string())?;
+        let node_limit =
+            Self::control_coverage_node_limit(reaching_predicates.len(), formula_slots);
         if !self.poll() {
             return Err("control coverage stopped".to_string());
         }
         let mut bdd = ControlBdd::new_with_optional_control(
-            self.safety_budget_remaining,
+            node_limit,
             self.control,
             Some(&self.stop_reason),
         );
@@ -2992,6 +2999,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     return Err("control coverage stopped".to_string());
                 }
                 let mut alternative_formula = BDD_TRUE;
+                let mut varying_assignments = BTreeMap::new();
                 for guard in &alternative.guards {
                     if !self.poll() {
                         return Err("control coverage stopped".to_string());
@@ -3001,36 +3009,56 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                             "aggregate proof currently requires branch-only guards".to_string()
                         );
                     };
+                    if varying_predicates.contains(predicate) {
+                        if varying_assignments
+                            .insert(*predicate, *truth)
+                            .is_some_and(|previous| previous != *truth)
+                        {
+                            alternative_formula = BDD_FALSE;
+                            break;
+                        }
+                        continue;
+                    }
+                    if !reaching_predicates.contains(predicate) {
+                        return Err(format!(
+                            "rendered domain for block 0x{block_addr:x} contains non-reaching predicate {:?}",
+                            predicate
+                        ));
+                    }
                     let literal = bdd.variable(*predicate, *truth)?;
                     alternative_formula = bdd.and(alternative_formula, literal)?;
                 }
                 occurrence_formula = bdd.or(occurrence_formula, alternative_formula)?;
             }
-            occurrence_formula =
-                bdd.exists(occurrence_formula, &varying_predicates, &mut HashMap::new())?;
             if bdd.and(rendered_formula, occurrence_formula)? != BDD_FALSE {
                 return Ok(false);
             }
             rendered_formula = bdd.or(rendered_formula, occurrence_formula)?;
         }
 
-        let mut reach = self
-            .func
-            .block_addrs()
+        // Prove whether the entry can reach this block by propagating backward
+        // from the block.  A forward proof carries every branch choice until
+        // its arms eventually reconverge; the reverse recurrence joins those
+        // arms at their branch, where the BDD can reduce them immediately.
+        // Both compute the same least fixed point over the same edge formulas.
+        let mut reaches_target = reaching_blocks
             .iter()
             .copied()
             .map(|addr| (addr, BDD_FALSE))
             .collect::<BTreeMap<_, _>>();
-        reach.insert(self.func.entry, BDD_TRUE);
-        let mut worklist = VecDeque::from([self.func.entry]);
-        let mut queued = BTreeSet::from([self.func.entry]);
-        while let Some(from) = worklist.pop_front() {
+        reaches_target.insert(block_addr, BDD_TRUE);
+        let mut worklist = VecDeque::from([block_addr]);
+        let mut queued = BTreeSet::from([block_addr]);
+        while let Some(to) = worklist.pop_front() {
             if !self.poll() {
                 return Err("control coverage stopped".to_string());
             }
-            queued.remove(&from);
-            let from_formula = reach.get(&from).copied().unwrap_or(BDD_FALSE);
-            for to in self.func.successors(from) {
+            queued.remove(&to);
+            let to_formula = reaches_target.get(&to).copied().unwrap_or(BDD_FALSE);
+            for from in self.func.predecessors(to) {
+                if !reaching_blocks.contains(&from) {
+                    continue;
+                }
                 if !self.poll() {
                     return Err("control coverage stopped".to_string());
                 }
@@ -3040,38 +3068,33 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     let predicate = facts
                         .branch_for_block(from)
                         .ok_or_else(|| format!("non-branch multi-successor block 0x{from:x}"))?;
-                    let truth = if predicate.true_target == to {
-                        true
+                    if varying_predicates.contains(&predicate.id) {
+                        BDD_TRUE
                     } else if predicate.false_target == to {
-                        false
+                        bdd.variable(predicate.id, false)?
+                    } else if predicate.true_target == to {
+                        bdd.variable(predicate.id, true)?
                     } else {
                         return Err(format!(
                             "successor 0x{to:x} is absent from predicate at 0x{from:x}"
                         ));
-                    };
-                    bdd.variable(predicate.id, truth)?
+                    }
                 };
-                let candidate = bdd.and(from_formula, edge_formula)?;
-                let previous = reach.get(&to).copied().unwrap_or(BDD_FALSE);
+                let candidate = bdd.and(edge_formula, to_formula)?;
+                let previous = reaches_target.get(&from).copied().unwrap_or(BDD_FALSE);
                 let joined = bdd.or(previous, candidate)?;
                 if joined != previous {
-                    reach.insert(to, joined);
-                    if queued.insert(to) {
-                        worklist.push_back(to);
+                    reaches_target.insert(from, joined);
+                    if queued.insert(from) {
+                        worklist.push_back(from);
                     }
                 }
             }
         }
-        let source_formula = bdd.exists(
-            reach.get(&block_addr).copied().unwrap_or(BDD_FALSE),
-            &varying_predicates,
-            &mut HashMap::new(),
-        )?;
-        let created_nodes = bdd.created_nodes();
-        drop(bdd);
-        if !self.consume_safety_budget(created_nodes) {
-            return Err("control coverage exhausted structuring safety budget".to_string());
-        }
+        let source_formula = reaches_target
+            .get(&self.func.entry)
+            .copied()
+            .unwrap_or(BDD_FALSE);
         Ok(source_formula == rendered_formula)
     }
 
@@ -4959,7 +4982,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
 mod tests {
     use super::{
         BDD_FALSE, BDD_TRUE, ControlBdd, ControlFlowStructureError, ControlFlowStructurer,
-        RenderedBlockDomain,
+        RenderedBlockDomain, RenderedBlockOccurrence,
     };
     use crate::ast::{
         BinaryOp, CExpr, CFunction, CStmt, CType, RenderObservationOwner, UnaryOp,
@@ -4976,7 +4999,7 @@ mod tests {
         BlockTerminator, ControlGuard, PhiNode, PredicateId, SSAFunction, SSAOp, SSAVar,
         SsaArtifact,
     };
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     /// The names a fixture in this module declares.
@@ -4998,21 +5021,79 @@ mod tests {
     }
 
     #[test]
-    fn control_bdd_projects_repeated_loop_predicates() {
-        let mut bdd = ControlBdd::new(64);
-        let repeated = PredicateId(0);
-        let stable = PredicateId(1);
-        let repeated_false = bdd.variable(repeated, false).expect("repeated literal");
-        let stable_true = bdd.variable(stable, true).expect("stable literal");
-        let path = bdd
-            .and(repeated_false, stable_true)
-            .expect("path conjunction");
+    fn control_bdd_node_limit_refusal_is_reachable() {
+        let mut bdd = ControlBdd::new(1);
+        let predicate = PredicateId(0);
+        bdd.variable(predicate, true).expect("first node in budget");
 
-        assert_eq!(
-            bdd.exists(path, &BTreeSet::from([repeated]), &mut HashMap::new())
-                .expect("existential projection"),
-            stable_true
+        assert!(
+            bdd.variable(predicate, false)
+                .expect_err("the second distinct node must exceed a one-node budget")
+                .contains("exceeded structuring safety budget (1)")
         );
+    }
+
+    #[test]
+    fn control_coverage_budget_is_local_to_each_block_reaching_predicates() {
+        let branch_count = 12u64;
+        let mut blocks = Vec::new();
+        for index in 0..branch_count {
+            let branch_addr = 0x1000 + index * 8;
+            let next_addr = branch_addr + 8;
+            let predicate = Varnode::unique(index + 1, 1);
+            let mut branch = R2ILBlock::new(branch_addr, 4);
+            branch.push(R2ILOp::IntEqual {
+                dst: predicate.clone(),
+                a: Varnode::register(0x10, 8),
+                b: Varnode::constant(index, 8),
+            });
+            branch.push(R2ILOp::CBranch {
+                target: Varnode::constant(next_addr, 8),
+                cond: predicate,
+            });
+            blocks.push(branch);
+
+            let mut exit = R2ILBlock::new(branch_addr + 4, 4);
+            exit.push(R2ILOp::Return {
+                target: Varnode::constant(index, 8),
+            });
+            blocks.push(exit);
+        }
+        let mut final_exit = R2ILBlock::new(0x1000 + branch_count * 8, 4);
+        final_exit.push(R2ILOp::Return {
+            target: Varnode::constant(branch_count, 8),
+        });
+        blocks.push(final_exit);
+
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let addresses = facts.source().function().block_addrs().to_vec();
+        let occurrence_for = |block_addr| {
+            let domain = ctx
+                .control_facts()
+                .and_then(|control| control.control_domain_for_block(block_addr))
+                .expect("exact control domain");
+            vec![RenderedBlockOccurrence {
+                alternatives: vec![RenderedBlockDomain {
+                    guards: domain.guards.clone(),
+                    loops: domain.loops.clone(),
+                }],
+            }]
+        };
+
+        for order in [addresses.clone(), addresses.into_iter().rev().collect()] {
+            let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+            for block_addr in order {
+                assert_eq!(
+                    structurer.rendered_branch_occurrences_cover_source(
+                        block_addr,
+                        &occurrence_for(block_addr),
+                    ),
+                    Ok(true),
+                    "block 0x{block_addr:x} must receive the same complete proof budget in either order"
+                );
+            }
+        }
     }
 
     #[test]
