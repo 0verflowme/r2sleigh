@@ -1976,11 +1976,13 @@ impl LegacyObservationJournal {
         // merely because there is nowhere left to spell it.
         //
         // This is deliberately narrower than "all currently empty values".
-        // Every graph read must already have the exact dead-definition reason,
-        // and a certified boundary read disqualifies the value because that
-        // read is absent from the graph. Defined inline expressions still owe
-        // their own write, input and effect cells independently; this closes
-        // only the value occurrence proved to be absent.
+        // Every graph read must already have an exact elision reason, and a
+        // certified boundary read disqualifies the value because that read is
+        // absent from the graph. This includes a dead definition directly and
+        // a source-certified merge that was already absent from the normalized
+        // program. Defined inline expressions still owe their own write, input
+        // and effect cells independently; this closes only the value occurrence
+        // proved to be absent.
         let certified_boundary_values = graph
             .insts
             .iter()
@@ -1999,12 +2001,10 @@ impl LegacyObservationJournal {
             })
             .filter(|value| !certified_boundary_values.contains(&value.id))
             .filter(|value| {
-                graph.use_sites(value.id).iter().all(|site| {
-                    matches!(
-                        elided_uses.get(site),
-                        Some(r2ssa::ledger::ElisionReason::DeadUnusedTemporary)
-                    )
-                })
+                graph
+                    .use_sites(value.id)
+                    .iter()
+                    .all(|site| elided_uses.contains_key(site))
             })
             .map(|value| value.id)
             .collect::<Vec<_>>();
