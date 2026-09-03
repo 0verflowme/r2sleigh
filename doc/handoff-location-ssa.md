@@ -10372,3 +10372,39 @@ Method worth reusing: install once, then run the decompiler per function with a
 timeout, outside the lock. Identifying which function is pathological does not
 need an exclusive plugin, and taking the lock for a hang is how a forty-minute
 hold happened in the first place.
+
+## The flag carriers are dead values, not un-inlined ones
+
+The 192 flag locals have been described here as an inlining problem for as long
+as the noise gate has existed, and an architecture survey reinforced it by
+reading `inlinable_values` and concluding that by its own text the
+temporary-to-architectural flag copy passes every gate. Running the probe rather
+than reading the function says something else, and it is not close.
+
+Counting why every flag-named value stays bound, across whole binaries at two
+configurations:
+
+| reason it stays bound | x64 -O0 | arm64 -O0 |
+| --- | --- | --- |
+| **no readers** | **14,323** | **10,852** |
+| expression kind does not render inline | 2,487 | 4,500 |
+| the one reader is a merge | 1,780 | 2,560 |
+| a location it reads is written before the reader | 1,270 | 260 |
+
+The dominant answer by a factor of three is that **nothing reads them at all**.
+`CF_1` and `OF_1` in `xxhash32` are the clean specimens: no readers, and bound
+and declared anyway.
+
+So the question was never which inlining gate rejects them. A value nothing
+reads should not acquire a binding or a declaration, and the machinery for that
+already exists in `DeadUnusedTemporary` and `DeadUnreadBinding`, which the
+journal closes from a reported set when placement drops a statement. Either that
+path does not cover a value that was dead before placement ran, or the binding
+is created before anything asks whether it has a reader. That is where to look,
+and it is a different file from the one everyone has been reading.
+
+Two lessons, both of which this session has now paid for more than once. A survey
+that reads a function will tell you what the function says, and what it says can
+be true while being about a different value than the one you are holding. And
+the probe that answers this took one command against a binary that was already
+built, against months of the same wrong framing.
