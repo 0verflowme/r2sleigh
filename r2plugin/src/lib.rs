@@ -29,7 +29,7 @@ use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, SSA_JSON_SCHEMA_VERSION, SSAOpInfo,
     export_instruction, op_json_named, ssa_op_to_info,
 };
-use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
+use r2sleigh_lift::{Disassembler, SemanticMetadataOptions};
 #[cfg(test)]
 use r2types::recover_vars_arch_profile;
 use std::ffi::{CStr, CString};
@@ -2149,8 +2149,15 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             )
         });
     };
-    let spec = build_arch_spec(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
-    let dis = Disassembler::from_sla(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
+    // Both from one parse. These were two separate loads of the same compiled
+    // `.sla` -- `build_arch_spec` parsed it for the architecture and `from_sla`
+    // parsed it again for the disassembler -- and the trusted lift path parsed
+    // it a third time. At 58 to 91 milliseconds a parse that was most of what
+    // creating an `R2ILContext` cost.
+    let spec = r2sleigh_lift::shared_arch_spec(lang.sla, lang.pspec, lang.name)
+        .map_err(|e| e.to_string())?;
+    let dis =
+        Disassembler::from_embedded(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
     Ok((spec, dis))
 }
 

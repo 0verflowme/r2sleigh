@@ -25,18 +25,47 @@ use std::sync::Arc;
 use crate::translate::{self, PcodeSource};
 use crate::{LiftError, Result};
 
-/// A disassembler that uses libsla to lift instructions to r2il.
-pub struct Disassembler {
+/// One parsed Sleigh specification: everything derived from the `.sla` and the
+/// processor spec, and nothing derived from who asked for it.
+///
+/// Parsing one is the single most expensive thing this crate does -- 58 to 91
+/// milliseconds for x86-64, against 21 to 83 *micro*seconds to lift a block --
+/// and it was being done three times over. `Disassembler::from_trusted_profile`
+/// did it on the lift path, and `create_disassembler_for_arch` in the plugin
+/// did it twice more for one `R2ILContext`: once through `build_arch_spec` for
+/// the architecture and once through `from_sla` for the disassembler. Splitting
+/// the parse from the caller's identity is what lets all three share one, and
+/// putting the split here rather than a cache at each call site is what stops
+/// there being a fourth.
+///
+/// The lift authority is minted with the specification rather than per
+/// disassembler because minting copies the whole `.sla` into an `Arc` and
+/// hashes it. Its documented meaning is unchanged: equality is the identity of
+/// a load event, and there is now one load event per specification instead of
+/// one per caller. It is handed out only to a caller holding a trusted profile.
+struct LoadedSpecification {
     /// The underlying Ghidra Sleigh instance
     sleigh: GhidraSleigh,
-    /// Architecture name
-    arch_name: String,
     /// Canonical register names by (offset, size)
     reg_name_map: HashMap<(u64, u32), String>,
     /// Exact mapping extracted with the architecture metadata for this session.
     space_map: HashMap<AddressSpaceId, SpaceId>,
     /// Register the processor spec names as the program counter.
     program_counter: String,
+    /// Architecture exactly as `extract_architecture` derived it, before any
+    /// processor-spec overlay a particular consumer wants.
+    arch: Arc<r2il::ArchSpec>,
+    /// Present only for a specification loaded from embedded bytes, which are
+    /// the only ones that can certify.
+    authority: Option<GenuineLiftAuthority>,
+}
+
+/// A disassembler that uses libsla to lift instructions to r2il.
+pub struct Disassembler {
+    /// The parsed specification, shared with every other holder of it.
+    spec: Rc<LoadedSpecification>,
+    /// Architecture name
+    arch_name: String,
     /// Opaque authority present only for an embedded trusted Sleigh profile.
     genuine_authority: Option<GenuineLiftAuthority>,
     trusted_profile: Option<TrustedSleighProfile>,
@@ -1296,7 +1325,7 @@ impl<'a> PcodeSource for DisasmInstructionWrapper<'a> {
     fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
         usize::try_from(idx)
             .ok()
-            .and_then(|idx| self.disasm.space_map.get(&AddressSpaceId::new(idx)))
+            .and_then(|idx| self.disasm.spec.space_map.get(&AddressSpaceId::new(idx)))
             .copied()
     }
 }
@@ -1333,13 +1362,10 @@ fn build_register_name_map(sleigh: &GhidraSleigh) -> HashMap<(u64, u32), String>
     map
 }
 
-impl Disassembler {
-    fn from_sla_parts(
-        sla_bytes: &[u8],
-        pspec: &str,
-        arch_name: &str,
-        trusted_profile: Option<TrustedSleighProfile>,
-    ) -> Result<Self> {
+impl LoadedSpecification {
+    /// Parse one specification. `certifying` says whether the bytes are
+    /// embedded, which is the only case that may mint authority.
+    fn load(sla_bytes: &[u8], pspec: &str, arch_name: &str, certifying: bool) -> Result<Self> {
         let sleigh = GhidraSleigh::builder()
             .processor_spec(pspec)
             .map_err(|e| LiftError::Parse(format!("Invalid processor spec: {}", e)))?
@@ -1349,7 +1375,7 @@ impl Disassembler {
         let reg_name_map = build_register_name_map(&sleigh);
         let extracted = crate::sleigh::extract_architecture(&sleigh, arch_name)?;
         let arch = Arc::new(extracted.arch);
-        let genuine_authority = trusted_profile.map(|_| {
+        let authority = certifying.then(|| {
             GenuineLiftAuthority::new(
                 Arc::from(sla_bytes),
                 Arc::from(pspec),
@@ -1361,12 +1387,142 @@ impl Disassembler {
         Ok(Self {
             program_counter: program_counter_from_pspec(pspec),
             sleigh,
-            arch_name: arch_name.to_string(),
             reg_name_map,
             space_map: extracted.space_map,
+            arch,
+            authority,
+        })
+    }
+}
+
+/// The one loaded copy of an embedded specification.
+///
+/// Keyed by `stable_lift_manifest_hash`, which this crate already documents as
+/// the identity "available for diagnostics and cache partitioning" -- this is
+/// that use. The obvious key, the address of the specification bytes, is wrong:
+/// the embedded specs are `const` arrays, so each use site may materialise its
+/// own promoted copy and two callers naming the same language can hold two
+/// different addresses for identical bytes. Keying on the address made the
+/// cache silently miss between the lift path and the plugin's context, which is
+/// the whole thing it exists to join.
+///
+/// The name alone is not a key either, and that one would be a wrong answer
+/// rather than a miss: ARM32 deliberately reports one `ArchSpec::name` across
+/// four A32/Thumb by endianness languages, so a name maps to four different
+/// grammars and the processor spec is what tells them apart. The manifest hash
+/// covers the `.sla`, the processor spec and the name together.
+///
+/// Hashing megabytes is not cheap, so it is done at most once per distinct
+/// pointer and the pointer answers afterwards. That memo is sound where a bare
+/// pointer key is not: a colliding address that has not been hashed before
+/// simply gets hashed, and a `'static` bound means an address that has been
+/// hashed can never be reused for something else.
+///
+/// The `'static` bounds are the safety argument rather than a convenience. The
+/// cache outlives every caller, so admitting bytes that could be freed would
+/// make a recycled address a stale hit. Bytes supplied by a caller are
+/// therefore never cached; they load their own.
+///
+/// Thread-local because the parsed instance owns a C++ Sleigh object that
+/// declares neither `Send` nor `Sync`. The bound is one per embedded
+/// specification per lifting thread: at most the number of languages the build
+/// embeds, and in practice one.
+fn shared_specification(
+    sla_bytes: &'static [u8],
+    pspec: &'static str,
+    arch_name: &'static str,
+) -> Result<Rc<LoadedSpecification>> {
+    thread_local! {
+        static MANIFEST_BY_ADDRESS: RefCell<HashMap<(usize, usize, &'static str), u64>> =
+            RefCell::new(HashMap::new());
+        static LOADED: RefCell<HashMap<u64, Rc<LoadedSpecification>>> =
+            RefCell::new(HashMap::new());
+    }
+    let address = (sla_bytes.as_ptr() as usize, sla_bytes.len(), arch_name);
+    let manifest = MANIFEST_BY_ADDRESS.with(|memo| memo.borrow().get(&address).copied());
+    let manifest = match manifest {
+        Some(manifest) => manifest,
+        None => {
+            let manifest = stable_lift_manifest_hash(sla_bytes, pspec, arch_name);
+            MANIFEST_BY_ADDRESS.with(|memo| {
+                memo.borrow_mut().insert(address, manifest);
+            });
+            manifest
+        }
+    };
+    if let Some(loaded) = LOADED.with(|cache| cache.borrow().get(&manifest).map(Rc::clone)) {
+        return Ok(loaded);
+    }
+    // Loaded outside the borrow: parsing is fallible and is the slow path.
+    let loaded = Rc::new(LoadedSpecification::load(
+        sla_bytes, pspec, arch_name, true,
+    )?);
+    LOADED.with(|cache| {
+        cache.borrow_mut().insert(manifest, Rc::clone(&loaded));
+    });
+    Ok(loaded)
+}
+
+/// The architecture an embedded specification describes, with the processor
+/// spec's program counter applied, without parsing the specification again.
+pub fn shared_arch_spec(
+    sla_bytes: &'static [u8],
+    pspec: &'static str,
+    arch_name: &'static str,
+) -> Result<r2il::ArchSpec> {
+    let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+    let mut arch = (*spec.arch).clone();
+    arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
+    Ok(arch)
+}
+
+impl Disassembler {
+    fn from_sla_parts(
+        sla_bytes: &[u8],
+        pspec: &str,
+        arch_name: &str,
+        trusted_profile: Option<TrustedSleighProfile>,
+    ) -> Result<Self> {
+        // Caller-supplied bytes: loaded on their own and never cached, because
+        // nothing here can promise they outlive the cache.
+        let spec = Rc::new(LoadedSpecification::load(
+            sla_bytes,
+            pspec,
+            arch_name,
+            trusted_profile.is_some(),
+        )?);
+        Ok(Self::wrap(spec, arch_name, trusted_profile))
+    }
+
+    /// Wrap a specification with one caller's identity. Everything expensive
+    /// already happened; this is an `Rc` clone and a name.
+    fn wrap(
+        spec: Rc<LoadedSpecification>,
+        arch_name: &str,
+        trusted_profile: Option<TrustedSleighProfile>,
+    ) -> Self {
+        let genuine_authority = trusted_profile.and_then(|_| spec.authority.clone());
+        Self {
+            spec,
+            arch_name: arch_name.to_string(),
             genuine_authority,
             trusted_profile,
-        })
+        }
+    }
+
+    /// Construct over an embedded specification without claiming authority.
+    ///
+    /// This is what the plugin's `R2ILContext` wants: the same parse the lift
+    /// path uses, none of the certification. It shares the specification rather
+    /// than parsing a second copy, which is what made one `R2ILContext` cost
+    /// two parses -- one here and one in `build_arch_spec` beside it.
+    pub fn from_embedded(
+        sla_bytes: &'static [u8],
+        pspec: &'static str,
+        arch_name: &'static str,
+    ) -> Result<Self> {
+        let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+        Ok(Self::wrap(spec, arch_name, None))
     }
 
     /// Construct from a pinned, embedded processor specification.
@@ -1374,54 +1530,15 @@ impl Disassembler {
     /// This is the only constructor that can mint genuine lift authority.
     pub fn from_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
         let (sla_bytes, pspec, arch_name) = profile.specification();
-        Self::from_sla_parts(sla_bytes, pspec, arch_name, Some(profile))
-    }
-
-    /// The one loaded instance of an embedded profile, loaded on first ask.
-    ///
-    /// Building a disassembler parses the whole compiled `.sla` and rebuilds
-    /// the register and address-space tables from it. Measured on the x86-64
-    /// profile: 58 to 91 milliseconds to load, against 21 to 83 *micro*seconds
-    /// to lift a three-byte block. Every capture used to pay that once for the
-    /// function asked for and once for each callee beside it, so a request with
-    /// three callees spent about a quarter of a second loading four identical
-    /// copies of one specification, and a twelve-byte import thunk -- which is
-    /// most of what an analysis sweep proves -- cost a profile load and almost
-    /// nothing else. That is where the per-function cost was.
-    ///
-    /// Reuse across functions is the same reuse that already happens across
-    /// blocks: `lift_genuine_block` takes `&self` and every block of a function
-    /// already goes through one instance, at arbitrary addresses and in
-    /// arbitrary order. Nothing is reset between them now and nothing was
-    /// before.
-    ///
-    /// Thread-local rather than global, because the instance owns a C++ Sleigh
-    /// object that declares neither `Send` nor `Sync`; a thread that lifts gets
-    /// its own, which is one per embedded profile per lifting thread. The bound
-    /// is the number of profiles the build embeds, at most eleven and in
-    /// practice one.
-    fn shared_trusted_profile(profile: TrustedSleighProfile) -> Result<Rc<Self>> {
-        thread_local! {
-            static LOADED: RefCell<HashMap<TrustedSleighProfile, Rc<Disassembler>>> =
-                RefCell::new(HashMap::new());
-        }
-        if let Some(loaded) = LOADED.with(|cache| cache.borrow().get(&profile).map(Rc::clone)) {
-            return Ok(loaded);
-        }
-        // Built outside the borrow: loading is fallible and can itself reach
-        // this function for another profile.
-        let loaded = Rc::new(Self::from_trusted_profile(profile)?);
-        LOADED.with(|cache| {
-            cache.borrow_mut().insert(profile, Rc::clone(&loaded));
-        });
-        Ok(loaded)
+        let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+        Ok(Self::wrap(spec, arch_name, Some(profile)))
     }
 
     /// Lift every byte of one opaque source capture with the one exact embedded
     /// profile selected by its owned machine tuple.
     pub fn lift_owned_function(source: OwnedFunctionSnapshot) -> Result<TrustedLiftedFunction> {
         let profile = TrustedSleighProfile::from_machine(source.machine())?;
-        let disassembler = Self::shared_trusted_profile(profile)?;
+        let disassembler = Self::from_trusted_profile(profile)?;
         if disassembler.trusted_profile != Some(profile) {
             return Err(LiftError::Unsupported(
                 "trusted profile identity was lost while loading Sleigh".to_string(),
@@ -1564,22 +1681,23 @@ impl Disassembler {
     /// Writing a branch target to the wrong name leaves the branch with no
     /// effect at all.
     pub fn program_counter(&self) -> &str {
-        &self.program_counter
+        &self.spec.program_counter
     }
 
     /// Get the default code address space.
     pub fn default_code_space(&self) -> AddressSpace {
-        self.sleigh.default_code_space()
+        self.spec.sleigh.default_code_space()
     }
 
     /// List all address spaces.
     pub fn address_spaces(&self) -> Vec<AddressSpace> {
-        self.sleigh.address_spaces()
+        self.spec.sleigh.address_spaces()
     }
 
     /// Get a register's varnode data by name.
     pub fn register(&self, name: &str) -> Result<VarnodeData> {
-        self.sleigh
+        self.spec
+            .sleigh
             .register_from_name(name)
             .map_err(|e| LiftError::Parse(format!("Unknown register '{}': {}", name, e)))
     }
@@ -1601,17 +1719,17 @@ impl Disassembler {
             return None;
         }
 
-        if let Some(name) = self.reg_name_map.get(&(vn.offset, vn.size)) {
+        if let Some(name) = self.spec.reg_name_map.get(&(vn.offset, vn.size)) {
             return Some(name.clone());
         }
 
         // Get the register address space
-        let reg_space = self.sleigh.address_space_by_name("register")?;
+        let reg_space = self.spec.sleigh.address_space_by_name("register")?;
 
         // Create a VarnodeData to query libsla
         let varnode_data = VarnodeData::new(Address::new(reg_space, vn.offset), vn.size as usize);
 
-        self.sleigh.register_name(&varnode_data)
+        self.spec.sleigh.register_name(&varnode_data)
     }
 
     /// Format a varnode as a human-readable string, resolving register names.
@@ -1667,7 +1785,7 @@ impl Disassembler {
     /// normalization required to preserve the instruction's control graph.
     /// No mnemonic, user-op name, or inferred metadata participates.
     fn lift_canonical(&self, bytes: &[u8], addr: u64) -> Result<R2ILBlock> {
-        let code_space = self.sleigh.default_code_space();
+        let code_space = self.spec.sleigh.default_code_space();
         let address = Address::new(code_space, addr);
 
         // Create an instruction loader from the bytes
@@ -1675,6 +1793,7 @@ impl Disassembler {
 
         // Disassemble to P-code
         let pcode = self
+            .spec
             .sleigh
             .disassemble_pcode(&loader, address)
             .map_err(|e| {
@@ -1850,11 +1969,12 @@ impl Disassembler {
 
     /// Disassemble and get native assembly mnemonic.
     pub fn disasm_native(&self, bytes: &[u8], addr: u64) -> Result<(String, usize)> {
-        let code_space = self.sleigh.default_code_space();
+        let code_space = self.spec.sleigh.default_code_space();
         let address = Address::new(code_space, addr);
         let loader = ByteLoader::new(bytes, addr);
 
         let native = self
+            .spec
             .sleigh
             .disassemble_native(&loader, address)
             .map_err(|e| LiftError::Parse(format!("Disassembly failed: {}", e)))?;
@@ -2563,7 +2683,7 @@ impl Disassembler {
 
     /// Convert a libsla AddressSpace using the exact metadata-extraction map.
     fn translate_space(&self, space: &AddressSpace) -> Result<SpaceId> {
-        self.space_map.get(&space.id).copied().ok_or_else(|| {
+        self.spec.space_map.get(&space.id).copied().ok_or_else(|| {
             LiftError::Unsupported(format!(
                 "Sleigh emitted unmapped address space '{}' ({})",
                 space.name, space.id
@@ -4179,7 +4299,7 @@ mod tests {
             .expect("trusted profile authority");
         let spaces = disassembler.address_spaces();
 
-        assert_eq!(spaces.len(), disassembler.space_map.len());
+        assert_eq!(spaces.len(), disassembler.spec.space_map.len());
         for space in spaces {
             let mapped = disassembler
                 .translate_space(&space)
@@ -4482,55 +4602,80 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "x86"))]
-mod sleigh_profile_load_cost {
+mod sleigh_specification_load_cost {
     use super::*;
 
-    /// What loading a profile costs against what lifting costs, which is the
-    /// measurement that moved the profile load out of the per-function path.
+    /// What parsing a specification costs against what lifting costs, which is
+    /// the measurement that moved the parse out of the per-caller path.
     ///
     /// Not a gate: it prints rather than asserts, because a wall-clock bound
     /// checked in CI is a flake and the ratio is the finding. Run it with
     /// `cargo test --release -p r2sleigh-lift --features x86
-    /// sleigh_profile_load_cost -- --ignored --nocapture`.
+    /// sleigh_specification_load_cost -- --ignored --nocapture`.
     #[test]
     #[ignore = "measurement, not a gate"]
-    fn loading_a_profile_costs_a_thousand_lifts() {
+    fn parsing_a_specification_costs_a_thousand_lifts() {
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
         for round in 0..3 {
             let started = std::time::Instant::now();
-            let cold = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
-                .expect("x86-64 profile");
+            let cold = LoadedSpecification::load(sla, pspec, name, true).expect("cold load");
             eprintln!(
-                "round {round}: cold load = {}us",
+                "round {round}: cold parse = {}us",
                 started.elapsed().as_micros()
             );
+            let wrapped = Disassembler::wrap(
+                std::rc::Rc::new(cold),
+                name,
+                Some(TrustedSleighProfile::X86_64),
+            );
             let started = std::time::Instant::now();
-            let _ = cold.lift_genuine_block(&[0x48, 0x89, 0xe5], 0x1000, 3);
+            let _ = wrapped.lift_genuine_block(&[0x48, 0x89, 0xe5], 0x1000, 3);
             eprintln!(
                 "round {round}: one three-byte block = {}us",
                 started.elapsed().as_micros()
             );
             let started = std::time::Instant::now();
-            let shared = Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
-                .expect("shared x86-64 profile");
+            let _ = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("shared profile");
             eprintln!(
-                "round {round}: shared load = {}us",
+                "round {round}: shared build = {}us",
                 started.elapsed().as_micros()
             );
-            assert_eq!(shared.trusted_profile, Some(TrustedSleighProfile::X86_64));
         }
     }
 
     #[test]
-    fn one_profile_is_loaded_once_and_handed_out_again() {
-        let first =
-            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("first ask");
-        let second =
-            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("second ask");
+    fn one_specification_is_parsed_once_and_shared_by_every_caller() {
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        let first = shared_specification(sla, pspec, name).expect("first ask");
+        let second = shared_specification(sla, pspec, name).expect("second ask");
         assert!(
             Rc::ptr_eq(&first, &second),
-            "the second ask must be the same loaded profile, not another copy"
+            "the second ask must be the same parse, not another copy"
         );
-        assert_eq!(first.trusted_profile, Some(TrustedSleighProfile::X86_64));
-        assert!(first.genuine_authority.is_some());
+        // And the two consumers that used to parse separately now reach it.
+        let lifter = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted disassembler");
+        assert!(Rc::ptr_eq(&lifter.spec, &first));
+        assert_eq!(lifter.trusted_profile, Some(TrustedSleighProfile::X86_64));
+        assert!(lifter.genuine_authority.is_some());
+        let arch = shared_arch_spec(sla, pspec, name).expect("arch spec");
+        assert_eq!(arch.name, first.arch.name);
+        // The architecture the plugin asks for carries the processor spec's
+        // program counter; the one the lifter holds is the raw extraction.
+        assert!(arch.program_counter.is_some());
+    }
+
+    #[test]
+    fn caller_supplied_bytes_are_never_served_from_the_cache() {
+        // Only `'static` embedded bytes may be cached, because the cache
+        // outlives any other caller's buffer and a recycled address would be a
+        // wrong answer rather than a slow one.
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        let owned = sla.to_vec();
+        let ad_hoc = Disassembler::from_sla(&owned, pspec, name).expect("ad hoc disassembler");
+        let shared = shared_specification(sla, pspec, name).expect("shared");
+        assert!(!Rc::ptr_eq(&ad_hoc.spec, &shared));
+        assert!(ad_hoc.genuine_authority.is_none());
     }
 }

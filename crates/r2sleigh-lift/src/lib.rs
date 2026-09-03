@@ -34,6 +34,7 @@ pub mod translate;
 use thiserror::Error;
 
 pub use context::LiftContext;
+pub use disasm::shared_arch_spec;
 pub use disasm::{
     Disassembler, GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, GenuineInstructionSpan,
     GenuineLiftAuthority, GenuineLiftedBlock, GenuineLiftedFunction,

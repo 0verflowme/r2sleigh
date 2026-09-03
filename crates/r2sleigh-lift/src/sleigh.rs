@@ -435,7 +435,7 @@ pub fn build_arch_spec(
 /// spelling, because the specification is where the fact lives. The element is
 /// `<programcounter register="NAME"/>` and appears at most once; anything else
 /// is treated as the specification not saying, which is the honest answer.
-fn processor_spec_program_counter(pspec_data: &str) -> Option<String> {
+pub(crate) fn processor_spec_program_counter(pspec_data: &str) -> Option<String> {
     let element = pspec_data.split("<programcounter").nth(1)?;
     let element = element.split('>').next()?;
     let attribute = element.split("register").nth(1)?;
