@@ -77,7 +77,6 @@ impl<'a> FoldingContext<'a> {
         };
         let prepared = self.prepared_ssa()?;
         let graph = prepared.graph();
-        let projection = plan.machine_projection();
 
         let base_expr = self.render_subscript_term(arena, base)?;
         let base_expr = self.subscript_base_at_element_type(arena, base, base_expr, elem_ty);
@@ -86,22 +85,6 @@ impl<'a> FoldingContext<'a> {
             base: Box::new(base_expr),
             index: Box::new(index_expr),
         };
-
-        // A constant the rewrite folded away -- the stride, an offset now
-        // measured in elements -- has no leaf left to be rendered at, and
-        // still owes its cell: the subscript is where it is rendered.
-        let imported = canonical.import().access(fact.access)?;
-        let remaining = arena.leaves(access.canonical);
-        for leaf in arena.leaves(imported.term) {
-            if remaining.contains(&leaf) {
-                continue;
-            }
-            if let Some(r2ssa::MachineExprKind::Constant { binding, .. }) =
-                projection.expr(leaf).map(|expr| expr.kind())
-            {
-                expr = self.observe_inlined_value_expr(binding.value(), expr);
-            }
-        }
 
         let discharged: Vec<r2ssa::InstId> = access
             .discharges
@@ -118,18 +101,49 @@ impl<'a> FoldingContext<'a> {
         if discharged.len() != access.discharges.len() {
             return None;
         }
+        // A literal operand of an instruction this term consumed is rendered
+        // here too, and it is the one cell `observe_discharged_expr` cannot
+        // fill. That function marks each discharged instruction's write, its
+        // output value, and its operands' *uses*; a constant has no defining
+        // instruction, so it is nobody's output and never appears in the
+        // discharged set at all, while its only occurrence was inside the
+        // address expression this subscript replaced.
+        //
+        // The earlier attempt looked for these among the term's leaves and
+        // found none, because import turns a constant into `TermKind::Literal`
+        // and `leaves` collects only `Leaf` and `Opaque`. Asking the graph for
+        // the instruction's operands avoids depending on how a constant
+        // happens to be represented in a term. Deduplicated, because one
+        // literal may be an operand of two consumed instructions and would
+        // otherwise be counted as two occurrences of one execution.
+        let mut folded_literals = std::collections::BTreeSet::new();
+        for inst in &discharged {
+            let graph_inst = graph.inst(*inst)?;
+            for input in graph_inst.inputs.iter().copied() {
+                if graph.def_inst(input).is_some() {
+                    continue;
+                }
+                if matches!(
+                    names.disposition_for_value(input),
+                    Some(crate::binding_plan::ValueDisposition::Inline { .. })
+                ) {
+                    folded_literals.insert(input);
+                }
+            }
+        }
+        for literal in folded_literals {
+            expr = self.observe_inlined_value_expr(literal, expr);
+        }
+
         // Always, even when the term absorbed nothing. The subscript is where
         // this address is rendered: the dereference path marks the address
         // value on its way through `certified_memory_address_expr`, and this
         // path does not go through it, so the cell has no other answerer.
         //
         // An empty discharge set is not the rare case. `constant_stride`
-        // absorbs the add and the multiply, so the set is non-empty and the
-        // marking happened by luck; `pointer_walk` rewrites a bare merge leaf
-        // and absorbs nothing, so the set is empty and the address went
-        // unaccounted. That is what refused six `x64_O2` cells with
-        // `RenderedValueRequired` -- every one a byte loop whose pointer the
-        // compiler walks round a phi.
+        // absorbs the add and the multiply, so the set is non-empty;
+        // `pointer_walk` rewrites a bare merge leaf and absorbs nothing, so
+        // the set is empty and the address would go unaccounted.
         expr = self.observe_discharged_expr(fact.address, &discharged, expr);
         Some(expr)
     }
