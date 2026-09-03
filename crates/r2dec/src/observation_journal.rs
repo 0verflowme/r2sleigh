@@ -1654,6 +1654,17 @@ impl LegacyObservationJournal {
                 let Some(input) = input else {
                     continue;
                 };
+                if matches!(op, r2ssa::SSAOp::CallRestore { .. })
+                    && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some()
+                {
+                    eprintln!(
+                        "call-restore coalescing site={site:?} source={:?} output={:?} source-disposition={:?} output-disposition={:?}",
+                        input.value,
+                        output.value,
+                        plan.disposition(input.value),
+                        plan.disposition(output.value),
+                    );
+                }
                 // A restore states the convention rather than performing a
                 // copy the program wrote, so the question this asks of a
                 // program copy -- did anything write the object between the
