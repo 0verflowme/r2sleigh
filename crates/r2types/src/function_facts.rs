@@ -2671,9 +2671,21 @@ impl FunctionFacts {
         prepared: &r2ssa::SsaArtifact,
         param_slots: &ParamSlotResolver,
     ) {
+        // Register call arguments are implicit machine reads and therefore do
+        // not appear in the graph's ordinary use lists. The callsite
+        // certificate is their canonical use table; index it once so a formal
+        // handed straight to a callee remains a live parameter binding.
+        let implicit_call_arguments = prepared
+            .certificates()
+            .callsites
+            .values()
+            .flat_map(|callsite| callsite.argument_values.iter().copied())
+            .collect::<BTreeSet<_>>();
         let mut entry_values_by_slot = BTreeMap::<u32, (BTreeSet<r2ssa::ValueId>, u32)>::new();
         for value in &prepared.graph().values {
-            if value.var.version != 0 || !parameter_entry_value_has_live_use(prepared, value.id) {
+            if value.var.version != 0
+                || !parameter_entry_value_has_live_use(prepared, value.id, &implicit_call_arguments)
+            {
                 continue;
             }
             let Some(slot) = param_slots.slot_for_value(value.id) else {
@@ -3263,13 +3275,20 @@ impl FunctionFacts {
     }
 }
 
-fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa::ValueId) -> bool {
+fn parameter_entry_value_has_live_use(
+    prepared: &r2ssa::SsaArtifact,
+    root: r2ssa::ValueId,
+    implicit_call_arguments: &BTreeSet<r2ssa::ValueId>,
+) -> bool {
     let graph = prepared.graph();
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(value) = pending.pop() {
         if !visited.insert(value) {
             continue;
+        }
+        if implicit_call_arguments.contains(&value) {
+            return true;
         }
         for use_site in graph.use_sites(value) {
             let Some(inst) = graph.inst(use_site.inst) else {
@@ -5966,6 +5985,81 @@ mod tests {
 
         assert!(certified.fact.renderable);
         assert!(certified.bindings.contains(&binding));
+    }
+
+    #[test]
+    fn an_implicit_call_read_keeps_its_entry_value_as_a_certified_parameter() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        let target = Varnode::constant(0x402000, 8);
+        block.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"implicit-call-parameter".to_vec();
+        let parameter_storage = register_storage(0x10);
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.clone(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter_storage)],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x28)))
+        .expect("exact caller interface");
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            revision,
+            r2ssa::SourceCallSiteIdentity::new(
+                0x401000,
+                0,
+                r2ssa::CanonicalStorageId::from_varnode(&target),
+            ),
+            true,
+            "sysv64",
+            [r2ssa::SourceCallArgumentSpec::new(0, parameter_storage)],
+            false,
+            false,
+            r2ssa::SourceCallResult::Void,
+        )
+        .expect("exact callee interface");
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&x86_stack_home_arch()),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("prepared implicit-call fixture");
+        let parameter = prepared
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("entry parameter boundary");
+        assert!(prepared.graph().use_sites(parameter.value).is_empty());
+        assert_eq!(
+            prepared
+                .callsite_certificate_for_op(0x401000, 0)
+                .expect("callsite certificate")
+                .argument_values,
+            [parameter.value]
+        );
+
+        let mut facts = FunctionFacts::default();
+        facts.attach_prepared_decompile_evidence(&prepared);
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
+
+        assert_eq!(
+            facts
+                .render()
+                .expect("render facts")
+                .parameter_values(0)
+                .collect::<Vec<_>>(),
+            [parameter.value]
+        );
     }
 
     #[test]

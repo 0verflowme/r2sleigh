@@ -560,8 +560,15 @@ pub struct SourceCallBoundaryFact {
     /// The split has to travel, because the declaration a rendering owes the
     /// callee can only spell the named ones.
     pub fixed_argument_count: Option<usize>,
+    /// Result values this function actually observes.
+    ///
+    /// A complete non-void boundary may carry no entries here when the caller
+    /// discards the result. `result_kind` still records the callee's exact
+    /// result carrier; only a reaching SSA value is absent.
     pub results: Vec<CallBoundaryValueFact>,
-    /// False until an ABI-aware boundary pass proves that every slot is known.
+    /// False until an ABI-aware boundary pass proves every argument and every
+    /// result value the caller observes. An exact discarded result is complete
+    /// because there is no caller-side value to identify.
     pub complete: bool,
 }
 
@@ -3149,6 +3156,11 @@ fn collect_source_boundary_facts(
     call_sites: &CallSiteFacts,
     machine_context: Option<&SourceMachineContext>,
 ) -> SourceBoundaryFacts {
+    // Calls read register arguments implicitly, so a preserved entry carrier
+    // has no graph use at the call instruction. Index exact entry values once
+    // for the whole boundary pass and attach that identity when the reaching
+    // proof says the carrier was untouched.
+    let entry_values = unique_entry_values_by_storage(graph);
     let mut facts = SourceBoundaryFacts {
         parameters: machine_context
             .map(|machine_context| collect_source_formal_parameter_facts(graph, machine_context))
@@ -3199,6 +3211,7 @@ fn collect_source_boundary_facts(
                             function,
                             graph,
                             machine_context,
+                            &entry_values,
                             block_addr,
                             op_index,
                             argument.storage(),
@@ -3217,7 +3230,7 @@ fn collect_source_boundary_facts(
                         Some(Vec::new())
                     }
                     (CallSiteTransfer::Call, SourceCallResult::Register { storage }) => {
-                        call_result_value_after_call(
+                        call_result_values_after_call(
                             function,
                             graph,
                             machine_context,
@@ -3225,17 +3238,10 @@ fn collect_source_boundary_facts(
                             op_index,
                             storage,
                         )
-                        .map(|value| {
-                            vec![CallBoundaryValueFact {
-                                slot: CallBoundarySlot::Register { index: 0, storage },
-                                value,
-                            }]
-                        })
                     }
                 };
-                if arguments.len() == interface.arguments().len()
-                    && let Some(results) = results
-                {
+                let arguments_complete = arguments.len() == interface.arguments().len();
+                if arguments_complete {
                     let mut arguments = arguments;
                     boundary.fixed_argument_count = Some(arguments.len());
                     arguments.extend(variadic_call_tail_arguments(
@@ -3247,12 +3253,16 @@ fn collect_source_boundary_facts(
                         op_index,
                     ));
                     boundary.arguments = arguments;
-                    boundary.results = results;
-                    boundary.complete = true;
                 }
+                let results_complete = results.is_some();
+                if let Some(results) = results {
+                    boundary.results = results;
+                }
+                boundary.complete = arguments_complete && results_complete;
             }
         }
         if !boundary.complete
+            && boundary.calling_convention.is_none()
             && let Some(machine_context) = machine_context
             && let Some((block_addr, op_index)) = graph.op_site_for_inst(call_site.at)
             && let Some(convention) =
@@ -3396,21 +3406,26 @@ fn collect_source_boundary_facts(
     facts
 }
 
-/// The single authoritative projection from source ABI parameter slots to
-/// entry SSA values. Preparation and published boundary facts consume this
-/// same answer; register spelling is never an identity input.
-pub(crate) fn collect_source_formal_parameter_facts(
-    graph: &SsaGraph,
+#[derive(Debug, Clone, Copy)]
+struct SourceFormalParameterProjection {
+    index: u32,
+    abi_storage: CanonicalStorageId,
+    graph_storage: CanonicalStorageId,
+    logical_value: Option<SourceLogicalValue>,
+}
+
+/// Validate and project the source's ABI parameter slots once.
+fn source_formal_parameter_projections(
     machine_context: &SourceMachineContext,
-) -> BTreeMap<u32, SourceFormalParameterFact> {
+) -> Vec<SourceFormalParameterProjection> {
     // Whole-ABI coherence also covers return and stack roles. Those unrelated
     // roles cannot invalidate an exact parameter/type projection; each slot is
     // checked against the interface and graph below before it becomes a fact.
     if !machine_context.abi_model().is_available() {
-        return BTreeMap::new();
+        return Vec::new();
     }
     let Some(interface) = machine_context.function_interface() else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     if interface.schema_version() != SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION
         || match interface.type_graph() {
@@ -3421,61 +3436,122 @@ pub(crate) fn collect_source_formal_parameter_facts(
             None => !interface.parameter_logical_values().is_empty(),
         }
     {
-        return BTreeMap::new();
+        return Vec::new();
     }
 
-    let mut facts = BTreeMap::new();
-    for (parameter_position, parameter) in interface.parameters().iter().enumerate() {
-        let abi_storage = parameter.storage();
-        if machine_context
-            .abi_model()
-            .argument_registers()
-            .iter()
-            .filter(|slot| slot.index() == parameter.index() && slot.storage() == abi_storage)
-            .count()
-            != 1
-        {
+    interface
+        .parameters()
+        .iter()
+        .enumerate()
+        .filter_map(|(parameter_position, parameter)| {
+            let abi_storage = parameter.storage();
+            if machine_context
+                .abi_model()
+                .argument_registers()
+                .iter()
+                .filter(|slot| slot.index() == parameter.index() && slot.storage() == abi_storage)
+                .count()
+                != 1
+            {
+                return None;
+            }
+            let logical_value = interface
+                .parameter_logical_values()
+                .get(parameter_position)
+                .copied();
+            let graph_storage = match (logical_value, interface.type_graph()) {
+                (Some(logical_value), Some(type_graph)) => {
+                    projected_formal_parameter_storage(abi_storage, logical_value, type_graph)?
+                }
+                (None, None) => abi_storage,
+                (Some(_), None) | (None, Some(_)) => return None,
+            };
+            Some(SourceFormalParameterProjection {
+                index: parameter.index(),
+                abi_storage,
+                graph_storage,
+                logical_value,
+            })
+        })
+        .collect()
+}
+
+/// Index the exact entry values by source storage in one graph pass.
+///
+/// `None` records ambiguity and is deliberately sticky: materialization must
+/// never turn two existing answers into a third one that merely looks exact.
+fn unique_entry_values_by_storage(
+    graph: &SsaGraph,
+) -> BTreeMap<CanonicalStorageId, Option<ValueId>> {
+    let mut values = BTreeMap::new();
+    for value in &graph.values {
+        let Some(storage) = value.canonical_storage else {
+            continue;
+        };
+        if graph.def_inst(value.id).is_some() || value.var.version != 0 {
             continue;
         }
-        let logical_value = interface
-            .parameter_logical_values()
-            .get(parameter_position)
-            .copied();
-        let graph_storage = match (logical_value, interface.type_graph()) {
-            (Some(logical_value), Some(type_graph)) => {
-                let Some(storage) =
-                    projected_formal_parameter_storage(abi_storage, logical_value, type_graph)
-                else {
-                    continue;
-                };
-                storage
-            }
-            (None, None) => abi_storage,
-            (Some(_), None) | (None, Some(_)) => continue,
-        };
-        let candidates = graph
-            .values
-            .iter()
-            .filter(|value| {
-                graph.def_inst(value.id).is_none()
-                    && value.var.version == 0
-                    && value.var.size == graph_storage.size
-                    && value.canonical_storage == Some(graph_storage)
-            })
-            .map(|value| value.id)
-            .collect::<Vec<_>>();
-        if let [value] = candidates.as_slice() {
-            facts.insert(
-                parameter.index(),
-                SourceFormalParameterFact {
-                    index: parameter.index(),
-                    abi_storage,
-                    graph_storage,
-                    logical_value,
-                    value: *value,
-                },
-            );
+        values
+            .entry(storage)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(value.id));
+    }
+    values
+}
+
+/// Add source-declared entry parameters that implicit call reads alone expose.
+///
+/// This is one pass over the existing graph plus one bounded pass over ABI
+/// slots. The graph value has no defining instruction; it is an exact boundary
+/// value whose eventual use is owned by a callsite certificate.
+pub(crate) fn ensure_source_formal_parameter_values(
+    graph: &mut SsaGraph,
+    machine_context: &SourceMachineContext,
+) {
+    let mut existing = unique_entry_values_by_storage(graph);
+    for parameter in source_formal_parameter_projections(machine_context) {
+        if existing.contains_key(&parameter.graph_storage) {
+            continue;
         }
+        let name = machine_context
+            .register_name(parameter.graph_storage)
+            .unwrap_or_else(|| format!("reg:{:x}", parameter.graph_storage.offset));
+        if let Some(value) = graph.ensure_entry_value(
+            SSAVar::initial(name, parameter.graph_storage.size),
+            parameter.graph_storage,
+        ) {
+            existing.insert(parameter.graph_storage, Some(value));
+        }
+    }
+}
+
+/// The single authoritative projection from source ABI parameter slots to
+/// entry SSA values. Preparation and published boundary facts consume this
+/// same answer; register spelling is never an identity input.
+pub(crate) fn collect_source_formal_parameter_facts(
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+) -> BTreeMap<u32, SourceFormalParameterFact> {
+    let entry_values = unique_entry_values_by_storage(graph);
+    let mut facts = BTreeMap::new();
+    for parameter in source_formal_parameter_projections(machine_context) {
+        let Some(value) = entry_values
+            .get(&parameter.graph_storage)
+            .copied()
+            .flatten()
+        else {
+            continue;
+        };
+        facts.insert(
+            parameter.index,
+            SourceFormalParameterFact {
+                index: parameter.index,
+                abi_storage: parameter.abi_storage,
+                graph_storage: parameter.graph_storage,
+                logical_value: parameter.logical_value,
+                value,
+            },
+        );
     }
     facts
 }
@@ -3711,6 +3787,7 @@ fn reaching_abi_argument_in_block(
     function: &SSAFunction,
     graph: &SsaGraph,
     machine_context: &SourceMachineContext,
+    entry_values: &BTreeMap<CanonicalStorageId, Option<ValueId>>,
     block_addr: u64,
     boundary_op_index: usize,
     storage: CanonicalStorageId,
@@ -3725,7 +3802,12 @@ fn reaching_abi_argument_in_block(
         true,
     )
     .map(|state| match state {
-        ReachingAbiState::PreservedEntry => SourceCallArgumentValue::PreservedEntry,
+        ReachingAbiState::PreservedEntry => entry_values
+            .get(&storage)
+            .copied()
+            .flatten()
+            .map(SourceCallArgumentValue::Value)
+            .unwrap_or(SourceCallArgumentValue::PreservedEntry),
         ReachingAbiState::Value(value) => SourceCallArgumentValue::Value(value),
     })
 }
@@ -4154,21 +4236,33 @@ fn validate_return_register_composition(
     actual == expected
 }
 
-fn call_result_value_after_call(
+/// Values this function observes from an exact non-void call result.
+///
+/// No `CallDefine` means the result is intentionally discarded, which is a
+/// complete answer: C renders the non-void call as an expression statement.
+/// Once any result definition exists, exactly one definition of the declared
+/// carrier must be present; zero or several are an ambiguous boundary.
+fn call_result_values_after_call(
     function: &SSAFunction,
     graph: &SsaGraph,
     _machine_context: &SourceMachineContext,
     block_addr: u64,
     call_op_index: usize,
     storage: CanonicalStorageId,
-) -> Option<ValueId> {
+) -> Option<Vec<CallBoundaryValueFact>> {
     let block = function.get_block(block_addr)?;
-    let mut candidates = block
+    let call_defines = block
         .ops
         .get(call_op_index.checked_add(1)?..)?
         .iter()
         .enumerate()
         .take_while(|(_, op)| matches!(op, SSAOp::CallDefine { .. }))
+        .collect::<Vec<_>>();
+    if call_defines.is_empty() {
+        return Some(Vec::new());
+    }
+    let candidates = call_defines
+        .into_iter()
         .filter_map(|(relative_index, op)| {
             let SSAOp::CallDefine { dst } = op else {
                 return None;
@@ -4186,8 +4280,11 @@ fn call_result_value_after_call(
             graph_inst.output
         })
         .collect::<Vec<_>>();
-    match candidates.as_mut_slice() {
-        [value] => Some(*value),
+    match candidates.as_slice() {
+        [value] => Some(vec![CallBoundaryValueFact {
+            slot: CallBoundarySlot::Register { index: 0, storage },
+            value: *value,
+        }]),
         _ => None,
     }
 }
