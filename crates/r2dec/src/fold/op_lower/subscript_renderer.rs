@@ -118,9 +118,19 @@ impl<'a> FoldingContext<'a> {
         if discharged.len() != access.discharges.len() {
             return None;
         }
-        if !discharged.is_empty() {
-            expr = self.observe_discharged_expr(fact.address, &discharged, expr);
-        }
+        // Always, even when the term absorbed nothing. The subscript is where
+        // this address is rendered: the dereference path marks the address
+        // value on its way through `certified_memory_address_expr`, and this
+        // path does not go through it, so the cell has no other answerer.
+        //
+        // An empty discharge set is not the rare case. `constant_stride`
+        // absorbs the add and the multiply, so the set is non-empty and the
+        // marking happened by luck; `pointer_walk` rewrites a bare merge leaf
+        // and absorbs nothing, so the set is empty and the address went
+        // unaccounted. That is what refused six `x64_O2` cells with
+        // `RenderedValueRequired` -- every one a byte loop whose pointer the
+        // compiler walks round a phi.
+        expr = self.observe_discharged_expr(fact.address, &discharged, expr);
         Some(expr)
     }
 
