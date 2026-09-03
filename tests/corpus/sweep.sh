@@ -1,13 +1,14 @@
 #!/bin/bash
-# Render the explicit 9-function binding corpus with machine-readable markers.
+# Render one corpus binary's functions with machine-readable markers.
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <corpus-binary>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "usage: $0 <corpus-binary> [hashes|shapes]" >&2
     exit 64
 fi
 
 binary=$1
+corpus=${2:-hashes}
 if [[ ! -r "$binary" ]]; then
     echo "corpus binary is not readable: $binary" >&2
     exit 66
@@ -18,27 +19,66 @@ r2_bin=$(command -v r2) || {
     exit 69
 }
 
-functions=(
-    fnv1a32
-    fnv1a64
-    djb2
-    sdbm
-    adler32
-    crc32_bitwise
-    murmur3_32
-    xxhash32
-    pearson
-)
-
-# Helpers the corpus functions call. They are not scored -- SPECS names the nine
-# above -- but a rendered call needs the callee's definition in the same
-# translation unit, so the verifier looks for a section by this name and uses it
-# when the caller declares that callee. At -O1 and above the compiler inlines
-# them and the symbol is gone, which the verifier treats as "no callee section"
-# rather than as a failure.
-callees=(
-    rotl32
-)
+# Helpers the corpus functions call. They are not scored -- verify_rendering.py
+# names the scored functions -- but a rendered call needs the callee's
+# definition in the same translation unit, so the verifier looks for a section
+# by this name and uses it when the caller declares that callee, transitively.
+# At -O1 and above a helper may be inlined and the symbol gone, which the
+# verifier treats as "no callee section" rather than as a failure.
+case $corpus in
+    hashes)
+        functions=(
+            fnv1a32
+            fnv1a64
+            djb2
+            sdbm
+            adler32
+            crc32_bitwise
+            murmur3_32
+            xxhash32
+            pearson
+        )
+        callees=(
+            rotl32
+        )
+        ;;
+    shapes)
+        functions=(
+            shape_variadic
+            shape_variadic_local
+            shape_call_chain
+            shape_struct_pointer
+            shape_struct_value
+            shape_struct_array
+            shape_stack_buffer
+            shape_recurse_direct
+            shape_recurse_mutual
+            shape_signed_divmod
+            shape_multiword_return
+            shape_pointer_to_pointer
+            shape_function_pointer
+        )
+        callees=(
+            vfold
+            shape_step
+            shape_stash
+            mixed_touch
+            mixed_fold
+            shape_mutual_even
+            shape_mutual_odd
+            wide_make
+            indirect_load
+            indirect_store
+            op_add
+            op_xor
+            op_mul
+        )
+        ;;
+    *)
+        echo "unknown corpus: $corpus" >&2
+        exit 64
+        ;;
+esac
 
 command_text="a:sla; aaa"
 for function in "${functions[@]}" "${callees[@]}"; do
