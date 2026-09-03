@@ -526,6 +526,16 @@ python3 "$root/tests/decbench/report_decbench.py" "${report_args[@]}"
 report_status=$?
 set -e
 
+if (( keep_remote )); then
+    ssh "${ssh_keepalive[@]}" "$host" \
+        "rm -f -- '$remote/.running'; date -u +%s > '$remote/.complete'"
+    echo "remote run retained for --resume/--gc: $remote"
+else
+    ssh "${ssh_keepalive[@]}" "$host" "rm -rf -- '$remote'"
+    echo "garbage-collected finished remote run: $remote"
+fi
+trap - EXIT
+
 run_finished=$(date -u +%s)
 wall_seconds=$((run_finished - run_started))
 disk_available_after=$(ssh "${ssh_keepalive[@]}" "$host" "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
@@ -547,14 +557,4 @@ printf 'cost: end-to-end wall %ss; peak run directory %.2f GiB; peak host disk %
 printf 'full 26x3 extrapolation: %.2f hours serial; %.2f GiB peak with per-project GC\n' \
     "$(awk -v n="$full_wall_seconds" 'BEGIN { print n / 3600 }')" \
     "$(awk -v n="$peak_run_bytes" 'BEGIN { print n / 1073741824 }')"
-
-trap - EXIT
-if (( keep_remote )); then
-    ssh "${ssh_keepalive[@]}" "$host" \
-        "rm -f -- '$remote/.running'; date -u +%s > '$remote/.complete'"
-    echo "remote run retained for --resume/--gc: $remote"
-else
-    ssh "${ssh_keepalive[@]}" "$host" "rm -rf -- '$remote'"
-    echo "garbage-collected finished remote run: $remote"
-fi
 exit "$report_status"
