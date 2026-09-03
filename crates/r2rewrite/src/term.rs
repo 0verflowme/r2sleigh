@@ -7,12 +7,13 @@
 //! structural equality is id equality and every rule that asks "are these the
 //! same operand" asks it exactly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use r2ssa::{
     MachineArithmeticFlagOp, MachineArithmeticOp, MachineBitVector, MachineBitwiseOp,
     MachineBooleanOp, MachineCastKind, MachineComparisonOp, MachineExprId,
-    MachineOvershiftBehavior, MachineShiftKind, MachineSignedness, MachineType,
+    MachineOvershiftBehavior, MachineShiftKind, MachineSignedness, MachineType, ObjectId,
+    StackAddressRoot,
 };
 use serde::Serialize;
 
@@ -49,6 +50,27 @@ pub enum TermKind {
     /// template is stated over variables, and the equivalence is checked for
     /// every assignment to them. Never produced by import, so never rendered.
     Variable(u32),
+    /// A read of the term's width from `object` at `address`.
+    ///
+    /// Also the cell a store writes: the cell is the one a load at that
+    /// address would read, so one term describes both and one rule rewrites
+    /// both. A load is never expanded into its reader and never duplicated,
+    /// because nothing here proves that no store intervenes.
+    Load {
+        object: ObjectId,
+        address: TermId,
+    },
+    /// Element `index` of an array of cells of the term's width beginning at
+    /// `base`: the read at `base + index * (width / 8)`. `base` and `index`
+    /// have the address width.
+    Subscript {
+        base: TermId,
+        index: TermId,
+    },
+    /// The address of an object the certificates place -- a stack slot at a
+    /// frame position, or a global at a fixed address. Rendered as the
+    /// object's name; an array decays to its own address.
+    ObjectAddress(ObjectId),
     Arithmetic {
         op: MachineArithmeticOp,
         left: TermId,
@@ -128,14 +150,17 @@ impl TermKind {
     pub fn children(&self) -> Children {
         let placeholder = TermId(0);
         let (items, len) = match *self {
-            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_) => {
-                ([placeholder, placeholder, placeholder], 0)
-            }
+            Self::Leaf(_)
+            | Self::Opaque(_)
+            | Self::Literal(_)
+            | Self::Variable(_)
+            | Self::ObjectAddress(_) => ([placeholder, placeholder, placeholder], 0),
             Self::Negate(input)
             | Self::BitwiseNot(input)
             | Self::BooleanNot(input)
             | Self::Cast { input, .. }
-            | Self::Extract { input, .. } => ([input, placeholder, placeholder], 1),
+            | Self::Extract { input, .. }
+            | Self::Load { address: input, .. } => ([input, placeholder, placeholder], 1),
             Self::Arithmetic { left, right, .. }
             | Self::Bitwise { left, right, .. }
             | Self::Boolean { left, right, .. }
@@ -143,6 +168,7 @@ impl TermKind {
             | Self::Flag { left, right, .. } => ([left, right, placeholder], 2),
             Self::Shift { value, count, .. } => ([value, count, placeholder], 2),
             Self::Concat { high, low } => ([high, low, placeholder], 2),
+            Self::Subscript { base, index } => ([base, index, placeholder], 2),
             Self::Select {
                 condition,
                 if_true,
@@ -160,14 +186,35 @@ impl TermKind {
     pub const fn is_nullary(&self) -> bool {
         matches!(
             self,
-            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_)
+            Self::Leaf(_)
+                | Self::Opaque(_)
+                | Self::Literal(_)
+                | Self::Variable(_)
+                | Self::ObjectAddress(_)
         )
+    }
+
+    /// Whether this term is a memory read or an element of one.
+    pub const fn reads_memory(&self) -> bool {
+        matches!(self, Self::Load { .. } | Self::Subscript { .. })
     }
 
     /// Rebuild this term over new children, given in operand order.
     pub fn with_children(&self, new: &[TermId]) -> Self {
         match *self {
-            Self::Leaf(_) | Self::Opaque(_) | Self::Literal(_) | Self::Variable(_) => *self,
+            Self::Leaf(_)
+            | Self::Opaque(_)
+            | Self::Literal(_)
+            | Self::Variable(_)
+            | Self::ObjectAddress(_) => *self,
+            Self::Load { object, .. } => Self::Load {
+                object,
+                address: new[0],
+            },
+            Self::Subscript { .. } => Self::Subscript {
+                base: new[0],
+                index: new[1],
+            },
             Self::Negate(_) => Self::Negate(new[0]),
             Self::BitwiseNot(_) => Self::BitwiseNot(new[0]),
             Self::BooleanNot(_) => Self::BooleanNot(new[0]),
@@ -244,9 +291,35 @@ impl Term {
     }
 }
 
+/// Where the certificates place an object whose address a term may name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum ObjectPlacement {
+    /// A stack slot at a fixed position from a frame base.
+    Stack(StackAddressRoot),
+    /// A global at a fixed address.
+    Global(u64),
+}
+
+/// The certificate that a pointer carried round a loop is an array base plus
+/// a counter times a stride: on every trip the pointer advances by `stride`
+/// and `counter` by one, and both start where `init` and zero do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct PointerWalk {
+    /// What the pointer holds on the edge into the loop.
+    pub init: TermId,
+    /// The loop's unit counter, as read at the same merge.
+    pub counter: TermId,
+    pub stride: u64,
+}
+
 /// Owner of every term for one function. Equal terms intern to one id; the
 /// intern map is looked up and never iterated, so nothing observable depends
 /// on hash order.
+///
+/// Besides the terms, the arena carries what the certificates say about the
+/// leaves, because a rule sees nothing else. Every table is keyed by a
+/// nullary term, which the driver never rebuilds, so a fact declared on a leaf
+/// is still on it when a rule reads it.
 #[derive(Debug, Clone, Default)]
 pub struct TermArena {
     nodes: Vec<Term>,
@@ -257,6 +330,18 @@ pub struct TermArena {
     /// leaf being expanded, so the rewritten term still reads the value by
     /// name and nothing new is discharged.
     definitions: HashMap<TermId, TermId>,
+    /// Leaves the certificates type as pointers: a value with parameter
+    /// address provenance, or one the machine arena types as an address at
+    /// some use. Which operand of an address sum is the base is a question
+    /// only they answer; the sum itself is integer arithmetic.
+    pointer_leaves: HashSet<TermId>,
+    /// The frame position a leaf's value holds, for a leaf that holds one.
+    stack_roots: HashMap<TermId, StackAddressRoot>,
+    /// Where each object a load reaches is placed, when it is placed.
+    placements: HashMap<ObjectId, ObjectPlacement>,
+    /// The walk certificate of a leaf that reads a pointer carried round a
+    /// loop.
+    walks: HashMap<TermId, PointerWalk>,
 }
 
 impl TermArena {
@@ -294,6 +379,67 @@ impl TermArena {
         self.definition(id).unwrap_or(id)
     }
 
+    /// Record that the certificates type `leaf` as a pointer.
+    pub fn declare_pointer(&mut self, leaf: TermId) {
+        debug_assert!(self.term(leaf).kind.is_nullary());
+        self.pointer_leaves.insert(leaf);
+    }
+
+    /// Whether the certificates type this term as a pointer.
+    pub fn is_pointer(&self, id: TermId) -> bool {
+        self.pointer_leaves.contains(&id)
+    }
+
+    /// Record that `leaf` holds the frame position `root`.
+    pub fn declare_stack_root(&mut self, leaf: TermId, root: StackAddressRoot) {
+        debug_assert!(self.term(leaf).kind.is_nullary());
+        self.stack_roots.insert(leaf, root);
+    }
+
+    /// The frame position this term holds, if the certificates say it holds
+    /// one.
+    pub fn stack_root(&self, id: TermId) -> Option<StackAddressRoot> {
+        self.stack_roots.get(&id).copied()
+    }
+
+    /// Record where `object` is placed.
+    pub fn place_object(&mut self, object: ObjectId, placement: ObjectPlacement) {
+        self.placements.insert(object, placement);
+    }
+
+    /// Where `object` is placed, if it is.
+    pub fn placement(&self, object: ObjectId) -> Option<ObjectPlacement> {
+        self.placements.get(&object).copied()
+    }
+
+    /// Record the walk certificate of `leaf`.
+    pub fn declare_walk(&mut self, leaf: TermId, walk: PointerWalk) {
+        debug_assert!(self.term(leaf).kind.is_nullary());
+        self.walks.insert(leaf, walk);
+    }
+
+    /// The walk certificate of this term, if it reads a walked pointer.
+    pub fn walk(&self, id: TermId) -> Option<PointerWalk> {
+        self.walks.get(&id).copied()
+    }
+
+    /// Whether any term under `root` reads memory.
+    pub fn reads_memory(&self, root: TermId) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let kind = self.term(id).kind;
+            if kind.reads_memory() {
+                return true;
+            }
+            stack.extend(kind.children());
+        }
+        false
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -325,7 +471,7 @@ impl TermArena {
                         out.push(expr);
                     }
                 }
-                TermKind::Literal(_) | TermKind::Variable(_) => {}
+                TermKind::Literal(_) | TermKind::Variable(_) | TermKind::ObjectAddress(_) => {}
                 kind => {
                     let children: Vec<TermId> = kind.children().collect();
                     stack.extend(children.into_iter().rev());

@@ -1,0 +1,90 @@
+name = "DecBench Scoreboard"
+description = ""
+version = "1.1"
+generated_at = "2026-09-03T06:57:43.404374"
+projects_evaluated = [ "bzip2",]
+optimization_levels = [ "O0",]
+decompilers = [ "angr", "r2sleigh",]
+metrics = [ "byte_match", "ged", "type_match",]
+total_functions = 16
+total_binaries = 1
+
+[decompiler_scores.angr]
+name = "angr"
+overall_perfect_count = 5
+overall_total_count = 16
+overall_perfect_percentage = 31.25
+overall_rank = 1
+total_functions_evaluated = 0
+total_binaries_evaluated = 0
+evaluation_time_seconds = 0.0
+
+[decompiler_scores.r2sleigh]
+name = "r2sleigh"
+overall_perfect_count = 4
+overall_total_count = 16
+overall_perfect_percentage = 25.0
+overall_rank = 2
+total_functions_evaluated = 0
+total_binaries_evaluated = 0
+evaluation_time_seconds = 0.0
+
+[decompiler_scores.angr.metric_scores.byte_match]
+metric_name = "byte_match"
+decompiler_name = "angr"
+perfect_count = 0
+total_count = 16
+perfect_percentage = 0.0
+mean = 0.6016926444913813
+median = 0.75
+rank = 1
+
+[decompiler_scores.angr.metric_scores.ged]
+metric_name = "ged"
+decompiler_name = "angr"
+perfect_count = 4
+total_count = 13
+perfect_percentage = 30.76923076923077
+mean = 5.538461538461538
+median = 3.0
+rank = 1
+
+[decompiler_scores.angr.metric_scores.type_match]
+metric_name = "type_match"
+decompiler_name = "angr"
+perfect_count = 3
+total_count = 11
+perfect_percentage = 27.272727272727273
+mean = 0.5909090909090909
+median = 0.6666666666666666
+rank = 1
+
+[decompiler_scores.r2sleigh.metric_scores.byte_match]
+metric_name = "byte_match"
+decompiler_name = "r2sleigh"
+perfect_count = 0
+total_count = 16
+perfect_percentage = 0.0
+mean = 0.1402626086466144
+median = 0.14814814814814814
+rank = 2
+
+[decompiler_scores.r2sleigh.metric_scores.ged]
+metric_name = "ged"
+decompiler_name = "r2sleigh"
+perfect_count = 4
+total_count = 13
+perfect_percentage = 30.76923076923077
+mean = 5.0
+median = 0.0
+rank = 2
+
+[decompiler_scores.r2sleigh.metric_scores.type_match]
+metric_name = "type_match"
+decompiler_name = "r2sleigh"
+perfect_count = 0
+total_count = 11
+perfect_percentage = 0.0
+mean = 0.125
+median = 0.0
+rank = 2

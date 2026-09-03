@@ -3,29 +3,40 @@
 //! A term of width `w` is a bit-vector of `w` bits. A Bool-typed term is a
 //! bit-vector of its storage width holding 0 or 1; a Bool-typed variable is
 //! `ite(b, 1, 0)` over a fresh Boolean, which is the invariant every boolean
-//! producer in the machine maintains. Every rule's equivalence is checked by
-//! asserting `before != after` and requiring Unsat.
+//! producer in the machine maintains. Memory is one uninterpreted array per
+//! address width and cell width, so two reads of one address at one width are
+//! one value and nothing else is assumed. A placed object's address is its
+//! frame base plus its offset, over one fresh bit-vector per frame base, and
+//! every certificate the arena carries becomes a hypothesis: a leaf holding a
+//! frame position equals that base plus that position, and a walked pointer
+//! equals its entry value plus the counter times the stride. Every rule's
+//! equivalence is checked by asserting the hypotheses and `before != after`
+//! and requiring Unsat.
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
-use r2rewrite::{TermArena, TermId, TermKind};
+use r2rewrite::{ObjectPlacement, TermArena, TermId, TermKind};
 use r2ssa::{
     MachineArithmeticFlagOp, MachineArithmeticOp, MachineBitwiseOp, MachineBooleanOp,
     MachineCastKind, MachineComparisonOp, MachineOvershiftBehavior, MachineShiftKind,
-    MachineSignedness, MachineType,
+    MachineSignedness, MachineType, ObjectId, StackAddressBase,
 };
-use z3::ast::{BV, Bool};
+use z3::Sort;
+use z3::ast::{Array, BV, Bool};
 
 pub struct Encoder<'a> {
     arena: &'a TermArena,
     variables: HashMap<(u32, MachineType), BV>,
     memo: HashMap<TermId, BV>,
-    /// `leaf == definition` for every defined leaf the encoding met: the
-    /// hypotheses under which a definition-aware rule is an equivalence, to
+    /// `leaf == definition` for every defined leaf the encoding met, and the
+    /// certificate equations of every stack-rooted or walked leaf: the
+    /// hypotheses under which a certificate-aware rule is an equivalence, to
     /// be asserted beside the negated equation.
     hypotheses: Vec<Bool>,
+    memories: HashMap<(u32, u32), Array>,
+    frames: HashMap<(StackAddressBase, u32), BV>,
 }
 
 fn zero(width: u32) -> BV {
@@ -62,6 +73,50 @@ impl<'a> Encoder<'a> {
             variables: HashMap::new(),
             memo: HashMap::new(),
             hypotheses: Vec::new(),
+            memories: HashMap::new(),
+            frames: HashMap::new(),
+        }
+    }
+
+    /// The frame base `base` at `width` bits.
+    fn frame(&mut self, base: StackAddressBase, width: u32) -> BV {
+        self.frames
+            .entry((base, width))
+            .or_insert_with(|| BV::new_const(format!("frame_{base:?}_{width}"), width))
+            .clone()
+    }
+
+    /// The cell of `width` bits at `address`.
+    fn select(&mut self, address: &BV, width: u32) -> BV {
+        let address_width = address.get_size();
+        let memory = self
+            .memories
+            .entry((address_width, width))
+            .or_insert_with(|| {
+                Array::new_const(
+                    format!("memory_{address_width}_{width}"),
+                    &Sort::bitvector(address_width),
+                    &Sort::bitvector(width),
+                )
+            })
+            .clone();
+        memory
+            .select(address)
+            .as_bv()
+            .expect("a cell is a bit-vector")
+    }
+
+    /// Where `object` sits, at `width` bits: its placement, or a fresh
+    /// address when it has none.
+    fn object_address(&mut self, object: ObjectId, ty: MachineType) -> BV {
+        let width = ty.width_bits();
+        match self.arena.placement(object) {
+            Some(ObjectPlacement::Stack(root)) => {
+                let frame = self.frame(root.base, width);
+                frame.bvadd(BV::from_i64(root.offset, width))
+            }
+            Some(ObjectPlacement::Global(address)) => BV::from_u64(address, width),
+            None => self.variable(0x4000_0000 | object.0, ty),
         }
     }
 
@@ -102,7 +157,31 @@ impl<'a> Encoder<'a> {
                     let defined = self.encode(definition);
                     self.hypotheses.push(bv.eq(defined));
                 }
+                if let Some(root) = self.arena.stack_root(id) {
+                    let frame = self.frame(root.base, width);
+                    self.hypotheses
+                        .push(bv.eq(frame.bvadd(BV::from_i64(root.offset, width))));
+                }
+                if let Some(walk) = self.arena.walk(id) {
+                    let init = self.encode(walk.init);
+                    let counter = self.encode(walk.counter);
+                    let stride = BV::from_u64(walk.stride, width);
+                    self.hypotheses
+                        .push(bv.eq(init.bvadd(counter.bvmul(stride))));
+                }
                 bv
+            }
+            TermKind::ObjectAddress(object) => self.object_address(object, term.ty),
+            TermKind::Load { address, .. } => {
+                let address = self.encode(address);
+                self.select(&address, width)
+            }
+            TermKind::Subscript { base, index } => {
+                let base = self.encode(base);
+                let index = self.encode(index);
+                let stride = BV::from_u64(u64::from(width / 8), base.get_size());
+                let address = base.bvadd(index.bvmul(stride));
+                self.select(&address, width)
             }
             TermKind::Leaf(expr) | TermKind::Opaque(expr) => {
                 // A base node in a proof term is a free variable keyed by

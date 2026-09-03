@@ -22,7 +22,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
-    CanonicalInstructionId, MachineExprId, MachineExprKind, MachineProjection, SsaArtifact, ValueId,
+    CanonicalInstructionId, MachineExprId, MachineExprKind, MachineProjection, SsaArtifact,
+    StructuredAccessId, ValueId,
 };
 use serde::Serialize;
 
@@ -65,6 +66,20 @@ pub struct CanonicalValue {
     pub multiplicity: Multiplicity,
 }
 
+/// The canonical term of the cell one structured memory access reads or
+/// writes. For a load it is the value's own canonical term; for a store it
+/// is the cell's, which has no value. A renderer spelling the access asks
+/// here whether the cell is an array element.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanonicalAccess {
+    pub access: StructuredAccessId,
+    pub canonical: TermId,
+    pub trace: Box<[Rewrite]>,
+    /// Instructions rendering `canonical` at the access renders: the address
+    /// producers expanded into the term whose values it no longer reads.
+    pub discharges: BTreeSet<CanonicalInstructionId>,
+}
+
 /// A node whose rewriting exceeded its derived budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BudgetFailure {
@@ -93,6 +108,7 @@ pub struct CanonicalRoots {
     arena: TermArena,
     import: Import,
     values: Box<[Option<CanonicalValue>]>,
+    accesses: BTreeMap<StructuredAccessId, CanonicalAccess>,
     budget_failures: Vec<BudgetFailure>,
 }
 
@@ -111,6 +127,14 @@ impl CanonicalRoots {
 
     pub fn values(&self) -> impl Iterator<Item = &CanonicalValue> {
         self.values.iter().flatten()
+    }
+
+    pub fn access(&self, access: StructuredAccessId) -> Option<&CanonicalAccess> {
+        self.accesses.get(&access)
+    }
+
+    pub fn accesses(&self) -> impl Iterator<Item = &CanonicalAccess> {
+        self.accesses.values()
     }
 
     pub fn budget_failures(&self) -> &[BudgetFailure] {
@@ -150,7 +174,18 @@ pub fn discharged_origins(
     let Some(imported) = import.value(value) else {
         return BTreeSet::new();
     };
-    let mut discharged = imported.substituted.clone();
+    discharged_from(&imported.substituted, projection, arena, canonical)
+}
+
+/// The producers among `substituted` whose values `canonical` no longer
+/// reads.
+fn discharged_from(
+    substituted: &BTreeSet<CanonicalInstructionId>,
+    projection: &MachineProjection,
+    arena: &TermArena,
+    canonical: TermId,
+) -> BTreeSet<CanonicalInstructionId> {
+    let mut discharged = substituted.clone();
     for leaf in arena.leaves(canonical) {
         if let Some(MachineExprKind::Source { binding, .. }) =
             projection.expr(leaf).map(|expr| expr.kind())
@@ -327,10 +362,30 @@ pub fn canonicalize_with(
             });
         }
     }
+    let mut accesses = BTreeMap::new();
+    for imported in import.accesses() {
+        let canonical_term = canonical
+            .get(&imported.term)
+            .copied()
+            .unwrap_or(imported.term);
+        let mut trace: Vec<Rewrite> = imported.trace.clone();
+        trace.extend(collect_rewrites(&arena, &rewrites_at, imported.term));
+        let discharges = discharged_from(&imported.substituted, projection, &arena, canonical_term);
+        accesses.insert(
+            imported.access,
+            CanonicalAccess {
+                access: imported.access,
+                canonical: canonical_term,
+                trace: trace.into_boxed_slice(),
+                discharges,
+            },
+        );
+    }
     Ok(CanonicalRoots {
         arena,
         import,
         values: values.into_boxed_slice(),
+        accesses,
         budget_failures,
     })
 }

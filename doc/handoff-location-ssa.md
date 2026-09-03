@@ -9162,6 +9162,179 @@ them:
 The shape run was executed twice under the lock and produced identical column
 totals both times, so the fourteen renderings and the eight differential passes
 are reproducible rather than a scheduling artifact.
+
+## Array indexing: the cell becomes a term, and what that measured
+
+Array indexing appeared in zero per cent of rendered functions, and the cause
+was not the renderer being timid. Nothing on the certified path could *say*
+"this cell is an element". The two pieces that came closest --
+`typed_subscript_access`, which divided a rendered index by the pointee width,
+and `certified_pointer_base_expr`, which decided which operand of a C address
+expression was the base -- worked on emitted text with no proof behind either
+decision, which is the second rewriting layer this branch exists to remove.
+
+The decision now lives in `r2rewrite`. Three term kinds carry it: `Load`, which
+is also the cell a store writes, because the cell a store writes is the one a
+load at that address would read; `Subscript`, the read at
+`base + index * (width / 8)`; and `ObjectAddress`, what a placed object's name
+decays to. Three rules turn the first into the second, each proven at 8, 16, 32
+and 64 bits like every other rule in the table. `constant_stride` needs no
+certificate for its *equivalence* -- `Mem[p + i*k]` is that cell whichever
+operand is called the base -- so the certificate only chooses the spelling.
+`stack_element[stack_slot]` and `pointer_walk[induction]` do rest on
+certificates and say so in their ids.
+
+**A pointer is proven by a dereference, not by being a parameter.** The first
+version asked whether a value had parameter address provenance, and every
+parameter has it: `arr_sum(const uint32_t *a, size_t n)` gives `n` a parameter
+expression exactly as it gives one to `a`. With both called pointers a sum has
+two candidate bases at unit coefficients and the rule refuses. Object existence
+is no better -- an object is made for every parameter appearing in any address
+expression, `n` included. What is evidence is a certified access whose address
+carries that parameter's provenance: memory was read or written through it. A
+value is a base when its provenance is that parameter with *no terms added*;
+with terms it is the whole address, and an address that is its own base leaves
+no index behind.
+
+**The shape that makes this work is the `-O0` parameter home.** A parameter is
+stored to the stack, reloaded, and the reload is indexed. The reload is a
+legitimate base only because the address provenance pass carries the parameter
+base through the spill -- a fact a reader of the emitted C cannot recover,
+which is why the earlier renderer-side attempts could not see it and were
+correctly recorded here as inert.
+
+**One case refuses and is worth naming.** Where both operands of an address sum
+are parameters -- `s[i]` with `i` itself a parameter -- the provenance pass
+gives the sum no expression at all, because two parameter bases combined have
+no single base. The access then has no proven pointer and the rule declines
+rather than picking an operand. The corpus's own shape indexes by a local
+initialised to a constant, which the pass does resolve, so this is a real
+limitation with no corpus cost yet measured.
+
+### Measured: zero subscripts to twenty-one, and two accounting defects
+
+On the fifty-four hash cells, counted exactly before and after:
+
+    subscript expressions        0 -> 21   (in 11 of 54 cells)
+    array declarations           0 ->  0
+    for loops                    0 ->  0
+    while headers               17 -> 17
+    do-while                    43 -> 43
+
+All fifty-four cells pass generation, raw, diagnostic, differential, binding
+audit, effect obligations, placement audit and render refusal. The snapshot
+column reports exactly eleven mismatches, and they are the same eleven cells
+that gained a subscript, which is the corroboration worth having: the output
+that changed is precisely the output that was meant to.
+
+What it looks like. `xxhash32` reads its lanes as
+`((uint32_t *)RDI_0)[1]` where it used to spell `*(uint32_t *)(p + 4)`, and
+`pearson` indexes its table as `((uint8_t *)RCX_2)[RDX_2]` with a variable
+index. Both are `constant_stride`; the `-O2` cells index because the compiler
+unrolled the byte loop into `p + i + k` forms, which is the shape the rule was
+written for.
+
+Array declarations and `for` loops are still zero. Stack buffers and
+region-level `for` construction were not reached, and nothing here should be
+read as evidence about either.
+
+**Two accounting defects, both found by the gates and neither by reading.**
+They are worth keeping because both are the same mistake in different clothes:
+the subscript path does not go through the code that used to answer for a
+cell, so it has to answer for that cell itself, and twice it did not.
+
+The first refused six `x64_O2` cells with `RenderedValueRequired`. The
+dereference path marks the address value inside
+`certified_memory_address_expr`; the subscript path bypasses that function, and
+marked the address only when the canonical term had absorbed a producer. That
+made the accounting depend on which rule fired rather than on what was
+rendered -- `constant_stride` absorbs the add and the multiply so the cell was
+filled by luck, `pointer_walk` absorbs nothing so it was not filled at all.
+
+Marking the address unconditionally did *not* clear those six cells, and the
+failure to clear was the useful part: it proved the address was never the
+missing thing. `R2DEC_TRACE_REFUSAL` then named the value outright --
+`ValueId(378)`, `Inline`, one use, **no defining instruction**, constant
+storage, read by the `IntAdd` that formed the address.
+`observe_discharged_expr` marks each consumed instruction's write, its output
+value and its operands' *uses*; a constant is nobody's output, so it never
+appears in a discharged set, and its only occurrence was inside the expression
+the subscript replaced.
+
+An earlier attempt at that same cell searched the term's leaves and found
+nothing, because import turns a constant into `TermKind::Literal` and `leaves`
+collects only `Leaf` and `Opaque`. Asking the graph for each consumed
+instruction's operands does not depend on how a constant happens to be
+represented in a term, which was the right question from the start. The marks
+are deduplicated: one literal can be an operand of two consumed instructions,
+and two marks would count one execution twice.
+
+The second defect refused every store to a proven element.
+`expr_is_store_target_candidate` saw through `Paren` but not `Observed`, and
+had never needed to, because the dereference path hands it an unmarked
+`CExpr::Deref` while the subscript path marks the address it renders. It now
+asks `unobserved()`, the idiom the rest of the tree already uses.
+
+The lesson for whoever adds the next rendering path: the cells a path must
+fill are not the cells its author thinks about, they are the cells the path it
+replaced used to fill. Diff the two.
+
+### Declared member and proven stride are one owner, not a ranking
+
+These look like two authorities over one access and cannot both answer.
+`certified_member_fact_for_memory` returns a fact only when it matches the
+access's object, access id *and* width, and only when exactly one such fact
+exists. So either it describes this very access or it is absent, and the states
+are disjoint: a matching member owns the access and the subscript declines; a
+width disagreement or a duplicate means no member fact is returned and the
+proven stride answers; neither present means the rewriter answers if it proved
+anything. There is deliberately no tie-break code, because a tie cannot occur,
+and a resolver for an impossible tie would be a second answerer for a settled
+question. This is stated again in the module documentation so nobody adds one.
+
+The one decided rather than derived case: a member fact matches but the member
+renderer cannot build an expression, because the C address carries no base
+identity to split around. That access renders as a dereference, not a
+subscript. Asserting an array shape a declared type contradicts is worse than
+declining to name the shape, which is the same rule under which a conflicting
+type refuses per value instead of guessing. **Revisit it only on a measurement
+showing those accesses are common enough to cost `type_match`.**
+
+### The benchmark witness never reached the binary, and the guard always fired
+
+`tests/decbench/run_decbench.sh` exists so that a `make install` aborting on
+stale objects cannot be mistaken for a change with no effect. As written it
+appended `pub const DECBENCH_WITNESS: &str = "..."` to `r2engine` and searched
+the installed library for the string. A `const` is inlined at its use sites and
+this one has none, so no storage is emitted and nothing reaches the binary: the
+check failed on every tree it was ever pointed at. The install had succeeded --
+a fresh 22MB library, minutes old -- and the run aborted claiming the library
+was stale. Two of the integration branch's own runs were read as hangs because
+of it.
+
+A guard that always fires is exactly as useless as one that never does, and
+worse than either, because it sends a reader hunting a build problem that does
+not exist and invites the next reader to disable it. `#[used]` with an exported
+symbol is emitted whether or not anything reads it, which is the property
+wanted, and it was verified against a real built `cdylib` -- symbol exported,
+string in the image -- rather than reasoned about. The search is `grep -a` now
+too, since BSD grep reports no match on a binary whose bytes do match, which
+would have made the check wrong again the first time anyone ran it against a
+locally built library instead of over ssh.
+
+### Two operational hazards this stretch hit
+
+A corpus run started while the tree is being edited measures neither the commit
+before nor the commit after. `locked_matrix.sh` builds, then queues for the
+shared install lock, and `run_matrix.sh` rebuilds once it has it -- so an edit
+made during the queue wait silently reaches the captured plugin. With four
+worktrees queued the wait is long enough that this is easy to do by accident.
+Cancel and re-run rather than editing through a queued measurement.
+
+The benchmark host is shared, and a run's remote directory can be removed by
+another agent's cleanup while it is still building. One run here died that way
+with its own install log already deleted underneath it. A run that vanishes
+mid-build is not a build failure and should not be read as one.
 ## The `aa` path measured directly, and the figure it replaces
 
 The last section named the `aa` path as the dominant remaining cost, at about

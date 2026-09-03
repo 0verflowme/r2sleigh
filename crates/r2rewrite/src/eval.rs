@@ -1,11 +1,13 @@
 //! Concrete interpreter for terms, the twin of the Z3 encoding in the proof
 //! harness. Widths are at most 64 bits; arithmetic is done in `u128` and
-//! masked to the term's width.
+//! masked to the term's width. Memory and placed objects are leaves too: the
+//! caller answers what a cell holds and where an object sits, and the
+//! interpreter only computes the address.
 
 use r2ssa::{
     MachineArithmeticFlagOp, MachineArithmeticOp, MachineBitwiseOp, MachineBooleanOp,
     MachineCastKind, MachineComparisonOp, MachineExprId, MachineOvershiftBehavior,
-    MachineShiftKind, MachineSignedness, MachineType,
+    MachineShiftKind, MachineSignedness, MachineType, ObjectId,
 };
 
 use crate::term::{TermArena, TermId, TermKind};
@@ -24,12 +26,19 @@ pub fn signed(bits: u128, width_bits: u32) -> i128 {
     ((bits << shift) as i128) >> shift
 }
 
-/// What a term reads from outside itself: a base-arena node, or a free
-/// variable of a proof template.
+/// What a term reads from outside itself: a base-arena node, a free variable
+/// of a proof template, a memory cell, or the address of a placed object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeafRef {
     Expr(MachineExprId),
     Variable(u32),
+    /// The cell of `width_bits` at `address`, which is already masked to the
+    /// address width.
+    Memory {
+        address: u128,
+        width_bits: u32,
+    },
+    ObjectAddress(ObjectId),
 }
 
 /// Evaluate `root`, asking `leaf` for the value of every base-arena node or
@@ -46,6 +55,31 @@ pub fn eval(
         TermKind::Leaf(expr) | TermKind::Opaque(expr) => leaf(LeafRef::Expr(expr), &term.ty),
         TermKind::Variable(index) => leaf(LeafRef::Variable(index), &term.ty),
         TermKind::Literal(bits) => u128::from(bits.bits()),
+        TermKind::ObjectAddress(object) => leaf(LeafRef::ObjectAddress(object), &term.ty),
+        TermKind::Load { address, .. } => {
+            let address = eval(arena, address, leaf);
+            leaf(
+                LeafRef::Memory {
+                    address,
+                    width_bits: width,
+                },
+                &term.ty,
+            )
+        }
+        TermKind::Subscript { base, index } => {
+            let address_width = arena.term(base).width_bits();
+            let b = eval(arena, base, leaf);
+            let i = eval(arena, index, leaf);
+            let address =
+                b.wrapping_add(i.wrapping_mul(u128::from(width / 8))) & mask(address_width);
+            leaf(
+                LeafRef::Memory {
+                    address,
+                    width_bits: width,
+                },
+                &term.ty,
+            )
+        }
         TermKind::Arithmetic { op, left, right } => {
             let l = eval(arena, left, leaf);
             let r = eval(arena, right, leaf);

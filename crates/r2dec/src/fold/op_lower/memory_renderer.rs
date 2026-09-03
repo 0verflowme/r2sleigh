@@ -79,13 +79,9 @@ impl<'a> FoldingContext<'a> {
         let expr = self
             .render_certified_memory_expr_for_fact(fact, elem_ty.clone())
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
-        let expr = if is_write {
-            Self::expr_is_store_target_candidate(&expr)
-                .then_some(expr)
-                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?
-        } else {
-            self.typed_subscript_access(expr, &elem_ty)
-        };
+        if is_write && !Self::expr_is_store_target_candidate(&expr) {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
         Ok(CertifiedMemoryAccessExpr {
             access: fact.access,
             address: fact.address,
@@ -124,7 +120,16 @@ impl<'a> FoldingContext<'a> {
         self.certified_memory_access_expr(address, value, val.size, true, elem_ty)
     }
 
-    fn certified_pointer_base_expr(&self, expr: &CExpr) -> bool {
+    /// Whether a rendered operand names an object declared a pointer.
+    ///
+    /// An object declared a pointer is a pointer wherever it is read, and
+    /// the declaration is the one place that says so: it already agrees with
+    /// the certificate that typed the parameter or the carrier, because it
+    /// was made from it. This is only consulted where a declared aggregate
+    /// fact says the address is a member or element and the C address has to
+    /// be split around the base; an element the rewriter proves is spelled
+    /// from its term and never comes here.
+    fn declared_pointer_expr(&self, expr: &CExpr) -> bool {
         let expr = match expr {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => inner.as_ref(),
             _ => expr,
@@ -132,47 +137,16 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Var(name) = expr else {
             return false;
         };
-        let role = self.symbols.borrow().get(*name).role;
-        if let crate::symbol::SymbolRole::Parameter(slot) = role {
-            return self.inputs.render_facts().is_some_and(|render| {
-                matches!(
-                    render
-                        .certified_entities
-                        .get(&r2ssa::SemanticId::Parameter(slot)),
-                    Some(r2types::CertifiedEntity::Parameter {
-                        slot: entity_slot,
-                        ty: Some(ty),
-                        ..
-                    }) if *entity_slot == slot
-                        && matches!(
-                            ty.clone(),
-                            CType::Pointer(_) | CType::Array(_, _)
-                        )
-                )
-            });
-        }
-        let Some(names) = self.inputs.binding_names else {
-            return false;
-        };
-        self.inputs.render_facts().is_some_and(|render| {
-            render.loop_carriers().any(|entity| {
-                let r2types::CertifiedEntity::LoopCarrier { phi, ty, .. } = entity else {
-                    return false;
-                };
-                matches!(
-                    names.require_value(*phi),
-                    Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) if symbol == *name
-                ) && ty
-                    .as_ref()
-                    .is_some_and(|ty| matches!(ty.clone(), CType::Pointer(_) | CType::Array(_, _)))
-            })
-        })
+        matches!(
+            self.symbols.borrow().get(*name).ty,
+            CType::Pointer(_) | CType::Array(_, _)
+        )
     }
 
-    fn certified_expr_contains_pointer_parameter(&self, expr: &CExpr) -> bool {
+    fn certified_expr_contains_declared_pointer(&self, expr: &CExpr) -> bool {
         let mut contains = false;
         expr.visit(&mut |node| {
-            if !contains && self.certified_pointer_base_expr(node) {
+            if !contains && self.declared_pointer_expr(node) {
                 contains = true;
             }
         });
@@ -283,7 +257,7 @@ impl<'a> FoldingContext<'a> {
                 Some((left_atom, coefficient))
             }
             _ if self.literal_to_i64(expr).is_some()
-                || self.certified_expr_contains_pointer_parameter(expr) =>
+                || self.certified_expr_contains_declared_pointer(expr) =>
             {
                 None
             }
@@ -299,7 +273,7 @@ impl<'a> FoldingContext<'a> {
         let mut base = None;
         let mut index = None::<(CExpr, i64)>;
         for (sign, term) in terms {
-            if self.certified_pointer_base_expr(&term) {
+            if self.declared_pointer_expr(&term) {
                 if sign != 1 || base.replace(term).is_some() {
                     return None;
                 }
@@ -322,7 +296,7 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn certified_member_fact_for_memory(
+    pub(super) fn certified_member_fact_for_memory(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
     ) -> Option<&r2types::MemberAccessRenderFact> {
@@ -566,8 +540,16 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Whether this expression can stand on the left of an assignment.
+    ///
+    /// The question is about syntax, so it is asked of the syntax: an
+    /// observation marker records who accounts for a node and changes nothing
+    /// about what the node *is*, exactly as a parenthesis does not. Asking it
+    /// of the marked node instead rejected every store whose target the
+    /// rewriter had proved to be an array element, because the subscript path
+    /// marks the address it renders and the dereference path does not.
     fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
-        match expr {
+        match expr.unobserved() {
             CExpr::Var(_)
             | CExpr::Deref(_)
             | CExpr::Subscript { .. }
@@ -575,76 +557,6 @@ impl<'a> FoldingContext<'a> {
             | CExpr::PtrMember { .. } => true,
             CExpr::Paren(inner) => Self::expr_is_store_target_candidate(inner),
             _ => false,
-        }
-    }
-
-    fn typed_subscript_access(&self, expr: CExpr, elem_ty: &CType) -> CExpr {
-        let CExpr::Subscript { base, index } = expr else {
-            return expr;
-        };
-        let elem_bytes = match elem_ty {
-            CType::Int {
-                bits,
-                signedness: r2types::Signedness::Signed,
-            }
-            | CType::Int {
-                bits,
-                signedness: r2types::Signedness::Unsigned,
-            }
-            | CType::Float(bits) => bits / 8,
-            _ => 0,
-        };
-        let already_typed = matches!(
-            base.as_ref(),
-            CExpr::Cast {
-                ty: CType::Pointer(_),
-                ..
-            }
-        );
-        if elem_bytes <= 1 || already_typed {
-            return CExpr::Subscript { base, index };
-        }
-        match Self::index_in_elements(&index, elem_bytes) {
-            Some(unscaled) => CExpr::Subscript {
-                base: Box::new(CExpr::cast(CType::ptr(elem_ty.clone()), *base)),
-                index: Box::new(unscaled),
-            },
-            None => CExpr::Deref(Box::new(CExpr::cast(
-                CType::ptr(elem_ty.clone()),
-                CExpr::binary(
-                    BinaryOp::Add,
-                    CExpr::cast(
-                        CType::ptr(CType::Int {
-                            bits: 8,
-                            signedness: r2types::Signedness::Unsigned,
-                        }),
-                        *base,
-                    ),
-                    *index,
-                ),
-            ))),
-        }
-    }
-
-    fn index_in_elements(index: &CExpr, elem_bytes: u32) -> Option<CExpr> {
-        match index {
-            CExpr::Paren(inner) => Self::index_in_elements(inner, elem_bytes),
-            CExpr::Binary {
-                op: BinaryOp::Mul,
-                left,
-                right,
-            } => match (left.as_ref(), right.as_ref()) {
-                (other, CExpr::IntLit(value)) | (CExpr::IntLit(value), other)
-                    if *value == i64::from(elem_bytes) =>
-                {
-                    Some(other.clone())
-                }
-                _ => None,
-            },
-            CExpr::IntLit(value) if value % i64::from(elem_bytes) == 0 => {
-                Some(CExpr::IntLit(value / i64::from(elem_bytes)))
-            }
-            _ => None,
         }
     }
 
@@ -789,6 +701,11 @@ impl<'a> FoldingContext<'a> {
         Some((addr, expr))
     }
 
+    /// The access as C, by whichever authority answers for it first: a
+    /// declared aggregate's element, the rewriter's proven subscript, a stack
+    /// slot's name, a declared member split out of the address, and last the
+    /// address itself dereferenced. Each is one lookup; none takes an
+    /// expression apart to decide.
     pub(super) fn render_certified_memory_expr_for_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
@@ -797,13 +714,16 @@ impl<'a> FoldingContext<'a> {
         if fact.space != r2il::SpaceId::Ram {
             return None;
         }
-        if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
-            return Some(expr);
-        }
         if let Some(array) = self.certified_array_fact_for_memory(fact)
             && (array.base.is_some() || array.index.is_some())
         {
             return self.render_certified_semantic_array_expr(fact);
+        }
+        if let Some(expr) = self.certified_subscript_expr_for_fact(fact, &elem_ty) {
+            return Some(expr);
+        }
+        if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
+            return Some(expr);
         }
         let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
         if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {
@@ -824,11 +744,23 @@ impl<'a> FoldingContext<'a> {
         Some(CExpr::Deref(Box::new(casted)))
     }
 
+    /// The slot's name, for an access that sits at the slot's own offset.
+    ///
+    /// An access at an offset the machine computes is inside the slot and
+    /// not at it, so the name alone would read the first element for every
+    /// element; that access is the subscript path's or, failing it, the
+    /// address's.
     fn certified_stack_owner_expr_for_memory_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
     ) -> Option<CExpr> {
         if fact.width == 0 {
+            return None;
+        }
+        if self
+            .prepared_ssa()
+            .is_some_and(|prepared| prepared.objects().address_is_indexed(fact.address))
+        {
             return None;
         }
         self.inputs.render_facts()?.stack_slot_offset(fact.object)?;

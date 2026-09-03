@@ -1055,6 +1055,12 @@ impl BindingPlan {
         &self.machine_projection
     }
 
+    /// The canonical term of every value and every structured memory
+    /// access, as the rewriter proved them equal to what the machine wrote.
+    pub(crate) const fn canonical(&self) -> &r2rewrite::CanonicalRoots {
+        &self.canonical
+    }
+
     pub(crate) fn binding(&self, id: BindingId) -> Option<&Binding> {
         self.bindings.get(id.index())
     }
