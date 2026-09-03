@@ -85,7 +85,16 @@ EOF
         echo "radare2 fork: host already at $want"
     fi
 fi
-ssh "$host" "printf 'pub const DECBENCH_WITNESS: &str = \"%s\";\n' '$witness' >> $remote/tree/crates/r2engine/src/lib.rs"
+# `#[used]` and an exported symbol, not a `const`. A `const` is inlined at
+# its use sites and this one has none, so nothing reaches the binary and the
+# check below failed on every tree it was ever pointed at -- a guard that
+# always fires is as useless as one that never does, and this one hid a
+# working install behind a stale-plugin error.
+ssh "$host" "cat >> $remote/tree/crates/r2engine/src/lib.rs" <<WITNESS
+#[used]
+#[unsafe(no_mangle)]
+pub static DECBENCH_WITNESS: &str = "$witness";
+WITNESS
 
 ssh "$host" bash -s <<EOF
 set -euo pipefail
@@ -96,7 +105,7 @@ LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$
     tail -20 '$remote/install.log'; exit 70; }
 lib=\$(find '$private_home/.local/share/radare2/plugins' -name 'libr2sleigh_plugin.*' | head -1)
 if [ -z "\$lib" ]; then echo "no plugin library was installed" >&2; exit 70; fi
-if ! grep -q '$witness' "\$lib"; then
+if ! grep -a -q '$witness' "\$lib"; then
     echo "the installed library is not this tree's: witness string absent" >&2
     exit 70
 fi
