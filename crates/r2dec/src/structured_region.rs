@@ -518,9 +518,9 @@ impl StructuredRegionDraft {
         let root = draft.push_node(None, 0, function_entry, StructuredRegionKind::FunctionBody)?;
         debug_assert_eq!(root, draft.root);
 
-        // An explicit stack avoids adding another recursion limit beside the
-        // structurer's existing work budget.  Children are pushed in reverse so
-        // allocation remains the exact forward render preorder.
+        // An explicit stack keeps artifact construction independent of Rust
+        // call-stack depth. Children are pushed in reverse so allocation
+        // remains the exact forward render preorder.
         let mut pending = vec![(root, region)];
         while let Some((parent, current)) = pending.pop() {
             let depth = draft.nodes[parent.index()]
