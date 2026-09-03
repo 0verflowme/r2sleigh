@@ -6779,11 +6779,8 @@ mod tests {
         }];
         let requested = Arc::new(prepared_from_ops(ops.clone(), &arch));
         let foreign = Arc::new(prepared_from_ops(ops, &arch));
-        let artifact = r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &foreign,
-            None,
-        );
+        let artifact =
+            r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), &foreign);
         let request = r2types::TypeWritebackAnalysisRequest::new(
             Arc::clone(&requested),
             r2types::ParsedExternalContext::default(),

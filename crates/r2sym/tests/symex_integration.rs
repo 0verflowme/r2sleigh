@@ -13,7 +13,7 @@ use r2sym::sim::{
 };
 use r2sym::{
     ExploreConfig, PathExplorer, SymState, SymValue, SymbolicReachabilityStatus,
-    compile_function_semantics_with_scope,
+    compile_function_semantics,
 };
 use std::sync::Arc;
 use z3::Context;
@@ -303,8 +303,7 @@ fn compile_function_semantics_prunes_self_xor_dead_branch() {
     );
     let ctx = Context::thread_local();
 
-    let artifact =
-        compile_function_semantics_with_scope(&ctx, &func, None, r2sym::SummaryProfile::Default);
+    let artifact = compile_function_semantics(&ctx, &func, r2sym::SummaryProfile::Default);
     let region = region_for_anchor(&artifact, 0x1000);
 
     assert_eq!(

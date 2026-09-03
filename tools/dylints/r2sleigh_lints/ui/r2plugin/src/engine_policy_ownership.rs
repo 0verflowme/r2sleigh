@@ -62,7 +62,7 @@ mod r2dec {
 
 mod r2sym {
     pub fn compile_summary_dense_worker_artifact_from_interproc_summary() {}
-    pub fn compile_semantic_artifact_default_with_scope() {}
+    pub fn compile_semantic_artifact_default() {}
     pub fn augment_semantic_artifact_with_interproc_summary() {}
 }
 
@@ -102,7 +102,7 @@ fn main() {
     );
     let _ = r2dec::render_semantic_worker_linearization();
     r2sym::compile_summary_dense_worker_artifact_from_interproc_summary();
-    r2sym::compile_semantic_artifact_default_with_scope();
+    r2sym::compile_semantic_artifact_default();
     r2sym::augment_semantic_artifact_with_interproc_summary();
     r2engine::decompile_route_decision();
     r2engine::auto_callback_plan_for_policy();

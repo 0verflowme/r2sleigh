@@ -6755,7 +6755,7 @@ fn plugin_engine_policy_ownership_expr(cx: &LateContext<'_>, expr: &Expr<'_>) ->
             [
                 "render_semantic_worker_linearization",
                 "compile_summary_dense_worker_artifact_from_interproc_summary",
-                "compile_semantic_artifact_default_with_scope",
+                "compile_semantic_artifact_default",
                 "augment_semantic_artifact_with_interproc_summary",
                 "decompile_route_decision",
                 "function_analysis_report_payload_from_type_response",

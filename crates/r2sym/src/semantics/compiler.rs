@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use r2ssa::{
@@ -7,10 +7,7 @@ use r2ssa::{
 };
 use z3::Context;
 
-use crate::sim::{
-    DerivedSummaryDiagnostics, PreparedFunctionScope, SummaryProfile, SummaryRegistry,
-    source_arch_spec,
-};
+use crate::sim::{DerivedSummaryDiagnostics, SummaryProfile, source_arch_spec};
 
 use super::artifact::{
     ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactReport,
@@ -19,7 +16,6 @@ use super::cache::SEMANTIC_ARTIFACT_SCHEMA_VERSION;
 use super::classify::classify_slice;
 use super::facts::{
     CollectedNativeSemanticRegions, SymbolicFunctionFactDiagnostics,
-    collect_canonical_semantic_regions_with_derived,
     collect_canonical_semantic_regions_with_scope_and_profile,
     collect_large_cfg_canonical_semantic_regions_with_limit,
 };
@@ -157,18 +153,9 @@ fn has_named_worker_family(summaries: &[NativeWorkerSummary]) -> bool {
 
 pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
     summaries: &PreparedInterprocSummarySet,
 ) -> Option<SemanticArtifact> {
     let summary = prepared_root_summary(func, summaries)?;
-    let scope = match scope {
-        Some(scope) => Some(scope.source_authorized_for_semantics(func)?),
-        None => None,
-    };
-    let scope = scope.as_ref();
-    if scope.is_some_and(|scope| !scope.matches_interproc_owners(summaries)) {
-        return None;
-    }
     let worker_summaries =
         super::native_worker::summaries_from_interproc_summary_unbounded(func.entry, summary);
     let worker_summaries = super::native_worker::bounded_worker_summaries(worker_summaries);
@@ -194,9 +181,7 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         return None;
     }
 
-    let helper_functions = scope
-        .map(|scope| scope.helper_functions().count())
-        .unwrap_or(summary.direct_callees.len());
+    let helper_functions = summary.direct_callees.len();
     let derived_diagnostics = DerivedSummaryDiagnostics::default();
     let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
     let slice_class = if named_worker_family
@@ -215,7 +200,7 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         return None;
     }
 
-    let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
+    let closure_functions = 1;
     let report = SemanticArtifactReport {
         schema_version: SEMANTIC_ARTIFACT_SCHEMA_VERSION,
         stage: RefinementStage::Compiled,
@@ -250,19 +235,11 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
         },
     }
     .normalized();
-    let mut artifact =
-        SemanticArtifact::new_with_interproc_provenance(Arc::clone(func), report, summaries)?;
-    if let Some(scope) = scope
-        && !artifact.retain_scope_provenance(scope)
-    {
-        return None;
-    }
-    Some(artifact)
+    SemanticArtifact::new_with_interproc_provenance(Arc::clone(func), report, summaries)
 }
 
 pub fn compile_native_worker_summary_artifact(
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
     summaries: Option<&PreparedInterprocSummarySet>,
     skipped_large_cfg: bool,
 ) -> Option<SemanticArtifact> {
@@ -270,16 +247,6 @@ pub fn compile_native_worker_summary_artifact(
         Some(summaries) => Some(prepared_root_summary(func, summaries)?),
         None => None,
     };
-    let scope = match scope {
-        Some(scope) => Some(scope.source_authorized_for_semantics(func)?),
-        None => None,
-    };
-    let scope = scope.as_ref();
-    if let (Some(scope), Some(summaries)) = (scope, summaries)
-        && !scope.matches_interproc_owners(summaries)
-    {
-        return None;
-    }
     if let Some(summary) = summary
         && super::native_worker::native_worker_summary_route_policy_for_summary(func.entry, summary)
             .should_prefer_full()
@@ -328,9 +295,8 @@ pub fn compile_native_worker_summary_artifact(
     }
 
     let derived_diagnostics = DerivedSummaryDiagnostics::default();
-    let helper_functions = scope
-        .map(|scope| scope.helper_functions().count())
-        .or_else(|| summary.map(|summary| summary.direct_callees.len()))
+    let helper_functions = summary
+        .map(|summary| summary.direct_callees.len())
         .unwrap_or(0);
     let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
     let slice_class = if named_worker_family
@@ -367,7 +333,7 @@ pub fn compile_native_worker_summary_artifact(
     } else {
         r2ssa::FunctionSemanticLinkage::Unknown
     };
-    let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
+    let closure_functions = 1;
     let collected = CollectedNativeSemanticRegions {
         regions: Default::default(),
         diagnostics: SymbolicFunctionFactDiagnostics {
@@ -395,18 +361,12 @@ pub fn compile_native_worker_summary_artifact(
         vm_step: None,
         vm_transfer: None,
     });
-    let mut artifact = match summaries {
+    Some(match summaries {
         Some(summaries) => {
             SemanticArtifact::new_with_interproc_provenance(Arc::clone(func), report, summaries)?
         }
         None => SemanticArtifact::new(Arc::clone(func), report)?,
-    };
-    if let Some(scope) = scope
-        && !artifact.retain_scope_provenance(scope)
-    {
-        return None;
-    }
-    Some(artifact)
+    })
 }
 
 fn prepared_root_summary<'a>(
@@ -540,15 +500,10 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
 fn build_semantic_artifact(
     prepared: Arc<SsaArtifact>,
     input: BuildSemanticArtifactInput,
-    scope: Option<&PreparedFunctionScope>,
 ) -> SemanticArtifact {
     let report = build_semantic_artifact_report(input);
-    match scope {
-        Some(scope) => SemanticArtifact::new_with_scope_provenance(prepared, report, scope)
-            .expect("compiler scope must retain the exact prepared root"),
-        None => SemanticArtifact::new(prepared, report)
-            .expect("compiler report must use the current semantic artifact schema"),
-    }
+    SemanticArtifact::new(prepared, report)
+        .expect("compiler report must use the current semantic artifact schema")
 }
 
 fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
@@ -570,119 +525,17 @@ fn bounded_large_cfg_branch_limit(func: &SsaArtifact) -> usize {
     }
 }
 
-fn bounded_large_cfg_helper_limit(func: &SsaArtifact) -> usize {
-    let summary = func.function().cfg_risk_summary();
-    let branch_count = func.predicates().predicates.len();
-    if summary.block_count > 160
-        || branch_count > 160
-        || summary.back_edge_count > 8
-        || summary.switch_block_count > 8
-    {
-        1
-    } else if summary.block_count > 96 || branch_count > 96 || summary.back_edge_count > 6 {
-        2
-    } else {
-        3
-    }
-}
-
-fn bounded_default_scope(
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-) -> Option<PreparedFunctionScope> {
-    let scope = scope.and_then(|scope| scope.exact_for_artifact(func))?;
-    let root = scope.root()?;
-    let helper_limit = bounded_large_cfg_helper_limit(func).max(4);
-    if scope.helper_functions().count() > helper_limit {
-        None
-    } else {
-        scope.with_prepared_root(Arc::clone(&root.prepared))
-    }
-}
-
-fn bounded_large_cfg_scope(
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-) -> Option<PreparedFunctionScope> {
-    let scope = scope.and_then(|scope| scope.exact_for_artifact(func))?;
-    let root = scope.root()?;
-    let root = root.clone();
-    let helper_limit = bounded_large_cfg_helper_limit(func);
-    if helper_limit == 0 {
-        return prepared_scope_subset(scope, vec![root]);
-    }
-
-    let mut functions = vec![root];
-    let mut seen = BTreeSet::from([scope.root_id()]);
-
-    for call in func.call_sites().by_id.values() {
-        if functions.len().saturating_sub(1) >= helper_limit {
-            break;
-        }
-        let Some(target) = call.direct_target else {
-            continue;
-        };
-        let function_id = InterprocFunctionId(target);
-        if !seen.insert(function_id) {
-            continue;
-        }
-        let Some(helper) = scope.functions().get(&function_id).cloned() else {
-            continue;
-        };
-        functions.push(helper);
-    }
-
-    prepared_scope_subset(scope, functions)
-}
-
-fn prepared_scope_subset(
-    source: &PreparedFunctionScope,
-    functions: Vec<crate::ScopedPreparedFunction>,
-) -> Option<PreparedFunctionScope> {
-    let provenance = functions
-        .iter()
-        .map(|function| {
-            source
-                .provenance_of(function)
-                .map(|provenance| (function.id, provenance))
-        })
-        .collect::<Option<std::collections::BTreeMap<_, _>>>()?;
-    PreparedFunctionScope::new_with_provenance(source.root_id().0, functions, provenance)
-}
-
-fn bounded_query_scope(
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    target_addr: u64,
-) -> Option<PreparedFunctionScope> {
-    let scope = scope.and_then(|scope| scope.exact_for_artifact(func))?;
-    let target_is_cross_function = scope
-        .function_containing_block(target_addr)
-        .is_some_and(|function| function.id != scope.root_id());
-    let helper_limit = bounded_large_cfg_helper_limit(func);
-    let has_many_helpers = scope.helper_functions().count() > helper_limit;
-
-    if !(target_is_cross_function || has_many_helpers) {
-        return None;
-    }
-
-    bounded_large_cfg_scope(func, Some(scope))
-}
-
 fn compile_function_semantics_from_current_inputs(
     ctx: &Context,
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
     let arch = source_arch_spec(func.as_ref());
     let symbol_map = HashMap::new();
-    let closure_functions = scope.map(|scope| scope.functions().len()).unwrap_or(1);
-    let helper_functions = scope
-        .map(|scope| scope.helper_functions().count())
-        .unwrap_or(0);
-    let mut derived_diagnostics = DerivedSummaryDiagnostics::default();
-    let mut derived_summaries = 0usize;
+    let closure_functions = 1;
+    let helper_functions = 0;
+    let derived_diagnostics = DerivedSummaryDiagnostics::default();
+    let derived_summaries = 0usize;
     let mut collected = CollectedNativeSemanticRegions::default();
     let interpreter = classify_interpreter_like(func);
     let vm_step_candidate = interpreter
@@ -703,11 +556,10 @@ fn compile_function_semantics_from_current_inputs(
             // be, so a dispatch loop has no more reason to skip it than anything
             // else expensive does. Skipping it left a VM function with no regions
             // at all, which is why nothing downstream could structure one.
-            let bounded_scope = bounded_large_cfg_scope(func, scope);
             collected = collect_large_cfg_canonical_semantic_regions_with_limit(
                 ctx,
                 func,
-                bounded_scope.as_ref(),
+                None,
                 arch,
                 &symbol_map,
                 summary_profile,
@@ -762,38 +614,17 @@ fn compile_function_semantics_from_current_inputs(
                     vm_step: vm_step.clone(),
                     vm_transfer: vm_transfer.clone(),
                 },
-                scope,
             );
         }
 
-        if let Some(scope) = scope
-            && let Some(registry) =
-                SummaryRegistry::with_profile_for_prepared(func, summary_profile)
-            && let Ok(derived) =
-                registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), &symbol_map)
-        {
-            derived_summaries = derived.summaries.len();
-            derived_diagnostics = derived.diagnostics.clone();
-            collected = collect_canonical_semantic_regions_with_derived(
-                ctx,
-                func,
-                Some(scope),
-                arch,
-                &symbol_map,
-                summary_profile,
-                &registry,
-                &derived,
-            );
-        } else {
-            collected = collect_canonical_semantic_regions_with_scope_and_profile(
-                ctx,
-                func,
-                None,
-                Some(arch),
-                &symbol_map,
-                summary_profile,
-            );
-        }
+        collected = collect_canonical_semantic_regions_with_scope_and_profile(
+            ctx,
+            func,
+            None,
+            Some(arch),
+            &symbol_map,
+            summary_profile,
+        );
     } else {
         collected.diagnostics.skipped_missing_arch = true;
     }
@@ -845,50 +676,30 @@ fn compile_function_semantics_from_current_inputs(
             vm_step,
             vm_transfer,
         },
-        scope,
     )
 }
 
-pub fn compile_function_semantics_with_scope(
+pub fn compile_function_semantics(
     ctx: &Context,
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    let scope = scope.and_then(|scope| scope.source_authorized_for_semantics(func));
-    compile_function_semantics_from_current_inputs(ctx, func, scope.as_ref(), summary_profile)
+    compile_function_semantics_from_current_inputs(ctx, func, summary_profile)
 }
 
-pub fn compile_semantic_artifact_with_scope(
+pub fn compile_semantic_artifact(
     ctx: &Context,
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    compile_function_semantics_with_scope(ctx, func, scope, summary_profile)
+    compile_function_semantics(ctx, func, summary_profile)
 }
 
-pub fn compile_query_semantic_artifact_with_scope(
+pub fn compile_semantic_artifact_default(
     ctx: &Context,
     func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
-    target_addr: u64,
-    summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    let scope = scope.and_then(|scope| scope.source_authorized_for_semantics(func));
-    let bounded_scope = bounded_query_scope(func, scope.as_ref(), target_addr);
-    let selected_scope = bounded_scope.as_ref().or(scope.as_ref());
-    compile_function_semantics_with_scope(ctx, func, selected_scope, summary_profile)
-}
-
-pub fn compile_semantic_artifact_default_with_scope(
-    ctx: &Context,
-    func: &Arc<SsaArtifact>,
-    scope: Option<&PreparedFunctionScope>,
-) -> SemanticArtifact {
-    let scope = scope.and_then(|scope| scope.source_authorized_for_semantics(func));
-    let rebound_scope = bounded_default_scope(func, scope.as_ref());
-    compile_semantic_artifact_with_scope(ctx, func, rebound_scope.as_ref(), SummaryProfile::Default)
+    compile_semantic_artifact(ctx, func, SummaryProfile::Default)
 }
 
 #[cfg(test)]
@@ -1013,11 +824,9 @@ mod tests {
         }];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
         let ctx = Context::thread_local();
-        let mut first =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let mut first = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
         first.report_mut().diagnostics.branches_evaluated = usize::MAX;
-        let second =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let second = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
 
         assert_eq!(first.diagnostics.branches_evaluated, usize::MAX);
         assert_ne!(second.diagnostics.branches_evaluated, usize::MAX);
@@ -1039,10 +848,9 @@ mod tests {
         let rebuilt =
             Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("rebuilt SSA"));
         let weak = Arc::downgrade(&prepared);
-        let artifact = compile_function_semantics_with_scope(
+        let artifact = compile_function_semantics(
             &Context::thread_local(),
             &prepared,
-            None,
             SummaryProfile::Default,
         );
 
@@ -1074,10 +882,9 @@ mod tests {
         foreign_arch.addr_size = 8;
 
         let projected = source_arch_spec(&prepared).expect("retained source architecture");
-        let artifact = compile_function_semantics_with_scope(
+        let artifact = compile_function_semantics(
             &Context::thread_local(),
             &prepared,
-            None,
             SummaryProfile::Default,
         );
 
@@ -1164,8 +971,7 @@ mod tests {
 
         assert_eq!(bounded_large_cfg_branch_limit(&func), 0);
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
         let native = artifact.native_body().expect("native body");
         assert!(artifact.diagnostics.skipped_large_cfg);
         assert_eq!(artifact.diagnostics.branches_evaluated, 0);
@@ -1219,65 +1025,9 @@ mod tests {
             root_summary.return_relation,
             r2ssa::SummaryReturnRelation::Unknown
         );
-        let root_scope = PreparedFunctionScope::new(
-            func.entry,
-            vec![crate::ScopedPreparedFunction {
-                id: InterprocFunctionId(func.entry),
-                name: None,
-                prepared: Arc::clone(&func),
-            }],
-        )
-        .expect("root scope");
-        assert!(root_scope.matches_interproc_owners(&summaries));
-
-        let detached_helper = Arc::new(
-            SsaArtifact::for_decompile_with_interface(
-                &[R2ILBlock {
-                    addr: 0x5000,
-                    size: 1,
-                    ops: vec![R2ILOp::Return {
-                        target: make_const(0, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                }],
-                Some(&arch),
-                interface,
-            )
-            .expect("detached helper"),
-        );
-        let mismatched_scope = PreparedFunctionScope::new(
-            func.entry,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(func.entry),
-                    name: None,
-                    prepared: Arc::clone(&func),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(detached_helper.entry),
-                    name: None,
-                    prepared: detached_helper,
-                },
-            ],
-        )
-        .expect("detached helper scope");
-        assert!(!mismatched_scope.matches_interproc_owners(&summaries));
-        assert!(
-            compile_summary_dense_worker_artifact_from_interproc_summary(
-                &func,
-                Some(&mismatched_scope),
-                &summaries,
-            )
-            .is_none()
-        );
-
-        let artifact = compile_summary_dense_worker_artifact_from_interproc_summary(
-            &func,
-            Some(&root_scope),
-            &summaries,
-        )
-        .expect("summary-dense worker artifact");
+        let artifact =
+            compile_summary_dense_worker_artifact_from_interproc_summary(&func, &summaries)
+                .expect("summary-dense worker artifact");
 
         let native = artifact.native_body().expect("native artifact");
         assert_eq!(artifact.stage, RefinementStage::Compiled);
@@ -1321,19 +1071,13 @@ mod tests {
         assert!(
             compile_summary_dense_worker_artifact_from_interproc_summary(
                 &requested,
-                None,
                 &foreign_summaries,
             )
             .is_none()
         );
         assert!(
-            compile_native_worker_summary_artifact(
-                &requested,
-                None,
-                Some(&foreign_summaries),
-                true,
-            )
-            .is_none()
+            compile_native_worker_summary_artifact(&requested, Some(&foreign_summaries), true,)
+                .is_none()
         );
     }
 
@@ -1423,8 +1167,7 @@ mod tests {
         }];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
 
-        let artifact =
-            compile_native_worker_summary_artifact(&func, None, None, true).expect("summary");
+        let artifact = compile_native_worker_summary_artifact(&func, None, true).expect("summary");
 
         let native = artifact.native_body().expect("native artifact");
         assert_eq!(artifact.granularity, ArtifactGranularity::SummaryOnly);
@@ -1443,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_compilation_drops_manual_helper_scope_and_lifetime() {
+    fn bounded_compilation_remains_single_function() {
         let mut blocks = vec![R2ILBlock {
             addr: 0x3000,
             size: 4,
@@ -1482,294 +1225,14 @@ mod tests {
             op_metadata: Default::default(),
         });
         let root = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("root"));
-        let helper = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
-                    addr: 0x5000,
-                    size: 1,
-                    ops: vec![R2ILOp::Return {
-                        target: make_const(0, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                }],
-                Some(&test_arch()),
-            )
-            .expect("helper"),
-        );
-        let helper_weak = Arc::downgrade(&helper);
-        let scope_a = crate::PreparedFunctionScope::new(
-            0x3000,
-            vec![crate::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x3000),
-                name: Some("sym.root".to_string()),
-                prepared: Arc::clone(&root),
-            }],
-        )
-        .expect("scope a");
-        let scope_b = crate::PreparedFunctionScope::new(
-            0x3000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x3000),
-                    name: Some("sym.root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x5000),
-                    name: Some("sym.helper".to_string()),
-                    prepared: Arc::clone(&helper),
-                },
-            ],
-        )
-        .expect("scope b");
-        drop(helper);
         let ctx = Context::thread_local();
+        let artifact = compile_function_semantics(&ctx, &root, SummaryProfile::Default);
 
-        let first = compile_function_semantics_with_scope(
-            &ctx,
-            &root,
-            Some(&scope_a),
-            SummaryProfile::Default,
-        );
-        let second = compile_function_semantics_with_scope(
-            &ctx,
-            &root,
-            Some(&scope_b),
-            SummaryProfile::Default,
-        );
-
-        assert!(first.diagnostics.skipped_large_cfg);
-        assert!(second.diagnostics.skipped_large_cfg);
-        let first_summary = &first.native_body().expect("native body").summary;
-        let second_summary = &second.native_body().expect("native body").summary;
-        assert_eq!(first_summary.closure_functions, 1);
-        assert_eq!(second_summary.closure_functions, 1);
-        assert_eq!(first_summary.helper_functions, 0);
-        assert_eq!(second_summary.helper_functions, 0);
-        assert!(!first.has_helper_provenance());
-        assert!(!second.has_helper_provenance());
-        let rejected_helper = helper_weak.upgrade().expect("scope still retains helper");
-        assert!(!second.retains_helper_provenance_owner(&rejected_helper));
-        drop(rejected_helper);
-        drop(scope_b);
-        assert!(helper_weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn bounded_query_scope_omits_cross_function_target_helpers() {
-        let root = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
-                    addr: 0x1000,
-                    size: 1,
-                    ops: vec![R2ILOp::Return {
-                        target: make_const(0, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                }],
-                Some(&test_arch()),
-            )
-            .expect("root"),
-        );
-        let helper = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
-                    addr: 0x2000,
-                    size: 1,
-                    ops: vec![R2ILOp::Return {
-                        target: make_const(0, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                }],
-                Some(&test_arch()),
-            )
-            .expect("helper"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x2000),
-                    name: Some("helper".to_string()),
-                    prepared: helper,
-                },
-            ],
-        )
-        .expect("scope");
-
-        let bounded = bounded_query_scope(&root, Some(&scope), 0x2000).expect("bounded scope");
-        assert_eq!(bounded.functions().len(), 1);
-        assert_eq!(bounded.root_id(), r2ssa::InterprocFunctionId(0x1000));
-        assert!(
-            bounded
-                .functions()
-                .contains_key(&r2ssa::InterprocFunctionId(0x1000))
-        );
-        assert!(
-            !bounded
-                .functions()
-                .contains_key(&r2ssa::InterprocFunctionId(0x2000))
-        );
-    }
-
-    #[test]
-    fn bounded_query_scope_keeps_same_function_targets_unbounded() {
-        let root = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
-                    addr: 0x1000,
-                    size: 1,
-                    ops: vec![R2ILOp::Return {
-                        target: make_const(0, 8),
-                    }],
-                    switch_info: None,
-                    op_metadata: Default::default(),
-                }],
-                Some(&test_arch()),
-            )
-            .expect("root"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![crate::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x1000),
-                name: Some("root".to_string()),
-                prepared: Arc::clone(&root),
-            }],
-        )
-        .expect("scope");
-
-        assert!(bounded_query_scope(&root, Some(&scope), 0x1000).is_none());
-    }
-
-    #[test]
-    fn bounded_scopes_refuse_foreign_root_authority() {
-        let blocks = [R2ILBlock {
-            addr: 0x1000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let requested = Arc::new(
-            SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("requested root"),
-        );
-        let scoped =
-            Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("scoped root"));
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![crate::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x1000),
-                name: Some("root".to_string()),
-                prepared: scoped,
-            }],
-        )
-        .expect("scope");
-
-        assert!(bounded_default_scope(&requested, Some(&scope)).is_none());
-        assert!(bounded_large_cfg_scope(&requested, Some(&scope)).is_none());
-    }
-
-    fn foreign_same_content_scope() -> (Arc<SsaArtifact>, PreparedFunctionScope) {
-        let root_blocks = [R2ILBlock {
-            addr: 0x1000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let helper_blocks = [R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            ops: vec![R2ILOp::Return {
-                target: make_const(1, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let requested = Arc::new(
-            SsaArtifact::for_symbolic(&root_blocks, None).expect("requested root artifact"),
-        );
-        let foreign =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, None).expect("foreign root artifact"));
-        let helper =
-            Arc::new(SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper artifact"));
-        let scope = PreparedFunctionScope::new(
-            requested.entry,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(requested.entry),
-                    name: Some("root".to_string()),
-                    prepared: foreign,
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(helper.entry),
-                    name: Some("helper".to_string()),
-                    prepared: helper,
-                },
-            ],
-        )
-        .expect("foreign scope");
-        (requested, scope)
-    }
-
-    fn assert_foreign_scope_was_dropped(artifact: &SemanticArtifact) {
-        let summary = &artifact.native_body().expect("native artifact").summary;
+        assert!(artifact.diagnostics.skipped_large_cfg);
+        let summary = &artifact.native_body().expect("native body").summary;
         assert_eq!(summary.closure_functions, 1);
         assert_eq!(summary.helper_functions, 0);
-    }
-
-    #[test]
-    fn standard_compile_drops_foreign_same_content_scope() {
-        let (requested, scope) = foreign_same_content_scope();
-        let artifact = compile_function_semantics_with_scope(
-            &Context::thread_local(),
-            &requested,
-            Some(&scope),
-            SummaryProfile::Default,
-        );
-
-        assert_foreign_scope_was_dropped(&artifact);
-    }
-
-    #[test]
-    fn query_compile_drops_foreign_same_content_cross_function_scope() {
-        let (requested, scope) = foreign_same_content_scope();
-        let artifact = compile_query_semantic_artifact_with_scope(
-            &Context::thread_local(),
-            &requested,
-            Some(&scope),
-            0x2000,
-            SummaryProfile::Default,
-        );
-
-        assert_foreign_scope_was_dropped(&artifact);
-    }
-
-    #[test]
-    fn query_fallback_does_not_reintroduce_foreign_same_content_scope() {
-        let (requested, scope) = foreign_same_content_scope();
-        let artifact = compile_query_semantic_artifact_with_scope(
-            &Context::thread_local(),
-            &requested,
-            Some(&scope),
-            requested.entry,
-            SummaryProfile::Default,
-        );
-
-        assert_foreign_scope_was_dropped(&artifact);
+        assert!(!artifact.has_helper_provenance());
     }
 
     #[test]
@@ -1890,8 +1353,7 @@ mod tests {
         ];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
         assert_eq!(artifact.execution, ExecutionModel::Vm);
         assert_eq!(
             artifact.stage,
@@ -2015,8 +1477,7 @@ mod tests {
         ];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
         assert_eq!(artifact.execution, ExecutionModel::Native);
         assert!(artifact.vm_body().is_none());
         assert_ne!(
@@ -2149,8 +1610,7 @@ mod tests {
         ];
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
 
         assert_eq!(artifact.execution, ExecutionModel::Native);
         assert!(artifact.vm_body().is_none());
@@ -2285,8 +1745,7 @@ mod tests {
             r2ssa::SsaArtifactProvenanceKind::Manual
         );
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
 
         let vm_step = artifact
             .vm_body()
@@ -2443,8 +1902,7 @@ mod tests {
 
         let func = Arc::new(SsaArtifact::for_symbolic(&blocks, Some(&test_arch())).expect("ssa"));
         let ctx = Context::thread_local();
-        let artifact =
-            compile_function_semantics_with_scope(&ctx, &func, None, SummaryProfile::Default);
+        let artifact = compile_function_semantics(&ctx, &func, SummaryProfile::Default);
 
         let native = artifact.native_body().expect("native body");
         assert_eq!(
@@ -2595,7 +2053,6 @@ mod tests {
                 vm_step: None,
                 vm_transfer: None,
             },
-            None,
         );
         assert!(matches!(artifact.query_plan(), crate::QueryPlan::Ready));
         assert!(matches!(

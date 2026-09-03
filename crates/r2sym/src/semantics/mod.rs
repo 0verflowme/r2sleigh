@@ -20,10 +20,9 @@ pub use claims::{
     SemanticClaimSummary, SemanticTypeSeedKind, SummaryRoleCertificate, SummaryRouteCertificate,
     SummaryRouteCertificateKind,
 };
-pub use compiler::compile_semantic_artifact_default_with_scope;
 pub use compiler::{
-    compile_function_semantics_with_scope, compile_native_worker_summary_artifact,
-    compile_query_semantic_artifact_with_scope, compile_semantic_artifact_with_scope,
+    compile_function_semantics, compile_native_worker_summary_artifact, compile_semantic_artifact,
+    compile_semantic_artifact_default,
     compile_summary_dense_worker_artifact_from_interproc_summary,
 };
 pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};

@@ -751,48 +751,6 @@ impl PreparedFunctionScope {
         .then_some(self)
     }
 
-    pub(crate) fn source_authorized_for_semantics(
-        &self,
-        artifact: &Arc<SsaArtifact>,
-    ) -> Option<Self> {
-        self.exact_for_artifact(artifact.as_ref())?;
-        let root = self.root()?.clone();
-        if self.provenance_of(&root) != Some(ScopedFunctionProvenance::Analyzed) {
-            return None;
-        }
-        let mut functions = vec![root];
-        for helper in self.helper_functions() {
-            match self.provenance_of(helper)? {
-                ScopedFunctionProvenance::RuntimeMaterialized => continue,
-                ScopedFunctionProvenance::Analyzed
-                    if helper.prepared.provenance_kind()
-                        == SsaArtifactProvenanceKind::TrustedSource =>
-                {
-                    functions.push(helper.clone());
-                }
-                ScopedFunctionProvenance::Analyzed => return None,
-            }
-        }
-        let provenance = functions
-            .iter()
-            .map(|function| (function.id, ScopedFunctionProvenance::Analyzed))
-            .collect();
-        Self::new_with_provenance(self.root.0, functions, provenance)
-    }
-
-    pub(crate) fn matches_interproc_owners(&self, summaries: &PreparedInterprocSummarySet) -> bool {
-        let Some(root) = self.root() else {
-            return false;
-        };
-        summaries.matches_root(&root.prepared)
-            && summaries.owners().len() == self.functions.len()
-            && self.functions.iter().all(|(id, function)| {
-                summaries
-                    .owner(*id)
-                    .is_some_and(|owner| Arc::ptr_eq(owner, &function.prepared))
-            })
-    }
-
     pub fn functions(&self) -> &BTreeMap<InterprocFunctionId, ScopedPreparedFunction> {
         &self.functions
     }
@@ -1050,18 +1008,6 @@ impl<'ctx> SummaryRegistry<'ctx> {
     /// Create a registry pre-populated with summaries for a typed workflow profile.
     pub fn with_profile_for_arch(arch: &ArchSpec, profile: SummaryProfile) -> Option<Self> {
         Some(Self::with_profile(CallConv::for_arch_spec(arch)?, profile))
-    }
-
-    /// Create a registry from the exact ABI carrier snapshot retained by one
-    /// prepared artifact. Missing or incoherent source ABI data fails closed.
-    pub(crate) fn with_profile_for_prepared(
-        prepared: &SsaArtifact,
-        profile: SummaryProfile,
-    ) -> Option<Self> {
-        Some(Self::with_profile(
-            CallConv::for_prepared(prepared)?,
-            profile,
-        ))
     }
 
     /// Create a registry using symbol-map environment hints when the architecture is ambiguous.
@@ -3980,10 +3926,6 @@ mod tests {
         assert_eq!(projected.variant, "default");
         assert_eq!(callconv.argument_storage(0), Some(argument));
         assert_eq!(callconv.result_storage(), Some(result));
-        assert!(
-            SummaryRegistry::with_profile_for_prepared(&prepared, SummaryProfile::PathListing,)
-                .is_some()
-        );
     }
 
     #[test]
@@ -4345,32 +4287,6 @@ mod tests {
         let runtime = scope.functions().get(&runtime_id).expect("runtime source");
         assert!(!is_runtime_materialized_scope_function(&scope, helper));
         assert!(is_runtime_materialized_scope_function(&scope, runtime));
-
-        let runtime_only = PreparedFunctionScope::new_with_provenance(
-            root_id.0,
-            vec![
-                ScopedPreparedFunction {
-                    id: root_id,
-                    name: None,
-                    prepared: Arc::clone(&root),
-                },
-                ScopedPreparedFunction {
-                    id: runtime_id,
-                    name: None,
-                    prepared: Arc::clone(&runtime.prepared),
-                },
-            ],
-            BTreeMap::from([
-                (root_id, ScopedFunctionProvenance::Analyzed),
-                (runtime_id, ScopedFunctionProvenance::RuntimeMaterialized),
-            ]),
-        )
-        .expect("runtime-only scope");
-        let semantic_scope = runtime_only
-            .source_authorized_for_semantics(&root)
-            .expect("runtime materialization is excluded, not promoted");
-        assert_eq!(semantic_scope.functions().len(), 1);
-        assert!(semantic_scope.functions().contains_key(&root_id));
     }
 
     #[test]

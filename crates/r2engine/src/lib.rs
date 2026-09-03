@@ -4037,10 +4037,9 @@ fn build_engine_analysis_artifact(
             );
         }
         optional_semantics_required.then(|| {
-            r2sym::compile_semantic_artifact_default_with_scope(
+            r2sym::compile_semantic_artifact_default(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
-                None,
             )
         })
     })();
@@ -4095,12 +4094,8 @@ fn maybe_compile_semantic_artifact_for_analysis(
             return None;
         }
         if !vm_route_evidence
-            && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-                ssa_func,
-                None,
-                interproc_summaries,
-                false,
-            )
+            && let Some(artifact) =
+                r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
             && artifact
                 .native_body()
                 .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
@@ -4144,31 +4139,23 @@ fn compile_semantic_artifact_for_analysis(
     let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
     if !vm_route_evidence
         && let Some(summaries) = interproc_summaries
-        && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
-            ssa_func, None, summaries,
-        )
+        && let Some(artifact) =
+            r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(ssa_func, summaries)
     {
         return artifact;
     }
     if !vm_route_evidence
         && should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary)
-        && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-            ssa_func,
-            None,
-            interproc_summaries,
-            false,
-        )
+        && let Some(artifact) =
+            r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
         && artifact
             .native_body()
             .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
     {
         return artifact;
     }
-    let mut artifact = r2sym::compile_semantic_artifact_default_with_scope(
-        &z3::Context::thread_local(),
-        ssa_func,
-        None,
-    );
+    let mut artifact =
+        r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), ssa_func);
     if let Some(summaries) = interproc_summaries {
         r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
     }

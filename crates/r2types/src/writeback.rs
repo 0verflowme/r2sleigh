@@ -11829,9 +11829,8 @@ mod tests {
     fn source_owned_writeback_retains_exact_prepared_owners() {
         let (source, _) = source_owned_worker_fixture(0x401000);
         let summary = prepared_summary_for(&source);
-        let semantic =
-            r2sym::compile_native_worker_summary_artifact(&source, None, Some(&summary), true)
-                .expect("source-owned semantic artifact");
+        let semantic = r2sym::compile_native_worker_summary_artifact(&source, Some(&summary), true)
+            .expect("source-owned semantic artifact");
         let request = TypeWritebackAnalysisRequest::new(
             Arc::clone(&source),
             ParsedExternalContext::default(),
@@ -12101,13 +12100,9 @@ mod tests {
         let (source, _) = source_owned_worker_fixture(0x402000);
         let (foreign, _) = source_owned_worker_fixture(0x402000);
         let foreign_summary = prepared_summary_for(&foreign);
-        let foreign_semantic = r2sym::compile_native_worker_summary_artifact(
-            &foreign,
-            None,
-            Some(&foreign_summary),
-            true,
-        )
-        .expect("foreign semantic artifact");
+        let foreign_semantic =
+            r2sym::compile_native_worker_summary_artifact(&foreign, Some(&foreign_summary), true)
+                .expect("foreign semantic artifact");
 
         assert_eq!(
             TypeWritebackAnalysisRequest::new(
@@ -12131,13 +12126,9 @@ mod tests {
         );
 
         let source_summary = prepared_summary_for(&source);
-        let source_semantic = r2sym::compile_native_worker_summary_artifact(
-            &source,
-            None,
-            Some(&source_summary),
-            true,
-        )
-        .expect("base semantic artifact");
+        let source_semantic =
+            r2sym::compile_native_worker_summary_artifact(&source, Some(&source_summary), true)
+                .expect("base semantic artifact");
         let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
             id: None,
             subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
@@ -12174,7 +12165,6 @@ mod tests {
         let conditioned_summary = prepared_summary_for(&conditioned);
         let conditioned_semantic = r2sym::compile_native_worker_summary_artifact(
             &conditioned,
-            None,
             Some(&conditioned_summary),
             true,
         )
