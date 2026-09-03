@@ -8869,6 +8869,68 @@ measured is the artifact you built. `run-placement.sh` on the host now copies
 the freshly built library itself and prints whether a string only this tree
 contains is present in the installed one.
 
+## The effect-ledger refusals, split by layer
+
+The effect ledger is the largest single cause of refusal among real functions,
+26 of them across the coverage baseline, and until now the cause line said only
+"N refused, N unaccounted, N conflicts". `R2SLEIGH_DEBUG_UNOWNED=1` writes a
+per-function ledger line to `/tmp/r2sleigh_unowned.log` naming the layer, the
+reason and the obligation ids, and it splits them cleanly. Swept over 78
+functions in three binaries, four had a refused obligation:
+
+| count | layer and reason | obligation kind |
+| --- | --- | --- |
+| 22 | `ssa/unsupported-effect` | `volatile-or-unknown` |
+| 5 | `codegen/block-not-rendered` | `live-value-producer` |
+
+The two are different problems and only one of them is about the decompiler's
+ability to read a program.
+
+**`ssa/unsupported-effect`** was written up here as a scope question about
+compiler stubs. That was wrong, and tracing it took twenty minutes. It is one
+unimplemented rule, and the same rule accounts for three other symptoms this
+branch is chasing separately.
+
+The obligations refuse at `crates/r2dec/src/effect_ledger.rs:78`, which turns
+`VolatileOrUnknownEffect` into a refusal unconditionally. That is the report,
+not the cause. The kind is minted at `crates/r2ssa/src/obligation.rs:519`,
+whenever a call boundary is not `complete`. And a boundary becomes complete in
+exactly one place, `crates/r2ssa/src/semantic.rs:3144`, reached only when
+`machine_context.call_site_interface` returns an interface for the site. The
+field's own comment says so: "Only an exact source-owned callsite interface may
+change this state to complete."
+
+So a call radare2 could not resolve to a callee has no interface, never
+completes, and every obligation it carries is refused. The refusing stub is
+precisely that shape. `sym._init` in the pinned GCC binary disassembles to
+`endbr64; sub rsp,8; mov rax,[rip+0x2fd1]; test rax,rax; je +2; call rax;
+add rsp,8; ret` — the `ff d0` at `0x401014` is an indirect call through a
+register, the standard `__gmon_start__` guard. Nothing about it is a compiler
+oddity worth excusing.
+
+The owner settled the second path years of this branch have needed: a call
+whose signature nothing knows takes its arity from the convention's argument
+registers that are provably written before the call and live into it. That rule
+would complete such a boundary. It is not implemented, and its absence is the
+single cause behind four things counted separately until now: these 22 refused
+obligations, the call that renders `f()` with an empty argument list under a
+proof line saying nothing was refused, the import thunks that transfer through
+a value, and the direct tail call. They are one defect seen from four sides.
+
+**`codegen/block-not-rendered`** is the real one. A block exists in the SSA,
+produces live values, and never reached the output, so the obligations of the
+values it produces have nowhere to be discharged. `siphash24` at x64-O1 is the
+clearest case: 435 obligations, 393 rendered, 40 elided, and exactly two
+refused, both `live-value-producer` on the same block. Anything that drops a
+block after the plan is fixed produces this, so the trace runs from the
+structurer's region handling and the linearizer through placement's statement
+removal.
+
+Note that the elision profile of that same function is healthy and worth
+keeping as a reference for what a well-accounted function looks like:
+21 coalesced identity phis, 6 coalesced copies, 3 dead stack bases,
+3 materialized phi edges, 3 stack frame, 2 return control, 1 direct control
+target and 1 with no native semantics.
 ## A second semantic gate, and the first map of what breaks outside hash functions
 
 The differential column was the project's strongest correctness evidence and it
@@ -9100,3 +9162,233 @@ them:
 The shape run was executed twice under the lock and produced identical column
 totals both times, so the fourteen renderings and the eight differential passes
 are reproducible rather than a scheduling artifact.
+## The `aa` path measured directly, and the figure it replaces
+
+The last section named the `aa` path as the dominant remaining cost, at about
+55 milliseconds per function across `sleigh_analyze_fcn`, `sleigh_get_data_refs`
+and `sleigh_op`. **That figure was wrong and the method that produced it was
+wrong.** It came from `(aaa - aa)` differencing, on the assumption that the
+proof sweep is what `aaa` adds to `aa`. radare2 runs the plugin's
+`post_analysis` hook during `aa` as well, so the subtraction cancelled most of
+the sweep instead of isolating it, and what was left over got attributed to
+callbacks that turn out to cost almost nothing.
+
+Each callback now counts and times itself, printed under `R2SLEIGH_TIMING`.
+bzip2recover, `aaa`, on a quiet VM:
+
+    site                calls    total      mean
+    analyze_fcn            32     2.6ms    81us
+    get_data_refs          38    14.9ms   392us
+    op                      0        --      --
+    eligible               72     320ms   4.4ms
+      context.create        1     302ms   302ms
+      context.regprofile   73     0.5ms   6.5us
+    post_analysis           1    1494ms
+      snapshot.walk        39     448ms  11.5ms
+      snapshot.reuse       43       9us   209ns
+      proof.engine         22     387ms  17.6ms
+
+Three things fall out that no amount of differencing would have given.
+
+**The three callbacks named in the brief cost 17.5 milliseconds between them,
+and `sleigh_op` is never called at all.** radare2 decodes this binary through
+another arch plugin, so the per-instruction path that looked like the obvious
+suspect does not run. Every per-instruction worry about `get_context` --
+the multi-kilobyte register-profile `strcmp`, the two FFI calls per instruction
+-- was about a function that is not on the path. `context.regprofile` is 73
+calls and half a millisecond in total.
+
+**What `eligible` costs is one Sleigh context creation.** radare2 asks the
+plugin's `eligible` hook per function, 72 times here, and 302 of the 320
+milliseconds is a single `sleigh_v2_context_create` -- the same compiled `.sla`
+parse the previous section moved off the lift path, on the other of the two
+paths that load one. The Rust side now shares a loaded profile through
+`shared_trusted_profile`; the C `R2ILContext` does not share with it, so a
+session that both analyses and decompiles parses the specification twice. That
+is one call and 0.3 seconds, and it is the cheapest item left.
+
+**Everything else is the sweep**, at 1.49 seconds, and the largest thing in it
+was the same function's snapshot being collected three times.
+
+### One walk per function instead of three
+
+`r_core_function_snapshot_at` collects the function, its blocks, its bytes, its
+type graph and the bodies of everything it calls. Three places asked for one
+per function and each kept a different part: `sleigh_artifact_plan_init` walked
+it all to read a single 64-bit revision, once for the proof plan and again for
+the taint plan, and `sleigh_proven_facts_json` walked it a third time for the
+wire buffer. 82 walks per `aaa` on a 38-function binary.
+
+One held capture keyed by the address and both dirty epochs brings that to 39
+walks and 43 reuses at 209 nanoseconds. One entry rather than a per-program
+cache, because the three readers are consecutive for one function, so a second
+entry buys no hit while holding whole snapshots for a program would hold the
+program twice over. The wire buffer is always built, because the walk is the
+cost -- 44.5ms with the buffer against 50.6ms without is the same number twice
+-- so making it conditional would only add a way for the entry to miss.
+
+**What that is worth, and a measurement that had to be thrown away.** Run as
+two blocks, before then after, the same two builds read 13.20s against 3.12s
+for `aaa` and 8.67s against 1.49s for post-analysis: a four- to sixfold win.
+It is not real. The before block ran while the machine was busy and the after
+block did not. Interleaved, three rounds, alternating:
+
+    round   before aaa   after aaa   before post   after post
+      1        2.79s       2.92s        1518ms       1249ms
+      2        2.87s       3.11s        1596ms       1245ms
+      3        3.26s       2.44s        1545ms       1378ms
+    bzip2     22.51s      21.30s
+
+So `aaa` is unchanged within noise and post-analysis falls about nineteen per
+cent, from 1.55s to 1.25s. That is 43 walks removed at the 11.5ms they actually
+cost on a quiet machine, not the 34 to 50ms the loaded runs reported. The
+proofs are identical either way: 22 functions, 16 skipped, the same two
+unreachable blocks.
+
+This is the seventh measurement this project has had to correct for measuring
+the wrong thing, and the second in two days. The rule that keeps working is to
+interleave the columns rather than run them in blocks, because a machine's load
+drifts over minutes and a block is minutes long. Private `HOME` per column
+stops another agent overwriting the plugin; interleaving stops the machine
+overwriting the answer.
+
+### The budget is now the program's size, not a number
+
+The sweep was governed by three whole-program constants -- two, ten and thirty
+seconds by analysis mode -- derived from nothing. Ten seconds is not a fact
+about a program. bzip2recover, 38 functions, finishes in 1.5 seconds and never
+touches it; bzip2, 154 functions, was stopped by it after a third of the
+program on every run. One number cannot be right for both, because the work
+scales with the function count and the number did not.
+
+The budget is now the function count times the project's own per-function
+performance bar, the one already agreed: under 100 milliseconds net per
+function. That is not a fresh judgement about how long is too long, it is the
+bar the sweep is already held to multiplied by the work in front of it. A
+function that exceeds it is a defect to fix rather than a budget to widen. The
+analysis mode is deliberately no longer a factor: a mode decides how much work
+each function gets, not how long a wall clock may run, and stating the same
+policy in two places is what let the two disagree.
+
+    bzip2               before              after
+      budget            10.0s               15.4s (154 x 100ms)
+      exhausted         yes, every run      no
+      functions reached 35 to 42 of 154     all 154
+      proved            35 to 42            46
+      skipped           0                   104
+      unreachable found 0                   2
+      aaa               21.3s               25.4s
+
+Finishing the program costs about four seconds more than being cut off two
+thirds of the way through, and buys 46 proved functions instead of 42 plus two
+unreachable blocks the sweep had never reached. bzip2recover is unchanged at
+2.88 seconds with the budget never binding.
+
+### What is left, in the order the measurement puts it
+
+**About 0.66 seconds of bzip2recover's 1.49-second sweep is still
+unattributed** -- post-analysis minus the snapshot walks and the proof engine.
+That is artifact submission, the taint plan path, and the budget checks, none
+of which is separated yet. It is now the largest unmeasured thing the plugin
+does and the next site to split.
+
+**The proof engine is 17.6 milliseconds per function** across 22 functions.
+That is the engine doing real work on a real snapshot and it is within the
+project's bar, so it is a target only after the unattributed remainder.
+
+**The C `R2ILContext` and the Rust trusted profile load the same specification
+separately**, 0.3 seconds once per session. Sharing one loaded Sleigh between
+`r2il_arch_init` and `shared_trusted_profile` removes it. Small, contained, and
+the last of the three places this project has found the same parse.
+
+**The structurer was not reached.** `main` in bzip2recover spends 2.27 seconds
+there and then refuses, against 2.77 for every other r2dec stage combined. The
+suspected cause is unchanged: the BDD safety budget at blocks times 128,
+consumed in whatever order the proofs run, so a late block gets what earlier
+ones left; `varying_predicates` in `structure.rs` already narrows the set the
+bound should come from, and the refusal at `consume_safety_budget` compares a
+counter against a limit fixed at construction to that same counter, so it can
+never fire.
+
+## Two performance figures in this document were wrong, and the method was worse
+
+**The attribution was wrong.** This document said roughly 55 milliseconds per
+function went into `sleigh_analyze_fcn`, `sleigh_get_data_refs` and
+`sleigh_op`. That number came from subtracting an `aa` timing from an `aaa`
+timing, which does not isolate what it appears to: radare2 runs the plugin's
+post-analysis during `aa` as well, so the subtraction cancelled the sweep rather
+than removing it. Measured directly with per-site counters on a quiet host, the
+three callbacks cost **17.5 milliseconds between them across a whole binary**,
+and `sleigh_op` is **never called at all**, because radare2 decodes this binary
+through a different architecture plugin. Every suspicion recorded here about
+per-instruction cost in `get_context` was about a function that is not on the
+path.
+
+**The speedups were inflated by measurement order.** Sequential before-and-after
+runs on the shared Linux host read 13.20 seconds against 3.12 for one change.
+Interleaved A/B over three alternating rounds put the same change at about
+**19 per cent**. The before block had simply run while the machine was busy with
+other agents. That makes seven measurements this project has had to correct, and
+it generalises: a private `HOME` stops another agent overwriting the plugin, and
+only interleaving stops the *machine* overwriting the answer. **Treat any
+before-and-after on that host that was not interleaved as unproven**, including
+the earlier figures in this document for the Sleigh profile load, which were
+taken the same way.
+
+What is solid, because it was measured directly rather than by subtraction:
+
+| site | calls | total | mean |
+| --- | --- | --- | --- |
+| post_analysis | 1 | 1494 ms | |
+| snapshot walk | 39 | 448 ms | 11.5 ms |
+| snapshot reuse | 43 | 9 µs | 209 ns |
+| proof engine | 22 | 387 ms | 17.6 ms |
+| context create, one `.sla` parse | 1 | 302 ms | 302 ms |
+| get_data_refs | 38 | 14.9 ms | 392 µs |
+| analyze_fcn | 32 | 2.6 ms | 81 µs |
+| sleigh_op | 0 | never called | |
+
+Two things follow that are worth more than another round of tuning. About 0.66
+of the sweep's 1.49 seconds is still unattributed, which makes it the largest
+unmeasured thing the plugin does. And the C context and the Rust trusted profile
+parse the same `.sla` file separately, at 302 milliseconds, which is the **third**
+place this project has found the same parse happening twice.
+
+## Working rules for parallel worktrees, learned the expensive way
+
+Several worktrees building and measuring at once produced four distinct
+failures in one session, three of them destructive, and none of them visible in
+the output of the thing that failed. They are recorded here because each one
+looked like a defect in the work rather than in the surroundings.
+
+**Reclaim a build directory, never a worktree.** A `target/` costs a rebuild to
+delete. A worktree can hold uncommitted work and can still be the workspace of
+an agent that is between steps, so removing one because its branch merged
+destroys work and orphans whoever was using it. That happened here, and only a
+commit-early habit saved the contents.
+
+**Never delete by glob on a shared host.** A sweep of stale directories matched
+a live run's source tree and deleted it underneath the compiler, twice, which
+reads as a build that failed before writing its log. The fix that holds is
+structural rather than careful: runs live under their own root that a sweep of
+the old namespace cannot match, they write a marker while live, and the
+collector spares anything marked, anything younger than a day whose state is
+unknown, and reports rather than removes unless forced.
+
+**Interleave every before-and-after.** Sequential blocks on a shared host
+measured the machine's load, not the change: one change read as four-fold
+sequentially and about nineteen per cent interleaved. A private plugin
+directory stops another worktree overwriting the binary; only interleaving
+stops the machine overwriting the answer.
+
+**A build outside a lock is a different tree from the one measured inside it.**
+The lock wrapper builds before it queues so a cold build does not block others,
+and the command it runs builds again once it holds the lock. Anything edited
+during the wait is what gets measured, silently. It now fingerprints the tree on
+both sides and refuses rather than report one tree's numbers under another
+tree's name.
+
+**Put a build setting in the manifest, not in the instructions.** Every worktree
+was told to build with line tables rather than full debug info. One did not, and
+grew a twelve gigabyte debug directory against three or four for the others.
+The setting is now in `Cargo.toml`.
