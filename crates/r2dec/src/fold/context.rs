@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 use crate::analysis;
 use crate::ast::CExpr;
+use crate::ast::CType;
 use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts};
 #[cfg(test)]
@@ -42,6 +43,7 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
+    pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     /// Sole `BindingId -> SymbolId` projection for this native rendering.
     pub(crate) binding_names: Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
@@ -767,7 +769,19 @@ impl<'a> FoldingContext<'a> {
                 EffectOccurrenceKind::Expression => match &inst.payload {
                     r2ssa::InstPayload::Op(
                         r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::BranchInd { .. },
-                    ) => obligation.id.kind == ObligationKind::ControlTransfer,
+                    ) => {
+                        obligation.id.kind == ObligationKind::ControlTransfer
+                            || rendered_call.is_some_and(|fact| {
+                                fact.disposition.is_terminal_return()
+                                    && (obligation.id.kind == ObligationKind::Call
+                                        || (obligation.id.kind == ObligationKind::CallArgument
+                                            && !obligation.inputs.is_empty()
+                                            && obligation
+                                                .inputs
+                                                .iter()
+                                                .all(|input| fact.proof_values.contains(input))))
+                            })
+                    }
                     r2ssa::InstPayload::Op(r2ssa::SSAOp::CBranch { .. }) => matches!(
                         obligation.id.kind,
                         ObligationKind::ControlPredicate | ObligationKind::ControlTransfer
@@ -1046,6 +1060,7 @@ impl<'a> FoldingContext<'a> {
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
+            function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
         };

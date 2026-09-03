@@ -80,7 +80,7 @@ pub use function_facts::{
     MemoryOpSiteKey, OpSiteKey, PredicateComparisonFact, RegisterCallArgumentLocationFact,
     ReturnValueRenderFact, SourceOwnedFunctionFacts, StackCallArgumentLocationFact,
     StackSlotOwnerRenderAuthorization, SummaryEffectRollup, SummaryHelperView, SummaryOutParamFact,
-    SwitchSelectorFact,
+    SwitchSelectorFact, exact_source_return_type,
 };
 pub use inference::{CombinedTypeOracle, TypeInference, register_alias_names};
 pub use model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};

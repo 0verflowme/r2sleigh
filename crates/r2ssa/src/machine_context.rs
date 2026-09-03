@@ -28,7 +28,7 @@ pub use r2source::{
     SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 20;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 21;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -524,6 +524,7 @@ pub struct SourceMachineContext {
     register_geometry_state: MachineRegisterGeometryState,
     register_projections: Box<[RegisterProjection]>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
+    tail_jump_call_sites: BTreeSet<CallSiteId>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
@@ -855,6 +856,26 @@ impl SourceMachineContext {
         convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
+        Self::from_blocks_with_interfaces_and_tail_jumps(
+            blocks,
+            arch,
+            function_interface,
+            machine_roles,
+            convention_slots,
+            call_site_interfaces,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn from_blocks_with_interfaces_and_tail_jumps(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+        convention_slots: Option<SourceConventionSlots>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        tail_jump_identities: Vec<SourceCallSiteIdentity>,
+    ) -> Self {
         // The architecture says where it returns a value, for a function whose
         // ABI was never recovered.
         let architecture_result_slot = arch.and_then(|arch| {
@@ -986,7 +1007,8 @@ impl SourceMachineContext {
                 && frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch)
                 && return_mechanism_matches_machine(interface, arch, &memory_model);
         }
-        let raw_call_sites_by_id = collect_raw_call_site_identities(blocks);
+        let (raw_call_sites_by_id, tail_jump_call_sites) =
+            collect_raw_call_site_identities(blocks, &tail_jump_identities);
         let raw_call_sites = raw_call_sites_by_id
             .values()
             .copied()
@@ -1065,6 +1087,7 @@ impl SourceMachineContext {
             register_geometry_state,
             register_projections,
             raw_call_sites_by_id,
+            tail_jump_call_sites,
             call_site_interfaces: call_site_interfaces_by_identity,
             memory_spaces_by_op,
         }
@@ -1281,6 +1304,10 @@ impl SourceMachineContext {
         self.raw_call_sites_by_id.get(&call_site).copied()
     }
 
+    pub fn is_tail_jump_call_site(&self, call_site: CallSiteId) -> bool {
+        self.tail_jump_call_sites.contains(&call_site)
+    }
+
     pub const fn call_site_interfaces(
         &self,
     ) -> &BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface> {
@@ -1435,6 +1462,7 @@ impl SourceMachineContext {
         for (call_site, identity) in &self.raw_call_sites_by_id {
             writer.u32(call_site.0);
             write_call_identity(&mut writer, *identity);
+            writer.bool(self.tail_jump_call_sites.contains(call_site));
         }
         writer.usize(self.call_site_interfaces.len());
         for interface in self.call_site_interfaces.values() {
@@ -1524,7 +1552,26 @@ fn ssa_memory_space(op: &SSAOp) -> Option<SpaceId> {
 
 fn collect_raw_call_site_identities(
     blocks: &[R2ILBlock],
-) -> BTreeMap<CallSiteId, SourceCallSiteIdentity> {
+    tail_jump_identities: &[SourceCallSiteIdentity],
+) -> (
+    BTreeMap<CallSiteId, SourceCallSiteIdentity>,
+    BTreeSet<CallSiteId>,
+) {
+    let tail_jump_identities = tail_jump_identities
+        .iter()
+        .copied()
+        .filter(|identity| {
+            blocks.iter().any(|block| {
+                identity.block_addr() == block.addr
+                    && identity.op_index() + 1 == block.ops.len()
+                    && block.ops.get(identity.op_index()).is_some_and(|op| {
+                        matches!(op, R2ILOp::Branch { target }
+                            if CanonicalStorageId::from_varnode(target) == identity.target())
+                    })
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let authorized_tail_jumps = &tail_jump_identities;
     let mut raw_calls = blocks
         .iter()
         .flat_map(|block| {
@@ -1532,31 +1579,46 @@ fn collect_raw_call_site_identities(
                 .ops
                 .iter()
                 .enumerate()
-                .filter_map(move |(op_index, op)| match op {
-                    R2ILOp::Call { target } | R2ILOp::CallInd { target } => Some((
-                        block.addr,
-                        op_index,
-                        Some(SourceCallSiteIdentity::new(
-                            block.addr,
-                            op_index,
-                            CanonicalStorageId::from_varnode(target),
-                        )),
-                    )),
-                    _ => None,
+                .filter_map(move |(op_index, op)| {
+                    let identity = match op {
+                        R2ILOp::Call { target } | R2ILOp::CallInd { target } => {
+                            SourceCallSiteIdentity::new(
+                                block.addr,
+                                op_index,
+                                CanonicalStorageId::from_varnode(target),
+                            )
+                        }
+                        R2ILOp::Branch { target } => {
+                            let identity = SourceCallSiteIdentity::new(
+                                block.addr,
+                                op_index,
+                                CanonicalStorageId::from_varnode(target),
+                            );
+                            if !authorized_tail_jumps.contains(&identity) {
+                                return None;
+                            }
+                            identity
+                        }
+                        _ => return None,
+                    };
+                    Some((block.addr, op_index, identity))
                 })
         })
         .collect::<Vec<_>>();
     raw_calls.sort_unstable_by_key(|(block_addr, op_index, _)| (*block_addr, *op_index));
-    raw_calls
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (_, _, identity))| {
-            u32::try_from(index)
-                .ok()
-                .zip(identity)
-                .map(|(index, identity)| (CallSiteId(index), identity))
-        })
-        .collect()
+    let mut by_id = BTreeMap::new();
+    let mut tails = BTreeSet::new();
+    for (index, (_, _, identity)) in raw_calls.into_iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        let call_site = CallSiteId(index);
+        if tail_jump_identities.contains(&identity) {
+            tails.insert(call_site);
+        }
+        by_id.insert(call_site, identity);
+    }
+    (by_id, tails)
 }
 
 fn memory_space(op: &R2ILOp) -> Option<SpaceId> {
@@ -1860,8 +1922,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 20);
-        assert_eq!(x86_context.schema_version(), 20);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 21);
+        assert_eq!(x86_context.schema_version(), 21);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64
@@ -2997,6 +3059,51 @@ mod tests {
                 CanonicalStorageId::from_varnode(&indirect_target),
             ))
         );
+    }
+
+    #[test]
+    fn only_an_exact_source_correlated_branch_is_a_tail_call_site() {
+        let target = Varnode::constant(0x5000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Branch {
+            target: target.clone(),
+        });
+        let identity =
+            SourceCallSiteIdentity::new(block.addr, 0, CanonicalStorageId::from_varnode(&target));
+        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+            &[block.clone()],
+            None,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+            vec![identity],
+        );
+        assert_eq!(
+            context.raw_call_site_identity(CallSiteId(0)),
+            Some(identity)
+        );
+        assert!(context.is_tail_jump_call_site(CallSiteId(0)));
+
+        let wrong_target = SourceCallSiteIdentity::new(
+            block.addr,
+            0,
+            CanonicalStorageId {
+                offset: 0x5004,
+                ..identity.target()
+            },
+        );
+        let unproved = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+            &[block],
+            None,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+            vec![wrong_target],
+        );
+        assert!(unproved.raw_call_sites_by_id().is_empty());
+        assert!(!unproved.is_tail_jump_call_site(CallSiteId(0)));
     }
 
     #[test]

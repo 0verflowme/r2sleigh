@@ -480,6 +480,16 @@ pub enum CallMemoryEffect {
     Unknown,
 }
 
+/// How control reaches and leaves one machine-proven call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSiteTransfer {
+    /// An ordinary call returns to a block in this function.
+    Call,
+    /// A direct branch enters another function and that callee returns on this
+    /// function's behalf.
+    TailCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSiteFact {
     pub id: CallSiteId,
@@ -490,6 +500,7 @@ pub struct CallSiteFact {
     pub target: ValueId,
     pub direct_target: Option<u64>,
     pub fallthrough: Option<u64>,
+    pub transfer: CallSiteTransfer,
     pub memory_effect: CallMemoryEffect,
 }
 
@@ -1277,6 +1288,7 @@ pub struct CallsiteCertificate {
     pub target: ValueId,
     pub direct_target: Option<u64>,
     pub fallthrough: Option<u64>,
+    pub transfer: CallSiteTransfer,
     pub argument_values: Vec<ValueId>,
     /// Whether the callee takes a variadic tail, as radare2's prototype for it
     /// says. Not a machine fact: nothing in the call instruction distinguishes
@@ -3200,22 +3212,26 @@ fn collect_source_boundary_facts(
                         })
                     })
                     .collect::<Vec<_>>();
-                let results = match interface.result() {
-                    SourceCallResult::Void => Some(Vec::new()),
-                    SourceCallResult::Register { storage } => call_result_value_after_call(
-                        function,
-                        graph,
-                        machine_context,
-                        block_addr,
-                        op_index,
-                        storage,
-                    )
-                    .map(|value| {
-                        vec![CallBoundaryValueFact {
-                            slot: CallBoundarySlot::Register { index: 0, storage },
-                            value,
-                        }]
-                    }),
+                let results = match (call_site.transfer, interface.result()) {
+                    (CallSiteTransfer::TailCall, _) | (_, SourceCallResult::Void) => {
+                        Some(Vec::new())
+                    }
+                    (CallSiteTransfer::Call, SourceCallResult::Register { storage }) => {
+                        call_result_value_after_call(
+                            function,
+                            graph,
+                            machine_context,
+                            block_addr,
+                            op_index,
+                            storage,
+                        )
+                        .map(|value| {
+                            vec![CallBoundaryValueFact {
+                                slot: CallBoundarySlot::Register { index: 0, storage },
+                                value,
+                            }]
+                        })
+                    }
                 };
                 if arguments.len() == interface.arguments().len()
                     && let Some(results) = results
@@ -5691,6 +5707,7 @@ fn collect_prepared_function_certificates(
                     target: fact.target,
                     direct_target: fact.direct_target,
                     fallthrough: fact.fallthrough,
+                    transfer: fact.transfer,
                     argument_values,
                     variadic,
                     fixed_argument_count,
@@ -8761,8 +8778,29 @@ fn collect_call_sites(
         };
 
         for (op_idx, op) in block.ops.iter().enumerate() {
-            let target = match op {
-                SSAOp::Call { target } | SSAOp::CallInd { target } => target.clone(),
+            let id = CallSiteId(next_id);
+            let raw_identity = machine_context
+                .and_then(|context| context.raw_call_site_identity(id))
+                .filter(|identity| identity.block_addr() == block_addr);
+            let (target, transfer) = match op {
+                SSAOp::Call { target } | SSAOp::CallInd { target } => {
+                    (target.clone(), CallSiteTransfer::Call)
+                }
+                SSAOp::Branch { target }
+                    if machine_context.is_some_and(|context| {
+                        context.is_tail_jump_call_site(id)
+                            && raw_identity.is_some_and(|identity| {
+                                graph
+                                    .value_id_for_var(target)
+                                    .and_then(|value| graph.value(value))
+                                    .is_some_and(|value| {
+                                        value.canonical_storage == Some(identity.target())
+                                    })
+                            })
+                    }) =>
+                {
+                    (target.clone(), CallSiteTransfer::TailCall)
+                }
                 _ => continue,
             };
             let Some(inst_id) = graph.inst_id_for_op_site(block_addr, op_idx) else {
@@ -8771,11 +8809,7 @@ fn collect_call_sites(
             let Some(target_id) = graph.value_id_for_var(&target) else {
                 continue;
             };
-            let id = CallSiteId(next_id);
             next_id = next_id.saturating_add(1);
-            let raw_identity = machine_context
-                .and_then(|context| context.raw_call_site_identity(id))
-                .filter(|identity| identity.block_addr() == block_addr);
             let direct_target = resolve_graph_literal_value(graph, prep_facts, &target)
                 .or_else(|| raw_identity.and_then(direct_target_from_raw_identity));
             by_inst.insert(inst_id, id);
@@ -8787,11 +8821,14 @@ fn collect_call_sites(
                     raw_identity,
                     target: target_id,
                     direct_target,
-                    fallthrough: if op_idx + 1 == block.ops.len() {
+                    fallthrough: if transfer == CallSiteTransfer::TailCall {
+                        None
+                    } else if op_idx + 1 == block.ops.len() {
                         fallthrough
                     } else {
                         None
                     },
+                    transfer,
                     memory_effect: CallMemoryEffect::Unknown,
                 },
             );

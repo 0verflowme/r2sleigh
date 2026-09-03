@@ -334,7 +334,7 @@ fn upstream_zero_occurrence_outcome(
     );
     Outcome::Refused {
         layer: LedgerLayer::Codegen,
-        reason: RefusalReason::BlockNotRendered,
+        reason: RefusalReason::NoRenderedOccurrence,
     }
 }
 

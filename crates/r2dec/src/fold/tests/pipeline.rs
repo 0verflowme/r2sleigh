@@ -620,6 +620,7 @@ mod tests {
         let empty_stack_slots = Box::leak(Box::new(BTreeMap::new()));
         let empty_visible = Box::leak(Box::new(Vec::new()));
         FoldingContext::from_inputs(FoldInputs {
+            function_return_type: None,
             normalization_origins: None,
             observation_journal: None,
             binding_names: None,

@@ -4158,9 +4158,7 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"observation-journal-test".to_vec(),
             "sysv64",
-            with_parameter
-                .then_some(SourceAbiParameterSpec::new(0, storage(0x38)))
-                .into_iter(),
+            with_parameter.then_some(SourceAbiParameterSpec::new(0, storage(0x38))),
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -4673,7 +4671,7 @@ mod tests {
             ledger.outcome(&obligation),
             r2ssa::ledger::Outcome::Refused {
                 layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::BlockNotRendered,
+                reason: r2ssa::ledger::RefusalReason::NoRenderedOccurrence,
             }
         );
     }
