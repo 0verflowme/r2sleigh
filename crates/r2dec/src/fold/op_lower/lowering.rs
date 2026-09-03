@@ -99,7 +99,7 @@ impl<'a> FoldingContext<'a> {
     ) -> OpLoweringRefusal {
         use crate::observation_journal::LegacyObservationJournalError as Error;
         match error {
-            Error::RenderedValueRequired(_)
+            Error::RenderedValueRequired { .. }
             | Error::InvalidPlannedInline { .. }
             | Error::PlannedElidedValueRendered { .. }
             | Error::PlannedRefusedValueRendered { .. }
@@ -557,8 +557,10 @@ impl<'a> FoldingContext<'a> {
     ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
         let Some(names) = self.inputs.binding_names else {
             return Err(
-                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
                     value,
+                    crate::observation_journal::RenderedValueRequirementCause::PlannedValueNamesUnavailable,
+                    None,
                 ),
             );
         };
@@ -721,8 +723,10 @@ impl<'a> FoldingContext<'a> {
         };
         let Some(names) = self.inputs.binding_names else {
             return Err(
-                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
                     input.value,
+                    crate::observation_journal::RenderedValueRequirementCause::PlannedInputNamesUnavailable,
+                    None,
                 ),
             );
         };
