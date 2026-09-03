@@ -10630,3 +10630,43 @@ chasing the wrong cause and kept because it is defensible on its own terms --
 a value the boundary spells through its own path should not be inlined -- but
 it was never shown to be *necessary* once the placement hole was closed.
 Removing it may admit more literals. That is one corpus run to find out.
+
+## The call-restore work is reverted from integration, and why
+
+Three independent measurements agreed that the integration branch had regressed,
+and all three point at the same change.
+
+| measurement | before | after |
+| --- | --- | --- |
+| corpus correctness gate | 54 of 54 | 52 of 54 |
+| whole-binary coverage, real functions | 321 of 409 | 312 of 409 |
+| benchmark functions decompiled | 7 of 14 | 1 of 14 |
+
+The two corpus cells are `murmur3_32` and `xxhash32` at x64_O0, the only two
+corpus functions that call anything, refusing with `UnownedBindingSymbol`. The
+six benchmark functions are all call-heavy. The branch was known to be at 52 of
+54 when it was merged, and merging it anyway was the mistake: five other workers
+branch from integration, so a regression there is inherited by every measurement
+taken against it, and their numbers stop meaning anything.
+
+Reverting also removed `crates/r2dec/src/lib.rs.bak`, a 10,654-line stray backup
+committed on that branch and merged without anyone looking at the file list.
+Whoever re-lands the work must drop it; the real change is about 800 lines
+across the SSA and r2dec layers.
+
+**None of the work is lost and it should come back.** `arch/expr-callstack`
+holds all eight commits, and what they fix is real: an x86-64 `call` is lowered
+as `RSP = RSP - 8` plus the return-address store and nothing refunds it, so a
+caller's stack pointer is wrong from its first call and by a further eight bytes
+at each one after. `SSAOp::CallRestore` states the refund at the boundary from
+the convention's own preserved-carrier fact, with no per-architecture constant
+anywhere, and the owner chose to license the coalescing by that proof rather
+than by an exception for one operation kind.
+
+The condition for re-landing is that the two cells render, measured on the
+branch, before the merge rather than after it.
+
+The rule this cost us: **a branch merges when its own gate is green, not when
+its work is good.** A red cell carried into integration is not one team's
+problem, it is everybody's, and it invalidates every measurement taken until it
+is fixed.
