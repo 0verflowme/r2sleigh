@@ -22,6 +22,8 @@ plan_only=0
 resume_id=
 shard_index=0
 shard_count=1
+requested_project_count=0
+requested_opt_count=0
 declare -a requested_projects=()
 declare -a requested_opts=()
 
@@ -55,8 +57,16 @@ while [[ $# -gt 0 ]]; do
         --refresh-reference) refresh_reference=1; shift ;;
         --keep-remote) keep_remote=1; shift ;;
         --plan) plan_only=1; shift ;;
-        --project) requested_projects+=("$2"); shift 2 ;;
-        --opt-level) requested_opts+=("$2"); shift 2 ;;
+        --project)
+            requested_projects+=("$2")
+            requested_project_count=$((requested_project_count + 1))
+            shift 2
+            ;;
+        --opt-level)
+            requested_opts+=("$2")
+            requested_opt_count=$((requested_opt_count + 1))
+            shift 2
+            ;;
         --shard)
             if [[ $2 != */* ]]; then
                 echo "--shard must be INDEX/COUNT" >&2
@@ -127,11 +137,12 @@ if [[ ! $shard_index =~ ^[0-9]+$ || ! $shard_count =~ ^[1-9][0-9]*$ ]] \
     echo "invalid zero-based shard $shard_index/$shard_count" >&2
     exit 64
 fi
-for opt in "${requested_opts[@]}"; do
-    case $opt in O0|O1|O2) ;; *) echo "unsupported optimization: $opt" >&2; exit 64 ;; esac
-done
-if (( ${#requested_opts[@]} == 0 )); then
+if (( requested_opt_count == 0 )); then
     requested_opts=(O0 O1 O2)
+else
+    for opt in "${requested_opts[@]}"; do
+        case $opt in O0|O1|O2) ;; *) echo "unsupported optimization: $opt" >&2; exit 64 ;; esac
+    done
 fi
 
 ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes)
@@ -148,7 +159,7 @@ if (( ${#all_projects[@]} != expected_project_count )); then
 fi
 
 declare -a candidates=()
-if (( ${#requested_projects[@]} == 0 )); then
+if (( requested_project_count == 0 )); then
     candidates=("${all_projects[@]}")
 else
     for wanted in "${requested_projects[@]}"; do
@@ -237,6 +248,7 @@ if [[ $angr_version != "$baseline_version" ]]; then
 fi
 declare -a project_reference_flags=()
 declare -a reference_projects=()
+reference_project_count=0
 for project in "${projects[@]}"; do
     include_project_reference=$refresh_all_reference
     if (( ! include_project_reference )); then
@@ -250,9 +262,10 @@ for project in "${projects[@]}"; do
     project_reference_flags+=("$include_project_reference")
     if (( include_project_reference )); then
         reference_projects+=("$project")
+        reference_project_count=$((reference_project_count + 1))
     fi
 done
-if (( ${#reference_projects[@]} == 0 )); then
+if (( reference_project_count == 0 )); then
     reference_reason="angr $angr_version is cached for every selected cell"
 elif (( ! refresh_all_reference )); then
     reference_reason="baseline lacks selected cells for: ${reference_projects[*]}"
@@ -294,7 +307,10 @@ artifact_root="$root/tests/decbench/artifacts/$run_id"
 
 selection_projects=$(IFS=,; echo "${projects[*]}")
 selection_opts=$(IFS=,; echo "${requested_opts[*]}")
-selection_reference_projects=$(IFS=,; echo "${reference_projects[*]}")
+selection_reference_projects=
+if (( reference_project_count > 0 )); then
+    selection_reference_projects=$(IFS=,; echo "${reference_projects[*]}")
+fi
 if [[ -n $resume_id ]]; then
     resume_metadata=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$remote/run.meta' 2>/dev/null" || true)
     if [[ -z $resume_metadata ]]; then
