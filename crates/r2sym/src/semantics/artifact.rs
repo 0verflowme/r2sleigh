@@ -14,13 +14,11 @@ use super::region::{
     SemanticArtifactDiagnostics, SemanticRegion, SemanticTargetConditionSource, VmArtifactBody,
 };
 use super::vm::InterpreterKind;
-use crate::sim::PreparedFunctionScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SliceClass {
     Wrapper,
     Worker,
-    RecursiveGroup,
     InterpreterSwitch,
     InterpreterIndirect,
     GenericLarge,
@@ -30,10 +28,10 @@ pub enum SliceClass {
 pub enum ResidualReason {
     MissingArch,
     LargeCfg,
-    SummaryBudgetExhausted,
-    SccBudgetExhausted,
     InterpreterRequiresStepSummary,
 }
+
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SemanticConfidence {
@@ -420,7 +418,6 @@ pub struct SemanticArtifact {
 #[derive(Debug, Clone, Default)]
 struct SemanticArtifactProvenance {
     interproc: Vec<PreparedInterprocSummarySet>,
-    scopes: Vec<PreparedFunctionScope>,
 }
 
 impl PartialEq for SemanticArtifact {
@@ -462,15 +459,6 @@ impl SemanticArtifact {
             .then_some(artifact)
     }
 
-    pub(crate) fn new_with_scope_provenance(
-        prepared: Arc<SsaArtifact>,
-        report: SemanticArtifactReport,
-        scope: &PreparedFunctionScope,
-    ) -> Option<Self> {
-        let mut artifact = Self::new(prepared, report)?;
-        artifact.retain_scope_provenance(scope).then_some(artifact)
-    }
-
     pub fn normalized(mut self) -> Self {
         self.report = self.report.normalized();
         self
@@ -494,21 +482,7 @@ impl SemanticArtifact {
 
     #[cfg(test)]
     pub(crate) fn has_helper_provenance(&self) -> bool {
-        !self.provenance.interproc.is_empty() || !self.provenance.scopes.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retains_helper_provenance_owner(&self, owner: &Arc<SsaArtifact>) -> bool {
-        self.provenance.interproc.iter().any(|summaries| {
-            summaries.owners().values().any(|candidate| {
-                !Arc::ptr_eq(candidate, &self.prepared) && Arc::ptr_eq(candidate, owner)
-            })
-        }) || self.provenance.scopes.iter().any(|scope| {
-            scope.functions().values().any(|function| {
-                !Arc::ptr_eq(&function.prepared, &self.prepared)
-                    && Arc::ptr_eq(&function.prepared, owner)
-            })
-        })
+        !self.provenance.interproc.is_empty()
     }
 
     pub(crate) fn retain_interproc_provenance(
@@ -528,27 +502,6 @@ impl SemanticArtifact {
             .any(|retained| same_interproc_owners(retained, summaries))
         {
             self.provenance.interproc.push(summaries.clone());
-        }
-        true
-    }
-
-    pub(crate) fn retain_scope_provenance(&mut self, scope: &PreparedFunctionScope) -> bool {
-        let Some(root) = scope.root() else {
-            return false;
-        };
-        if !Arc::ptr_eq(&root.prepared, &self.prepared) {
-            return false;
-        }
-        if scope.helper_functions().next().is_none() {
-            return true;
-        }
-        if !self
-            .provenance
-            .scopes
-            .iter()
-            .any(|retained| same_scope_owners(retained, scope))
-        {
-            self.provenance.scopes.push(scope.clone());
         }
         true
     }
@@ -591,17 +544,6 @@ fn same_interproc_owners(
             right
                 .owner(*id)
                 .is_some_and(|candidate| Arc::ptr_eq(owner, candidate))
-        })
-}
-
-fn same_scope_owners(left: &PreparedFunctionScope, right: &PreparedFunctionScope) -> bool {
-    left.root_id() == right.root_id()
-        && left.functions().len() == right.functions().len()
-        && left.functions().iter().all(|(id, function)| {
-            right
-                .functions()
-                .get(id)
-                .is_some_and(|candidate| Arc::ptr_eq(&function.prepared, &candidate.prepared))
         })
 }
 
@@ -925,7 +867,6 @@ mod tests {
         SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
         SemanticEvidenceSoundness, SliceClass,
     };
-    use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
         RefinementStage,
@@ -951,8 +892,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },
@@ -1078,8 +1017,6 @@ mod tests {
             residuals in proptest::collection::vec(prop_oneof![
                 Just(ResidualReason::MissingArch),
                 Just(ResidualReason::LargeCfg),
-                Just(ResidualReason::SummaryBudgetExhausted),
-                Just(ResidualReason::SccBudgetExhausted),
                 Just(ResidualReason::InterpreterRequiresStepSummary),
             ], 0..8),
             ambiguous in proptest::collection::vec(any::<u64>(), 0..8),

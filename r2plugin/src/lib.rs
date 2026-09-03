@@ -2648,7 +2648,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iters: 1,
             interproc_converged: false,
-            symbolic_scope: None,
             writeback_budget,
             writeback_apply_policy,
         },
@@ -2694,7 +2693,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             max_iterations: 1,
             converged: false,
             scope_report: None,
-            symbolic_scope: None,
         },
     );
     Some(EngineV2Output {
@@ -6429,8 +6427,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 4,
                     helper_functions: 3,
-                    derived_summaries: 0,
-                    derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },

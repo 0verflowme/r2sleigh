@@ -21,10 +21,6 @@ pub struct CompiledSemanticInfo {
     pub ambiguous_targets: Vec<String>,
     pub closure_functions: usize,
     pub helper_functions: usize,
-    pub derived_summaries: usize,
-    pub summary_attempted: usize,
-    pub summary_budget_exhausted: usize,
-    pub summary_scc_count: usize,
     pub region_count: usize,
     pub control_region_count: usize,
     pub memory_region_count: usize,
@@ -628,7 +624,6 @@ pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSem
             .map(|slice_class| match slice_class {
                 crate::SliceClass::Wrapper => "wrapper",
                 crate::SliceClass::Worker => "worker",
-                crate::SliceClass::RecursiveGroup => "recursive_group",
                 crate::SliceClass::InterpreterSwitch => "interpreter_switch",
                 crate::SliceClass::InterpreterIndirect => "interpreter_indirect",
                 crate::SliceClass::GenericLarge => "generic_large",
@@ -643,8 +638,6 @@ pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSem
                 match reason {
                     crate::ResidualReason::MissingArch => "missing_arch",
                     crate::ResidualReason::LargeCfg => "large_cfg",
-                    crate::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-                    crate::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
                     crate::ResidualReason::InterpreterRequiresStepSummary => {
                         "interpreter_requires_step_summary"
                     }
@@ -665,25 +658,6 @@ pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSem
         helper_functions: compiled
             .native_body()
             .map(|body| body.summary.helper_functions)
-            .unwrap_or(0),
-        derived_summaries: compiled
-            .native_body()
-            .map(|body| body.summary.derived_summaries)
-            .unwrap_or(0),
-        summary_attempted: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.attempted)
-            .unwrap_or(0),
-        summary_budget_exhausted: compiled
-            .native_body()
-            .map(|body| {
-                body.summary.derived_diagnostics.budget_exhausted
-                    + body.summary.derived_diagnostics.scc_budget_exhausted
-            })
-            .unwrap_or(0),
-        summary_scc_count: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.scc_count)
             .unwrap_or(0),
         region_count: native.map(|body| body.regions.len()).unwrap_or(0),
         control_region_count: native
@@ -772,13 +746,6 @@ mod tests {
                         role_identity: None,
                         closure_functions: 3,
                         helper_functions: 2,
-                        derived_summaries: 1,
-                        derived_diagnostics: crate::DerivedSummaryDiagnostics {
-                            attempted: 4,
-                            budget_exhausted: 1,
-                            scc_count: 2,
-                            ..crate::DerivedSummaryDiagnostics::default()
-                        },
                         region_summaries: Vec::new(),
                         worker_summaries: Vec::new(),
                     },
@@ -811,10 +778,6 @@ mod tests {
         assert_eq!(value["slice_class"], "worker");
         assert_eq!(value["closure_functions"], 3);
         assert_eq!(value["helper_functions"], 2);
-        assert_eq!(value["derived_summaries"], 1);
-        assert_eq!(value["summary_attempted"], 4);
-        assert_eq!(value["summary_budget_exhausted"], 1);
-        assert_eq!(value["summary_scc_count"], 2);
         assert_eq!(value["branches_pruned"], 7);
         assert_eq!(value["branches_unknown"], 5);
         assert_eq!(value["skipped_large_cfg"], true);

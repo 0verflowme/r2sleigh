@@ -460,7 +460,6 @@ pub(crate) fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'st
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
         r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
         r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
         r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
         r2sym::SliceClass::GenericLarge => "generic_large",
@@ -471,8 +470,6 @@ pub(crate) fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &
     match reason {
         r2sym::ResidualReason::MissingArch => "missing_arch",
         r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
         r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }
@@ -5946,8 +5943,6 @@ pub(crate) fn test_native_semantic_report(
                 role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
-                derived_summaries: 0,
-                derived_diagnostics: Default::default(),
                 region_summaries: Vec::new(),
                 worker_summaries: Vec::new(),
             },
@@ -6779,11 +6774,8 @@ mod tests {
         }];
         let requested = Arc::new(prepared_from_ops(ops.clone(), &arch));
         let foreign = Arc::new(prepared_from_ops(ops, &arch));
-        let artifact = r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &foreign,
-            None,
-        );
+        let artifact =
+            r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), &foreign);
         let request = r2types::TypeWritebackAnalysisRequest::new(
             Arc::clone(&requested),
             r2types::ParsedExternalContext::default(),

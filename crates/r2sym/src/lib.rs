@@ -51,7 +51,7 @@ pub(crate) mod value;
 pub use backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
     BackwardMemoryRegion, BackwardRegionRef, CompiledBackwardCondition,
-    compile_derived_summary_return_postcondition, compile_target_precondition,
+    compile_target_precondition,
 };
 pub use control::{SymCancellationToken, SymExecutionControl, SymExecutionStopReason};
 pub use executor::{CallHookResult, SymExecutor};
@@ -68,9 +68,8 @@ pub use memory::{
 pub use memory_address::SemanticMemoryAddress;
 pub use path::{ExploreConfig, PathExplorer, PathResult, PublicSolvedPath, SolvedPath};
 pub use runtime::{
-    install_runtime_hooks_for_arch_advisory, install_runtime_hooks_for_scope,
     seed_default_state_for_arch, seed_default_state_for_prepared, seed_memory_regions_for_arch,
-    seed_memory_regions_for_prepared, seed_scope_state_for_arch, seed_scope_state_for_prepared,
+    seed_memory_regions_for_prepared,
 };
 pub use semantic_report::{
     CompiledSemanticInfo, InterpreterDispatchInfo, MemorySummaryInfo, VmGuardConditionInfo,
@@ -99,9 +98,9 @@ pub use semantics::{
     TargetQueryExecutionRoute, TargetQueryPlan, TargetQueryRoutePlan, TypePlan, VmArtifactBody,
     VmBinaryOp, VmGuardCondition, VmGuardedExit, VmMemoryCondition, VmMemoryRegionRef,
     VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp, VmValueExpr,
-    augment_semantic_artifact_with_interproc_summary, compile_function_semantics_with_scope,
-    compile_native_worker_summary_artifact, compile_query_semantic_artifact_with_scope,
-    compile_semantic_artifact_default_with_scope, compile_semantic_artifact_with_scope,
+    augment_semantic_artifact_with_interproc_summary, compile_function_semantics,
+    compile_native_worker_summary_artifact, compile_semantic_artifact,
+    compile_semantic_artifact_default,
     compile_summary_dense_worker_artifact_from_interproc_summary,
     function_semantic_summary_seed_for_name, function_semantic_summary_seed_for_name_with_linkage,
     has_program_orchestrator_summary_family, has_strong_vm_evidence,
@@ -109,13 +108,11 @@ pub use semantics::{
     native_worker_summary_applicability_for_summary,
     native_worker_summary_route_policy_for_summary, normalize_native_worker_role_name,
     semantic_summary_has_modeled_evidence, semantic_summary_has_runtime_copy_role,
-    stable_scope_hash, strong_vm_step_summary,
+    strong_vm_step_summary,
 };
 pub use sim::{
-    CallConv, CallInfo, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
-    DerivedSummaryDiagnostics, DerivedSummaryInput, DerivedSummarySet, FunctionSummary,
-    PreparedFunctionScope, ScopedPreparedFunction, SummaryEffect, SummaryInstallStats,
-    SummaryProfile, SummaryRegistry,
+    CallConv, CallInfo, FunctionSummary, SummaryEffect, SummaryInstallStats, SummaryProfile,
+    SummaryRegistry,
 };
 pub use solver::{SatResult, SolverStats, SymModel, SymSolver};
 pub use state::{

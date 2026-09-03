@@ -6,9 +6,7 @@
 //! needed for a request. Analysis artifacts are built directly for each
 //! source snapshot request.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1184,516 +1182,9 @@ impl EngineAnalysis {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineRuntimeMaterializedSource {
-    pub addr: u64,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineInterprocTargetSkipReason {
-    Imported,
-    SummaryModeled,
-    Unmaterialized,
-    OverBudget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetMetrics {
-    pub basic_block_count: u32,
-    pub cost: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetInput {
-    pub direct_target: u64,
-    /// Advisory presentation/debug metadata; never role or linkage authority.
-    pub name: Option<String>,
-    pub linkage: r2ssa::FunctionSemanticLinkage,
-    pub semantic_summary: Option<r2ssa::FunctionSemanticSummary>,
-    pub resolved_target: Option<u64>,
-    pub target_materialized: bool,
-    pub target_metrics: Option<EngineInterprocTargetMetrics>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetDecision {
-    pub direct_target: u64,
-    pub resolved_target: Option<u64>,
-    pub queued_targets: Vec<u64>,
-    pub registration_target: bool,
-    pub runtime_copy_target: bool,
-    pub skip_reason: Option<EngineInterprocTargetSkipReason>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetPlan {
-    pub queued_targets: Vec<u64>,
-    pub registration_targets: Vec<u64>,
-    pub runtime_copy_targets: Vec<u64>,
-    pub decisions: Vec<EngineInterprocTargetDecision>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineSymbolicScopeFunctionReason {
-    Allowed,
-    ScopeFull,
-    InterprocDisabled,
-    TargetTerminal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSymbolicScopeFunctionInput {
-    pub current_scope_count: usize,
-    pub root_function: bool,
-    pub target_hint_function: bool,
-    pub interproc: EngineInterprocSessionPlan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSymbolicScopeFunctionPlan {
-    pub append_function: bool,
-    pub expand_targets: bool,
-    pub reason: EngineSymbolicScopeFunctionReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineRuntimeMaterializedSourceReason {
-    Allowed,
-    ScopeFull,
-    EmptySource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineRuntimeMaterializedSourcePlan {
-    pub append_source: bool,
-    pub capped_size: u64,
-    pub slot_bytes: u64,
-    pub reason: EngineRuntimeMaterializedSourceReason,
-}
-
-fn engine_linkage_is_imported(linkage: r2ssa::FunctionSemanticLinkage) -> bool {
-    matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
-}
-
-fn interproc_target_skip_reason_from_evidence(
-    import_authorized: bool,
-    has_modeled_summary: bool,
-    target_materialized: bool,
-    metrics_within_budget: bool,
-) -> Option<EngineInterprocTargetSkipReason> {
-    if import_authorized {
-        Some(EngineInterprocTargetSkipReason::Imported)
-    } else if has_modeled_summary {
-        Some(EngineInterprocTargetSkipReason::SummaryModeled)
-    } else if !target_materialized {
-        Some(EngineInterprocTargetSkipReason::Unmaterialized)
-    } else if !metrics_within_budget {
-        Some(EngineInterprocTargetSkipReason::OverBudget)
-    } else {
-        None
-    }
-}
-
-fn interproc_target_metrics_within_budget(metrics: Option<&EngineInterprocTargetMetrics>) -> bool {
-    let Some(metrics) = metrics else {
-        return false;
-    };
-    metrics.basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
-        && metrics.cost <= ENGINE_INTERPROC_HELPER_MAX_COST
-}
-
-pub fn interproc_helper_scope_within_budget(basic_block_count: u32, cost: u32) -> bool {
-    interproc_target_metrics_within_budget(Some(&EngineInterprocTargetMetrics {
-        basic_block_count,
-        cost,
-    }))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineInterprocSessionPurpose {
-    TypeAnalysis,
-    Decompile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocSessionPlan {
-    pub include_type_interproc_scope: bool,
-    pub include_root_symbolic_scope: bool,
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSessionPolicyPlan {
-    pub interproc: EngineInterprocSessionPlan,
-    pub type_writeback_mode: EngineTypeWritebackMode,
-    pub global_max_links: usize,
-    pub max_type_decls: usize,
-    pub max_mutations: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EngineSessionBudgetInput {
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-    pub global_max_links: usize,
-    pub max_type_decls: usize,
-    pub max_mutations: usize,
-    pub type_writeback_mode: EngineTypeWritebackMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineSessionBudget {
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-    pub writeback_budget: r2types::TypeWritebackMutationBudget,
-    pub writeback_apply_policy: r2types::TypeWritebackApplyPolicy,
-}
-
-impl EngineSessionBudget {
-    pub fn from_input(input: EngineSessionBudgetInput) -> Self {
-        let interproc_iter = input.interproc_iter.max(1);
-        let interproc_max_iters = input.interproc_max_iters.max(interproc_iter);
-        Self {
-            interproc_iter,
-            interproc_max_iters,
-            interproc_converged: input.interproc_converged,
-            writeback_budget: r2types::TypeWritebackMutationBudget::new(
-                input.global_max_links.max(1),
-                input.max_type_decls.max(1),
-                input.max_mutations.max(1),
-            ),
-            writeback_apply_policy: type_writeback_apply_policy_for_mode(input.type_writeback_mode),
-        }
-    }
-}
-
-pub fn interproc_session_plan(
-    policy: EngineAnalysisPolicy,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineInterprocSessionPlan {
-    let within_budget = interproc_target_metrics_within_budget(metrics.as_ref());
-    match purpose {
-        EngineInterprocSessionPurpose::TypeAnalysis if within_budget => {
-            EngineInterprocSessionPlan {
-                include_type_interproc_scope: true,
-                include_root_symbolic_scope: false,
-                interproc_iter: 1,
-                interproc_max_iters: policy.type_interproc_max_iters.max(1),
-                interproc_converged: true,
-            }
-        }
-        EngineInterprocSessionPurpose::TypeAnalysis => EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: true,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: false,
-        },
-        EngineInterprocSessionPurpose::Decompile if within_budget => EngineInterprocSessionPlan {
-            include_type_interproc_scope: true,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        },
-        EngineInterprocSessionPurpose::Decompile => EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        },
-    }
-}
-
-pub fn session_policy_plan(
-    policy: EngineAnalysisPolicy,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineSessionPolicyPlan {
-    EngineSessionPolicyPlan {
-        interproc: interproc_session_plan(policy, purpose, metrics),
-        type_writeback_mode: policy.type_writeback_mode,
-        global_max_links: policy.type_global_max_links,
-        max_type_decls: policy.type_max_decls,
-        max_mutations: policy.type_max_mutations,
-    }
-}
-
-pub fn session_policy_plan_for_radare2_depth(
-    depth: u32,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineSessionPolicyPlan {
-    session_policy_plan(analysis_policy_for_radare2_depth(depth), purpose, metrics)
-}
-
-fn interproc_target_queue_pair(
-    direct_target: u64,
-    resolved_target: Option<u64>,
-    skip_reason: Option<EngineInterprocTargetSkipReason>,
-) -> (Option<u64>, Option<u64>) {
-    if skip_reason.is_some() {
-        return (None, None);
-    }
-    let effective_target = resolved_target.unwrap_or(direct_target);
-    if effective_target != direct_target {
-        (Some(direct_target), Some(effective_target))
-    } else {
-        (Some(effective_target), None)
-    }
-}
-
-pub fn interproc_scope_target_plan<I>(targets: I) -> EngineInterprocTargetPlan
-where
-    I: IntoIterator<Item = EngineInterprocTargetInput>,
-{
-    let mut queued_targets = BTreeSet::new();
-    let mut runtime_copy_targets = BTreeSet::new();
-    let mut decisions = Vec::new();
-
-    for target in targets {
-        let direct_target = target.direct_target;
-        let resolved_target = target.resolved_target.filter(|addr| *addr != 0);
-        let semantic_summary = target.semantic_summary.as_ref();
-
-        // No source-owned typed registration role exists yet. An import name
-        // is presentation metadata, so exact planning refuses this role.
-        let registration_target = false;
-
-        let runtime_copy_target =
-            semantic_summary.is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
-        if runtime_copy_target {
-            runtime_copy_targets.insert(direct_target);
-        }
-
-        let skip_reason = interproc_target_skip_reason_from_evidence(
-            engine_linkage_is_imported(target.linkage),
-            semantic_summary.is_some_and(r2sym::semantic_summary_has_modeled_evidence),
-            target.target_materialized,
-            interproc_target_metrics_within_budget(target.target_metrics.as_ref()),
-        );
-
-        let mut decision_queued_targets = Vec::new();
-        let (first_queue_target, second_queue_target) =
-            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
-        for target in [first_queue_target, second_queue_target]
-            .into_iter()
-            .flatten()
-        {
-            queued_targets.insert(target);
-            decision_queued_targets.push(target);
-        }
-        decision_queued_targets.sort_unstable();
-        decision_queued_targets.dedup();
-
-        decisions.push(EngineInterprocTargetDecision {
-            direct_target,
-            resolved_target,
-            queued_targets: decision_queued_targets,
-            registration_target,
-            runtime_copy_target,
-            skip_reason,
-        });
-    }
-
-    decisions.sort_by_key(|decision| decision.direct_target);
-
-    EngineInterprocTargetPlan {
-        queued_targets: queued_targets.into_iter().collect(),
-        registration_targets: Vec::new(),
-        runtime_copy_targets: runtime_copy_targets.into_iter().collect(),
-        decisions,
-    }
-}
-
-pub fn symbolic_scope_function_plan(
-    input: EngineSymbolicScopeFunctionInput,
-) -> EngineSymbolicScopeFunctionPlan {
-    if input.current_scope_count >= SYMBOLIC_SCOPE_MAX_FUNCTIONS {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: false,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::ScopeFull,
-        };
-    }
-
-    if input.root_function {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: true,
-            expand_targets: true,
-            reason: EngineSymbolicScopeFunctionReason::Allowed,
-        };
-    }
-
-    if input.target_hint_function {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: true,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::TargetTerminal,
-        };
-    }
-
-    if !input.interproc.include_type_interproc_scope {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: false,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::InterprocDisabled,
-        };
-    }
-
-    EngineSymbolicScopeFunctionPlan {
-        append_function: true,
-        expand_targets: true,
-        reason: EngineSymbolicScopeFunctionReason::Allowed,
-    }
-}
-
-pub fn runtime_materialized_source_plan(
-    current_scope_count: usize,
-    addr: u64,
-    size: u64,
-) -> EngineRuntimeMaterializedSourcePlan {
-    if current_scope_count >= SYMBOLIC_SCOPE_MAX_FUNCTIONS {
-        return EngineRuntimeMaterializedSourcePlan {
-            append_source: false,
-            capped_size: 0,
-            slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-            reason: EngineRuntimeMaterializedSourceReason::ScopeFull,
-        };
-    }
-    if addr == 0 || size == 0 {
-        return EngineRuntimeMaterializedSourcePlan {
-            append_source: false,
-            capped_size: 0,
-            slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-            reason: EngineRuntimeMaterializedSourceReason::EmptySource,
-        };
-    }
-
-    EngineRuntimeMaterializedSourcePlan {
-        append_source: true,
-        capped_size: size.min(RUNTIME_MATERIALIZED_MAX_BYTES),
-        slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-        reason: EngineRuntimeMaterializedSourceReason::Allowed,
-    }
-}
-
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
-
-    #[kani::proof]
-    fn interproc_target_skip_reason_is_fail_closed_and_priority_ordered() {
-        let import_authorized: bool = kani::any();
-        let has_modeled_summary: bool = kani::any();
-        let target_materialized: bool = kani::any();
-        let metrics_within_budget: bool = kani::any();
-
-        let skip_reason = interproc_target_skip_reason_from_evidence(
-            import_authorized,
-            has_modeled_summary,
-            target_materialized,
-            metrics_within_budget,
-        );
-
-        if import_authorized {
-            assert_eq!(skip_reason, Some(EngineInterprocTargetSkipReason::Imported));
-        } else if has_modeled_summary {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::SummaryModeled)
-            );
-        } else if !target_materialized {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::Unmaterialized)
-            );
-        } else if !metrics_within_budget {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::OverBudget)
-            );
-        } else {
-            assert_eq!(skip_reason, None);
-        }
-
-        if skip_reason.is_none() {
-            assert!(target_materialized);
-            assert!(metrics_within_budget);
-            assert!(!has_modeled_summary);
-            assert!(!import_authorized);
-        }
-    }
-
-    #[kani::proof]
-    fn imported_skip_authority_is_typed_linkage_only() {
-        let linkage = match kani::any::<u8>() % 3 {
-            0 => r2ssa::FunctionSemanticLinkage::Unknown,
-            1 => r2ssa::FunctionSemanticLinkage::Internal,
-            _ => r2ssa::FunctionSemanticLinkage::Imported,
-        };
-
-        assert_eq!(
-            engine_linkage_is_imported(linkage),
-            matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
-        );
-    }
-
-    #[kani::proof]
-    fn interproc_target_metric_budget_is_owned_by_engine_thresholds() {
-        let basic_block_count: u32 = kani::any();
-        let cost: u32 = kani::any();
-        let metrics = EngineInterprocTargetMetrics {
-            basic_block_count,
-            cost,
-        };
-
-        let within_budget = interproc_target_metrics_within_budget(Some(&metrics));
-        assert_eq!(
-            within_budget,
-            basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
-                && cost <= ENGINE_INTERPROC_HELPER_MAX_COST
-        );
-        assert_eq!(
-            interproc_helper_scope_within_budget(basic_block_count, cost),
-            within_budget
-        );
-        assert!(!interproc_target_metrics_within_budget(None));
-    }
-
-    #[kani::proof]
-    fn interproc_target_queue_pair_queues_only_unskipped_targets() {
-        let direct_target = 0x1000 + u64::from(kani::any::<u16>());
-        let resolved_offset = u64::from(kani::any::<u8>() % 4);
-        let has_resolved_target: bool = kani::any();
-        let skipped: bool = kani::any();
-        let resolved_target = has_resolved_target.then_some(direct_target + resolved_offset);
-
-        let skip_reason = skipped.then_some(EngineInterprocTargetSkipReason::OverBudget);
-        let (first, second) =
-            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
-
-        if skipped {
-            assert_eq!(first, None);
-            assert_eq!(second, None);
-        } else {
-            let effective_target = resolved_target.unwrap_or(direct_target);
-            if effective_target != direct_target {
-                assert_eq!(first, Some(direct_target));
-                assert_eq!(second, Some(effective_target));
-            } else {
-                assert_eq!(first, Some(effective_target));
-                assert_eq!(second, None);
-            }
-        }
-    }
 
     #[kani::proof]
     fn analysis_policy_depths_have_nonzero_monotonic_budgets() {
@@ -1785,167 +1276,6 @@ mod kani_proofs {
             assert!(!prefers_bounded);
         }
     }
-}
-
-pub fn interproc_direct_call_targets(analysis: &EngineAnalysis) -> Vec<u64> {
-    let mut targets = BTreeSet::new();
-    for call in analysis.ssa_func.call_sites().by_id.values() {
-        if let Some(target) = analysis.ssa_func.resolved_call_target(call) {
-            targets.insert(target);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-fn debug_runtime_scope_enabled() -> bool {
-    std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_TARGETS").is_some()
-}
-
-fn debug_runtime_scope_log(message: &str) {
-    if !debug_runtime_scope_enabled() {
-        return;
-    }
-    let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_TARGETS_LOG")
-        .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_targets.log".to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{message}");
-    }
-}
-
-fn windows_x64_runtime_call_observations(
-    analysis: &EngineAnalysis,
-) -> Option<BTreeMap<r2ssa::CallSiteId, Vec<r2ssa::CallArgObservation>>> {
-    let prepared = analysis.ssa_func();
-    if prepared.machine_context().effective_abi_class() != r2ssa::SourceAbiClass::MicrosoftX64 {
-        return None;
-    }
-    let abi = prepared.abi()?;
-    Some(r2ssa::observe_call_arguments(prepared, &abi))
-}
-
-fn complete_windows_x64_call_arguments<'a>(
-    analysis: &EngineAnalysis,
-    observations: &'a BTreeMap<r2ssa::CallSiteId, Vec<r2ssa::CallArgObservation>>,
-    call_id: r2ssa::CallSiteId,
-) -> Option<&'a [r2ssa::CallArgObservation]> {
-    let prepared = analysis.ssa_func();
-    let machine = prepared.machine_context();
-    let interface = machine.call_site_interface(call_id)?;
-    if !interface.is_complete()
-        || machine
-            .architecture_family()
-            .refine_abi_class(interface.abi_class())
-            != r2ssa::SourceAbiClass::MicrosoftX64
-    {
-        return None;
-    }
-    let arguments = observations.get(&call_id)?;
-    (arguments.len() == interface.arguments().len()
-        && !arguments
-            .iter()
-            .any(|argument| matches!(argument, r2ssa::CallArgObservation::Unknown)))
-    .then_some(arguments)
-}
-
-/// Discover registered handlers only from an exact Microsoft x64 function ABI
-/// and complete, exact Microsoft x64 callsite observations.
-pub fn interproc_runtime_registration_targets(
-    analysis: &EngineAnalysis,
-    registration_call_targets: &[u64],
-) -> Vec<u64> {
-    if registration_call_targets.is_empty() {
-        return Vec::new();
-    }
-    let Some(observations) = windows_x64_runtime_call_observations(analysis) else {
-        debug_runtime_scope_log("skip missing exact Microsoft x64 ABI authority");
-        return Vec::new();
-    };
-
-    let registrations = registration_call_targets
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut targets = BTreeSet::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            debug_runtime_scope_log(&format!("call_id={call_id:?} unresolved_target"));
-            continue;
-        };
-        if !registrations.contains(&target) {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} not_registration"
-            ));
-            continue;
-        }
-        let Some(args) = complete_windows_x64_call_arguments(analysis, &observations, *call_id)
-        else {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} incomplete_exact_args"
-            ));
-            continue;
-        };
-        let Some(r2ssa::CallArgObservation::Const(handler)) = args.get(1) else {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler_arg={:?}",
-                args.get(1)
-            ));
-            continue;
-        };
-        if *handler >= 0x1000 {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler=0x{handler:x}"
-            ));
-            targets.insert(*handler);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-/// Discover materialized code only from the same exact ABI/callsite authority
-/// required for runtime registration targets.
-pub fn interproc_runtime_materialized_sources(
-    analysis: &EngineAnalysis,
-    copy_call_targets: &[u64],
-) -> Vec<EngineRuntimeMaterializedSource> {
-    if copy_call_targets.is_empty() {
-        return Vec::new();
-    }
-    let Some(observations) = windows_x64_runtime_call_observations(analysis) else {
-        return Vec::new();
-    };
-
-    let copy_targets = copy_call_targets.iter().copied().collect::<BTreeSet<_>>();
-    let mut sources = BTreeMap::<u64, u64>::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            continue;
-        };
-        if !copy_targets.contains(&target) {
-            continue;
-        }
-        let Some(args) = complete_windows_x64_call_arguments(analysis, &observations, *call_id)
-        else {
-            continue;
-        };
-        let (
-            Some(r2ssa::CallArgObservation::Const(source)),
-            Some(r2ssa::CallArgObservation::Const(size)),
-        ) = (args.get(1), args.get(2))
-        else {
-            continue;
-        };
-        if *source >= 0x1000 && *size > 0 {
-            sources
-                .entry(*source)
-                .and_modify(|existing| *existing = (*existing).max(*size))
-                .or_insert(*size);
-        }
-    }
-
-    sources
-        .into_iter()
-        .map(|(addr, size)| EngineRuntimeMaterializedSource { addr, size })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -2196,7 +1526,6 @@ pub struct EngineAnalyzeRequest {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub semantic_mode: EngineSemanticMode,
     pub include_interproc_summary_set: bool,
     pub execution: EngineExecutionControl,
@@ -2214,7 +1543,6 @@ pub struct EngineAnalyzeRequestParts {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2334,7 +1662,6 @@ pub struct EngineAnalyzeRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2345,7 +1672,6 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2761,7 +2087,6 @@ impl EngineAnalyzeRequest {
             reg_type_hints: parts.reg_type_hints,
             parsed_context: parts.parsed_context,
             interproc_max_iterations: parts.interproc_max_iterations,
-            symbolic_scope: parts.symbolic_scope,
             semantic_mode,
             include_interproc_summary_set: parts.include_interproc_summary_set,
             execution: EngineExecutionControl::default(),
@@ -2776,7 +2101,7 @@ impl EngineAnalyzeRequest {
     /// Attach one request-local trusted SSA owner.
     ///
     /// The exact retained lift replaces every detached identity, block,
-    /// architecture, source snapshot, type hint, external context, scope, and
+    /// architecture, source snapshot, type hint, external context, and
     /// precomputed-semantic input. Root-only interprocedural solving remains
     /// enabled when requested because it derives solely from this exact owner.
     /// Trusted authority remains request-local.
@@ -2804,7 +2129,6 @@ impl EngineAnalyzeRequest {
             ..r2types::ParsedExternalContext::default()
         };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);
-        self.symbolic_scope = None;
         self.semantic_mode = EngineSemanticMode::Full;
         self.trusted_ssa = Some(trusted);
         self
@@ -2871,7 +2195,6 @@ fn engine_analyze_request_input_from_function(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -2893,7 +2216,6 @@ fn engine_analyze_request_parts_from_input(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -2934,7 +2256,6 @@ pub struct EngineFunctionDecompileRequestInput {
     ptr_bits: Option<u32>,
     parsed_context: r2types::ParsedExternalContext,
     interproc_max_iterations: usize,
-    symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
@@ -2953,7 +2274,6 @@ impl EngineFunctionDecompileRequestInput {
             ptr_bits,
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -3003,16 +2323,6 @@ impl EngineFunctionDecompileRequestInput {
         );
         self
     }
-
-    pub fn with_interproc_scope(
-        mut self,
-        interproc_max_iterations: usize,
-        symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    ) -> Self {
-        self.interproc_max_iterations = interproc_max_iterations.max(1);
-        self.symbolic_scope = symbolic_scope;
-        self
-    }
 }
 
 impl EngineFunctionDecompileRequest {
@@ -3028,7 +2338,6 @@ impl EngineFunctionDecompileRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             )
@@ -3085,7 +2394,6 @@ pub struct EngineFunctionAnalysisArtifactRequestInput {
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -3095,7 +2403,6 @@ pub struct EngineFunctionAnalysisReportRequestInput {
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iters: usize,
     pub interproc_converged: bool,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub writeback_budget: r2types::TypeWritebackMutationBudget,
     pub writeback_apply_policy: r2types::TypeWritebackApplyPolicy,
 }
@@ -3110,7 +2417,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3132,7 +2438,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3195,7 +2500,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3221,7 +2525,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3372,7 +2675,6 @@ impl EngineSession {
             scope_report,
         } = request;
         let analysis = analysis.canonicalize_trusted();
-        let symbolic_scope = analysis.symbolic_scope.clone();
         let response = self.analyze(analysis)?;
         let summary = response
             .artifact
@@ -3386,7 +2688,6 @@ impl EngineSession {
             converged,
             summary,
             scope_report: scope_report.as_ref(),
-            symbolic_scope: symbolic_scope.as_ref(),
         });
         Some(EngineInterprocSummaryReportResponse {
             report,
@@ -4625,7 +3926,6 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
 struct InterprocSummaryBuildInput<'a> {
     pub analysis: &'a EngineAnalysis,
     pub max_iterations: usize,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     /// Bodies of the functions the root calls, captured with it. Without these
     /// every direct call is an unresolved callee, and the solver has to mark
     /// every pointer argument read, written and escaped.
@@ -4636,31 +3936,11 @@ fn build_prepared_interproc_summary_set(
     input: InterprocSummaryBuildInput<'_>,
 ) -> Result<r2ssa::PreparedInterprocSummarySet, r2ssa::PreparedInterprocSummaryError> {
     let root = r2ssa::InterprocFunctionId(input.analysis.ssa_func.function().entry);
-    let symbolic_scope = input.symbolic_scope.filter(|scope| {
-        scope.root_id() == root
-            && scope.root().is_some_and(|scope_root| {
-                scope_root.id == root
-                    && scope_root.prepared.function().entry == root.0
-                    && scope_root.prepared.authority() == input.analysis.ssa_func().authority()
-            })
-    });
     let mut functions = vec![r2ssa::PreparedInterprocFunctionInput {
         id: root,
         name: input.analysis.ssa_func.function().name.clone(),
         prepared: &input.analysis.ssa_func,
     }];
-    if let Some(scope) = symbolic_scope {
-        for function in scope.functions().values() {
-            if function.id == root {
-                continue;
-            }
-            functions.push(r2ssa::PreparedInterprocFunctionInput {
-                id: function.id,
-                name: function.name.clone(),
-                prepared: &function.prepared,
-            });
-        }
-    }
     for callee in input.trusted_callees {
         let id = r2ssa::InterprocFunctionId(callee.function().entry);
         if id == root || functions.iter().any(|function| function.id == id) {
@@ -4709,7 +3989,6 @@ fn build_engine_analysis_artifact(
         match build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
             analysis: &semantic_analysis,
             max_iterations: request.interproc_max_iterations,
-            symbolic_scope: request.symbolic_scope.as_ref(),
             trusted_callees: &request.trusted_callees,
         }) {
             Ok(summary) => Some(summary),
@@ -4749,15 +4028,13 @@ fn build_engine_analysis_artifact(
             }
             return maybe_compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
                 interproc_summary_set.as_ref(),
             );
         }
         optional_semantics_required.then(|| {
-            r2sym::compile_semantic_artifact_default_with_scope(
+            r2sym::compile_semantic_artifact_default(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
             )
         })
     })();
@@ -4801,7 +4078,6 @@ fn build_engine_analysis_artifact(
 
 fn maybe_compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> Option<r2sym::SemanticArtifact> {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
@@ -4813,12 +4089,8 @@ fn maybe_compile_semantic_artifact_for_analysis(
             return None;
         }
         if !vm_route_evidence
-            && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-                ssa_func,
-                symbolic_scope,
-                interproc_summaries,
-                false,
-            )
+            && let Some(artifact) =
+                r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
             && artifact
                 .native_body()
                 .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
@@ -4832,7 +4104,6 @@ fn maybe_compile_semantic_artifact_for_analysis(
     }
     Some(compile_semantic_artifact_for_analysis(
         ssa_func,
-        symbolic_scope,
         interproc_summaries,
     ))
 }
@@ -4857,40 +4128,29 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 
 fn compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> r2sym::SemanticArtifact {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
     let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
     if !vm_route_evidence
         && let Some(summaries) = interproc_summaries
-        && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
-            ssa_func,
-            symbolic_scope,
-            summaries,
-        )
+        && let Some(artifact) =
+            r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(ssa_func, summaries)
     {
         return artifact;
     }
     if !vm_route_evidence
         && should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary)
-        && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-            ssa_func,
-            symbolic_scope,
-            interproc_summaries,
-            false,
-        )
+        && let Some(artifact) =
+            r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
         && artifact
             .native_body()
             .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
     {
         return artifact;
     }
-    let mut artifact = r2sym::compile_semantic_artifact_default_with_scope(
-        &z3::Context::thread_local(),
-        ssa_func,
-        symbolic_scope,
-    );
+    let mut artifact =
+        r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), ssa_func);
     if let Some(summaries) = interproc_summaries {
         r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
     }
@@ -5441,7 +4701,6 @@ fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
         r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
         r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
         r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
         r2sym::SliceClass::GenericLarge => "generic_large",
@@ -5452,8 +4711,6 @@ fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &'static str
     match reason {
         r2sym::ResidualReason::MissingArch => "missing_arch",
         r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
         r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }
@@ -5770,7 +5027,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert!(Arc::ptr_eq(
@@ -5827,7 +5083,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
 
@@ -5871,7 +5126,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Optional,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -6095,30 +5349,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_interproc_summary_json_merges_symbolic_scope_report() {
-        let root_blocks = const_return_blocks(0x401000, 0);
-        let helper_blocks = const_return_blocks(0x402000, 1);
-        let root_prepared =
-            Arc::new(r2ssa::SsaArtifact::for_symbolic(&root_blocks, None).expect("root prepared"));
-        let helper_prepared = Arc::new(
-            r2ssa::SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper prepared"),
-        );
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x401000),
-                    name: Some("root".to_string()),
-                    prepared: root_prepared,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x402000),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("scope");
+    fn engine_interproc_summary_json_preserves_supplied_scope_report() {
         let existing_scope = serde_json::json!({
             "payloads": [{ "function_addr": 0x403000u64, "function_name": "seeded" }],
             "seeds": [{ "id": 0x403000u64, "name": "seeded" }],
@@ -6131,19 +5362,11 @@ mod tests {
             converged: true,
             summary: None,
             scope_report: Some(&existing_scope),
-            symbolic_scope: Some(&scope),
         });
-        let scope = interproc.scope.expect("merged scope");
 
         assert_eq!(interproc.iterations, 1);
         assert_eq!(interproc.max_iterations, 1);
-        assert_eq!(scope["phase"], "symbolic_scope");
-        assert_eq!(scope["payloads"].as_array().expect("payloads").len(), 2);
-        assert_eq!(scope["seeds"].as_array().expect("seeds").len(), 2);
-        assert_eq!(scope["payloads"][1]["function_addr"], 0x402000);
-        assert_eq!(scope["payloads"][1]["function_name"], "helper");
-        assert_eq!(scope["seeds"][1]["id"], 0x402000);
-        assert_eq!(scope["seeds"][1]["name"], "helper");
+        assert_eq!(interproc.scope, Some(existing_scope));
     }
 
     #[test]
@@ -6329,7 +5552,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -6365,7 +5587,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 32),
             interproc_max_iterations: 2,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -6401,7 +5622,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::parse_external_context_json("{}", 32),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert_eq!(grouped.function_name, "sym.grouped");
@@ -6492,7 +5712,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         };
 
@@ -6522,7 +5741,7 @@ mod tests {
     }
 
     #[test]
-    fn interproc_summary_scope_requires_exact_root_and_source_helper_provenance() {
+    fn interproc_summary_build_uses_only_trusted_callee_bodies() {
         let root_addr = 0x401000;
         let helper_addr = 0x402000;
         let root_blocks = const_return_blocks(root_addr, 0);
@@ -6566,148 +5785,27 @@ mod tests {
             .expect("helper prepared"),
         );
         let analysis = EngineAnalysis::from_prepared_ssa(Arc::clone(&root_prepared));
-        let exact_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root_prepared),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: Arc::clone(&helper_prepared),
-                },
-            ],
-        )
-        .expect("exact scope");
-        let foreign_root = Arc::new(
-            r2ssa::SsaArtifact::for_decompile_with_interface(&root_blocks, Some(&arch), interface)
-                .expect("foreign root prepared"),
-        );
-        let foreign_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: foreign_root,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("foreign scope");
-        let solve = |symbolic_scope| {
+        let solve = |trusted_callees: &[Arc<r2ssa::SsaArtifact>]| {
             build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
                 analysis: &analysis,
                 max_iterations: 1,
-                symbolic_scope,
-                trusted_callees: &[],
+                trusted_callees,
             })
         };
 
         assert_eq!(
-            solve(Some(&exact_scope)).expect_err("manual helper must not become source evidence"),
+            solve(&[helper_prepared]).expect_err("manual helper must not become source evidence"),
             r2ssa::PreparedInterprocSummaryError::ManualFunction
         );
 
-        let foreign = solve(Some(&foreign_scope)).expect("root-only prepared summary set");
-        assert_eq!(foreign.report().diagnostics.scope_size, 1);
+        let root_only = solve(&[]).expect("root-only prepared summary set");
+        assert_eq!(root_only.report().diagnostics.scope_size, 1);
         assert!(
-            !foreign
+            !root_only
                 .report()
                 .summaries
                 .contains_key(&r2ssa::InterprocFunctionId(helper_addr))
         );
-    }
-
-    fn windows_x64_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rcx", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rdx", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("r8", 24, 8));
-        arch.add_register(r2il::RegisterDef::new("r9", 32, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 40, 8));
-        arch.add_register(r2il::RegisterDef::new("rsp", 48, 8));
-        arch
-    }
-
-    fn runtime_reg(offset: u64, size: u32) -> r2il::Varnode {
-        r2il::Varnode {
-            space: r2il::SpaceId::Register,
-            offset,
-            size,
-            meta: None,
-        }
-    }
-
-    fn windows_runtime_source_snapshot(
-        revision: &str,
-        function_convention: &str,
-        calls: &[(u64, usize, u64, usize, bool, &str)],
-    ) -> Arc<EngineSourceSnapshot> {
-        let revision_identity = revision.as_bytes().to_vec();
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
-            revision_identity.clone(),
-            function_convention,
-            [],
-            r2ssa::SourceFunctionReturn::Void,
-            [],
-        )
-        .and_then(|interface| interface.with_return_address_storage(register(40)))
-        .and_then(|interface| interface.with_stack_pointer_storage(register(48)))
-        .expect("exact runtime function interface");
-        let argument_offsets = [8, 16, 24, 32];
-        let call_site_interfaces = calls
-            .iter()
-            .map(
-                |&(block_addr, op_index, target, argument_count, complete, convention)| {
-                    r2ssa::SourceCallSiteInterface::new(
-                        revision_identity.clone(),
-                        r2ssa::SourceCallSiteIdentity::new(
-                            block_addr,
-                            op_index,
-                            r2ssa::CanonicalStorageId {
-                                space: r2ssa::CanonicalStorageSpace::Constant,
-                                offset: target,
-                                size: 8,
-                            },
-                        ),
-                        complete,
-                        convention,
-                        argument_offsets[..argument_count].iter().enumerate().map(
-                            |(index, offset)| {
-                                r2ssa::SourceCallArgumentSpec::new(index as u32, register(*offset))
-                            },
-                        ),
-                        false,
-                        false,
-                        r2ssa::SourceCallResult::Void,
-                    )
-                    .expect("exact runtime callsite interface")
-                },
-            )
-            .collect::<Vec<_>>();
-        Arc::new(
-            EngineSourceSnapshot::new(
-                revision_identity,
-                Some(function_interface),
-                call_site_interfaces,
-            )
-            .expect("exact runtime source snapshot"),
-        )
     }
 
     const VM_TEST_RAX: u64 = 0;
@@ -7050,7 +6148,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             semantic_mode: EngineSemanticMode::Full,
             include_interproc_summary_set: true,
             execution: EngineExecutionControl::default(),
@@ -7119,7 +6216,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         })
     }
@@ -7844,7 +6940,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             })
             .with_cancellation(cancellation);
@@ -8183,7 +7278,7 @@ mod tests {
                 .with_name("dbg.init_node"),
         );
 
-        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None, None);
+        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None);
 
         assert_ne!(
             artifact.granularity,
@@ -8265,7 +7360,7 @@ mod tests {
         );
 
         assert!(should_skip_unbounded_semantic_artifact_after_worker_preprobe(&loop_ssa, None));
-        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None, None).is_none());
+        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None).is_none());
     }
 
     #[test]
@@ -8287,709 +7382,11 @@ mod tests {
         );
         assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
 
-        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None, None)
+        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None)
             .expect("vm artifact should not be refused before classification");
 
         assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
         assert!(artifact.vm_body().is_some());
-    }
-
-    #[test]
-    fn engine_owns_interproc_direct_call_target_collection() {
-        let arch = windows_x64_runtime_scope_arch();
-        let snapshot = test_source_snapshot("sym.wrapper/rev1");
-        let analysis = build_engine_analysis_from_parts(
-            "sym.wrapper",
-            &direct_call_return_blocks(0x401000, 0x2000),
-            Some(&arch),
-            &snapshot,
-        )
-        .expect("analysis");
-
-        assert_eq!(interproc_direct_call_targets(&analysis), vec![0x2000]);
-    }
-
-    fn small_interproc_target_metrics() -> EngineInterprocTargetMetrics {
-        EngineInterprocTargetMetrics {
-            basic_block_count: 1,
-            cost: 1,
-        }
-    }
-
-    fn oversized_interproc_target_metrics() -> EngineInterprocTargetMetrics {
-        EngineInterprocTargetMetrics {
-            basic_block_count: ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
-            cost: 1,
-        }
-    }
-
-    #[test]
-    fn interproc_helper_scope_budget_is_engine_owned() {
-        assert!(interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
-            ENGINE_INTERPROC_HELPER_MAX_COST,
-        ));
-        assert!(!interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
-            ENGINE_INTERPROC_HELPER_MAX_COST,
-        ));
-        assert!(!interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
-            ENGINE_INTERPROC_HELPER_MAX_COST + 1,
-        ));
-    }
-
-    #[test]
-    fn interproc_session_plan_owns_scope_and_budget_policy() {
-        let policy = analysis_policy_for_depth(EngineAnalysisDepth::Default);
-        let small = Some(small_interproc_target_metrics());
-        let oversized = Some(oversized_interproc_target_metrics());
-
-        let full_type =
-            interproc_session_plan(policy, EngineInterprocSessionPurpose::TypeAnalysis, small);
-        assert!(full_type.include_type_interproc_scope);
-        assert!(!full_type.include_root_symbolic_scope);
-        assert_eq!(full_type.interproc_iter, 1);
-        assert_eq!(
-            full_type.interproc_max_iters,
-            policy.type_interproc_max_iters
-        );
-        assert!(full_type.interproc_converged);
-
-        let bounded_type = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::TypeAnalysis,
-            oversized,
-        );
-        assert!(!bounded_type.include_type_interproc_scope);
-        assert!(bounded_type.include_root_symbolic_scope);
-        assert_eq!(bounded_type.interproc_iter, 1);
-        assert_eq!(bounded_type.interproc_max_iters, 1);
-        assert!(!bounded_type.interproc_converged);
-
-        let full_decompile = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(small_interproc_target_metrics()),
-        );
-        assert!(full_decompile.include_type_interproc_scope);
-        assert!(!full_decompile.include_root_symbolic_scope);
-        assert_eq!(full_decompile.interproc_max_iters, 1);
-        assert!(full_decompile.interproc_converged);
-
-        let bounded_decompile = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(oversized_interproc_target_metrics()),
-        );
-        assert!(!bounded_decompile.include_type_interproc_scope);
-        assert!(!bounded_decompile.include_root_symbolic_scope);
-        assert_eq!(bounded_decompile.interproc_max_iters, 1);
-        assert!(bounded_decompile.interproc_converged);
-    }
-
-    #[test]
-    fn session_policy_plan_owns_budget_projection() {
-        let policy = analysis_policy_for_depth(EngineAnalysisDepth::Aggressive);
-        let plan = session_policy_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(small_interproc_target_metrics()),
-        );
-
-        assert!(plan.interproc.include_type_interproc_scope);
-        assert_eq!(plan.interproc.interproc_iter, 1);
-        assert_eq!(plan.interproc.interproc_max_iters, 1);
-        assert_eq!(plan.type_writeback_mode, policy.type_writeback_mode);
-        assert_eq!(plan.global_max_links, policy.type_global_max_links);
-        assert_eq!(plan.max_type_decls, policy.type_max_decls);
-        assert_eq!(plan.max_mutations, policy.type_max_mutations);
-
-        let bounded = session_policy_plan_for_radare2_depth(
-            RADARE2_ANALYSIS_DEPTH_BASIC,
-            EngineInterprocSessionPurpose::TypeAnalysis,
-            Some(oversized_interproc_target_metrics()),
-        );
-        let basic_policy = analysis_policy_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC);
-        assert!(!bounded.interproc.include_type_interproc_scope);
-        assert!(bounded.interproc.include_root_symbolic_scope);
-        assert_eq!(
-            bounded.type_writeback_mode,
-            basic_policy.type_writeback_mode
-        );
-        assert_eq!(bounded.global_max_links, basic_policy.type_global_max_links);
-        assert_eq!(bounded.max_type_decls, basic_policy.type_max_decls);
-        assert_eq!(bounded.max_mutations, basic_policy.type_max_mutations);
-    }
-
-    #[test]
-    fn session_budget_input_normalizes_limits_in_engine() {
-        let budget = EngineSessionBudget::from_input(EngineSessionBudgetInput {
-            interproc_iter: 0,
-            interproc_max_iters: 0,
-            interproc_converged: true,
-            global_max_links: 0,
-            max_type_decls: 0,
-            max_mutations: 0,
-            type_writeback_mode: EngineTypeWritebackMode::Balanced,
-        });
-
-        assert_eq!(budget.interproc_iter, 1);
-        assert_eq!(budget.interproc_max_iters, 1);
-        assert!(budget.interproc_converged);
-        assert_eq!(budget.writeback_budget.global_max_links, 1);
-        assert_eq!(budget.writeback_budget.max_type_decls, 1);
-        assert_eq!(budget.writeback_budget.max_mutations, 1);
-        assert_eq!(
-            budget.writeback_apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Balanced
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_keeps_plugin_out_of_import_policy() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x2000,
-                name: Some("sym.imp.printf".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
-                semantic_summary: None,
-                resolved_target: Some(0x2000),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x3000,
-                name: Some("sym.imp.memcpy".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Imported,
-                semantic_summary: None,
-                resolved_target: Some(0x3000),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x2000],
-            "import-shaped names must not skip helper scope without typed import linkage"
-        );
-        let imported = plan
-            .decisions
-            .iter()
-            .find(|decision| decision.direct_target == 0x3000)
-            .expect("imported decision");
-        assert_eq!(
-            imported.skip_reason,
-            Some(EngineInterprocTargetSkipReason::Imported)
-        );
-        assert!(
-            plan.runtime_copy_targets.is_empty(),
-            "an imported memcpy spelling is advisory without typed semantic summary evidence"
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_reports_runtime_roles_and_thunks() {
-        let runtime_copy_summary = r2sym::function_semantic_summary_seed_for_name_with_linkage(
-            r2ssa::InterprocFunctionId(0x4200),
-            "memcpy",
-            r2ssa::FunctionSemanticLinkage::Imported,
-        )
-        .expect("typed memcpy summary");
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x4100,
-                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Imported,
-                semantic_summary: None,
-                resolved_target: Some(0x4100),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4200,
-                name: Some("sym.local_memcpy_thunk".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: Some(runtime_copy_summary),
-                resolved_target: Some(0x4200),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4300,
-                name: Some("sym.local_thunk".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x4310),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert!(
-            plan.registration_targets.is_empty(),
-            "registration names must refuse until a typed source role exists"
-        );
-        assert_eq!(plan.runtime_copy_targets, vec![0x4200]);
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x4300, 0x4310],
-            "thunked direct targets queue both the direct wrapper and resolved target"
-        );
-        let summary = plan
-            .decisions
-            .iter()
-            .find(|decision| decision.direct_target == 0x4200)
-            .expect("summary decision");
-        assert_eq!(
-            summary.skip_reason,
-            Some(EngineInterprocTargetSkipReason::SummaryModeled)
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_rejects_name_only_runtime_roles() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x4400,
-                name: Some("memcpy".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x4400),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4500,
-                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Imported,
-                semantic_summary: None,
-                resolved_target: Some(0x4500),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert!(
-            plan.registration_targets.is_empty(),
-            "even imported linkage plus a matching name is not a typed registration role"
-        );
-        assert!(
-            plan.runtime_copy_targets.is_empty(),
-            "runtime copy requires explicit modeled summary evidence"
-        );
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x4400],
-            "the internal helper queues normally; typed imported linkage skips the imported target without granting a runtime role"
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_refuses_unmaterialized_and_over_budget_targets() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x5000,
-                name: Some("sym.unmaterialized".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: None,
-                target_materialized: false,
-                target_metrics: None,
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x6000,
-                name: Some("sym.too_large".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x6000),
-                target_materialized: true,
-                target_metrics: Some(oversized_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x7000,
-                name: Some("sym.unmeasured".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x7000),
-                target_materialized: true,
-                target_metrics: None,
-            },
-        ]);
-
-        assert!(plan.queued_targets.is_empty());
-        assert_eq!(
-            plan.decisions
-                .iter()
-                .map(|decision| decision.skip_reason)
-                .collect::<Vec<_>>(),
-            vec![
-                Some(EngineInterprocTargetSkipReason::Unmaterialized),
-                Some(EngineInterprocTargetSkipReason::OverBudget),
-                Some(EngineInterprocTargetSkipReason::OverBudget),
-            ]
-        );
-    }
-
-    #[test]
-    fn symbolic_scope_function_plan_owns_queue_admission_policy() {
-        let allowed_interproc = EngineInterprocSessionPlan {
-            include_type_interproc_scope: true,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        };
-        let disabled_interproc = EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: true,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: false,
-        };
-
-        let root = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 0,
-            root_function: true,
-            target_hint_function: false,
-            interproc: disabled_interproc,
-        });
-        assert!(root.append_function);
-        assert!(root.expand_targets);
-        assert_eq!(root.reason, EngineSymbolicScopeFunctionReason::Allowed);
-
-        let helper = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: false,
-            interproc: allowed_interproc,
-        });
-        assert!(helper.append_function);
-        assert!(helper.expand_targets);
-
-        let target_terminal = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: true,
-            interproc: disabled_interproc,
-        });
-        assert!(target_terminal.append_function);
-        assert!(!target_terminal.expand_targets);
-        assert_eq!(
-            target_terminal.reason,
-            EngineSymbolicScopeFunctionReason::TargetTerminal
-        );
-
-        let disabled = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: false,
-            interproc: disabled_interproc,
-        });
-        assert!(!disabled.append_function);
-        assert!(!disabled.expand_targets);
-        assert_eq!(
-            disabled.reason,
-            EngineSymbolicScopeFunctionReason::InterprocDisabled
-        );
-
-        let full = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: SYMBOLIC_SCOPE_MAX_FUNCTIONS,
-            root_function: true,
-            target_hint_function: false,
-            interproc: allowed_interproc,
-        });
-        assert!(!full.append_function);
-        assert!(!full.expand_targets);
-        assert_eq!(full.reason, EngineSymbolicScopeFunctionReason::ScopeFull);
-    }
-
-    #[test]
-    fn runtime_materialized_source_plan_owns_caps() {
-        let allowed = runtime_materialized_source_plan(0, 0x9000, 0x20);
-        assert!(allowed.append_source);
-        assert_eq!(allowed.capped_size, 0x20);
-        assert_eq!(allowed.slot_bytes, RUNTIME_MATERIALIZED_SLOT_BYTES);
-        assert_eq!(
-            allowed.reason,
-            EngineRuntimeMaterializedSourceReason::Allowed
-        );
-
-        let capped =
-            runtime_materialized_source_plan(0, 0x9000, RUNTIME_MATERIALIZED_MAX_BYTES + 1);
-        assert!(capped.append_source);
-        assert_eq!(capped.capped_size, RUNTIME_MATERIALIZED_MAX_BYTES);
-
-        let empty = runtime_materialized_source_plan(0, 0, 0x20);
-        assert!(!empty.append_source);
-        assert_eq!(
-            empty.reason,
-            EngineRuntimeMaterializedSourceReason::EmptySource
-        );
-
-        let full = runtime_materialized_source_plan(SYMBOLIC_SCOPE_MAX_FUNCTIONS, 0x9000, 0x20);
-        assert!(!full.append_source);
-        assert_eq!(
-            full.reason,
-            EngineRuntimeMaterializedSourceReason::ScopeFull
-        );
-    }
-
-    #[test]
-    fn engine_owns_windows_runtime_registration_scope_targets() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(1, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x1400_3d0f, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_1000, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        let snapshot = windows_runtime_source_snapshot(
-            "sym.runtime_seed/rev1",
-            "ms",
-            &[(0x5000, 2, 0x1800_1000, 2, true, "ms")],
-        );
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert_eq!(
-            interproc_runtime_registration_targets(&analysis, &[0x1800_1000]),
-            vec![0x1400_3d0f],
-            "handler comes from the complete exact Microsoft x64 callsite observation"
-        );
-        assert!(
-            interproc_runtime_registration_targets(&analysis, &[0x1800_2000]).is_empty(),
-            "non-registration callees must not expand symbolic scope"
-        );
-    }
-
-    #[test]
-    fn runtime_registration_scope_refuses_absent_non_microsoft_or_incomplete_evidence() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(1, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x1400_3d0f, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_1000, 8),
-        });
-        let absent = test_source_snapshot("sym.runtime_seed/gated/absent/rev1");
-        let absent_analysis = build_engine_analysis_from_parts(
-            "sym.runtime_seed",
-            &[block.clone()],
-            Some(&arch),
-            &absent,
-        )
-        .expect("analysis without ABI authority");
-        assert!(
-            interproc_runtime_registration_targets(&absent_analysis, &[0x1800_1000]).is_empty(),
-            "absent source ABI authority must refuse runtime scope expansion"
-        );
-
-        let system_v = windows_runtime_source_snapshot(
-            "sym.runtime_seed/gated/system-v/rev1",
-            "amd64",
-            &[(0x5000, 2, 0x1800_1000, 2, true, "ms")],
-        );
-        let system_v_analysis = build_engine_analysis_from_parts(
-            "sym.runtime_seed",
-            &[block.clone()],
-            Some(&arch),
-            &system_v,
-        )
-        .expect("System V analysis");
-        assert!(
-            interproc_runtime_registration_targets(&system_v_analysis, &[0x1800_1000]).is_empty(),
-            "an exact System V ABI must not enable Microsoft runtime policy"
-        );
-
-        let incomplete = windows_runtime_source_snapshot(
-            "sym.runtime_seed/gated/incomplete/rev1",
-            "ms",
-            &[(0x5000, 2, 0x1800_1000, 2, false, "ms")],
-        );
-        let incomplete_analysis = build_engine_analysis_from_parts(
-            "sym.runtime_seed",
-            &[block.clone()],
-            Some(&arch),
-            &incomplete,
-        )
-        .expect("incomplete-callsite analysis");
-        assert!(
-            interproc_runtime_registration_targets(&incomplete_analysis, &[0x1800_1000]).is_empty(),
-            "an incomplete callsite must refuse otherwise exact arguments"
-        );
-
-        let unknown_callsite_abi = windows_runtime_source_snapshot(
-            "sym.runtime_seed/gated/unknown-callsite-abi/rev1",
-            "ms",
-            &[(0x5000, 2, 0x1800_1000, 2, true, "default")],
-        );
-        let unknown_callsite_abi_analysis = build_engine_analysis_from_parts(
-            "sym.runtime_seed",
-            &[block],
-            Some(&arch),
-            &unknown_callsite_abi,
-        )
-        .expect("unknown-callsite-ABI analysis");
-        assert!(
-            interproc_runtime_registration_targets(&unknown_callsite_abi_analysis, &[0x1800_1000])
-                .is_empty(),
-            "an unknown callsite ABI must not inherit the function ABI"
-        );
-
-        let mut unknown_argument_block = R2ILBlock::new(0x5100, 4);
-        unknown_argument_block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x1400_3d0f, 8),
-        });
-        unknown_argument_block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_1000, 8),
-        });
-        let unknown_argument = windows_runtime_source_snapshot(
-            "sym.runtime_seed/gated/unknown-argument/rev1",
-            "ms",
-            &[(0x5100, 1, 0x1800_1000, 2, true, "ms")],
-        );
-        let unknown_argument_analysis = build_engine_analysis_from_parts(
-            "sym.runtime_seed",
-            &[unknown_argument_block],
-            Some(&arch),
-            &unknown_argument,
-        )
-        .expect("unknown-argument analysis");
-        assert!(
-            interproc_runtime_registration_targets(&unknown_argument_analysis, &[0x1800_1000])
-                .is_empty(),
-            "one unknown observed argument invalidates the complete call observation"
-        );
-    }
-
-    #[test]
-    fn engine_owns_runtime_materialized_source_collection() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x6000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(0x7000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x20, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(0x7000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x40, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        let snapshot = windows_runtime_source_snapshot(
-            "sym.runtime_copy/rev1",
-            "ms",
-            &[
-                (0x6000, 3, 0x1800_2000, 3, true, "ms"),
-                (0x6000, 7, 0x1800_2000, 3, true, "ms"),
-            ],
-        );
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert_eq!(
-            interproc_runtime_materialized_sources(&analysis, &[0x1800_2000]),
-            vec![EngineRuntimeMaterializedSource {
-                addr: 0x9000,
-                size: 0x40
-            }],
-            "duplicate copy observations must collapse to the maximum materialized size"
-        );
-    }
-
-    #[test]
-    fn runtime_materialized_sources_reject_non_code_and_zero_size_inputs() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x6000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(0x7000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x900, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x20, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(0x7000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        let snapshot = windows_runtime_source_snapshot(
-            "sym.runtime_copy/rejected/rev1",
-            "ms",
-            &[
-                (0x6000, 3, 0x1800_2000, 3, true, "ms"),
-                (0x6000, 7, 0x1800_2000, 3, true, "ms"),
-            ],
-        );
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, &[0x1800_2000]).is_empty(),
-            "runtime materialization needs both a code-like source address and a nonzero size"
-        );
     }
 
     #[test]
@@ -9128,7 +7525,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9165,7 +7561,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9200,7 +7595,6 @@ mod tests {
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iters: 5,
                 interproc_converged: true,
-                symbolic_scope: None,
                 writeback_budget: r2types::TypeWritebackMutationBudget::new(7, 11, 13),
                 writeback_apply_policy: type_writeback_apply_policy_for_mode(
                     EngineTypeWritebackMode::Balanced,
@@ -9236,7 +7630,6 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 9,
-                symbolic_scope: None,
             },
         );
 
@@ -9273,7 +7666,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9306,7 +7698,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 2,
                 lifted_blocks: 1,
@@ -9376,7 +7767,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9430,7 +7820,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 1,
                 lifted_blocks: 0,
@@ -9490,7 +7879,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9543,7 +7931,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9589,7 +7976,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9638,7 +8024,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9683,7 +8068,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9726,7 +8110,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9755,7 +8138,6 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 3,
-                symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
                 trusted_ssa: None,

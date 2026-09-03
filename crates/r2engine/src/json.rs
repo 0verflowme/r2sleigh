@@ -198,7 +198,6 @@ pub struct EngineInterprocSummaryJsonInput<'a> {
     pub converged: bool,
     pub summary: Option<&'a r2ssa::FunctionSemanticSummary>,
     pub scope_report: Option<&'a serde_json::Value>,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +245,6 @@ pub struct EngineFunctionAnalysisTypeWritebackJsonRequest<'a> {
     pub max_iterations: usize,
     pub converged: bool,
     pub scope_report: Option<&'a serde_json::Value>,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
 fn writeback_evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<String> {
@@ -431,7 +429,6 @@ pub fn type_writeback_report_json_from_function_analysis(
             converged: request.converged,
             summary: request.report.current_summary.as_ref(),
             scope_report: request.scope_report,
-            symbolic_scope: request.symbolic_scope,
         }),
         semantics,
         compiled_semantics,
@@ -454,78 +451,6 @@ pub fn type_writeback_report_json_from_function_analysis(
     report
 }
 
-pub fn symbolic_scope_report_json(
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<serde_json::Value> {
-    let scope = symbolic_scope?;
-    let payloads = scope
-        .helper_functions()
-        .filter_map(|function| {
-            function.name.as_ref().map(|name| {
-                serde_json::json!({
-                    "function_addr": function.id.0,
-                    "function_name": name,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    let seeds = scope
-        .helper_functions()
-        .filter_map(|function| {
-            function.name.as_ref().map(|name| {
-                serde_json::json!({
-                    "id": function.id.0,
-                    "name": name,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    if seeds.is_empty() && payloads.is_empty() {
-        return None;
-    }
-    Some(serde_json::json!({
-        "phase": "symbolic_scope",
-        "payloads": payloads,
-        "seeds": seeds,
-    }))
-}
-
-pub fn merged_interproc_scope_report_json(
-    scope_report: Option<&serde_json::Value>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<serde_json::Value> {
-    let Some(symbolic_scope_json) = symbolic_scope_report_json(symbolic_scope) else {
-        return scope_report.cloned();
-    };
-    let Some(mut merged) = scope_report.cloned() else {
-        return Some(symbolic_scope_json);
-    };
-    let (Some(merged_obj), Some(symbolic_obj)) =
-        (merged.as_object_mut(), symbolic_scope_json.as_object())
-    else {
-        return Some(merged);
-    };
-
-    if !merged_obj.contains_key("phase")
-        && let Some(phase) = symbolic_obj.get("phase")
-    {
-        merged_obj.insert("phase".to_string(), phase.clone());
-    }
-    for key in ["payloads", "seeds"] {
-        let Some(serde_json::Value::Array(symbolic_items)) = symbolic_obj.get(key) else {
-            continue;
-        };
-        let entry = merged_obj
-            .entry(key.to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let serde_json::Value::Array(items) = entry {
-            items.extend(symbolic_items.iter().cloned());
-        }
-    }
-
-    Some(merged)
-}
-
 pub fn interproc_summary_json(
     input: EngineInterprocSummaryJsonInput<'_>,
 ) -> EngineInterprocSummaryJson {
@@ -539,7 +464,7 @@ pub fn interproc_summary_json(
         summary_json: input
             .summary
             .and_then(|summary| serde_json::to_string(summary).ok()),
-        scope: merged_interproc_scope_report_json(input.scope_report, input.symbolic_scope),
+        scope: input.scope_report.cloned(),
     }
 }
 

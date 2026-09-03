@@ -78,7 +78,7 @@ LL |     r2sym::compile_summary_dense_worker_artifact_from_interproc_summary();
 warning: r2plugin must delegate route/budget/fallback decisions to r2engine
   --> $DIR/engine_policy_ownership.rs:105:5
    |
-LL |     r2sym::compile_semantic_artifact_default_with_scope();
+LL |     r2sym::compile_semantic_artifact_default();
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: r2plugin must delegate route/budget/fallback decisions to r2engine
@@ -147,4 +147,3 @@ LL |     let _ = EngineSemanticMode::Optional;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: 21 warnings emitted
-
