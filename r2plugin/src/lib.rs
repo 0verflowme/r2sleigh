@@ -237,8 +237,8 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         reg_meta.insert(alias_lower.clone(), (bits, offset, alias_lower));
     };
 
-    let arch_name = arch.name.to_ascii_lowercase();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(Some(arch));
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
     if is_arm64 {
         // AArch64 Sleigh specs often expose CY/ZR/NG/OV instead of cf/zf/nf/vf.
         add_gpr_alias("cf", "cy");
@@ -264,7 +264,10 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         })
     };
 
-    let is_x86 = matches!(arch_name.as_str(), "x86" | "x86-64");
+    let is_x86 = matches!(
+        architecture,
+        r2ssa::MachineArchitectureFamily::X86 | r2ssa::MachineArchitectureFamily::X86_64
+    );
     let address_bits = arch.addr_size.checked_mul(8);
     // The program counter is stated by the processor specification --
     // `<programcounter register="pc"/>` -- so it is read, not guessed. Every
@@ -3395,24 +3398,11 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
 }
 
 #[cfg(test)]
-fn test_stack_register_names(arch: Option<&ArchSpec>, ptr_bits: u32) -> (String, String) {
-    let arch_name = arch
-        .map(|arch| arch.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    match arch_name.as_str() {
-        name if name.contains("x86-64") || name.contains("amd64") => {
-            ("rsp".to_string(), "rbp".to_string())
-        }
-        name if name.contains("x86") || name.contains("i386") => {
-            if ptr_bits >= 64 {
-                ("rsp".to_string(), "rbp".to_string())
-            } else {
-                ("esp".to_string(), "ebp".to_string())
-            }
-        }
-        name if name.contains("aarch64") || name.contains("arm64") => {
-            ("sp".to_string(), "fp".to_string())
-        }
+fn test_stack_register_names(arch: Option<&ArchSpec>) -> (String, String) {
+    match r2ssa::MachineArchitectureFamily::from_arch_spec(arch) {
+        r2ssa::MachineArchitectureFamily::X86_64 => ("rsp".to_string(), "rbp".to_string()),
+        r2ssa::MachineArchitectureFamily::X86 => ("esp".to_string(), "ebp".to_string()),
+        r2ssa::MachineArchitectureFamily::AArch64 => ("sp".to_string(), "fp".to_string()),
         _ => ("sp".to_string(), "fp".to_string()),
     }
 }
@@ -3427,7 +3417,7 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
-    let (sp_name, fp_name) = test_stack_register_names(arch, ptr_bits);
+    let (sp_name, fp_name) = test_stack_register_names(arch);
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), ArgAddrExpr> = HashMap::new();

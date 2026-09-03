@@ -1014,7 +1014,7 @@ impl TypeWritebackAnalysis {
     }
 
     fn enrich_from_source_for_decompile(&mut self) -> bool {
-        if crate::prepare::prepared_arch_name(self.source.as_ref()).is_none() {
+        if crate::prepare::prepared_arch_display_name(self.source.as_ref()).is_none() {
             return false;
         }
         let prior_facts = self.function_facts.clone();
@@ -1095,7 +1095,7 @@ impl TypeWritebackAnalysis {
             return false;
         };
         let source = self.source.as_ref();
-        let Some(arch_name) = crate::prepare::prepared_arch_name(source) else {
+        let Some(arch_name) = crate::prepare::prepared_arch_display_name(source) else {
             return false;
         };
         let ptr_bits = source
@@ -1333,8 +1333,7 @@ struct PreparedMachineVarProfile {
 }
 
 struct ScalarArrayMachineProfile<'a> {
-    arch_name: Option<&'a str>,
-    architecture: Option<r2ssa::MachineArchitectureFamily>,
+    architecture: r2ssa::MachineArchitectureFamily,
     pointer_arg_slots: Option<&'a HashMap<String, usize>>,
     ptr_bits: u32,
 }
@@ -4266,12 +4265,9 @@ fn build_type_writeback_analysis_inner(
         merged_signature.as_ref(),
         &local_structs.slot_element_strides,
         ScalarArrayMachineProfile {
-            arch_name: if input.inferred_signature.arch.is_empty() {
-                input.parsed_context.callconv.as_deref()
-            } else {
-                Some(input.inferred_signature.arch.as_str())
-            },
-            architecture: machine_profile.map(|profile| profile.architecture),
+            architecture: machine_profile
+                .map(|profile| profile.architecture)
+                .unwrap_or(r2ssa::MachineArchitectureFamily::Unknown),
             pointer_arg_slots: machine_profile.map(|profile| &profile.pointer_arg_slots),
             ptr_bits: input.ptr_bits,
         },
@@ -4513,7 +4509,14 @@ fn aarch64_register_identity() -> crate::RegisterIdentity {
 fn build_type_writeback_analysis(
     input: DerivedTypeWritebackAnalysisInput<'_>,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None, None, None, &x86_64_register_identity())
+    let machine = detached_x86_64_test_machine_profile();
+    build_type_writeback_analysis_inner(
+        input,
+        None,
+        None,
+        Some(&machine),
+        &x86_64_register_identity(),
+    )
 }
 
 #[cfg(test)]
@@ -4521,11 +4524,12 @@ fn build_type_writeback_analysis_with_prep_facts(
     input: DerivedTypeWritebackAnalysisInput<'_>,
     prep_facts: &r2ssa::DecompilePrepFacts,
 ) -> DerivedTypeWritebackAnalysis {
+    let machine = detached_x86_64_test_machine_profile();
     build_type_writeback_analysis_inner(
         input,
         None,
         Some(prep_facts),
-        None,
+        Some(&machine),
         &x86_64_register_identity(),
     )
 }
@@ -4535,13 +4539,23 @@ fn build_type_writeback_analysis_with_semantics(
     input: DerivedTypeWritebackAnalysisInput<'_>,
     semantic_inputs: DerivedTypeWritebackSemanticInputs<'_>,
 ) -> DerivedTypeWritebackAnalysis {
+    let machine = detached_x86_64_test_machine_profile();
     build_type_writeback_analysis_inner(
         input,
         Some(semantic_inputs),
         None,
-        None,
+        Some(&machine),
         &x86_64_register_identity(),
     )
+}
+
+#[cfg(test)]
+fn detached_x86_64_test_machine_profile() -> PreparedMachineVarProfile {
+    let architecture = r2ssa::MachineArchitectureFamily::X86_64;
+    PreparedMachineVarProfile {
+        architecture,
+        pointer_arg_slots: collect_pointer_arg_slot_map(architecture, 64),
+    }
 }
 
 pub fn build_source_owned_type_writeback_analysis(
@@ -4573,7 +4587,7 @@ pub fn build_source_owned_type_writeback_analysis(
     let inferred_signature = crate::infer_signature_from_prepared_ssa(source.as_ref());
     let recovered_vars = crate::prepare::recover_vars_from_prepared_ssa(source.as_ref(), ptr_bits);
     let mut diagnostics = TypeWritebackDiagnostics::default();
-    let arch_name = crate::prepare::prepared_arch_name(source.as_ref());
+    let arch_name = crate::prepare::prepared_arch_display_name(source.as_ref());
     let machine_profile = PreparedMachineVarProfile {
         architecture: source.machine_context().architecture_family(),
         pointer_arg_slots: collect_prepared_pointer_arg_slot_map(source.as_ref()),
@@ -5699,12 +5713,12 @@ fn local_struct_inference_from_function_blocks(
 
 pub fn infer_local_struct_artifacts_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_local_blocks(ssa_blocks);
-    let architecture = crate::prepare::legacy_architecture_family(arch_name);
+    let arch_name = crate::prepare::architecture_family_name(architecture);
     let pointer_arg_slots = collect_pointer_arg_slot_map(architecture, ptr_bits);
     infer_local_struct_artifacts_from_blocks(
         &blocks,
@@ -6769,10 +6783,7 @@ fn scalar_array_access_certificates_from_ssa(
     local_element_strides: &HashMap<usize, u64>,
     machine: ScalarArrayMachineProfile<'_>,
 ) -> ScalarArrayAccessCertificates {
-    let arch_name = machine.arch_name.filter(|name| !name.is_empty());
-    let architecture = machine
-        .architecture
-        .unwrap_or_else(|| crate::prepare::legacy_architecture_family(arch_name));
+    let architecture = machine.architecture;
     let detached_pointer_arg_slots;
     let pointer_arg_slot_map = match machine.pointer_arg_slots {
         Some(slots) => slots,
@@ -20526,7 +20537,7 @@ mod tests {
 
         let local_structs = infer_local_struct_artifacts_from_ssa(
             &ssa_blocks,
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             64,
             &mut diagnostics,
         );
@@ -20641,7 +20652,7 @@ mod tests {
 
         let local_structs = infer_local_struct_artifacts_from_ssa(
             &ssa_blocks,
-            Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
             64,
             &mut diagnostics,
         );

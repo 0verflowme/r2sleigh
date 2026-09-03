@@ -337,7 +337,7 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
         r2ssa::SsaArtifact::for_patterns(blocks, Some(&arch)).expect("pattern SSA fixture");
     let inferred = r2types::recover_signature_params_from_ssa(
         &prepared_ssa.local_ssa_blocks(),
-        Some("x86-64"),
+        r2ssa::MachineArchitectureFamily::X86_64,
         &std::collections::HashMap::new(),
         false,
         64,

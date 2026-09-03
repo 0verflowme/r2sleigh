@@ -197,53 +197,18 @@ pub fn recover_vars_arch_profile(
     }
 }
 
-pub(crate) fn legacy_architecture_family(
-    arch_name: Option<&str>,
-) -> r2ssa::MachineArchitectureFamily {
-    use r2ssa::MachineArchitectureFamily;
-
-    match arch_name
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("x86") | Some("x86-32") | Some("i386") | Some("i686") => {
-            MachineArchitectureFamily::X86
-        }
-        Some("x86-64") | Some("x86_64") | Some("x64") | Some("amd64") => {
-            MachineArchitectureFamily::X86_64
-        }
-        Some("arm") => MachineArchitectureFamily::Arm,
-        Some("aarch64") | Some("arm64") => MachineArchitectureFamily::AArch64,
-        Some("riscv32") | Some("rv32") => MachineArchitectureFamily::RiscV32,
-        Some("riscv64") | Some("rv64") => MachineArchitectureFamily::RiscV64,
-        Some("mips") | Some("mips32") => MachineArchitectureFamily::Mips32,
-        Some("mips64") => MachineArchitectureFamily::Mips64,
-        Some("ppc") | Some("powerpc") | Some("powerpc32") => MachineArchitectureFamily::PowerPc32,
-        Some("ppc64") | Some("powerpc64") => MachineArchitectureFamily::PowerPc64,
-        _ => MachineArchitectureFamily::Unknown,
-    }
-}
-
-fn arch_is_x86_64_sysv_like(arch_name: Option<&str>) -> bool {
-    let Some(arch_name) = arch_name else {
-        return false;
-    };
-    let arch_name = arch_name.to_ascii_lowercase();
-    arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || (arch_name.contains("x86") && arch_name.contains("64"))
+fn arch_is_x86_64_sysv_like(architecture: r2ssa::MachineArchitectureFamily) -> bool {
+    matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64)
 }
 
 fn incoming_stack_arg_index(
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     base: &SSAVar,
     offset: i64,
     ptr_bits: u32,
     arg_reg_count: usize,
 ) -> Option<usize> {
-    if !arch_is_x86_64_sysv_like(arch_name)
+    if !arch_is_x86_64_sysv_like(architecture)
         || base.version != 0
         || !base.name.eq_ignore_ascii_case("rsp")
         || ptr_bits != 64
@@ -284,14 +249,14 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
     }
 }
 
-fn incoming_stack_arg_addr_temp<'a>(
-    op: &'a SSAOp,
-    arch_name: Option<&str>,
+fn incoming_stack_arg_addr_temp(
+    op: &SSAOp,
+    architecture: r2ssa::MachineArchitectureFamily,
     ptr_bits: u32,
     arg_reg_count: usize,
-) -> Option<(&'a SSAVar, &'a SSAVar, i64)> {
+) -> Option<(&SSAVar, &SSAVar, i64)> {
     let (dst, base, offset) = stack_addr_temp(op, &["rsp"])?;
-    if incoming_stack_arg_index(arch_name, base, offset, ptr_bits, arg_reg_count).is_some() {
+    if incoming_stack_arg_index(architecture, base, offset, ptr_bits, arg_reg_count).is_some() {
         Some((dst, base, offset))
     } else {
         None
@@ -417,14 +382,17 @@ pub fn merge_type_hint(hints: &mut HashMap<String, TypeHint>, key: String, incom
 pub fn collect_signature_type_evidence_context(
     ssa_blocks: &[SSABlock],
 ) -> SignatureTypeEvidenceContext {
-    collect_signature_type_evidence_context_with_arch(ssa_blocks, None)
+    collect_signature_type_evidence_context_with_arch(
+        ssa_blocks,
+        r2ssa::MachineArchitectureFamily::Unknown,
+    )
 }
 
 pub fn collect_signature_type_evidence_context_with_arch(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> SignatureTypeEvidenceContext {
-    let (_, stack_bases, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
+    let (_, stack_bases, _) = recover_vars_arch_profile(architecture);
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let pointer_pointee_width_bytes =
         infer_pointer_pointee_width_bytes(ssa_blocks, &pointer_vars, stack_bases);
@@ -446,20 +414,20 @@ pub fn collect_signature_type_evidence_context_with_arch(
 
 pub fn recover_signature_params_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
     ptr_bits: u32,
 ) -> Vec<RecoveredSignatureParam> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
     if arg_regs.is_empty() {
         return Vec::new();
     }
 
     let signature_evidence =
-        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, architecture);
     let (usage_reg_type_hints, _pointer_var_keys) =
-        infer_usage_register_type_hints(ssa_blocks, arch_name);
+        infer_usage_register_type_hints(ssa_blocks, architecture);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -480,7 +448,7 @@ pub fn recover_signature_params_from_ssa(
             match op {
                 SSAOp::IntAdd { .. } | SSAOp::IntSub { .. } => {
                     if let Some((dst, base, offset)) =
-                        incoming_stack_arg_addr_temp(op, arch_name, ptr_bits, arg_regs.len())
+                        incoming_stack_arg_addr_temp(op, architecture, ptr_bits, arg_regs.len())
                     {
                         let dst_key = ssa_var_block_key(block.addr, dst);
                         stack_addr_temps.insert(dst_key, (base.clone(), offset));
@@ -495,7 +463,7 @@ pub fn recover_signature_params_from_ssa(
                     if !control_return_targets.contains(&ssa_var_key(dst))
                         && let Some((base, offset)) = stack_addr_temps.get(&addr_key)
                         && let Some(index) = incoming_stack_arg_index(
-                            arch_name,
+                            architecture,
                             base,
                             *offset,
                             ptr_bits,
@@ -666,8 +634,10 @@ fn source_parameter_has_certified_memory_use(prepared: &r2ssa::SsaArtifact, inde
         })
 }
 
-pub(crate) fn prepared_arch_name(prepared: &r2ssa::SsaArtifact) -> Option<&'static str> {
-    match prepared.machine_context().architecture_family() {
+pub(crate) fn architecture_family_name(
+    architecture: r2ssa::MachineArchitectureFamily,
+) -> Option<&'static str> {
+    match architecture {
         r2ssa::MachineArchitectureFamily::X86 => Some("x86"),
         r2ssa::MachineArchitectureFamily::X86_64 => Some("x86-64"),
         r2ssa::MachineArchitectureFamily::Arm => Some("arm"),
@@ -680,6 +650,10 @@ pub(crate) fn prepared_arch_name(prepared: &r2ssa::SsaArtifact) -> Option<&'stat
         r2ssa::MachineArchitectureFamily::PowerPc64 => Some("powerpc64"),
         r2ssa::MachineArchitectureFamily::Unknown => None,
     }
+}
+
+pub(crate) fn prepared_arch_display_name(prepared: &r2ssa::SsaArtifact) -> Option<&'static str> {
+    architecture_family_name(prepared.machine_context().architecture_family())
 }
 
 fn prepared_register_name(prepared: &r2ssa::SsaArtifact, index: usize) -> Option<String> {
@@ -766,14 +740,14 @@ pub(crate) fn recover_vars_from_prepared_ssa(
 
 pub fn recover_vars_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
 ) -> Vec<RecoveredVariable> {
     recover_vars_from_ssa_with_prep_facts(
         ssa_blocks,
         None,
-        arch_name,
+        architecture,
         metadata_reg_type_hints,
         semantic_metadata_enabled,
     )
@@ -782,24 +756,23 @@ pub fn recover_vars_from_ssa(
 pub fn recover_vars_from_ssa_with_prep_facts(
     ssa_blocks: &[SSABlock],
     prep_facts: Option<&DecompilePrepFacts>,
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
 ) -> Vec<RecoveredVariable> {
     let mut vars = Vec::new();
     let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
-    let (arg_regs, stack_bases, frame_bases) =
-        recover_vars_arch_profile(legacy_architecture_family(arch_name));
-    let ptr_bits = if arch_is_x86_64_sysv_like(arch_name) {
+    let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
+    let ptr_bits = if arch_is_x86_64_sysv_like(architecture) {
         64
     } else {
         0
     };
     let signature_evidence =
-        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, architecture);
     let (usage_reg_type_hints, pointer_var_keys) =
-        infer_usage_register_type_hints(ssa_blocks, arch_name);
+        infer_usage_register_type_hints(ssa_blocks, architecture);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -851,7 +824,7 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                             StackVarRecoveryHint {
                                 type_override,
                                 stack_arg_index: incoming_stack_arg_index(
-                                    arch_name,
+                                    architecture,
                                     base,
                                     *offset,
                                     ptr_bits,
@@ -884,7 +857,7 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                             StackVarRecoveryHint {
                                 type_override,
                                 stack_arg_index: incoming_stack_arg_index(
-                                    arch_name,
+                                    architecture,
                                     base,
                                     *offset,
                                     ptr_bits,
@@ -2138,9 +2111,9 @@ fn infer_scalar_var_evidence_from_ssa(
 
 fn infer_usage_register_type_hints(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> (HashMap<String, TypeHint>, HashSet<String>) {
-    let (_, stack_bases, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
+    let (_, stack_bases, _) = recover_vars_arch_profile(architecture);
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let mut hints = HashMap::new();
 
@@ -2428,8 +2401,13 @@ mod tests {
             }],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "arg0");
@@ -2459,7 +2437,13 @@ mod tests {
                 .expect("unsigned metadata hint"),
         )]);
 
-        let params = recover_signature_params_from_ssa(&[block], Some("x86-64"), &hints, true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &hints,
+            true,
+            64,
+        );
 
         assert_eq!(
             params[0].initial_ty,
@@ -2494,7 +2478,7 @@ mod tests {
 
         let params = recover_signature_params_from_ssa(
             std::slice::from_ref(&block),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
@@ -2511,7 +2495,12 @@ mod tests {
             }
         );
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         let var = vars
             .iter()
             .find(|var| var.name == "arg2")
@@ -2574,7 +2563,7 @@ mod tests {
 
             let params = recover_signature_params_from_ssa(
                 &[block],
-                Some("x86-64"),
+                r2ssa::MachineArchitectureFamily::X86_64,
                 &HashMap::new(),
                 false,
                 64,
@@ -2619,8 +2608,13 @@ mod tests {
             ],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), false, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            false,
+            64,
+        );
         let first = params
             .iter()
             .find(|param| param.arg_index == 0)
@@ -2652,8 +2646,13 @@ mod tests {
             ],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "arg0");
@@ -2704,14 +2703,14 @@ mod tests {
         let custom = block_for_space(r2il::SpaceId::Custom(7));
         let ram_params = recover_signature_params_from_ssa(
             std::slice::from_ref(&ram),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
         );
         let custom_params = recover_signature_params_from_ssa(
             std::slice::from_ref(&custom),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
@@ -2719,8 +2718,18 @@ mod tests {
         assert!(ram_params.iter().any(|param| param.arg_index == 6));
         assert!(!custom_params.iter().any(|param| param.arg_index == 6));
 
-        let ram_vars = recover_vars_from_ssa(&[ram], Some("x86-64"), &HashMap::new(), true);
-        let custom_vars = recover_vars_from_ssa(&[custom], Some("x86-64"), &HashMap::new(), true);
+        let ram_vars = recover_vars_from_ssa(
+            &[ram],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
+        let custom_vars = recover_vars_from_ssa(
+            &[custom],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         assert!(ram_vars.iter().any(|var| var.kind == "s" && var.delta == 8));
         assert!(
             ram_vars
@@ -2771,7 +2780,7 @@ mod tests {
         let param_type_for_space = |space| {
             recover_signature_params_from_ssa(
                 &blocks_for_space(space),
-                Some("x86-64"),
+                r2ssa::MachineArchitectureFamily::X86_64,
                 &HashMap::new(),
                 false,
                 64,
@@ -2856,7 +2865,7 @@ mod tests {
 
         let params = recover_signature_params_from_ssa(
             &[entry, body],
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             false,
             64,
@@ -2904,7 +2913,10 @@ mod tests {
             ],
         };
 
-        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
 
         assert!(
             evidence
@@ -2955,7 +2967,10 @@ mod tests {
             ],
         };
 
-        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
 
         assert!(
             evidence
@@ -3031,8 +3046,10 @@ mod tests {
             ],
         };
 
-        let evidence =
-            collect_signature_type_evidence_context_with_arch(&[entry, body], Some("aarch64"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[entry, body],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
         assert!(
             evidence
                 .pointer_vars
@@ -3068,7 +3085,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         let stack_arg = vars
             .iter()
             .find(|var| var.kind == "s" && var.delta == 8)
@@ -3114,7 +3136,7 @@ mod tests {
         let vars = recover_vars_from_ssa_with_prep_facts(
             &[block],
             Some(&prep_facts),
-            Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
             &HashMap::new(),
             true,
         );
@@ -3150,7 +3172,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
 
         assert!(vars.iter().all(|var| !var.isarg));
         assert!(vars.iter().all(|var| var.delta != 8));
@@ -3175,7 +3202,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
 
         assert!(vars.is_empty());
     }
@@ -3191,8 +3223,13 @@ mod tests {
             }],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("aarch64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "arg1");
