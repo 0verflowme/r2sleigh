@@ -2007,10 +2007,38 @@ impl LegacyObservationJournal {
     ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(value, discharged)?);
+        targets.extend(self.discharged_instruction_targets(Some(value), discharged)?);
         let mut marked = expr;
         for id in self.allocate_many(targets)? {
             marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// Mark every cell the instructions a rendered statement discharges.
+    ///
+    /// The statement twin of [`Self::observe_discharged_expr`], for a
+    /// definition whose write projection stands for other instructions: a
+    /// write the machine projection certified as a zero-extension into its
+    /// carrier has spoken for the extensions that certified it, and those have
+    /// no statement of their own. The statement already carries its own value
+    /// and write markers from [`Self::observe_normalized_output_stmt`]; this
+    /// adds the discharged instructions' writes, operands and outputs, exact,
+    /// on the one occurrence that now renders them.
+    ///
+    /// Those operands read the very value the statement defines, so placement
+    /// is told which reads name what their own statement produced -- see
+    /// `Occurrence::self_defined` -- rather than being left to order a read of
+    /// the object before the write that assigns it.
+    pub(crate) fn observe_discharged_stmt(
+        &mut self,
+        discharged: &[InstId],
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let targets = self.discharged_instruction_targets(None, discharged)?;
+        let mut marked = stmt;
+        for id in self.allocate_many(targets)? {
+            marked = CStmt::observed(id, marked);
         }
         Ok(marked)
     }
@@ -2020,7 +2048,7 @@ impl LegacyObservationJournal {
     /// the caller has already marked, and every operand it read.
     fn discharged_instruction_targets(
         &mut self,
-        rendered: ValueId,
+        rendered: Option<ValueId>,
         discharged: &[InstId],
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
@@ -2047,7 +2075,7 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                if output != rendered {
+                if Some(output) != rendered {
                     self.value_slot(output)?;
                     targets.push(ObservationTarget::Value(output));
                 }
