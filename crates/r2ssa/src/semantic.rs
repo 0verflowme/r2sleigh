@@ -3040,6 +3040,102 @@ fn variadic_call_tail_arguments(
     tail
 }
 
+/// What a call boundary carries when nothing knows the callee's signature.
+struct ConventionCallBoundary {
+    calling_convention: String,
+    arguments: Vec<SourceCallArgumentFact>,
+    results: Vec<CallBoundaryValueFact>,
+}
+
+/// The arity a call takes from the convention when no prototype describes it.
+///
+/// A boundary otherwise completes in exactly one way, from a source-owned
+/// callsite interface, and that is the better answer wherever it exists. Where
+/// it does not -- an indirect call, a callee radare2 never resolved, a thunk --
+/// the alternative was not fewer facts but none: the boundary stayed
+/// incomplete, every obligation on it was seeded as an unknown effect, and the
+/// function refused. `sym._init` in a stock GCC binary refuses for exactly
+/// that, on the indirect `__gmon_start__` guard, and so does every import
+/// thunk and every tail call.
+///
+/// The rule is the one the project owner settled: the count comes from the
+/// convention's argument registers that this function provably wrote on the way
+/// to the call and that reach it. That is dataflow evidence rather than a
+/// guess, and it is the same evidence a variadic call's tail already rests on
+/// -- the same scan answers both, so the two cannot come to disagree about what
+/// counts as an argument. A call is a barrier in that scan, so a register left
+/// set by an earlier call's arguments is not mistaken for this call's, and a
+/// register this function never wrote ends the count: without a prototype
+/// saying an argument exists, an untouched register carrying whatever the
+/// function was entered with is no evidence that the call reads it.
+///
+/// The result is the convention's result register, and only when something
+/// reads it. A read after the call proves the callee returned a value there. No
+/// read proves nothing either way -- the callee may be `void`, or its result
+/// may simply be ignored -- and since nothing observes it, claiming one would
+/// add a local no reader ever names.
+///
+/// Where the convention itself is unknown there is no ground to stand on, and
+/// the boundary stays incomplete: the function refuses, which is the honest
+/// answer and the one this leaves in place for that case alone.
+fn convention_call_boundary(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    op_index: usize,
+) -> Option<ConventionCallBoundary> {
+    let convention = machine_context.convention_slots()?;
+    let mut arguments = Vec::new();
+    for (position, slot) in convention.argument_slots().iter().enumerate() {
+        let Ok(index) = u32::try_from(position) else {
+            break;
+        };
+        let Some(value) = reaching_variadic_tail_argument_in_block(
+            function,
+            graph,
+            machine_context,
+            block_addr,
+            op_index,
+            *slot,
+        ) else {
+            break;
+        };
+        arguments.push(SourceCallArgumentFact {
+            slot: CallBoundarySlot::Register {
+                index,
+                storage: *slot,
+            },
+            value: SourceCallArgumentValue::Value(value),
+        });
+    }
+
+    let results = convention
+        .result_slot()
+        .and_then(|storage| {
+            let value = call_result_value_after_call(
+                function,
+                graph,
+                machine_context,
+                block_addr,
+                op_index,
+                storage,
+            )?;
+            (!graph.use_sites(value).is_empty()).then_some(CallBoundaryValueFact {
+                slot: CallBoundarySlot::Register { index: 0, storage },
+                value,
+            })
+        })
+        .into_iter()
+        .collect();
+
+    Some(ConventionCallBoundary {
+        calling_convention: convention.calling_convention().to_string(),
+        arguments,
+        results,
+    })
+}
+
 fn collect_source_boundary_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -3144,6 +3240,22 @@ fn collect_source_boundary_facts(
                     boundary.complete = true;
                 }
             }
+        }
+        if !boundary.complete
+            && let Some(machine_context) = machine_context
+            && let Some((block_addr, op_index)) = graph.op_site_for_inst(call_site.at)
+            && let Some(convention) =
+                convention_call_boundary(function, graph, machine_context, block_addr, op_index)
+        {
+            boundary.calling_convention = Some(convention.calling_convention);
+            // Nothing said this callee is variadic, and the count came from
+            // the machine rather than from a prototype, so every argument
+            // found is a fixed one as far as anything here can tell.
+            boundary.variadic = Some(false);
+            boundary.fixed_argument_count = Some(convention.arguments.len());
+            boundary.arguments = convention.arguments;
+            boundary.results = convention.results;
+            boundary.complete = true;
         }
         facts.calls.insert(call_site.id, boundary);
     }

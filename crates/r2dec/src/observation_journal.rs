@@ -1566,10 +1566,37 @@ impl LegacyObservationJournal {
                 // not: a write projection narrower than the object, or a read
                 // that converts, is a real operation whatever the two sides
                 // are called.
-                let r2ssa::SSAOp::Copy { src, .. } = op else {
-                    continue;
+                // And the restore a call boundary makes. It is admitted here
+                // for exactly the reason an edge copy is -- both sides resolve
+                // to one binding, which is tested below -- and it is licensed
+                // by the convention fact it was built from rather than by its
+                // operation kind. The interference rule above declines a save
+                // and restore around a clobber *for want of proof* that
+                // nothing touched the object in between; here the source
+                // states that the callee leaves this carrier where it found
+                // it, and names the carrier it means, which is that proof. A
+                // restore the convention does not speak for is declined
+                // exactly as an unproven program copy is.
+                let src = match op {
+                    r2ssa::SSAOp::Copy { src, .. } => src,
+                    r2ssa::SSAOp::CallRestore { src, dst }
+                        if boundary_restores_carrier(source.source(), dst) =>
+                    {
+                        src
+                    }
+                    _ => continue,
                 };
-                if src.version == 0 && !copy_source_is_a_parameter(&plan, graph, src) {
+                // A restore's source is the carrier as the function was
+                // entered with it whenever the call is the first one, and that
+                // version-0 exclusion does not reach it: the reason for the
+                // exclusion is that a live-in register with no declaration is
+                // read before it is assigned, and the stack pointer has no
+                // declaration on either side of this copy, because the frame
+                // it addresses is not a C object at all.
+                if !matches!(op, r2ssa::SSAOp::CallRestore { .. })
+                    && src.version == 0
+                    && !copy_source_is_a_parameter(&plan, graph, src)
+                {
                     continue;
                 }
                 let mut program_copy = None;
@@ -1616,7 +1643,14 @@ impl LegacyObservationJournal {
                 let Some(input) = input else {
                     continue;
                 };
+                // A restore states the convention rather than performing a
+                // copy the program wrote, so the question this asks of a
+                // program copy -- did anything write the object between the
+                // value and the copy -- is the one the certificate already
+                // answered. The call is the only thing between the two sides,
+                // and the certificate is about exactly that call.
                 if let Some(inst) = program_copy
+                    && !matches!(op, r2ssa::SSAOp::CallRestore { .. })
                     && !nothing_wrote_the_object_between(&plan, graph, inst, input.value)
                 {
                     continue;
@@ -3532,6 +3566,40 @@ fn nothing_wrote_the_object_between(
                 )
             })
     })
+}
+
+/// Whether the convention proves that a call leaves this carrier untouched.
+///
+/// This is the third thing that may license a coalescing here, beside a
+/// storage span and a certified entity, and it is a proof rather than an
+/// exemption. The two rules above decline to fold a save and restore around a
+/// clobber because nothing shows the object survived the clobber; the source
+/// shows exactly that for this one carrier, in the same statement the restore
+/// was built from -- radare2 reads it off the calling convention and publishes
+/// it even for a function whose signature it never linked.
+///
+/// It asks the certificate rather than the operation, and the difference is
+/// the point: a restore whose carrier the convention does not name, or one in
+/// a function for which the source made no such statement, is declined and
+/// keeps its own object. Reaching for the operation kind instead would be the
+/// exemption this exists to avoid.
+fn boundary_restores_carrier(source: &r2ssa::SsaArtifact, dst: &r2ssa::SSAVar) -> bool {
+    let context = source.machine_context();
+    let Some(carrier) = context.stack_pointer_carrier() else {
+        return false;
+    };
+    let restored = context
+        .machine_roles()
+        .call_preserved_carriers()
+        .map_or_else(
+            || {
+                context.function_interface().is_some_and(
+                    r2ssa::SourceFunctionInterface::stack_pointer_preserved_across_calls,
+                )
+            },
+            |carriers| carriers.stack_pointer(),
+        );
+    restored && source.graph().canonical_storage_for_var(dst) == Some(carrier)
 }
 
 /// Whether a copy's undefined source is a value the signature declares.
