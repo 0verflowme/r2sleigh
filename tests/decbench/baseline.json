@@ -1,177 +1,277 @@
 {
   "functions": {
-    "bzip2recover/O0::bsClose": {
+    "bzip2/bzip2recover/O0::bsClose": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.8472222222222222,
         "ged": 8.0,
         "type_match": 0.5
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::bsGetBit": {
+    "bzip2/bzip2recover/O0::bsGetBit": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.375,
         "ged": 2.0,
         "type_match": 0.5
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::bsOpenReadStream": {
+    "bzip2/bzip2recover/O0::bsOpenReadStream": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.75,
         "ged": 6.0,
         "type_match": 0.0
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::bsOpenWriteStream": {
+    "bzip2/bzip2recover/O0::bsOpenWriteStream": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.75,
         "ged": 6.0,
         "type_match": 0.0
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::bsPutBit": {
+    "bzip2/bzip2recover/O0::bsPutBit": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.45588235294117646,
         "ged": 2.0,
         "type_match": 0.6666666666666666
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.05339805825242718,
         "ged": 5.0,
         "type_match": 0.0
       }
     },
-    "bzip2recover/O0::bsPutUChar": {
+    "bzip2/bzip2recover/O0::bsPutUChar": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.35135135135135137,
         "ged": 3.0,
         "type_match": 0.3333333333333333
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::bsPutUInt32": {
+    "bzip2/bzip2recover/O0::bsPutUInt32": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.5161290322580645,
         "ged": 3.0,
         "type_match": 0.6666666666666666
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::endsInBz2": {
+    "bzip2/bzip2recover/O0::endsInBz2": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.7777777777777778,
         "ged": 7.0,
         "type_match": 1.0
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.08866995073891626,
         "ged": 25.0,
         "type_match": 0.5
       }
     },
-    "bzip2recover/O0::entry.fini0": {
+    "bzip2/bzip2recover/O0::entry.fini0": {
       "decompiled": true,
       "reference": {},
+      "reference_decompiled": false,
       "scores": {
         "byte_match": 0.0
       }
     },
-    "bzip2recover/O0::main": {
+    "bzip2/bzip2recover/O0::main": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.533515731874145,
         "ged": 35.0,
         "type_match": 0.8333333333333334
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::mallocFail": {
+    "bzip2/bzip2recover/O0::mallocFail": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.9090909090909091,
         "ged": 0.0,
         "type_match": 1.0
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.18181818181818182,
         "ged": 0.0,
         "type_match": 0.0
       }
     },
-    "bzip2recover/O0::readError": {
+    "bzip2/bzip2recover/O0::readError": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.9130434782608695,
         "ged": 0.0
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.2549019607843137,
         "ged": 0.0
       }
     },
-    "bzip2recover/O0::sub_401285": {
+    "bzip2/bzip2recover/O0::sub_401285": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.0
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::sub_4017ef": {
+    "bzip2/bzip2recover/O0::sub_4017ef": {
       "decompiled": false,
       "reference": {
         "byte_match": 0.0
       },
+      "reference_decompiled": true,
       "scores": {}
     },
-    "bzip2recover/O0::tooManyBlocks": {
+    "bzip2/bzip2recover/O0::tooManyBlocks": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.9333333333333333,
         "ged": 0.0,
         "type_match": 1.0
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.14814814814814814,
         "ged": 0.0,
         "type_match": 0.0
       }
     },
-    "bzip2recover/O0::writeError": {
+    "bzip2/bzip2recover/O0::writeError": {
       "decompiled": true,
       "reference": {
         "byte_match": 0.9130434782608695,
         "ged": 0.0
       },
+      "reference_decompiled": true,
       "scores": {
         "byte_match": 0.2549019607843137,
         "ged": 0.0
       }
     }
   },
-  "schema_version": 1,
+  "groups": [
+    "bzip2/bzip2recover/O0"
+  ],
+  "reference": {
+    "decompiler": "angr",
+    "version": "9.3.3"
+  },
+  "schema_version": 2,
+  "selection": {
+    "cells": [
+      "bzip2/O0"
+    ],
+    "opt_levels": [
+      "O0"
+    ],
+    "projects": [
+      "bzip2"
+    ]
+  },
   "summary": {
-    "byte_match": {
-      "mean": 0.1402626086466144,
-      "n": 7
+    "metrics": {
+      "byte_match": {
+        "all_functions": {
+          "mean": 0.0613648912828938,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "native, higher_is_better"
+        },
+        "direction": "higher_is_better",
+        "reference_all_functions": {
+          "mean": 0.5640868542106698,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "native, higher_is_better"
+        },
+        "reference_rendered": {
+          "mean": 0.6016926444913812,
+          "n": 15
+        },
+        "rendered": {
+          "mean": 0.1402626086466144,
+          "n": 7
+        }
+      },
+      "ged": {
+        "all_functions": {
+          "mean": 0.26282051282051283,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "quality=1/(1+distance), higher_is_better"
+        },
+        "direction": "lower_is_better",
+        "reference_all_functions": {
+          "mean": 0.35726686507936506,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "quality=1/(1+distance), higher_is_better"
+        },
+        "reference_rendered": {
+          "mean": 5.538461538461538,
+          "n": 13
+        },
+        "rendered": {
+          "mean": 5.0,
+          "n": 6
+        }
+      },
+      "type_match": {
+        "all_functions": {
+          "mean": 0.03125,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "native, higher_is_better"
+        },
+        "direction": "higher_is_better",
+        "reference_all_functions": {
+          "mean": 0.40625,
+          "n": 16,
+          "refusal_value": 0.0,
+          "scale": "native, higher_is_better"
+        },
+        "reference_rendered": {
+          "mean": 0.5909090909090909,
+          "n": 11
+        },
+        "rendered": {
+          "mean": 0.125,
+          "n": 4
+        }
+      }
     },
-    "ged": {
-      "mean": 5.0,
-      "n": 6
-    },
-    "type_match": {
-      "mean": 0.125,
-      "n": 4
+    "population": {
+      "coverage": 0.4375,
+      "functions": 16,
+      "reference_coverage": 0.9375,
+      "reference_rendered": 15,
+      "rendered": 7
     }
   }
 }
