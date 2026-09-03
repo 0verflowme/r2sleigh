@@ -38,8 +38,12 @@ if [[ ${#functions[@]} -eq 0 ]]; then
     exit 70
 fi
 
+# A corpus may have no helpers at all -- the value corpus is deliberately all
+# leaves -- and bash 3.2, which is what /bin/bash is on macOS, treats "${a[@]}"
+# on an empty array as an unbound variable under `set -u`. The +expansion keeps
+# an empty helper list from aborting the sweep.
 command_text="a:sla; aaa"
-for function in "${functions[@]}" "${callees[@]}"; do
+for function in "${functions[@]}" ${callees[@]+"${callees[@]}"}; do
     command_text+="; ?e R2SLEIGH_CORPUS_BEGIN__${function}"
     command_text+="; s sym._${function}"
     command_text+="; pdd"

@@ -1,29 +1,46 @@
 #!/bin/bash
-# Build, render, and measure the 13-function x 6-configuration shape matrix.
+# Build, render, and measure a non-hash corpus across the six configurations.
+#
+# Defaults to the shape corpus, so `run_shapes.sh --gate shapes-measurement` is
+# exactly what it always was. `--corpus values` runs the value-hazard corpus
+# instead, with gates named for it. The file keeps its name because other work
+# is invoking it by that name right now; a rename would be the whole cost of
+# the generalisation and none of the benefit.
 #
 # This is a second semantic gate, deliberately separate from run_matrix.sh.
-# run_matrix.sh gates merges on 54 hash cells that all pass; these 78 cells
-# cover shapes that corpus cannot express -- a variadic call, a stack frame
-# read across calls, structs, arrays, recursion, signed division, a multi-word
-# return, a pointer to a pointer, an indirect call -- and many of them are
-# expected to be red today. That is the point: a gate that cannot see a defect
-# is worse than a red cell, and the three defects found by the external
-# benchmark this week were all invisible to the hash corpus.
+# run_matrix.sh gates merges on 54 hash cells that all pass; these cells cover
+# what that corpus cannot express, and many of them are expected to be red. That
+# is the point: a gate that cannot see a defect is worse than a red cell, and
+# the three defects found by the external benchmark were all invisible to the
+# hash corpus.
 #
-# Gates:
-#   shapes-measurement  every cell produced a record. This is the one that can
-#                       be required today: it fails only if the harness itself
-#                       stopped measuring, not if a rendering is wrong.
-#   shapes-snapshot     every rendering matches the recorded baseline hash.
-#   shapes-raw          the emitted C compiles strictly for every cell.
-#   shapes-differential every cell agrees with the source-built oracle.
+# Two corpora run through this script.
+#   shapes  program shapes -- a variadic call, a stack frame read across calls,
+#           structs, arrays, recursion, signed division, a multi-word return, a
+#           pointer to a pointer, an indirect call. These mostly fail *closed*:
+#           the renderer declines at a call boundary or a frame object and names
+#           the rule that declined.
+#   values  leaf functions with no calls, frames or aggregates, each isolating
+#           one arithmetic hazard. Nothing to decline on, so these fail *open*:
+#           a mistake is a plausible wrong number, which is the failure this
+#           project treats as worse than a refusal.
 #
-# Promotion. When a shape's cells reach `pass` on every correctness column, add
-# it to REQUIRED_DIFFERENTIAL below and it is gated from then on; when all
-# thirteen are listed there, `shapes-differential` becomes the gate CI runs and
-# this file's per-shape list can go. Promote a shape only on evidence from a
-# locked run -- tests/corpus/locked_shapes.sh -- never from a bare invocation,
-# because every worktree installs the plugin to the same place.
+# Gates, named for the corpus (<corpus>-measurement and so on):
+#   -measurement   every cell produced a record. This is the one that can be
+#                  required today: it fails only if the harness itself stopped
+#                  measuring, not if a rendering is wrong.
+#   -snapshot      every rendering matches the recorded baseline hash. Opt-in,
+#                  and deliberately not implied by the correctness gates.
+#   -raw           the emitted C compiles strictly for every cell.
+#   -differential  every cell agrees with the source-built oracle.
+#
+# Promotion. When a function's cells reach `pass` on every correctness column,
+# add it to REQUIRED_DIFFERENTIAL below and it is gated from then on; when every
+# function of a corpus is listed there, `<corpus>-differential` becomes the gate
+# CI runs and this file's per-function list can go. Promote only on evidence
+# from a locked run -- tests/corpus/locked_shapes.sh or locked_values.sh --
+# never from a bare invocation, because every worktree installs the plugin to
+# the same place.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -31,34 +48,50 @@ repo_root=$(cd "$script_dir/../.." && pwd)
 artifact_root="$script_dir/artifacts"
 accept_baseline=0
 gate=
+corpus=shapes
 while [[ $# -gt 0 ]]; do
     case $1 in
         --accept-baseline)
             accept_baseline=1
             shift
             ;;
+        --corpus)
+            if [[ $# -lt 2 ]]; then
+                echo "--corpus requires a name" >&2
+                exit 64
+            fi
+            corpus=$2
+            shift 2
+            ;;
         --gate)
             if [[ $# -lt 2 ]]; then
-                echo "--gate requires shapes-measurement, shapes-snapshot, shapes-raw, or shapes-differential" >&2
+                echo "--gate requires <corpus>-measurement, -snapshot, -raw, or -differential" >&2
                 exit 64
             fi
             gate=$2
             shift 2
             ;;
         *)
-            echo "usage: $0 [--accept-baseline] [--gate shapes-measurement|shapes-snapshot|shapes-raw|shapes-differential]" >&2
+            echo "usage: $0 [--accept-baseline] [--corpus shapes|values] --gate <corpus>-measurement|-snapshot|-raw|-differential" >&2
             exit 64
             ;;
     esac
 done
+case $corpus in
+    shapes|values) ;;
+    *)
+        echo "unsupported corpus: $corpus (shapes or values)" >&2
+        exit 64
+        ;;
+esac
 if [[ -z $gate ]]; then
-    echo "--gate is required: shapes-measurement, shapes-snapshot, shapes-raw, or shapes-differential" >&2
+    echo "--gate is required: ${corpus}-measurement, ${corpus}-snapshot, ${corpus}-raw, or ${corpus}-differential" >&2
     exit 64
 fi
 case $gate in
-    shapes-measurement|shapes-snapshot|shapes-raw|shapes-differential) ;;
+    "${corpus}-measurement"|"${corpus}-snapshot"|"${corpus}-raw"|"${corpus}-differential") ;;
     *)
-        echo "unsupported gate: $gate" >&2
+        echo "unsupported gate for corpus $corpus: $gate" >&2
         exit 64
         ;;
 esac
@@ -72,7 +105,7 @@ if ! grep -q '^Installed to ' "$install_log"; then
     exit 70
 fi
 
-provenance="$artifact_root/shapes-provenance.txt"
+provenance="$artifact_root/${corpus}-provenance.txt"
 {
     echo "git_head=$(git -C "$repo_root" rev-parse HEAD)"
     echo "git_branch=$(git -C "$repo_root" branch --show-current)"
@@ -95,26 +128,26 @@ for index in "${!configs[@]}"; do
     config=${configs[$index]}
     arch=${arches[$index]}
     level=${levels[$index]}
-    binary="$artifact_root/bin/shapes_${config}"
-    oracle="$artifact_root/bin/shapes_oracle_${config}"
-    dump="$artifact_root/dumps/shapes_out_${config}.txt"
+    binary="$artifact_root/bin/${corpus}_${config}"
+    oracle="$artifact_root/bin/${corpus}_oracle_${config}"
+    dump="$artifact_root/dumps/${corpus}_out_${config}.txt"
 
-    clang -arch "$arch" "-O$level" -o "$binary" "$script_dir/shapes.c"
+    clang -arch "$arch" "-O$level" -o "$binary" "$script_dir/${corpus}.c"
     clang -arch "$arch" "-O$level" -std=c11 -Wall -Wextra -Wpedantic -Werror \
-        -o "$oracle" "$script_dir/shapes_oracle.c"
-    "$script_dir/sweep.sh" "$binary" shapes > "$dump"
+        -o "$oracle" "$script_dir/${corpus}_oracle.c"
+    "$script_dir/sweep.sh" "$binary" "$corpus" > "$dump"
 
     python3 "$script_dir/verify_rendering.py" \
         "$config" \
-        --corpus shapes \
+        --corpus "$corpus" \
         --input "$dump" \
         --binary "$binary" \
         --oracle "$oracle" \
         --artifact-root "$artifact_root"
 done
 
-python3 - "$artifact_root/results" "$script_dir/raw-baseline-shapes-sha256.json" \
-    "$accept_baseline" "$gate" <<'PY'
+python3 - "$artifact_root/results" "$script_dir/raw-baseline-${corpus}-sha256.json" \
+    "$accept_baseline" "$gate" "$corpus" <<'PY'
 import json
 import os
 import sys
@@ -125,11 +158,12 @@ result_dir = Path(sys.argv[1])
 baseline_path = Path(sys.argv[2])
 accept_baseline = sys.argv[3] == "1"
 gate = sys.argv[4]
+corpus = sys.argv[5]
 sys.path.insert(0, str(baseline_path.parent))
 configs = ("x64_O0", "x64_O1", "x64_O2", "arm64_O0", "arm64_O1", "arm64_O2")
 import verify_rendering as verifier
 
-functions = tuple(verifier.CORPUS_SPECS["shapes"])
+functions = tuple(verifier.CORPUS_SPECS[corpus])
 # Shapes whose cells are known green and are gated from now on. Empty until the
 # first shape passes on all six configurations; see the promotion note at the
 # top of this script.
@@ -137,13 +171,13 @@ REQUIRED_DIFFERENTIAL: set[str] = set()
 
 expected_cells = len(configs) * len(functions)
 reports = [
-    json.loads((result_dir / f"shapes_{config}.json").read_text())
+    json.loads((result_dir / f"{corpus}_{config}.json").read_text())
     for config in configs
 ]
 entries = [entry for report in reports for entry in report["entries"]]
 if len(entries) != expected_cells:
     raise SystemExit(
-        f"shape matrix is incomplete: expected {expected_cells} entries, "
+        f"{corpus} matrix is incomplete: expected {expected_cells} entries, "
         f"found {len(entries)}"
     )
 keys = {(entry["config"], entry["function"]) for entry in entries}
@@ -151,7 +185,7 @@ expected_keys = {(config, function) for config in configs for function in functi
 if keys != expected_keys:
     missing = sorted(expected_keys - keys)
     unexpected = sorted(keys - expected_keys)
-    raise SystemExit(f"shape matrix key mismatch: missing={missing} unexpected={unexpected}")
+    raise SystemExit(f"{corpus} matrix key mismatch: missing={missing} unexpected={unexpected}")
 
 if accept_baseline:
     raw_hashes = {}
@@ -165,7 +199,7 @@ if accept_baseline:
     payload = {"schema_version": 1, "raw_sha256": dict(sorted(raw_hashes.items()))}
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        "w", dir=baseline_path.parent, prefix=".raw-baseline-shapes.", delete=False
+        "w", dir=baseline_path.parent, prefix=f".raw-baseline-{corpus}.", delete=False
     ) as temporary:
         json.dump(payload, temporary, indent=2, sort_keys=True)
         temporary.write("\n")
@@ -179,17 +213,17 @@ if accept_baseline:
                 "expected_sha256": actual,
                 "actual_sha256": actual,
             }
-        (result_dir / f"shapes_{report['config']}.json").write_text(
+        (result_dir / f"{corpus}_{report['config']}.json").write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n"
         )
 
 combined = {
     "schema_version": 1,
-    "corpus": "shapes",
+    "corpus": corpus,
     "expected_entries": expected_cells,
     "entries": entries,
 }
-matrix_path = result_dir / "shapes-matrix.json"
+matrix_path = result_dir / f"{corpus}-matrix.json"
 matrix_path.write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n")
 
 for score in (
@@ -204,7 +238,7 @@ for score in (
 # The per-cell map. This is the deliverable the gate exists for: what this
 # decompiler gets wrong outside hash functions, cell by cell.
 print()
-print("shape cells (raw / differential / named cause):")
+print(f"{corpus} cells (raw / differential / named cause):")
 for entry in sorted(entries, key=lambda item: (item["function"], item["config"])):
     key = f"{entry['config']}/{entry['function']}"
     differential = entry["differential"]
@@ -254,18 +288,18 @@ for entry in entries:
     for score in ("raw", "diagnostic", "differential"):
         if entry[score]["status"] == "not_run":
             failures.append(f"{key}: {score} was not measured")
-    gated = gate == "shapes-differential" or entry["function"] in REQUIRED_DIFFERENTIAL
+    gated = gate == f"{corpus}-differential" or entry["function"] in REQUIRED_DIFFERENTIAL
     # Snapshot is its own opt-in gate and is deliberately not implied by the
     # correctness ones. Sixty-four of these cells are refusal comments today;
     # pinning their text as the expected rendering would make every improvement
     # to the decompiler read as a regression, which is the corpus-as-specification
     # mistake this project has already paid for once.
-    if gate == "shapes-snapshot" and entry["snapshot"]["status"] not in {
+    if gate == f"{corpus}-snapshot" and entry["snapshot"]["status"] not in {
         "match",
         "accepted",
     }:
         failures.append(f"{key}: snapshot={entry['snapshot']['status']}")
-    if gate == "shapes-raw" or gated:
+    if gate == f"{corpus}-raw" or gated:
         if entry["raw"]["status"] != "pass":
             failures.append(f"{key}: raw={entry['raw']['status']}")
     if gated and (
