@@ -9477,3 +9477,28 @@ function and the halved gain would have travelled forward invisibly.
 Note also that `byte_match` and `type_match` are deterministic, unlike the
 timing figures corrected earlier in this document, so a single run of each tree
 settles a comparison between them. Only the timings need interleaving.
+
+## An unowned refusal that hides which argument failed
+
+`missing machine projection authorization` accounts for six of the seventy-two
+real-function refusals in the coverage baseline and sixteen of the seventy-eight
+shape cells. Three sites raise it, and they are not one problem.
+
+`memory_renderer.rs:81` was a store to a proven array element being rejected
+because the store-target predicate looked through `Paren` but not through an
+observation marker; that is fixed on the array branch.
+
+`calls.rs:144` is two callsites of one callee that would need different
+declarations, which refuses correctly and is the right answer.
+
+`calls.rs:308` is the one worth taking, and its defect is as much about
+diagnosis as about rendering. The site collects every call argument through
+`collect::<Option<Vec<_>>>()`, so a single argument that cannot be spelled
+becomes a refusal of the whole function, and the refusal says only that a
+projection authorization was missing. Which argument, and why, is discarded at
+exactly the point where it is known. Every other refusal on this branch has been
+made to name its subject -- placement now names the binding and its occurrences,
+the ledger names the layer and the obligation ids -- and this one has not, which
+is why it has stayed unowned while smaller causes were traced. Name the argument
+index and the value first, then the cause will be a short read rather than a
+hunt.
