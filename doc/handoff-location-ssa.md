@@ -10837,3 +10837,33 @@ present on both sides. The coverage report already records `decompiled` beside
 each score for exactly this reason; the noise columns do not, and a
 `cells_rendered` denominator printed beside them would make this class of
 mistake impossible rather than merely detectable.
+
+### Measured again after the call-restore work came back
+
+The fix above was measured against the tree with the call-restore work
+reverted. Integration reapplied it while this was in flight, so everything was
+run again on the merged tree:
+
+    cargo test --workspace                    2,066 passed, 0 failed
+    locked_matrix.sh --gate differential      differential 54/54, raw 54/54,
+                                              binding audit, effect obligations,
+                                              placement audit and render refusal
+                                              54/54 each
+    locked_coverage.sh                        328 of 517 rendered
+
+No cell refuses with `ambiguous_observation_execution_order` anywhere in the
+sweep. Two things still make those two scripts exit non-zero and neither is
+this work, both established by a controlled comparison rather than by
+inference:
+
+- **`x64_O0/murmur3_32` and `x64_O0/xxhash32` snapshot mismatches.** Rendering
+  both cells with and without this change, on the merged tree, gives
+  byte-identical output. `raw-baseline-sha256.json` was last blessed by
+  `bc5a76e`, which is an ancestor of the reapply, so the recorded hashes
+  describe the pre-reapply rendering. Whoever re-landed the call-restore work
+  owes that re-bless.
+- **`pinned_branchy_gcc_x64_O0::sym.pure_zero_guard` and `sym.slot_eq_guard`
+  refusing with `ExactUseRequiresRenderedOccurrence`.** Both render in the
+  whole-binary sweep taken from this worktree before the merge, with and
+  without this change, so they arrived with the reapply. They are the second of
+  the three regression families the coverage sweep found.
