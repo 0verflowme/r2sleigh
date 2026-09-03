@@ -1719,33 +1719,33 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
-    fn certified_call_result_owner_for_source(
+    fn certified_call_result_definition_for_source(
         &self,
         source_call: (u64, usize),
-    ) -> Option<&r2ssa::ValueOwner> {
+    ) -> Option<&r2types::CallResultFact> {
         let callsite = r2types::CallsiteKey {
             block_addr: source_call.0,
             op_index: source_call.1,
         };
-        self.inputs.call_result_facts()?.owner_for_site(callsite)
+        self.inputs
+            .call_result_facts()?
+            .definition_for_site(callsite)
     }
 
     fn certified_call_result_owner_expr_for_source(
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
-        match self.certified_call_result_owner_for_source(source_call)? {
-            r2ssa::ValueOwner::StackSlot { object, .. } => {
-                self.certified_stack_var_expr_for_object(*object)
+        let value = self
+            .certified_call_result_definition_for_source(source_call)?
+            .value;
+        match self.planned_value_expr(value) {
+            Ok(expr) => Some(expr),
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
+                None
             }
-            r2ssa::ValueOwner::Value(value) => match self.planned_value_expr(*value) {
-                Ok(expr) => Some(expr),
-                Err(error) => {
-                    self.retain_first_observation_error(error);
-                    self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                    None
-                }
-            },
         }
     }
 
@@ -1804,13 +1804,7 @@ impl<'a> FoldingContext<'a> {
     /// nothing. What the statement assigns is this value, and naming it is what
     /// lets the obligation be discharged by the statement that renders it.
     pub(super) fn certified_call_result_value(&self, site: (u64, usize)) -> Option<ValueId> {
-        let view = self.prepared_semantic_view()?;
-        view.call_result_facts_by_value
-            .values()
-            .find(|cert| {
-                (cert.callsite.block_addr, cert.callsite.op_index) == site
-                    && cert.relation.is_identity()
-            })
+        self.certified_call_result_definition_for_source(site)
             .map(|cert| cert.value)
     }
 
@@ -1824,11 +1818,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         site: (u64, usize),
     ) -> Option<(u64, usize)> {
-        let view = self.prepared_semantic_view()?;
-        let cert = view.call_result_facts_by_value.values().find(|cert| {
-            (cert.callsite.block_addr, cert.callsite.op_index) == site
-                && cert.relation.is_identity()
-        })?;
+        let cert = self.certified_call_result_definition_for_source(site)?;
         let graph = self.inputs.prepared_ssa?.graph();
         graph.op_site_for_inst(graph.def_inst(cert.value)?)
     }

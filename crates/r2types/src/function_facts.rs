@@ -81,6 +81,30 @@ impl FunctionCallResultFacts {
             .filter_map(|value| self.by_value.get(value))
     }
 
+    /// The value the call boundary itself defines.
+    ///
+    /// A result may acquire a stable stack owner after copies, a store and a
+    /// reload. That owner is useful for later reads, but it is not the value
+    /// whose definition the call statement renders. The boundary definition is
+    /// the earliest identity result carried in a register; propagated identity
+    /// results occur later. A tie is ambiguous and therefore remains unowned.
+    pub fn definition_for_site(&self, callsite: CallsiteKey) -> Option<&CallResultFact> {
+        let is_boundary_definition = |result: &CallResultFact| {
+            result.relation.is_identity()
+                && matches!(result.carrier, r2ssa::ReturnCarrier::Register { .. })
+        };
+        let earliest = self
+            .results_for_site(callsite)
+            .filter(|result| is_boundary_definition(result))
+            .map(|result| result.at)
+            .min()?;
+        let mut definitions = self
+            .results_for_site(callsite)
+            .filter(|result| is_boundary_definition(result) && result.at == earliest);
+        let definition = definitions.next()?;
+        definitions.next().is_none().then_some(definition)
+    }
+
     pub fn owner_for_site(&self, callsite: CallsiteKey) -> Option<&r2ssa::ValueOwner> {
         let direct_stack_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
             result.relation.is_identity()
@@ -5646,6 +5670,69 @@ mod tests {
                 .and_then(|results| results.owner_for_site(callsite)),
             Some(&owner),
             "call-result owner lookup must be available by callsite"
+        );
+    }
+
+    #[test]
+    fn call_result_definition_is_not_replaced_by_a_later_stack_owner() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 7,
+        };
+        let defined = r2ssa::ValueId(20);
+        let stored = r2ssa::ValueId(21);
+        let storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0x10,
+            size: 8,
+        };
+        let stack_owner = r2ssa::ValueOwner::StackSlot {
+            object: r2ssa::ObjectId(3),
+            offset: -8,
+        };
+        let call_results = FunctionCallResultFacts {
+            by_value: BTreeMap::from([
+                (
+                    defined,
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(8),
+                        value: defined,
+                        width: 8,
+                        relation: r2ssa::CallResultValueRelation::Identity,
+                        carrier: r2ssa::ReturnCarrier::Register { storage },
+                        owner: Some(r2ssa::ValueOwner::Value(defined)),
+                    },
+                ),
+                (
+                    stored,
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(9),
+                        value: stored,
+                        width: 8,
+                        relation: r2ssa::CallResultValueRelation::Identity,
+                        carrier: r2ssa::ReturnCarrier::Register { storage },
+                        owner: Some(stack_owner.clone()),
+                    },
+                ),
+            ]),
+            by_callsite: BTreeMap::from([(callsite, vec![defined, stored])]),
+        };
+
+        assert_eq!(
+            call_results
+                .definition_for_site(callsite)
+                .map(|result| result.value),
+            Some(defined),
+            "the call statement must keep the boundary definition the binding plan can spell"
+        );
+        assert_eq!(
+            call_results.owner_for_site(callsite),
+            Some(&stack_owner),
+            "the later stable owner remains available for subsequent result flow"
         );
     }
 
