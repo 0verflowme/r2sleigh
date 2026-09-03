@@ -8886,11 +8886,36 @@ functions in three binaries, four had a refused obligation:
 The two are different problems and only one of them is about the decompiler's
 ability to read a program.
 
-**`ssa/unsupported-effect`** appears entirely in `_init` and `entry.init0` of
-the pinned GCC binaries, at a single address. Those are compiler-generated
-stubs whose effects the SSA layer declines to model. Whether they are worth
-modelling at all is a scope question rather than a defect, and their share of
-the count makes the ledger cause look larger than the part that matters.
+**`ssa/unsupported-effect`** was written up here as a scope question about
+compiler stubs. That was wrong, and tracing it took twenty minutes. It is one
+unimplemented rule, and the same rule accounts for three other symptoms this
+branch is chasing separately.
+
+The obligations refuse at `crates/r2dec/src/effect_ledger.rs:78`, which turns
+`VolatileOrUnknownEffect` into a refusal unconditionally. That is the report,
+not the cause. The kind is minted at `crates/r2ssa/src/obligation.rs:519`,
+whenever a call boundary is not `complete`. And a boundary becomes complete in
+exactly one place, `crates/r2ssa/src/semantic.rs:3144`, reached only when
+`machine_context.call_site_interface` returns an interface for the site. The
+field's own comment says so: "Only an exact source-owned callsite interface may
+change this state to complete."
+
+So a call radare2 could not resolve to a callee has no interface, never
+completes, and every obligation it carries is refused. The refusing stub is
+precisely that shape. `sym._init` in the pinned GCC binary disassembles to
+`endbr64; sub rsp,8; mov rax,[rip+0x2fd1]; test rax,rax; je +2; call rax;
+add rsp,8; ret` — the `ff d0` at `0x401014` is an indirect call through a
+register, the standard `__gmon_start__` guard. Nothing about it is a compiler
+oddity worth excusing.
+
+The owner settled the second path years of this branch have needed: a call
+whose signature nothing knows takes its arity from the convention's argument
+registers that are provably written before the call and live into it. That rule
+would complete such a boundary. It is not implemented, and its absence is the
+single cause behind four things counted separately until now: these 22 refused
+obligations, the call that renders `f()` with an empty argument list under a
+proof line saying nothing was refused, the import thunks that transfer through
+a value, and the direct tail call. They are one defect seen from four sides.
 
 **`codegen/block-not-rendered`** is the real one. A block exists in the SSA,
 produces live values, and never reached the output, so the obligations of the
