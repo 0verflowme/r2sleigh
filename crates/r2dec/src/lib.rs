@@ -5489,16 +5489,31 @@ fn restate_string_conversions_in_expr(
                 | BinaryOp::BitXor
         )
     {
-        // Only an address is given a requirement here. The operator's own
-        // operand rule was settled when the expression was built, and
-        // restating it from this pass -- which knows the address width and
-        // nothing else -- would widen a narrow computation to the address
-        // width and change what it computes.
+        // An address takes the address integer, because arithmetic on an
+        // address is arithmetic on a number. The operator's own operand rule
+        // is otherwise left alone: restating it from this pass, which knows
+        // the address width and nothing else, would widen a narrow
+        // computation and change what it computes.
+        //
+        // A literal is the exception, and only for the operators whose
+        // operands C converts to the result's type. There the type the whole
+        // expression is read at is the type the operand is read at, so a
+        // literal the renderer spells as a negative -- an `int` to the
+        // compiler whatever value it denotes -- can be given that type. A
+        // shift's count is not such an operand: it keeps its own type, and
+        // saying otherwise would be a claim about a different thing.
         let address = CType::uint(pointer_bits);
-        for operand in [left, right] {
-            let wanted = substituted_address_under_conversions(operand)
-                .is_some()
-                .then_some(&address);
+        let converted_together = !matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+        for (index, operand) in [left, right].into_iter().enumerate() {
+            let wanted = if substituted_address_under_conversions(operand).is_some() {
+                Some(&address)
+            } else if (index == 0 || converted_together)
+                && crate::fold::op_lower::convert::literal_renders_as_signed(operand)
+            {
+                required
+            } else {
+                None
+            };
             restate_string_conversions_in_expr(operand, pointer_bits, wanted, symbols);
         }
         return;
