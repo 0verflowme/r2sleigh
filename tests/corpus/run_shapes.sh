@@ -121,20 +121,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 result_dir = Path(sys.argv[1])
 baseline_path = Path(sys.argv[2])
 accept_baseline = sys.argv[3] == "1"
 gate = sys.argv[4]
+sys.path.insert(0, str(baseline_path.parent))
 configs = ("x64_O0", "x64_O1", "x64_O2", "arm64_O0", "arm64_O1", "arm64_O2")
-functions = (
-    "shape_variadic", "shape_variadic_local", "shape_call_chain",
-    "shape_struct_pointer", "shape_struct_value", "shape_struct_array",
-    "shape_stack_buffer", "shape_recurse_direct", "shape_recurse_mutual",
-    "shape_signed_divmod", "shape_multiword_return",
-    "shape_pointer_to_pointer", "shape_function_pointer",
-)
+import verify_rendering as verifier
+
+functions = tuple(verifier.CORPUS_SPECS["shapes"])
 # Shapes whose cells are known green and are gated from now on. Empty until the
 # first shape passes on all six configurations; see the promotion note at the
 # top of this script.
