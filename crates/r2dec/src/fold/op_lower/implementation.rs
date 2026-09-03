@@ -3315,6 +3315,13 @@ impl<'a> FoldingContext<'a> {
                 let rhs = self.assignment_rhs_from_source_type(dst, returned, call);
                 self.assign_stmt(lhs, rhs)
             }
+            // The carrier a call left where it found it. Nothing in C says
+            // that, and nothing needs to: the value after the call is the
+            // value before it, and every reader is planned against the value
+            // rather than against a name this would assign. Rendering an
+            // assignment here would state the frame's own plumbing as a
+            // statement, which is what the frame certificates elide.
+            SSAOp::CallRestore { .. } => None,
             SSAOp::Nop => None,
             // A trap. `__builtin_trap` is a real compiler builtin, so the
             // emitted C still compiles standalone with nothing declared, and it
