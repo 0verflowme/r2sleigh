@@ -540,8 +540,16 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Whether this expression can stand on the left of an assignment.
+    ///
+    /// The question is about syntax, so it is asked of the syntax: an
+    /// observation marker records who accounts for a node and changes nothing
+    /// about what the node *is*, exactly as a parenthesis does not. Asking it
+    /// of the marked node instead rejected every store whose target the
+    /// rewriter had proved to be an array element, because the subscript path
+    /// marks the address it renders and the dereference path does not.
     fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
-        match expr {
+        match expr.unobserved() {
             CExpr::Var(_)
             | CExpr::Deref(_)
             | CExpr::Subscript { .. }
