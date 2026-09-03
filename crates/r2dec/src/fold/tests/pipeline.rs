@@ -2516,6 +2516,38 @@ mod tests {
     }
 
     #[test]
+    fn certified_call_args_refuse_without_binding_plan_spelling() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
+            .with_name("call_arg_without_spelling_authority");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        enter_exact_test_site(&ctx, block.addr, 2);
+        assert_eq!(
+            ctx.op_to_stmt_with_args(&block.ops[2], block.addr, 2),
+            Err(OpLoweringRefusal::missing_machine_projection()),
+            "a certified position without binding-plan spelling authority must refuse the call"
+        );
+    }
+
+    #[test]
     fn certified_call_args_take_spelling_only_from_binding_plan() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -2557,13 +2589,6 @@ mod tests {
         );
 
         let block = prepared.function().get_block(0x1000).expect("entry");
-        enter_exact_test_site(&ctx, block.addr, 3);
-        assert_eq!(
-            ctx.op_to_stmt_with_args(&block.ops[3], block.addr, 3),
-            Err(OpLoweringRefusal::missing_machine_projection()),
-            "a certified position without binding-plan spelling authority must refuse the call"
-        );
-
         let (_plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
         for value in &argument_values {
             assert!(
