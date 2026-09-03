@@ -705,6 +705,8 @@ mod tests {
                             .enumerate()
                             .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
                             .collect(),
+                        variadic: cert.variadic,
+                        fixed_argument_count: cert.fixed_argument_count,
                         register_argument_locations,
                         stack_argument_locations,
                     },
@@ -925,7 +927,9 @@ mod tests {
         // A narrow register write as the lift states it: the arithmetic write,
         // then Sleigh's own extension of the whole carrier. An arithmetic write
         // rather than a copy so the narrow value survives as its own
-        // definition instead of being folded into its uses.
+        // definition instead of being folded into its uses -- and each of the
+        // extra readers below is itself read, because a reader nothing
+        // observes is elided and no longer counts against folding.
         entry.push(R2ILOp::IntAdd {
             dst: Varnode::register(0, 4),
             a: Varnode::register(0, 4),
@@ -935,11 +939,16 @@ mod tests {
             dst: Varnode::register(0, 8),
             src: Varnode::register(0, 4),
         });
-        for offset in [0x20, 0x28] {
+        for (offset, address) in [(0x20, 0x2010), (0x28, 0x2018)] {
             entry.push(R2ILOp::IntAdd {
                 dst: Varnode::unique(offset, 4),
                 a: Varnode::register(0, 4),
                 b: Varnode::constant(1, 4),
+            });
+            entry.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(address, 8),
+                val: Varnode::unique(offset, 4),
             });
         }
         entry.push(R2ILOp::Store {
@@ -1497,6 +1506,18 @@ mod tests {
                 && ctx
                     .source_inst_for_normalized_op(block.addr, prefix_idx)
                     .is_some_and(|prefix_inst| target_definitions.contains(&prefix_inst))
+            {
+                continue;
+            }
+            // What `fold_block` does before it lowers anything: a definition
+            // the plan inlines has no statement, and asking for one requests
+            // the name the plan deliberately withheld. A call's arguments are
+            // now foldable -- the callsite certificate is a reader even though
+            // the graph records none -- so the staging writes reach this and
+            // the loop has to skip them exactly as the folder does.
+            if block.ops[prefix_idx]
+                .dst()
+                .is_some_and(|dst| ctx.should_inline(dst))
             {
                 continue;
             }
@@ -2559,7 +2580,16 @@ mod tests {
         let expected = ctx
             .planned_value_expr(arg_value)
             .expect("the plan spells every certified argument value");
-        assert_eq!(argument.unobserved(), &expected);
+        // Through the markers, not around them. Asking the plan a second time
+        // allocates fresh observation ids, so two spellings of one value are
+        // equal as expressions and unequal as trees; `unobserved` strips only
+        // the outermost marker, which was enough while an argument was always
+        // a bound name and is not now that it can be a folded expression
+        // carrying the cells of the definition it replaced.
+        assert!(
+            argument.transparently_eq(&expected),
+            "argument {argument:?} is not the plan's spelling {expected:?}"
+        );
         assert!(
             matches!(argument, CExpr::Observed { .. }),
             "a call argument is a read and must carry its read marker: {argument:?}"

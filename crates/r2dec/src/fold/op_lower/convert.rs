@@ -160,12 +160,21 @@ fn renders_as_signed(expr: &CExpr) -> bool {
     }
 }
 
+/// Respell a literal only where the target type reads it as a different
+/// number.
+///
+/// A constant already spelled as a non-negative decimal converts exactly to
+/// every integer type that holds it, so `7` is `7` whatever reads it, and
+/// respelling it `7U` adds a suffix that says nothing while making one
+/// spelling of an argument differ from the plan's. The one reinterpretation
+/// that matters is a value whose high bit is set at the width a *signed*
+/// type reads it at: `0xffffffff` read as an `int32_t` is `-1`, and spelling
+/// it as the number it denotes is what makes the C say what the machine does.
 fn respell_literal(expr: CExpr, signed: bool, bits: u32) -> CExpr {
     match expr {
         CExpr::Observed { id, expr } => CExpr::observed(id, respell_literal(*expr, signed, bits)),
         CExpr::Paren(inner) => CExpr::Paren(Box::new(respell_literal(*inner, signed, bits))),
-        CExpr::UIntLit(value) => crate::typed_integer_literal_expr(value, signed, bits),
-        CExpr::IntLit(value) => crate::typed_integer_literal_expr(value as u64, signed, bits),
+        CExpr::UIntLit(value) if signed => crate::typed_integer_literal_expr(value, signed, bits),
         other => other,
     }
 }

@@ -197,13 +197,24 @@ impl CodeGenerator {
             self.output.push_str(&declaration.name);
             self.output.push('(');
             match &declaration.params {
-                Some(params) if params.is_empty() => self.output.push_str("void"),
+                // C has no spelling for a function whose whole parameter list
+                // is an ellipsis, so a variadic callee with no named
+                // parameters is declared with an unspecified list instead: it
+                // accepts the arguments the call passes, which is the point,
+                // and asserts nothing else.
+                Some(params) if params.is_empty() => {
+                    self.output
+                        .push_str(if declaration.variadic { "" } else { "void" });
+                }
                 Some(params) => {
                     for (index, param) in params.iter().enumerate() {
                         if index > 0 {
                             self.output.push_str(", ");
                         }
                         self.emit_type(param);
+                    }
+                    if declaration.variadic {
+                        self.output.push_str(", ...");
                     }
                 }
                 None => {}
@@ -1139,6 +1150,63 @@ mod tests {
         let code = generate(&func);
         assert!(code.contains("int32_t add(int32_t a, int32_t b)"));
         assert!(code.contains("return a + b;"));
+    }
+
+    /// One declaration has to serve every call to the callee, and two calls to
+    /// a variadic callee legitimately pass different numbers of arguments. The
+    /// ellipsis is what makes both of them legal C; a fixed list would
+    /// contradict one of them.
+    #[test]
+    fn a_variadic_callee_is_declared_with_an_ellipsis() {
+        let symbols = test_table();
+        let declaration = |params: Option<Vec<CType>>, variadic: bool| {
+            let func = CFunction {
+                externs: vec![crate::ast::CExternDecl {
+                    name: "sym_imp_fprintf".to_string(),
+                    ret_type: CType::uint(64),
+                    params,
+                    variadic,
+                }],
+                extern_objects: Vec::new(),
+                name: "caller".to_string(),
+                ret_type: CType::Void,
+                params: Vec::new(),
+                locals: Vec::new(),
+                body: Vec::new(),
+                params_known: true,
+                symbols: std::rc::Rc::clone(&func_symbols(&symbols)),
+            };
+            generate(&func)
+        };
+
+        let named = vec![CType::uint(64), CType::uint(64)];
+        assert!(
+            declaration(Some(named.clone()), true)
+                .contains("uint64_t sym_imp_fprintf(uint64_t, uint64_t, ...);"),
+            "a variadic callee keeps its named parameters and gains the ellipsis"
+        );
+        assert!(
+            declaration(Some(named), false)
+                .contains("uint64_t sym_imp_fprintf(uint64_t, uint64_t);"),
+            "a callee that is not variadic is declared with exactly its parameters"
+        );
+        // C has no spelling for a parameter list that is only an ellipsis, so
+        // an unspecified list stands in: it accepts what the call passes and
+        // asserts nothing, where `void` would say the callee takes nothing.
+        assert!(
+            declaration(Some(Vec::new()), true).contains("uint64_t sym_imp_fprintf();"),
+            "a variadic callee with no named parameters asserts no parameter list"
+        );
+        assert!(
+            declaration(Some(Vec::new()), false).contains("uint64_t sym_imp_fprintf(void);"),
+            "an empty recovered list means the callee takes nothing"
+        );
+    }
+
+    fn func_symbols(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>> {
+        std::rc::Rc::new(std::cell::RefCell::new(symbols.borrow().clone()))
     }
 
     #[test]

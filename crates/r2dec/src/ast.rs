@@ -1173,6 +1173,14 @@ pub struct CExternDecl {
     pub ret_type: CType,
     /// The callee's parameter types, or `None` when they are unknown.
     pub params: Option<Vec<CType>>,
+    /// Whether the callee takes a variadic tail.
+    ///
+    /// One declaration has to describe every call to the callee in this
+    /// function, and a fixed parameter list cannot describe two calls that
+    /// pass different numbers of arguments. Declaring the ellipsis is what
+    /// makes both of them legal C rather than a call the declaration
+    /// contradicts.
+    pub variadic: bool,
 }
 
 /// A function parameter.

@@ -4537,7 +4537,65 @@ static void sleigh_taint_plan_stats_fini(SleighTaintPlanStats *stats) {
  * contributes is targets for transfers radare2 could not follow and blocks
  * nothing reaches, so a function whose every transfer already has a known
  * target has nothing here to find. The deep pass takes them all regardless. */
-static bool sleigh_function_may_prove(RAnalFunction *fcn) {
+/* Address of a block's last instruction, or the block's own address when
+ * radare2 recorded no instruction positions for it. */
+static ut64 sleigh_block_last_instruction(const RAnalBlock *bb) {
+	if (!bb) {
+		return UT64_MAX;
+	}
+	if (bb->ninstr > 1 && bb->op_pos) {
+		return bb->addr + bb->op_pos[bb->ninstr - 2];
+	}
+	return bb->addr;
+}
+
+/* Does this block end in a transfer radare2 could not resolve?
+ *
+ * The predicate this replaces asked whether the block had no successor, which
+ * reads as "radare2 did not know where this goes" and is not what it means: a
+ * block ending in `ret` has no successor either. Every function has a return
+ * block, so the filter admitted every function, `skipped` was 0 on every
+ * binary, and the proof sweep lifted and proved the whole program at `aaa`
+ * time. Measured on bzip2recover, that took analysis from 0.68 seconds to
+ * 11.98 and then refused the remainder against its own ten-second budget.
+ *
+ * What the prover actually reads is a dispatch it can resolve and radare2
+ * cannot, so ask the instruction, not the edge. */
+static bool sleigh_block_ends_unresolved(RAnal *anal, const RAnalBlock *bb) {
+	if (!anal || !bb || bb->size == 0) {
+		return false;
+	}
+	ut64 at = sleigh_block_last_instruction (bb);
+	if (at == UT64_MAX) {
+		return false;
+	}
+	ut8 buf[32] = {0};
+	int len = (int)R_MIN ((ut64)sizeof (buf), bb->addr + bb->size - at);
+	if (len <= 0 || !anal->iob.read_at || !anal->iob.read_at (anal->iob.io, at, buf, len)) {
+		return false;
+	}
+	RAnalOp op = {0};
+	r_anal_op_init (&op);
+	bool unresolved = false;
+	if (r_anal_op (anal, &op, at, buf, len, R_ARCH_OP_MASK_BASIC) > 0) {
+		/* The register, indirect and conditional bits are modifiers on a base
+		 * type, so strip them and compare the base rather than enumerating
+		 * every combination and missing one. A jump whose target is read from
+		 * memory keeps the MEM bit instead, and is the import-thunk shape the
+		 * prover resolves, so it counts too. */
+		const ut32 type = (ut32)(op.type & R_ANAL_OP_TYPE_MASK);
+		const ut32 base = type & ~(ut32)(R_ANAL_OP_TYPE_REG
+			| R_ANAL_OP_TYPE_IND | R_ANAL_OP_TYPE_COND);
+		unresolved = base == R_ANAL_OP_TYPE_UJMP
+			|| base == R_ANAL_OP_TYPE_UCALL
+			|| base == (R_ANAL_OP_TYPE_JMP | R_ANAL_OP_TYPE_MEM)
+			|| base == (R_ANAL_OP_TYPE_CALL | R_ANAL_OP_TYPE_MEM);
+	}
+	r_anal_op_fini (&op);
+	return unresolved;
+}
+
+static bool sleigh_function_may_prove(RAnal *anal, RAnalFunction *fcn) {
 	if (!fcn || !fcn->bbs) {
 		return false;
 	}
@@ -4550,9 +4608,7 @@ static bool sleigh_function_may_prove(RAnalFunction *fcn) {
 		if (bb->switch_op) {
 			return true;
 		}
-		/* A block ending with no known successor ended in a transfer radare2
-		 * could not resolve, which is what the prover reads. */
-		if (bb->jump == UT64_MAX && bb->fail == UT64_MAX) {
+		if (sleigh_block_ends_unresolved (anal, bb)) {
 			return true;
 		}
 	}
@@ -5027,7 +5083,7 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		 * is the engine's rather than ours. */
 		SleighArtifactPlan proof_plan;
 		const bool proof_eligible = post_mode >= SLEIGH_MODE_FULL
-			|| sleigh_function_may_prove (fcn);
+			|| sleigh_function_may_prove (anal, fcn);
 		if (proof_eligible && sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
 			if (collect_proof_artifacts_for_function (&proof_plan, core, fcn,
 					&proof_xrefs, &proof_dead_blocks)

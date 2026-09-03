@@ -961,18 +961,24 @@ pub(crate) enum UpstreamValueDisposition {
 
 /// Transient Stage 4 validation oracle.
 ///
-/// This is deliberately rebuilt from the exact source and is never retained by
-/// a [`BindingPlan`] or consumed by lowering. Machine facts remain owned by the
-/// source-backed [`MachineProjection`]; component membership is resolved by the
-/// sealing module's independent certificate walk.
+/// Every judgment here is deliberately re-derived from the exact source and no
+/// plan decision reaches it, so a wrong plan disposition is observable instead
+/// of validating itself. It is never retained by a [`BindingPlan`] or consumed
+/// by lowering; component membership is resolved by the sealing module's
+/// independent certificate walk.
+///
+/// The machine projection it reads is borrowed from the plan rather than built
+/// again. It is derived from the source alone and `BindingPlan::validate_source`
+/// has proven the borrowed one is what this source produces, so re-lowering the
+/// arena would be the same answer at the price of a whole render.
 #[derive(Debug)]
-pub(crate) struct UpstreamShadowOracle {
-    machine_projection: MachineProjection,
+pub(crate) struct UpstreamShadowOracle<'a> {
+    machine_projection: &'a MachineProjection,
     components: Box<[Box<[ValueId]>]>,
     values: Box<[UpstreamValueDisposition]>,
 }
 
-impl UpstreamShadowOracle {
+impl UpstreamShadowOracle<'_> {
     pub(crate) fn component(&self, id: CanonicalComponentId) -> Option<&[ValueId]> {
         self.components.get(id.index()).map(Box::as_ref)
     }

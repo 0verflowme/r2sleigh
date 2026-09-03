@@ -27,22 +27,15 @@ command=$2
 shift 2
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-lock=${R2SLEIGH_PLUGIN_LOCK:-/tmp/r2sleigh-plugin-install.lock}
-: "${CARGO_TARGET_DIR:=$root/target}"
-export CARGO_TARGET_DIR
-
-echo "building $root without the lock" >&2
-cargo build --release --features all-archs -p r2sleigh-plugin \
-    --manifest-path "$root/Cargo.toml" >&2
-
-echo "waiting for $lock" >&2
-until mkdir "$lock" 2>/dev/null; do
-    sleep 10
-done
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
-
-make -C "$root/r2plugin" RUST_FEATURES=all-archs install >&2
 
 # The measurement and the install are one critical section. Releasing between
-# them is what makes a stale answer possible.
-env "$@" r2 -e scr.color=0 -q -c "$command" "$binary"
+# them is what makes a stale answer possible, so both run inside the lock.
+exec "$root/tests/locked_run.sh" bash -c '
+    set -euo pipefail
+    root=$1
+    binary=$2
+    command=$3
+    shift 3
+    make -C "$root/r2plugin" RUST_FEATURES=all-archs install >&2
+    env "$@" r2 -e scr.color=0 -q -c "$command" "$binary"
+' locked-probe "$root" "$binary" "$command" "$@"

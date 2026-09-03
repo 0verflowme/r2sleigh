@@ -1080,6 +1080,41 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Analysis)?;
+        // A placement refusal names a binding by number, and the number is
+        // never the question: which program object could not be placed, and
+        // where it was mentioned, is. Both are in hand exactly here, and
+        // nowhere downstream -- the refusal that reaches the reader carries
+        // only its category. So the operands travel on the same diagnostic
+        // channel every other refusing predicate uses.
+        if r2il::refusal_evidence::tracing() {
+            for (binding, decision) in decisions.iter() {
+                let Some(crate::placement::PlacementDecision::Refused(reason)) = decision else {
+                    continue;
+                };
+                let name = placement
+                    .names
+                    .symbol_for_binding(binding)
+                    .map(|symbol| placement.names.spelling(symbol).to_string())
+                    .unwrap_or_default();
+                let reads = occurrences
+                    .reads()
+                    .iter()
+                    .filter(|read| read.binding == binding)
+                    .map(|read| (read.block, read.source))
+                    .collect::<Vec<_>>();
+                let writes = occurrences
+                    .writes()
+                    .iter()
+                    .filter(|write| write.binding == binding)
+                    .map(|write| (write.block, write.inst))
+                    .collect::<Vec<_>>();
+                r2il::refusal_evidence!(
+                    "placement-decision",
+                    "binding={binding:?} name={name} reason={reason:?} \
+                     reads={reads:?} writes={writes:?}"
+                );
+            }
+        }
         // Which writes lost their statements is only known once the decisions
         // have been applied: one can be declined because the tree still
         // mentions the symbol, and one binding's removal can take away the last
@@ -1472,43 +1507,60 @@ impl LegacyObservationJournal {
                     block: block_id,
                     op_idx,
                 };
-                // Any materialised merge edge: a copy on an incoming edge, or
-                // an initializer relocated ahead of the edges it replaces.
-                // What makes the copy say nothing is that both sides resolve
-                // to one binding, which is tested below; the certified loop
-                // carrier is where the case was found, not the reason it
-                // holds, and neither is the origin kind or the source's
-                // version. A version-0 source was once excluded on the
-                // grounds that the edge copy is the only statement writing
-                // the merge; but the merge and the source are one object
-                // here, and that object is caller-supplied, so the write the
-                // copy would spell is the caller's, already made. What stayed
-                // was `X1_0 = X1_0;`, hidden from `-Wself-assign` only by a
-                // cast to the type the object already has.
-                let input_uses: Option<&[UseSite]> = match origins.origin(site) {
-                    Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => {
-                        Some(std::slice::from_ref(&origin.incoming))
-                    }
-                    Some(NormalizedOpOrigin::RelocatedInitializer(origin)) => {
-                        Some(&origin.replaced_sites)
-                    }
-                    Some(NormalizedOpOrigin::Original(_)) | None => None,
-                };
-                let Some(input_uses) = input_uses else {
-                    continue;
-                };
-                if !matches!(op, r2ssa::SSAOp::Copy { .. }) {
+                // Any copy normalization made for a merge: the copy on each
+                // materialised edge, and the initializer a certified carrier
+                // relocates ahead of its entry edges. What makes the copy say
+                // nothing is that both sides resolve to one binding, which is
+                // tested below; the loop carrier is where the case was found,
+                // not the reason it holds. A version-0 source stays excluded:
+                // it has no defining statement, and while `x = x` writes
+                // nothing, a live-in register that is not a parameter has no
+                // declaration to be rendered by either, so eliding its copy
+                // leaves the object read before it is assigned.
+                //
+                // And the program's own copies. `subs x1, x1, #1` lifts to a
+                // subtraction into a temporary and a copy of the temporary
+                // into `x1`; once the carrier certificate puts the temporary
+                // and the register in one object, that copy is `x = x` for
+                // exactly the reason the edge copies are. It keeps its
+                // statement only where the copy does something the name does
+                // not: a write projection narrower than the object, or a read
+                // that converts, is a real operation whatever the two sides
+                // are called.
+                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
                     continue;
                 }
+                let incoming = match origins.origin(site) {
+                    Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => Some(origin.incoming),
+                    Some(NormalizedOpOrigin::RelocatedInitializer(_)) => None,
+                    // One of the program's own copies is deliberately not
+                    // coalesced here. Both sides being one binding makes the
+                    // copy *look* redundant, and for a copy normalization
+                    // introduced it is: nothing else can have touched the
+                    // object between a merge edge's two ends. A program copy
+                    // has a position, and the object can be written between
+                    // the source's definition and the copy -- a save and
+                    // restore around a clobber is exactly that shape. The
+                    // interference tests decline to coalesce such values, so
+                    // the two sides should not be one binding at all; three
+                    // corpus cells say otherwise and compute the wrong answer
+                    // when the copy is dropped. Until that disagreement is
+                    // settled the copy keeps its statement.
+                    Some(NormalizedOpOrigin::Original(_)) => continue,
+                    None => continue,
+                };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
                 let Some(output) = projection.output else {
                     continue;
                 };
-                let Some(input) = projection
-                    .inputs
-                    .iter()
-                    .find(|input| input_uses.iter().any(|site| input.uses.contains(site)))
-                else {
+                let input = match incoming {
+                    Some(incoming) => projection
+                        .inputs
+                        .iter()
+                        .find(|input| input.uses.contains(&incoming)),
+                    None => projection.inputs.first(),
+                };
+                let Some(input) = input else {
                     continue;
                 };
                 if matches!(
@@ -1655,8 +1707,8 @@ impl LegacyObservationJournal {
             .copied()
             .collect::<Vec<_>>();
         for site in coalesced_carrier_uses {
-            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) {
-                Some(r2ssa::ledger::ElisionReason::CoalescedEdgeCopy) | None => {}
+            match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
             }
         }
@@ -1671,6 +1723,12 @@ impl LegacyObservationJournal {
             .iter()
             .map(|origin| origin.definition.inst)
             .collect::<BTreeSet<_>>();
+        // A merge normalization left in place whose every input is its own
+        // binding performs nothing. Which merges those are is the plan's
+        // statement, `identity_merges`, and the seal fills their value cells
+        // from the same statement; asking it twice in two spellings is how
+        // the value cell and the write cell came to disagree about one merge.
+        let identity_merges = self.plan.identity_merges(graph);
         for inst in &graph.insts {
             if removed_phis.contains(&inst.id)
                 || !matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
@@ -1680,18 +1738,7 @@ impl LegacyObservationJournal {
             let Some(output) = inst.output else {
                 return Err(LegacyObservationJournalError::InvalidWrite(inst.id));
             };
-            let Some(ValueDisposition::Bound {
-                binding: output_binding,
-            }) = self.plan.disposition(output)
-            else {
-                continue;
-            };
-            if !inst.inputs.iter().all(|input| {
-                matches!(
-                    self.plan.disposition(*input),
-                    Some(ValueDisposition::Bound { binding }) if binding == output_binding
-                )
-            }) {
+            if !identity_merges.contains(&output) {
                 continue;
             }
             for input_idx in 0..inst.inputs.len() {
@@ -1960,6 +2007,23 @@ impl LegacyObservationJournal {
     ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
+        targets.extend(self.discharged_instruction_targets(value, discharged)?);
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// The cells each discharged instruction still owes, in canonical order:
+    /// its write, the value it produced unless that is the `rendered` value
+    /// the caller has already marked, and every operand it read.
+    fn discharged_instruction_targets(
+        &mut self,
+        rendered: ValueId,
+        discharged: &[InstId],
+    ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
+        let mut targets = Vec::new();
         let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
@@ -1983,7 +2047,7 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                if output != value {
+                if output != rendered {
                     self.value_slot(output)?;
                     targets.push(ObservationTarget::Value(output));
                 }
@@ -2002,11 +2066,7 @@ impl LegacyObservationJournal {
                 });
             }
         }
-        let mut marked = expr;
-        for id in self.allocate_many(targets)? {
-            marked = CExpr::observed(id, marked);
-        }
-        Ok(marked)
+        Ok(targets)
     }
 
     /// Mark the value an inlined expression produces, where it is rendered.
@@ -2152,12 +2212,18 @@ impl LegacyObservationJournal {
     /// stands in its place -- so its cell is closed here, at the seal, in the
     /// same way `account_materialized_phi_occurrences` closes the cells of
     /// definitions placement dropped.
-    fn account_identity_merge_values(
+    ///
+    fn account_values_rendered_by_binding(
         &mut self,
         symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
     ) -> Result<(), LegacyObservationJournalError> {
         let graph = self.source.graph();
-        for value in self.plan.identity_merges(graph) {
+        let rendered_by_binding = self
+            .plan
+            .identity_merges(graph)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for value in rendered_by_binding {
             let Some(slot) = self.values.get(value.0 as usize) else {
                 continue;
             };
@@ -2893,7 +2959,7 @@ impl LegacyObservationJournal {
         }
         self.effect_occurrence_regions = effect_occurrence_regions;
         self.account_materialized_phi_occurrences();
-        self.account_identity_merge_values(&symbol_bindings)?;
+        self.account_values_rendered_by_binding(&symbol_bindings)?;
         if let Some(error) = self.first_unaccounted_render_observation() {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
@@ -4102,10 +4168,17 @@ mod tests {
             cond: Varnode::constant(1, 1),
             target: Varnode::constant(0x1008, 8),
         });
+        // Each edge copies a register the function entered holding, not a
+        // constant. A fixture built from constants stops having a subject
+        // every time the plan gets better at spelling one: every value in it
+        // folds into its reader, and a test about a *bound* merge input then
+        // asserts about values the plan no longer binds. This is the third
+        // time that has been corrected here, so the reason is written down
+        // rather than the shape merely repaired.
         let mut left = R2ILBlock::new(0x1004, 4);
         left.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(11, 8),
+            src: Varnode::register(0x38, 8),
         });
         left.push(R2ILOp::Branch {
             target: Varnode::constant(0x100c, 8),
@@ -4113,7 +4186,7 @@ mod tests {
         let mut right = R2ILBlock::new(0x1008, 4);
         right.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(12, 8),
+            src: Varnode::register(0x20, 8),
         });
         right.push(R2ILOp::Branch {
             target: Varnode::constant(0x100c, 8),
@@ -4189,10 +4262,15 @@ mod tests {
 
     #[test]
     fn normalized_identity_phi_edge_is_a_precise_elision_not_an_absence() {
+        // The carrier enters holding a register rather than a constant, for
+        // the reason given in the immutable-phi fixture above: a constant
+        // initialiser folds into its readers, the entry edge is then not a
+        // copy between two bound values, and the coalescing this test is
+        // about has nothing to coalesce.
         let mut entry = R2ILBlock::new(0x2000, 4);
         entry.push(R2ILOp::Copy {
             dst: Varnode::register(0, 8),
-            src: Varnode::constant(1, 8),
+            src: Varnode::register(0x38, 8),
         });
         entry.push(R2ILOp::Branch {
             target: Varnode::constant(0x2004, 8),
@@ -4274,7 +4352,7 @@ mod tests {
                 assert_eq!(
                     journal.uses[source_use.inst.0 as usize][source_use.input_idx],
                     Some(LegacyUseObservation::Elided(
-                        r2ssa::ledger::ElisionReason::CoalescedEdgeCopy
+                        r2ssa::ledger::ElisionReason::CoalescedCopy
                     ))
                 );
             }
