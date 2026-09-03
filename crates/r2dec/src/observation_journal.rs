@@ -4773,7 +4773,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_memory_effect_is_a_typed_refusal_not_a_rendered_occurrence() {
+    fn residual_memory_effect_is_unaccounted_not_a_rendered_occurrence() {
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Store {
             space: r2il::SpaceId::Ram,
@@ -4819,15 +4819,13 @@ mod tests {
             crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
         assert_eq!(
             ledger.outcome(&obligation),
-            r2ssa::ledger::Outcome::Refused {
-                layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::NoRenderedOccurrence,
-            }
+            r2ssa::ledger::Outcome::Unattributed
         );
+        assert!(ledger.unattributed().any(|id| *id == obligation));
     }
 
     #[test]
-    fn duplicate_surviving_effect_occurrence_is_a_codegen_refusal() {
+    fn duplicate_surviving_effect_occurrence_is_a_conflict() {
         let (source, _plan, mut function, mut journal) = journal_fixture();
         let obligation = *source
             .source()
@@ -4856,12 +4854,13 @@ mod tests {
             NormalizationOrigins::for_unchanged(source.source().function(), source.source());
         let ledger =
             crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
-        assert_eq!(
+        assert!(matches!(
             ledger.outcome(&obligation),
-            r2ssa::ledger::Outcome::Refused {
-                layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::DuplicateRenderedOccurrence,
-            }
+            r2ssa::ledger::Outcome::Rendered { .. }
+        ));
+        assert_eq!(
+            ledger.conflicts().collect::<Vec<_>>(),
+            vec![(&obligation, 1)]
         );
     }
 

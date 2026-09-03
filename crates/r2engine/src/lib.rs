@@ -3310,9 +3310,25 @@ fn effect_obligation_refusal_reason(audit: EffectObligationAudit) -> Option<Stri
         || audit.unaccounted != 0
         || audit.conflicts != 0)
         .then(|| {
+            fn tally(
+                count: usize,
+                label: &str,
+                obligation: Option<r2ssa::SemanticObligationId>,
+            ) -> String {
+                obligation.map_or_else(
+                    || format!("{count} {label}"),
+                    |id| format!("{count} {label} ({} at {})", id.kind, id.instruction),
+                )
+            }
             format!(
-                "native effect obligations refused: {} refused, {} unaccounted, {} conflicts",
-                audit.refused, audit.unaccounted, audit.conflicts
+                "native effect obligations refused: {}, {}, {}",
+                tally(audit.refused, "refused", audit.refused_obligation),
+                tally(
+                    audit.unaccounted,
+                    "unaccounted",
+                    audit.unaccounted_obligation
+                ),
+                tally(audit.conflicts, "conflicts", audit.conflicting_obligation)
             )
         })
 }
@@ -6554,6 +6570,9 @@ mod tests {
                         refused: 1,
                         unaccounted: 2,
                         conflicts: 1,
+                        refused_obligation: None,
+                        unaccounted_obligation: None,
+                        conflicting_obligation: None,
                     },
                     PlacementAudit::NotRun,
                     Some(DecompileRenderRefusal::UnrepresentableOperation),
@@ -6605,6 +6624,14 @@ mod tests {
 
     #[test]
     fn refused_effect_obligations_produce_a_typed_engine_refusal() {
+        let obligation = r2ssa::SemanticObligationId {
+            instruction: r2ssa::CanonicalInstructionId {
+                block_addr: 0x401000,
+                site: r2ssa::CanonicalInstructionSite::Op(7),
+            },
+            kind: r2ssa::SemanticObligationKind::ObservableMemoryWrite,
+            component: r2ssa::SemanticObligationComponent::Whole,
+        };
         let effect_obligations = EffectObligationAudit {
             disposition: EffectObligationDisposition::Refused,
             total: 9,
@@ -6613,9 +6640,16 @@ mod tests {
             refused: 2,
             unaccounted: 1,
             conflicts: 1,
+            refused_obligation: Some(obligation),
+            unaccounted_obligation: Some(obligation),
+            conflicting_obligation: Some(obligation),
         };
         let reason = effect_obligation_refusal_reason(effect_obligations)
             .expect("refused effects must refuse the native engine outcome");
+        assert_eq!(
+            reason,
+            "native effect obligations refused: 2 refused (memory-write at 0x401000:op:7), 1 unaccounted (memory-write at 0x401000:op:7), 1 conflicts (memory-write at 0x401000:op:7)"
+        );
         let render_time = Duration::from_micros(17);
         let mut metrics = EngineMetrics::default();
         metrics.record_phase(
@@ -6678,6 +6712,9 @@ mod tests {
                 refused: 1,
                 unaccounted: 0,
                 conflicts: 0,
+                refused_obligation: None,
+                unaccounted_obligation: None,
+                conflicting_obligation: None,
             })
             .is_some(),
             "nonzero refusal counts fail closed independently of disposition"

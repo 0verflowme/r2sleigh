@@ -36,14 +36,14 @@ fn traced_zero_occurrence_outcome(
     origins: &NormalizationOrigins,
     effects: &SurvivingEffectObservations,
     id: SemanticObligationId,
-) -> Outcome {
+) -> Option<Outcome> {
     let outcome = upstream_zero_occurrence_outcome(prepared, origins, effects, id);
     if matches!(
         id.kind,
         SemanticObligationKind::Call
             | SemanticObligationKind::CallArgument
             | SemanticObligationKind::CallResult
-    ) && let Outcome::Elided(reason) = outcome
+    ) && let Some(Outcome::Elided(reason)) = outcome
     {
         r2il::refusal_evidence!(
             "call-elided",
@@ -68,21 +68,21 @@ fn upstream_zero_occurrence_outcome(
     origins: &NormalizationOrigins,
     effects: &SurvivingEffectObservations,
     id: SemanticObligationId,
-) -> Outcome {
+) -> Option<Outcome> {
     // The instruction does nothing, so there is nothing to render for it and
     // nothing left unaccounted when the rendering omits it.
     if id.kind == SemanticObligationKind::NoNativeSemantics {
-        return Outcome::Elided(ElisionReason::NoNativeSemantics);
+        return Some(Outcome::Elided(ElisionReason::NoNativeSemantics));
     }
 
     if matches!(
         id.kind,
         SemanticObligationKind::VolatileOrUnknownEffect | SemanticObligationKind::Trap
     ) {
-        return Outcome::Refused {
+        return Some(Outcome::Refused {
             layer: LedgerLayer::Ssa,
             reason: RefusalReason::UnsupportedEffect,
-        };
+        });
     }
 
     let graph = prepared.graph();
@@ -97,7 +97,7 @@ fn upstream_zero_occurrence_outcome(
             .stack_frame_round_trip_by_inst
             .contains_key(&inst)
     }) {
-        return Outcome::Elided(ElisionReason::StackFrame);
+        return Some(Outcome::Elided(ElisionReason::StackFrame));
     }
     if source_inst.is_some_and(|inst| {
         prepared
@@ -105,7 +105,7 @@ fn upstream_zero_occurrence_outcome(
             .machine_return_control_by_inst
             .contains_key(&inst)
     }) {
-        return Outcome::Elided(ElisionReason::ReturnControl);
+        return Some(Outcome::Elided(ElisionReason::ReturnControl));
     }
     // The copies a return address reaches its return through. AArch64's `ret`
     // is a copy of the link register into the program counter followed by a
@@ -114,7 +114,7 @@ fn upstream_zero_occurrence_outcome(
     if source_inst.is_some_and(|inst| {
         crate::binding_plan::certified_return_control_insts(prepared).contains(&inst)
     }) {
-        return Outcome::Elided(ElisionReason::ReturnControl);
+        return Some(Outcome::Elided(ElisionReason::ReturnControl));
     }
     // A store into a frame slot this function owns and never reads. The
     // obligation is real -- writing memory is an effect -- and it is answered
@@ -125,14 +125,14 @@ fn upstream_zero_occurrence_outcome(
         && crate::binding_plan::certified_dead_frame_slot_accesses(prepared)
             .contains(&(id.instruction.block_addr, op_index))
     {
-        return Outcome::Elided(ElisionReason::DeadFrameSlotStore);
+        return Some(Outcome::Elided(ElisionReason::DeadFrameSlotStore));
     }
     // The push that records a call's return address. The call statement is the
     // transfer, and no C statement writes the machine's return address.
     if source_inst.is_some_and(|inst| {
         crate::binding_plan::certified_call_return_address_insts(prepared).contains(&inst)
     }) {
-        return Outcome::Elided(ElisionReason::CallReturnAddress);
+        return Some(Outcome::Elided(ElisionReason::CallReturnAddress));
     }
     // The copies a callee's address reaches its call through. The call spells
     // the callee's name, so no statement answers for the copy that put the
@@ -140,11 +140,11 @@ fn upstream_zero_occurrence_outcome(
     if source_inst.is_some_and(|inst| {
         crate::binding_plan::certified_direct_call_target_insts(prepared).contains(&inst)
     }) {
-        return Outcome::Elided(ElisionReason::DirectCallTarget);
+        return Some(Outcome::Elided(ElisionReason::DirectCallTarget));
     }
     if source_inst.is_some_and(|inst| prepared.certificates().stack_geometry.insts.contains(&inst))
     {
-        return Outcome::Elided(ElisionReason::DeadStackBase);
+        return Some(Outcome::Elided(ElisionReason::DeadStackBase));
     }
     if matches!(id.instruction.site, CanonicalInstructionSite::Phi(_))
         && source_inst
@@ -152,7 +152,7 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|inst| inst.output)
             .is_some_and(|value| prepared.unobserved_merges().contains(value))
     {
-        return Outcome::Elided(ElisionReason::UnobservedMerge);
+        return Some(Outcome::Elided(ElisionReason::UnobservedMerge));
     }
 
     if let Some(inst) = source_inst
@@ -162,7 +162,7 @@ fn upstream_zero_occurrence_outcome(
             SemanticObligationKind::LoopCarriedState | SemanticObligationKind::LiveValueProducer
         )
     {
-        return Outcome::Elided(ElisionReason::CoalescedIdentityPhi);
+        return Some(Outcome::Elided(ElisionReason::CoalescedIdentityPhi));
     }
     // The same fact for a copy rather than a merge. A copy whose two sides
     // are one object produces nothing the statement that made the value did
@@ -175,7 +175,7 @@ fn upstream_zero_occurrence_outcome(
             SemanticObligationKind::LoopCarriedState | SemanticObligationKind::LiveValueProducer
         )
     {
-        return Outcome::Elided(ElisionReason::CoalescedCopy);
+        return Some(Outcome::Elided(ElisionReason::CoalescedCopy));
     }
     if id.kind == SemanticObligationKind::LiveStateTransition
         && prepared
@@ -185,7 +185,7 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|obligation| obligation.edge_use)
             .is_some_and(|site| effects.is_coalesced_carrier_use(site))
     {
-        return Outcome::Elided(ElisionReason::CoalescedCopy);
+        return Some(Outcome::Elided(ElisionReason::CoalescedCopy));
     }
 
     if let Some(inst) = source_inst
@@ -205,7 +205,7 @@ fn upstream_zero_occurrence_outcome(
                 .and_then(|obligation| obligation.edge_use)
                 .is_some_and(|site| removed.noop_sites().contains(&site)) =>
             {
-                return Outcome::Elided(ElisionReason::RedundantPhiEdge);
+                return Some(Outcome::Elided(ElisionReason::RedundantPhiEdge));
             }
             (SemanticObligationKind::LoopCarriedState, _)
                 if removed
@@ -213,7 +213,7 @@ fn upstream_zero_occurrence_outcome(
                     .iter()
                     .all(|site| removed.noop_sites().contains(site)) =>
             {
-                return Outcome::Elided(ElisionReason::RedundantPhiEdge);
+                return Some(Outcome::Elided(ElisionReason::RedundantPhiEdge));
             }
             // Every input the merge had is written by a copy on its own
             // incoming edge, so the state it carried is carried by those
@@ -232,7 +232,7 @@ fn upstream_zero_occurrence_outcome(
                     .all(|site| removed.noop_sites().contains(site) || materialized.contains(site))
             } =>
             {
-                return Outcome::Elided(ElisionReason::MaterializedPhiEdges);
+                return Some(Outcome::Elided(ElisionReason::MaterializedPhiEdges));
             }
             _ => {}
         }
@@ -280,7 +280,7 @@ fn upstream_zero_occurrence_outcome(
                 _ => false,
             })
     {
-        return Outcome::Elided(ElisionReason::DirectControlTarget);
+        return Some(Outcome::Elided(ElisionReason::DirectControlTarget));
     }
 
     // The obligation names an instruction in source coordinates and every
@@ -307,19 +307,20 @@ fn upstream_zero_occurrence_outcome(
     // is reached only for zero surviving occurrences, so the obligation can be
     // closed without hiding an occurrence that actually rendered.
     if effects.dead_unused_value_effect(id) {
-        return Outcome::Elided(ElisionReason::DeadUnusedTemporary);
+        return Some(Outcome::Elided(ElisionReason::DeadUnusedTemporary));
     }
     // Placement removed the statement this obligation's only occurrence sat
     // on, because nothing reads the object that statement wrote. The value,
     // use and write cells are already answered with that same fact; the
     // obligation is dead with the statement rather than unaccounted for.
     if effects.placement_removed_effect(id) {
-        return Outcome::Elided(ElisionReason::DeadUnreadBinding);
+        return Some(Outcome::Elided(ElisionReason::DeadUnreadBinding));
     }
 
     r2il::refusal_evidence!(
         "zero-occurrence-outcome",
-        "kind={:?} component={:?} block={:#x} source_inst={source_inst:?}          graph_block={:?} output={refused_output:?} inputs={:?}",
+        "tally=unaccounted function={:#x} kind={:?} component={:?} block={:#x} source_inst={source_inst:?}          graph_block={:?} output={refused_output:?} inputs={:?}",
+        prepared.function().entry,
         id.kind,
         id.instruction.site,
         id.instruction.block_addr,
@@ -332,10 +333,7 @@ fn upstream_zero_occurrence_outcome(
             .get(&id)
             .map(|obligation| obligation.inputs.clone())
     );
-    Outcome::Refused {
-        layer: LedgerLayer::Codegen,
-        reason: RefusalReason::NoRenderedOccurrence,
-    }
+    None
 }
 
 /// Build one closed-domain ledger from exact surviving occurrence counts.
@@ -351,9 +349,7 @@ pub(crate) fn build_obligation_ledger(
             .occurrence_count(id)
             .expect("effect observation domain is opened from this source inventory");
         let outcome = match count {
-            0 => Some(traced_zero_occurrence_outcome(
-                prepared, origins, effects, id,
-            )),
+            0 => traced_zero_occurrence_outcome(prepared, origins, effects, id),
             1 => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
             // Several occurrences are one execution when the structured form
@@ -372,10 +368,15 @@ pub(crate) fn build_obligation_ledger(
             // would be three evaluations.
             _ if effects.duplicates_are_a_repeated_literal(id) => rendered_site(id)
                 .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx }),
-            _ => Some(Outcome::Refused {
-                layer: LedgerLayer::Codegen,
-                reason: RefusalReason::DuplicateRenderedOccurrence,
-            }),
+            _ => {
+                if let Some(outcome) = rendered_site(id)
+                    .map(|(block_addr, op_idx)| Outcome::Rendered { block_addr, op_idx })
+                {
+                    let _ = ledger.record(id, outcome);
+                }
+                let _ = ledger.record_conflict(id);
+                None
+            }
         };
         if let Some(outcome) = outcome {
             let _ = ledger.record(id, outcome);

@@ -301,7 +301,7 @@ impl LedgerClosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObligationLedger {
     outcomes: BTreeMap<SemanticObligationId, Outcome>,
-    conflicts: usize,
+    conflicts: BTreeMap<SemanticObligationId, usize>,
 }
 
 impl ObligationLedger {
@@ -313,7 +313,7 @@ impl ObligationLedger {
                 .keys()
                 .map(|id| (*id, Outcome::Unattributed))
                 .collect(),
-            conflicts: 0,
+            conflicts: BTreeMap::new(),
         }
     }
 
@@ -329,10 +329,24 @@ impl ObligationLedger {
             }
             existing if existing == outcome => Record::Redundant,
             existing => {
-                self.conflicts += 1;
+                *self.conflicts.entry(id).or_insert(0) += 1;
                 Record::Conflict(existing)
             }
         }
+    }
+
+    /// Record that several incompatible occurrences answer one obligation.
+    ///
+    /// The obligation keeps its first outcome so the closure equation still
+    /// has one owner for every source cell. The conflict is an independent
+    /// admission failure, keyed by that same canonical source identity so a
+    /// refusal can name where the incompatible answers occurred.
+    pub fn record_conflict(&mut self, id: SemanticObligationId) -> Record {
+        let Some(existing) = self.outcomes.get(&id).copied() else {
+            return Record::Unknown;
+        };
+        *self.conflicts.entry(id).or_insert(0) += 1;
+        Record::Conflict(existing)
     }
 
     /// Replace an outcome a later layer disproved, without counting it as a conflict.
@@ -376,6 +390,11 @@ impl ObligationLedger {
         counts
     }
 
+    /// Obligations with incompatible answers, in canonical source order.
+    pub fn conflicts(&self) -> impl Iterator<Item = (&SemanticObligationId, usize)> {
+        self.conflicts.iter().map(|(id, count)| (id, *count))
+    }
+
     /// How many refusals there are, by the layer that made them and why.
     pub fn refusals_by_layer(&self) -> BTreeMap<(LedgerLayer, RefusalReason), usize> {
         let mut counts = BTreeMap::new();
@@ -402,7 +421,7 @@ impl ObligationLedger {
     pub fn close(&self) -> LedgerClosure {
         let mut closure = LedgerClosure {
             total: self.outcomes.len(),
-            conflicts: self.conflicts,
+            conflicts: self.conflicts.values().sum(),
             ..LedgerClosure::default()
         };
         let trace = std::env::var_os("R2DEC_TRACE_REFUSAL").is_some();
@@ -449,7 +468,7 @@ mod tests {
     fn ledger_of(ids: &[SemanticObligationId]) -> ObligationLedger {
         ObligationLedger {
             outcomes: ids.iter().map(|id| (*id, Outcome::Unattributed)).collect(),
-            conflicts: 0,
+            conflicts: BTreeMap::new(),
         }
     }
 
