@@ -399,11 +399,23 @@ pub(super) fn declaration_type_for_stack_object(
 /// object, whatever else it may be true of, and the machine word stands. A
 /// pointer is the one type whose width is the pointer width rather than the
 /// declared object's, and it is admitted at exactly that width.
-fn admit_declaration(ty: r2types::CTypeLike, width_bits: u32, ptr_bits: u32) -> r2types::CTypeLike {
+pub(crate) fn admit_declaration(
+    ty: r2types::CTypeLike,
+    width_bits: u32,
+    ptr_bits: u32,
+) -> r2types::CTypeLike {
     let admissible = match &ty {
         r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
         r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
         r2types::CTypeLike::Float(bits) => *bits == width_bits,
+        // Preserve a target-sized scalar typedef only when its spelling is one
+        // the canonical parser can place. An unknown identifier remains
+        // unplaceable and therefore cannot displace a machine type merely by
+        // looking more specific.
+        r2types::CTypeLike::Typedef(name) => {
+            r2types::parse_c_type_like(name, ptr_bits).and_then(|parsed| parsed.bits(ptr_bits))
+                == Some(width_bits)
+        }
         _ => false,
     };
     if admissible {

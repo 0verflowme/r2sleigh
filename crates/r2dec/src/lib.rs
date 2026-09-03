@@ -4803,18 +4803,26 @@ impl Decompiler {
             .parameters()
             .map(|resolved| {
                 let resolved = resolved?;
-                // The parameter is declared as the object the body actually
-                // reads: the unsigned machine word of its register's width.
-                // An inferred signature type disagreed with every use of it,
-                // so a strict compile rejected the whole function as a
-                // signedness-changing conversion on its own argument.
-                //
-                // This is the documented contract -- a parameter is an
-                // unsigned integer of the register's own width, and
-                // signedness, pointer-ness and names are never asserted. How
-                // that compares to the source's own types is reported by the
-                // typed-recovery score instead of being claimed here.
-                let ty = resolved.declaration_type;
+                // The render-authorized signature is the canonical declaration
+                // fact and is already the type authority used while lowering
+                // this parameter's uses. Admit that same fact at the header
+                // boundary only when it describes the certified carrier width;
+                // otherwise this value alone keeps its sealed machine type.
+                let ty = render_signature
+                    .and_then(|signature| {
+                        usize::try_from(resolved.slot)
+                            .ok()
+                            .and_then(|slot| signature.params.get(slot))
+                    })
+                    .and_then(|parameter| parameter.ty.clone())
+                    .map(|ty| {
+                        crate::binding_plan::admit_declaration(
+                            ty,
+                            resolved.width_bits,
+                            self.config.ptr_size,
+                        )
+                    })
+                    .unwrap_or(resolved.declaration_type);
                 Ok(ast::CParam {
                     ty,
                     name: resolved.symbol,

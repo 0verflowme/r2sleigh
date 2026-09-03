@@ -14,6 +14,22 @@ use std::sync::Arc;
 
 use crate::symbol::SymbolTable;
 
+#[test]
+fn declaration_admission_accepts_placeable_target_sized_typedefs_only() {
+    assert_eq!(
+        super::admit_declaration(CType::Typedef("size_t".to_string()), 64, 64),
+        CType::Typedef("size_t".to_string())
+    );
+    assert_eq!(
+        super::admit_declaration(CType::Typedef("unplaceable_t".to_string()), 64, 64),
+        CType::u64()
+    );
+    assert_eq!(
+        super::admit_declaration(CType::Typedef("size_t".to_string()), 32, 64),
+        CType::u32()
+    );
+}
+
 fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFacts {
     let mut block = R2ILBlock::new(0x1000, 4);
     for op in ops {

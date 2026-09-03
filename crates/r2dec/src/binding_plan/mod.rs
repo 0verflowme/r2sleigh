@@ -1231,6 +1231,7 @@ impl BindingPlan {
 mod construction;
 mod name_resolution;
 mod rules;
+pub(crate) use rules::admit_declaration;
 mod seal;
 
 pub(crate) use name_resolution::{
