@@ -9852,3 +9852,36 @@ registers. The fix is to pass `MachineArchitectureFamily` and read
 `machine_context().abi_model().argument_registers()`, and note the second
 feeder at `r2plugin/src/lib.rs:3268` passes radare2's own `"x86"` for both
 widths, so fixing one site leaves the other ambiguous.
+
+## The benchmark cannot see the array work, and that is a fact about the workload
+
+Array indexing landed and is measurably working: subscripts went from zero in
+all fifty-four corpus cells to twenty-one across eleven of them, with the
+snapshot column reporting mismatches on exactly those eleven and no others.
+
+`type_match` on DecBench did not move, and the reason is not the feature.
+Rendering every function of `bzip2recover` and counting gives **one** subscript
+in the whole binary, a store, against twenty-one on the hash corpus. The seven
+functions r2sleigh renders there are small input and output helpers with almost
+no indexed access at all.
+
+So the benchmark's *rendered subset* contains almost none of the construct, and
+a metric computed over it measures nothing about that construct. The apparent
+`type_match` rise, 0.100 to 0.125, is an artefact of a different kind and was
+caught by the per-function record: every function that scores is unchanged, and
+the mean moved only because a function scoring zero stopped being decompiled and
+left the denominator. Zero perfect functions, unchanged, against angr's three.
+
+Two consequences for how this project measures itself.
+
+A metric is only evidence about a feature if the population it is computed over
+exercises that feature. Before reporting that a change did or did not move a
+benchmark number, count how often the construct appears in what was actually
+rendered. That count is cheap and it is the difference between a result and a
+coincidence.
+
+And the way to make `type_match` mean something here is coverage, not more
+rules. The functions in that binary which do index arrays are among the ones
+r2sleigh still refuses, so the array work will remain unmeasurable there until
+the refusals fall. A second benchmark project with indexed access in its
+rendered subset would also serve, and is cheaper than waiting.
