@@ -9364,3 +9364,104 @@ matrix.json` before a run, and do not edit the tree between starting
 `locked_matrix.sh` and its completion -- `run_matrix.sh` builds again under the
 lock, so an edit in that window is measured. That is the sixth reading this
 class of hazard has cost.
+
+
+## Both forks answered, and what the answers cost to carry out
+
+The two forks the typed-boundary work left are resolved, and the resolutions
+are implemented. What follows is what each turned out to require, because in
+both cases the answer was cheap to state and the accounting behind it was not.
+
+**Fork one, the elision reason for a copy whose two sides are one binding.**
+The rename had already landed on the integration branch -- `CoalescedEdgeCopy`
+became `CoalescedCopy`, one reason widened rather than a sibling added,
+following `CoalescedCarrierEdge` before it -- and its documentation already
+named the program's own copies as the case it covers. The journal did not:
+it declined every `Original` copy, because dropping them on the strength of
+the coalescing alone made three corpus cells compute the wrong answer.
+
+That decline was right and its reason is worth keeping. A copy normalization
+makes for a merge sits at an edge, where nothing can have touched the object
+between the edge's two ends. A copy the program made has a *position*, and a
+save and restore around a clobber is the same shape -- there the object is
+written in between and the restore is the only thing that puts the value
+back. So the question is now asked at the copy rather than of the coalescing:
+*nothing wrote this object between the value being produced and the copy of
+it*. That is local, exact, and independent of the interference test having
+been right. A source defined in another block declines, because reaching it
+crosses a control edge and what wrote the object on the way is a liveness
+question this does not ask.
+
+Eliding the statement then took three more answers, one per layer, and each
+was a separate refusal until it was given:
+
+  * the *value* the copy defined is rendered by its binding -- the same answer
+    the symmetric merge case gives, where a merge coalesced to one binding is
+    rendered by that binding rather than by a write of its own;
+  * the *write* is elided with the statement, because the object was already
+    written by whatever produced the value copied;
+  * the *`LiveValueProducer` obligation* is answered by that same statement,
+    which is the rule the coalesced merge already had, asked of a copy.
+
+Separately, a parameter's entry copy is now elided too. The version-0
+exclusion was wider than the reason recorded beside it: that reason is about a
+live-in register nothing declares, and a parameter is the case it excepts,
+since the signature declares it and the binding is written before the body
+starts. Excluding it left `X0_0 = X0_0;` on the first two lines of every arm64
+function that takes arguments.
+
+**Fork two, the type a global object is declared with: answered, not
+implemented, and the reason is a missing fact rather than a missing
+decision.** The answer -- radare2's type where it has one, marked as radare2's
+fact, and the evidenced access width where it does not, with the per-binary
+engine cache as the program scope that makes refuse-on-conflict possible --
+needs radare2's type for a data object to *reach* the renderer, and it does
+not. `DisplayNames` carries three maps and all three are spellings:
+`functions`, `symbols`, `strings`. The plugin's wire writes a data symbol as
+an address and a name and nothing else (`snapshot_walk.c`, the
+`num_data_symbols` loop). So the work is a vertical slice -- the C snapshot
+walk, the wire, `r2source`, `r2types`, then the renderer and the cache -- and
+none of it is the decision. It is left whole rather than started, because a
+half-plumbed type fact is worse than none.
+
+**The measurement, all fifty-four cells, after both.**
+
+    predicate                    start    now
+    same_type_casts               3395     185
+    cast_chains                      8       1
+    self_assignments               225     155
+    literal_only_declarations      103      80
+    flag_carriers                  192     192
+    comma_conditions                17      17
+    gotos                          125     125
+
+    column               result
+    binding_audit        54 / 54
+    effect_obligations   54 / 54
+    placement_audit      54 / 54
+    render_refusal       54 / 54
+    differential         52 pass, 1 fail, 1 blocked
+    raw                  52 pass, 2 fail
+
+The workspace suite is 2,216 green. The raw column went 23 failures to 2 over
+this stretch, and the two left are named rather than counted:
+
+  * `x64_O2 xxhash32:411`, `tmp_3ea80_2 < -0x4` -- a mask compared against a
+    `uint64_t`. The restatement gives a compared literal the type of what it
+    is compared with, and this site is not reached by it; every other mask
+    shape in the corpus is.
+  * `arm64_O0 xxhash32:332`, `uint8_t *X0_9 = sym__rotl32(...)` -- a call
+    result assigned to a pointer-declared object. Neither the callee's
+    recorded signature nor the call-result certificate names the value behind
+    the object at that site, so nothing states what the call produced.
+
+**The one that cost the most to find, and would again.** A render marker is
+metadata, and the restatement walk matched on the expression *directly*, so a
+marked right-hand side fell through with the requirement dropped. In
+production nearly every right-hand side carries an occurrence marker, so the
+pass silently did nothing on most statements while working perfectly in its
+own unit tests. What made it visible was two adjacent lines in one rendered
+function, the same shape, one converted and one not -- the converted one had
+been converted at lowering, not by this pass. A pass that walks the rendered
+tree has to look through `Observed` and `Paren` at every branch, not only in
+the descent.
