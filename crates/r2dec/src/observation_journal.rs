@@ -726,6 +726,11 @@ pub(crate) struct LegacyObservationJournal {
     /// Removed carrier phis for which every incoming edge is already accounted
     /// by SSA identity or one of `coalesced_carrier_copy_sites`.
     coalesced_carrier_phi_writes: BTreeSet<InstId>,
+    /// Program copies this journal elides, by instruction.
+    ///
+    /// Their write is elided with them, for the same reason: the object was
+    /// already written by the statement that produced the value copied.
+    coalesced_copy_writes: BTreeSet<InstId>,
     /// Values defined by a program copy this journal elides.
     ///
     /// The copy said nothing because its two sides are one object, so the
@@ -1500,6 +1505,7 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let mut coalesced_carrier_copy_sites = BTreeSet::new();
+        let mut coalesced_copy_writes = BTreeSet::new();
         let mut coalesced_copy_outputs = BTreeSet::new();
         for block_id in graph.block_order.iter().copied() {
             let Some(block) = graph
@@ -1606,8 +1612,9 @@ impl LegacyObservationJournal {
                     ) if input == output
                 ) {
                     coalesced_carrier_copy_sites.insert(site);
-                    if program_copy.is_some() {
+                    if let Some(inst) = program_copy {
                         coalesced_copy_outputs.insert(output.value);
+                        coalesced_copy_writes.insert(inst);
                     }
                 }
             }
@@ -1682,6 +1689,7 @@ impl LegacyObservationJournal {
             coalesced_carrier_copy_sites,
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
+            coalesced_copy_writes,
             coalesced_copy_outputs,
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
@@ -1754,6 +1762,16 @@ impl LegacyObservationJournal {
         for inst in self.coalesced_carrier_phi_writes.iter().copied() {
             match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) {
                 Some(r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+            }
+        }
+        // A program copy that says nothing owes no write either. The object
+        // it would have written was written by the statement that produced
+        // the value it copies, which is the same fact that let the statement
+        // go.
+        for inst in self.coalesced_copy_writes.iter().copied() {
+            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
             }
         }
