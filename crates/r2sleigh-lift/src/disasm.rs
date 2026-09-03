@@ -3330,6 +3330,43 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_conditional_compare_normalizes_instruction_local_control() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+        // ccmp w1, #14, #0, eq, little-endian encoding.
+        let bytes = padded_instruction([0x20, 0x08, 0x4e, 0x7a]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("ccmp w1, #14, #0, eq lift");
+
+        assert!(
+            !lifted
+                .block()
+                .ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::CBranch { .. })),
+            "instruction-local CBranch must not escape the canonical lift: {:?}",
+            lifted.block().ops
+        );
+        assert!(
+            lifted
+                .block()
+                .ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::Select { .. })),
+            "the conditional flag updates must retain their exact Select semantics"
+        );
+        assert!(
+            lifted.block().ops.iter().all(|op| {
+                !matches!(op, R2ILOp::Select { dst, .. } if dst.space == SpaceId::Unique)
+            }),
+            "instruction-local temporaries must feed the selected register candidates instead of preserving an undefined temporary: {:?}",
+            lifted.block().ops
+        );
+    }
+
     #[cfg(feature = "x86")]
     #[test]
     fn x86_imul_overflow_chain_retains_its_exact_128_bit_product_geometry() {

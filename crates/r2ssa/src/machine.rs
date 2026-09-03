@@ -4573,6 +4573,18 @@ fn value_has_boolean_producer(graph: &crate::graph::SsaGraph, value: ValueId) ->
                     .as_slice()
                     .first()
                     .is_some_and(|input| visit(graph, *input, visiting)),
+                // A selection is boolean only when both values it can produce
+                // are boolean. The condition alone proves nothing about the
+                // result: `cond ? 2 : 3` is still an integer. Instruction-local
+                // conditional control is normalized into this exact shape, so
+                // following both arms is what lets a later BoolNot consume a
+                // selected condition-code value without treating arbitrary
+                // integer truthiness as a boolean.
+                InstPayload::Op(SSAOp::Select { .. }) => {
+                    inst.inputs.len() == 3
+                        && visit(graph, inst.inputs[1], visiting)
+                        && visit(graph, inst.inputs[2], visiting)
+                }
                 InstPayload::Phi { .. } => {
                     !inst.inputs.is_empty()
                         && inst
@@ -5507,6 +5519,51 @@ mod tests {
             Err(MachineBuildError::UnsupportedOperation { op, .. })
                 if matches!(*op, SSAOp::Select { .. })
         ));
+    }
+
+    #[test]
+    fn boolean_not_accepts_a_select_with_two_boolean_arms() {
+        let first = Varnode::unique(0x10, 1);
+        let second = Varnode::unique(0x18, 1);
+        let condition = Varnode::unique(0x20, 1);
+        let selected = Varnode::unique(0x28, 1);
+        let inverted = Varnode::unique(0x30, 1);
+        let artifact = artifact_with_ops([
+            R2ILOp::IntEqual {
+                dst: first.clone(),
+                a: Varnode::register(0, 4),
+                b: Varnode::constant(7, 4),
+            },
+            R2ILOp::IntEqual {
+                dst: second.clone(),
+                a: Varnode::register(4, 4),
+                b: Varnode::constant(14, 4),
+            },
+            R2ILOp::IntEqual {
+                dst: condition.clone(),
+                a: Varnode::register(8, 4),
+                b: Varnode::constant(21, 4),
+            },
+            R2ILOp::Select {
+                dst: selected.clone(),
+                cond: condition,
+                if_true: first,
+                if_false: second,
+            },
+            R2ILOp::BoolNot {
+                dst: inverted,
+                src: selected,
+            },
+        ]);
+
+        let machine = MachineFunction::from_artifact(&artifact)
+            .expect("a select of proven boolean arms remains boolean");
+        assert!(machine.entities().iter().any(|entity| {
+            matches!(
+                machine.expr(entity.root()).map(MachineExpr::kind),
+                Some(MachineExprKind::BooleanNot { .. })
+            )
+        }));
     }
 
     #[test]
