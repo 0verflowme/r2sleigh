@@ -35,6 +35,14 @@ enum FinalObservationScope {
     Exact {
         region: RegionId,
         order: FinalOccurrenceOrder,
+        /// Which rendered statement this observation belongs to.
+        ///
+        /// Not the same as `order`: one statement contributes two ordered
+        /// groups, its reads and then its writes, because a statement reads
+        /// its operands before it assigns its destination. Both groups carry
+        /// the same statement here, so a read can be recognised as naming a
+        /// value its own statement defines.
+        statement: u64,
     },
     Ambiguous,
 }
@@ -44,6 +52,14 @@ enum FinalObservationScope {
 pub(crate) struct FinalBindingRead {
     pub(crate) binding: BindingId,
     pub(crate) source: PlacementRead,
+    /// The SSA value this read names, where the read has one.
+    ///
+    /// A read of a value that the *same* statement defines is not a read of
+    /// the object before it is assigned, however the two are ordered inside
+    /// the statement. See `Occurrence::self_defined`.
+    pub(crate) value: Option<r2ssa::ValueId>,
+    /// The rendered statement this read belongs to.
+    pub(crate) statement: u64,
     pub(crate) region: RegionId,
     pub(crate) block: u64,
     pub(crate) order: FinalOccurrenceOrder,
@@ -54,6 +70,10 @@ pub(crate) struct FinalBindingRead {
 pub(crate) struct FinalBindingWrite {
     pub(crate) binding: BindingId,
     pub(crate) inst: InstId,
+    /// The SSA value this write defines, where it defines one.
+    pub(crate) defines: Option<r2ssa::ValueId>,
+    /// The rendered statement this write belongs to.
+    pub(crate) statement: u64,
     pub(crate) region: RegionId,
     pub(crate) block: u64,
     pub(crate) order: FinalOccurrenceOrder,
@@ -261,7 +281,12 @@ pub(crate) fn collect_final_placement_occurrences(
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     for (index, target) in targets.iter().copied().enumerate() {
-        let Some(FinalObservationScope::Exact { region, order }) = scoped[index] else {
+        let Some(FinalObservationScope::Exact {
+            region,
+            order,
+            statement,
+        }) = scoped[index]
+        else {
             continue;
         };
         let observation = RenderObservationId::from_dense_index(index);
@@ -277,6 +302,8 @@ pub(crate) fn collect_final_placement_occurrences(
                 if let Some(binding) = bound_value(names, value)? {
                     reads.push(FinalBindingRead {
                         binding,
+                        value: Some(value),
+                        statement,
                         source: PlacementRead::Use(site),
                         region,
                         block,
@@ -301,6 +328,8 @@ pub(crate) fn collect_final_placement_occurrences(
                         .addr;
                     reads.push(FinalBindingRead {
                         binding,
+                        value: Some(value),
+                        statement,
                         source: PlacementRead::CertifiedValue { value, at },
                         region,
                         block,
@@ -323,6 +352,8 @@ pub(crate) fn collect_final_placement_occurrences(
                     if matches!(projection, r2ssa::MachineWriteProjection::Insert { .. }) {
                         reads.push(FinalBindingRead {
                             binding,
+                            value: None,
+                            statement,
                             source: PlacementRead::PreservedCarrierWrite(inst_id),
                             region,
                             block,
@@ -332,6 +363,8 @@ pub(crate) fn collect_final_placement_occurrences(
                     writes.push(FinalBindingWrite {
                         binding,
                         inst: inst_id,
+                        defines: Some(value),
+                        statement,
                         region,
                         block,
                         order,
@@ -375,6 +408,8 @@ pub(crate) fn collect_final_placement_occurrences(
                     writes.push(FinalBindingWrite {
                         binding,
                         inst: access.inst,
+                        defines: None,
+                        statement,
                         region,
                         block,
                         order,
@@ -394,6 +429,8 @@ pub(crate) fn collect_final_placement_occurrences(
                         .is_some_and(|fact| source.objects().address_is_indexed(fact.address));
                     reads.push(FinalBindingRead {
                         binding,
+                        value: None,
+                        statement,
                         source: if indexed {
                             PlacementRead::IndexedStackAccess(access)
                         } else {
@@ -788,6 +825,7 @@ fn record_observation_group(
     ids: &[RenderObservationId],
     region: Option<RegionId>,
     ambiguous: bool,
+    statement: u64,
     order: &mut u64,
     scoped: &mut [Option<FinalObservationScope>],
 ) {
@@ -814,6 +852,7 @@ fn record_observation_group(
             FinalObservationScope::Exact {
                 region,
                 order: current,
+                statement,
             }
         });
     }
@@ -940,8 +979,13 @@ fn record_completion_observations(
         .iter()
         .copied()
         .partition(|id| observation_is_write(targets, *id));
-    record_observation_group(&reads, current, false, order, scoped);
-    record_observation_group(&writes, current, false, order, scoped);
+    // One statement, two ordered groups: it reads its operands and then
+    // assigns its destination. They share a statement identity so a read of a
+    // value this very statement defines can be told from a read of the value
+    // it replaces.
+    let statement = *order;
+    record_observation_group(&reads, current, false, statement, order, scoped);
+    record_observation_group(&writes, current, false, statement, order, scoped);
 }
 
 #[track_caller]
@@ -956,7 +1000,8 @@ fn record_control_observations(
         .iter()
         .copied()
         .any(|id| observation_is_placement_relevant(targets, id));
-    record_observation_group(ids, current, ambiguous, order, scoped);
+    let statement = *order;
+    record_observation_group(ids, current, ambiguous, statement, order, scoped);
 }
 
 #[track_caller]
@@ -970,7 +1015,8 @@ fn record_ambiguous_expr_group<'a>(
     for expr in exprs {
         visit_expr_observations(expr, &mut |id| ids.push(id));
     }
-    record_observation_group(&ids, current, true, order, scoped);
+    let statement = *order;
+    record_observation_group(&ids, current, true, statement, order, scoped);
 }
 
 fn collect_expr_observation_scopes(
@@ -1013,9 +1059,11 @@ fn collect_expr_observation_scopes(
         } => {
             if let Some((reads, writes)) = direct_stack_assignment_observations(left, targets) {
                 collect_expr_observation_scopes(right, current, targets, order, scoped);
-                // The destination's address is read before the store that uses it.
-                record_observation_group(&reads, current, false, order, scoped);
-                record_observation_group(&writes, current, false, order, scoped);
+                // The destination's address is read before the store that uses
+                // it, and both belong to the one assignment.
+                let statement = *order;
+                record_observation_group(&reads, current, false, statement, order, scoped);
+                record_observation_group(&writes, current, false, statement, order, scoped);
             } else if expression_has_placement_write(left, targets)
                 || expression_has_placement_write(right, targets)
             {
@@ -3104,13 +3152,28 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
         )?;
     }
 
+    // Which value each occurrence group defines, so a read of one of them can
+    // be recognised as naming what its own statement produced.
+    let defined_in_group = writes
+        .iter()
+        .filter_map(|write| {
+            write
+                .defines
+                .map(|value| (write.statement, write.block, value))
+        })
+        .collect::<BTreeSet<_>>();
     let mut occurrences = vec![Vec::<Occurrence>::new(); binding_count];
     for read in reads {
+        let self_defined = read
+            .value
+            .is_some_and(|value| defined_in_group.contains(&(read.statement, read.block, value)));
         occurrences[read.binding.index()].push(Occurrence {
             region: read.region,
             block: read.block,
             order: read.order,
             kind: OccurrenceKind::Read(read.source),
+            self_defined,
+            statement: read.statement,
         });
     }
     for write in writes {
@@ -3122,6 +3185,8 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
                 inst: write.inst,
                 inline_eligible: write.inline_eligible,
             },
+            self_defined: false,
+            statement: write.statement,
         });
     }
     for binding_occurrences in &mut occurrences {
@@ -3349,22 +3414,49 @@ struct Occurrence {
     block: u64,
     order: FinalOccurrenceOrder,
     kind: OccurrenceKind,
+    /// A read of a value that a write in this same occurrence group defines.
+    ///
+    /// Every marker on one statement shares an order, and a read sorts before
+    /// a write at equal order, which is right for `x = x + 1`: that read names
+    /// the value the statement replaces. It is wrong when the read names the
+    /// value the statement *produces*. A write projection that absorbed the
+    /// instructions certifying it renders them all as one statement, and the
+    /// absorbed carrier extension reads exactly the value the fused statement
+    /// defines -- `RAX = zext(EAX)` folded into the write of `EAX`. Ordering
+    /// that read first says the object is read before it is assigned, which
+    /// refused ten of the fifty-four corpus cells.
+    ///
+    /// It is an ordering fact, not a smaller kind of occurrence: the read
+    /// still happens and still belongs to the binding, so it is placed after
+    /// the write that produced what it reads rather than dropped.
+    self_defined: bool,
+    /// The rendered statement this occurrence belongs to, which is what the
+    /// sort orders on. A statement contributes its reads at one order and its
+    /// writes at the next, so ordering on `order` alone can never put a read
+    /// after a write of the same statement, however it is ranked.
+    statement: u64,
 }
 
 impl Occurrence {
-    fn sort_key(&self) -> (FinalOccurrenceOrder, u8, u64, usize, u32, usize) {
+    /// Where a read sits against the writes sharing its order: before them,
+    /// as an ordinary read does, or after the one that produced what it reads.
+    const fn read_rank(&self) -> u8 {
+        if self.self_defined { 2 } else { 0 }
+    }
+
+    fn sort_key(&self) -> (u64, u8, u64, usize, u32, usize) {
         match self.kind {
             OccurrenceKind::Read(PlacementRead::Use(site)) => (
-                self.order,
-                0,
+                self.statement,
+                self.read_rank(),
                 self.block,
                 self.region.index(),
                 site.inst.0,
                 site.input_idx,
             ),
             OccurrenceKind::Read(PlacementRead::CertifiedValue { value, at }) => (
-                self.order,
-                0,
+                self.statement,
+                self.read_rank(),
                 self.block,
                 self.region.index(),
                 at.0,
@@ -3373,19 +3465,29 @@ impl Occurrence {
             OccurrenceKind::Read(
                 PlacementRead::StackAccess(access) | PlacementRead::IndexedStackAccess(access),
             ) => (
-                self.order,
-                0,
+                self.statement,
+                self.read_rank(),
                 self.block,
                 self.region.index(),
                 access.inst.0,
                 access.ordinal as usize,
             ),
-            OccurrenceKind::Read(PlacementRead::PreservedCarrierWrite(inst)) => {
-                (self.order, 0, self.block, self.region.index(), inst.0, 0)
-            }
-            OccurrenceKind::Write { inst, .. } => {
-                (self.order, 1, self.block, self.region.index(), inst.0, 0)
-            }
+            OccurrenceKind::Read(PlacementRead::PreservedCarrierWrite(inst)) => (
+                self.statement,
+                self.read_rank(),
+                self.block,
+                self.region.index(),
+                inst.0,
+                0,
+            ),
+            OccurrenceKind::Write { inst, .. } => (
+                self.statement,
+                1,
+                self.block,
+                self.region.index(),
+                inst.0,
+                0,
+            ),
         }
     }
 }
@@ -3461,7 +3563,19 @@ fn first_read_before_assignment(
         for occurrence in block_occurrences {
             match occurrence.kind {
                 OccurrenceKind::Read(PlacementRead::IndexedStackAccess(_)) => {}
-                OccurrenceKind::Read(read) if !assigned => return Some(read),
+                OccurrenceKind::Read(read) if !assigned => {
+                    r2il::refusal_evidence!(
+                        "read-before-assignment",
+                        "binding={binding:?} block={block:#x} order={:?} self_defined={} read={read:?} all={:?}",
+                        occurrence.order,
+                        occurrence.self_defined,
+                        occurrences
+                            .iter()
+                            .map(|o| (o.block, o.order.0, o.self_defined, &o.kind))
+                            .collect::<Vec<_>>()
+                    );
+                    return Some(read);
+                }
                 OccurrenceKind::Read(_) => {}
                 OccurrenceKind::Write { .. } => assigned = true,
             }
@@ -3822,6 +3936,8 @@ mod tests {
         let merge_region = region_with_entry(&regions, 0x1030, StructuredRegionKind::Block);
         let writes = [
             FinalBindingWrite {
+                statement: 0,
+                defines: None,
                 effectful: false,
                 binding,
                 inst: InstId(1),
@@ -3832,6 +3948,8 @@ mod tests {
                 inline_eligible: true,
             },
             FinalBindingWrite {
+                statement: 0,
+                defines: None,
                 effectful: false,
                 binding,
                 inst: InstId(2),
@@ -3843,6 +3961,8 @@ mod tests {
             },
         ];
         let reads = [FinalBindingRead {
+            statement: 0,
+            value: None,
             binding,
             source: PlacementRead::Use(UseSite {
                 inst: InstId(3),
@@ -3882,6 +4002,8 @@ mod tests {
             input_idx: 0,
         };
         let writes = [FinalBindingWrite {
+            statement: 0,
+            defines: None,
             effectful: false,
             binding,
             inst: InstId(1),
@@ -3892,6 +4014,8 @@ mod tests {
             inline_eligible: true,
         }];
         let reads = [FinalBindingRead {
+            statement: 0,
+            value: None,
             binding,
             source: PlacementRead::Use(site),
             region: merge_region,
@@ -3958,6 +4082,8 @@ mod tests {
         assert!(regions.regions_are_exclusive(merge_regions[0], merge_regions[1]));
         let writes = [
             FinalBindingWrite {
+                defines: None,
+                statement: 0x1010,
                 effectful: false,
                 binding,
                 inst: InstId(1),
@@ -3968,6 +4094,8 @@ mod tests {
                 inline_eligible: true,
             },
             FinalBindingWrite {
+                defines: None,
+                statement: 0x1020,
                 effectful: false,
                 binding,
                 inst: InstId(2),
@@ -3980,6 +4108,8 @@ mod tests {
         ];
         let reads = [
             FinalBindingRead {
+                value: None,
+                statement: 0x1030,
                 binding,
                 source: PlacementRead::Use(UseSite {
                     inst: InstId(3),
@@ -3990,6 +4120,8 @@ mod tests {
                 order: FinalOccurrenceOrder(2),
             },
             FinalBindingRead {
+                value: None,
+                statement: 0x1030,
                 binding,
                 source: PlacementRead::Use(UseSite {
                     inst: InstId(3),
@@ -4029,6 +4161,8 @@ mod tests {
         let inst = InstId(0);
         let order = FinalOccurrenceOrder(0);
         let reads = [FinalBindingRead {
+            statement: 0,
+            value: None,
             binding,
             source: PlacementRead::PreservedCarrierWrite(inst),
             region: block_region,
@@ -4036,6 +4170,8 @@ mod tests {
             order,
         }];
         let writes = [FinalBindingWrite {
+            statement: 0,
+            defines: None,
             effectful: false,
             binding,
             inst,
@@ -4085,6 +4221,8 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &[FinalBindingRead {
+                statement: 0,
+                value: None,
                 binding,
                 source: PlacementRead::Use(UseSite {
                     inst: InstId(2),
@@ -4095,6 +4233,8 @@ mod tests {
                 order: FinalOccurrenceOrder(2),
             }],
             &[FinalBindingWrite {
+                statement: 0,
+                defines: None,
                 effectful: false,
                 binding,
                 inst: write,
@@ -4130,6 +4270,8 @@ mod tests {
         let binding = BindingId::from_dense_index(0).expect("binding");
         let block_region = region_with_entry(&regions, 0x1000, StructuredRegionKind::Block);
         let reads = [FinalBindingRead {
+            statement: 0,
+            value: None,
             binding,
             source: PlacementRead::Use(UseSite {
                 inst: InstId(0),

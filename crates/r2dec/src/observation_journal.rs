@@ -2341,8 +2341,72 @@ impl LegacyObservationJournal {
         let (expr, value, replaced, obligations) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        let mut represented_values = BTreeSet::from([value]);
-        let mut order = replaced;
+        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
+
+        for obligation in obligations {
+            if !self.effect_occurrences.contains_key(&obligation) {
+                return Err(LegacyObservationJournalError::InvalidEffectObligation(
+                    obligation,
+                ));
+            }
+            targets.push(ObservationTarget::Effect(obligation));
+        }
+
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// Mark every cell the instructions a rendered statement discharges.
+    ///
+    /// The statement twin of [`Self::observe_rendered_replacement_expr`], for a
+    /// definition whose write projection stands for other instructions: a
+    /// write the machine projection certified as a zero-extension into its
+    /// carrier has spoken for the extensions that certified it, and those have
+    /// no statement of their own. The statement already carries its own value
+    /// and write markers from [`Self::observe_normalized_output_stmt`]; this
+    /// adds the discharged instructions' writes, operands and outputs, exact,
+    /// on the one occurrence that now renders them.
+    ///
+    /// Those operands read the very value the statement defines, so placement
+    /// is told which reads name what their own statement produced -- see
+    /// `Occurrence::self_defined` -- rather than being left to order a read of
+    /// the object before the write that assigns it.
+    pub(crate) fn observe_discharged_stmt(
+        &mut self,
+        discharged: &[InstId],
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let targets = self.discharged_instruction_targets(None, discharged, None)?;
+        let mut marked = stmt;
+        for id in self.allocate_many(targets)? {
+            marked = CStmt::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
+    /// The cells each discharged instruction still owes, in canonical order:
+    /// its write, the value it produced, and every operand it read.
+    ///
+    /// `rendered` is the value the caller has already marked, and `expr` is the
+    /// expression standing in for the vanished statements. Both are absent when
+    /// a *statement* discharges the instructions, and that absence is what
+    /// distinguishes the two cases rather than a second copy of this walk. With
+    /// an expression there is no statement left to answer for the operands it
+    /// spells, so their value cells are filled here; with a statement the
+    /// statement's own markers already answer for them, and filling them again
+    /// would put two answers on one cell.
+    fn discharged_instruction_targets(
+        &mut self,
+        rendered: Option<ValueId>,
+        discharged: &[InstId],
+        expr: Option<&CExpr>,
+    ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
+        let mut targets = Vec::new();
+        let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
+        let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
         let produced = order
@@ -2363,7 +2427,8 @@ impl LegacyObservationJournal {
             // The write the vanished statement performed. Its result is part
             // of the expression now standing in the reader's place.
             if let Some(output) = inst.output {
-                if output != value
+                if expr.is_some()
+                    && Some(output) != rendered
                     && !matches!(
                         self.plan.disposition(output),
                         Some(ValueDisposition::Inline { .. })
@@ -2394,6 +2459,9 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
+                let Some(expr) = expr else {
+                    continue;
+                };
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
@@ -2404,7 +2472,7 @@ impl LegacyObservationJournal {
                             true
                         }
                         Some(ValueDisposition::Inline { .. })
-                            if self.expr_has_value_observation(&expr, input) =>
+                            if self.expr_has_value_observation(expr, input) =>
                         {
                             false
                         }
@@ -2424,21 +2492,7 @@ impl LegacyObservationJournal {
                 }
             }
         }
-
-        for obligation in obligations {
-            if !self.effect_occurrences.contains_key(&obligation) {
-                return Err(LegacyObservationJournalError::InvalidEffectObligation(
-                    obligation,
-                ));
-            }
-            targets.push(ObservationTarget::Effect(obligation));
-        }
-
-        let mut marked = expr;
-        for id in self.allocate_many(targets)? {
-            marked = CExpr::observed(id, marked);
-        }
-        Ok(marked)
+        Ok(targets)
     }
 
     pub(crate) fn observe_certified_value_read_expr(

@@ -8700,8 +8700,8 @@ below is measured on the fifty-four cells with `locked_matrix.sh`, and every
 number that moved is stated with the state it moved from.
 
     predicate                    before   after   what happened
-    self_assignments               225     205    merge-copy coalescing widened; the
-                                                  carrier zero-extend is still open
+    self_assignments               225      50    merge-copy coalescing widened, and the
+                                                  carrier zero-extend now discharges
     literal_only_declarations      103      80    call arguments now spell their literal
                                                   where it is read; the rest are open
     flag_carriers                  192     192    untouched, and still the open question
@@ -8785,7 +8785,10 @@ it, and placement refuses with `read_before_assignment`. Dropping just the
 operand targets changes the refusal to `ExactUseRequiresRenderedOccurrence`,
 which is the proof that the operand cell is the one at fault.
 
-That is a question, not a bug, and it is the fork this work stopped at. What is
+That looked like a question about accounting and it was not. **The answer is
+below, under "the conflation was in placement's ordering model"; what follows
+is the reasoning that turned out to be aimed at the wrong layer, kept because
+the options are the ones anybody will reach for next.** What is
 the honest cell for an operand read that a write projection absorbed?
 
 - *Elide it*, with a reason of its own. Truthful -- the read does not appear in
@@ -8800,8 +8803,46 @@ the honest cell for an operand read that a write projection absorbed?
 - *Narrow the discharge* to extensions whose operand is not in the absorbing
   write's binding. This disables the feature: same-binding is its precondition.
 
-The first looks right and none of it was landed, because it decides what
-"rendered by equivalence" means for two ledgers at once.
+None of the three is needed.
+
+### The conflation was in placement's ordering model, one level below
+
+Asked to trace it further rather than choose among ways of living with it, the
+answer came out clean and it is now landed.
+
+A statement contributes **two** ordered occurrence groups, not one:
+`record_completion_observations` partitions its markers into reads and writes
+and records the reads at order N and the writes at order N+1, because a
+statement reads its operands before it assigns its destination. That is right
+for `x = x + 1`, where the read names the value the statement replaces. It is
+wrong when the read names the value the statement *produces*, and nothing in
+the model could tell those two apart: the only thing relating a statement's two
+groups was that their orders happened to be consecutive, so a read could never
+sort after a write of its own statement however it was ranked. The first
+attempt at a fix ranked self-reads after writes and changed nothing, because
+the rank only breaks ties *within* one order and these are two orders. The
+trace that showed it is worth keeping in mind:
+
+    binding=BindingId(3) order=24 self_defined=true  Read(Use(inst 20, input 0))
+                         order=25 self_defined=false Write { inst: 19 }
+                         order=25 self_defined=false Write { inst: 20 }
+
+So the two groups now carry the statement they came from, occurrences sort on
+that statement rather than on the group order, and a read of a value that a
+write in the same statement defines is ranked after the writes. The read stays
+an occurrence, stays exact, stays the binding's, and proves the object live; it
+is placed where it happens. `FinalBindingRead` gained the value it names and
+`FinalBindingWrite` the value it defines, which is what lets them be matched,
+and `FinalObservationScope::Exact` gained the statement.
+
+No new elision reason, no split between what the journal calls an occurrence
+and what placement does. The accounting rule the owner settled -- a rendered
+term discharges the replaced instructions' cells as exact, by equivalence --
+holds exactly as written; it was the *order* that was wrong, not the cell.
+
+Self-assignments fall from 205 to **50** across the fifty-four cells, with
+`pearson`, `crc32_bitwise` and `fnv1a64` rendering at every x86-64 level where
+they had refused. What is left is not the carrier zero-extend.
 
 **Coalescing the program's own copies, merge edges whose source is version 0,
 and literals held in registers all delete an object's only definition.** A
