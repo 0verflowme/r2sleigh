@@ -589,6 +589,44 @@ pub(super) fn inlinable_values(
     inlinable_core(source_owned, projection, &admitted)
 }
 
+/// Whether a reader's term may absorb the producer of `value`.
+///
+/// One question with one answer: a term absorbs a producer exactly when the
+/// plan renders that producer's value without a local. Both are
+/// `inlinable_values`, so there is nothing here for the two to disagree
+/// about, and the plan and the seal each derive the set from their own
+/// projection and then call this.
+///
+/// # Why duplicability is not a second reason
+///
+/// The policy used to admit a producer whose term is duplicable -- literals
+/// and entry values the function never writes -- on the ground that
+/// duplicability is a property of the term rather than of the plan's
+/// disposition. That is true of duplicability and beside the point of this
+/// question. Absorbing a producer does not remove the producer's own
+/// statement; only the plan's disposition does. A value the plan bound is
+/// therefore rendered twice: once as `name = ...`, and again inside every
+/// term that absorbed it. The rewriter then reports that producer as
+/// discharged by each of those terms, because its value is no longer a leaf
+/// of them, and the renderer marks the vanished instruction's write on the
+/// expression standing in for it -- a second answerer for a write the
+/// producer's own statement already renders.
+///
+/// That went unnoticed while nothing rendered from the canonical terms. The
+/// subscript renderer does, and `elem_at`, `elem_before`, `bounded_fetch` and
+/// `half_stride` at x86-64 -O1 and -O2 stopped rendering: their index is
+/// `sext(esi)`, whose value the plan binds because a width change has no
+/// inline form, and whose term is duplicable because `esi` is an entry value.
+/// Placement found the absorbed write inside the right-hand side of an
+/// assignment, where C states no order between it and the reads beside it,
+/// and refused with `ambiguous_observation_execution_order`.
+pub(super) fn term_absorbs_producer(
+    inlinable: &BTreeSet<ValueId>,
+    query: &r2rewrite::ExpansionQuery<'_>,
+) -> bool {
+    inlinable.contains(&query.value)
+}
+
 /// Literals held in a machine location that are alone in their object.
 ///
 /// A literal in a lowering temporary is admitted by the gate in

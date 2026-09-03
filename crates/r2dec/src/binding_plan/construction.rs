@@ -942,20 +942,14 @@ impl BindingPlan {
         // producer be expanded into its reader" and "may this value be
         // rendered without a local" are one answer rather than two that agree
         // today. `inlinable_values` is computed once from the same projection
-        // and the closure only tests membership.
+        // and `term_absorbs_producer` only tests membership.
         let inlinable_for_expansion =
             super::rules::inlinable_values(source_owned, &machine_projection);
         let canonical = r2rewrite::canonicalize_with(
             source,
             &machine_projection,
             &|query: &r2rewrite::ExpansionQuery<'_>| {
-                inlinable_for_expansion.contains(&query.value)
-                    || r2rewrite::term_is_duplicable(
-                        query.projection,
-                        query.arena,
-                        query.entry_never_redefined,
-                        query.producer_term,
-                    )
+                super::rules::term_absorbs_producer(&inlinable_for_expansion, query)
             },
         )
         .map_err(BindingPlanBuildError::Canonicalisation)?;
