@@ -9450,6 +9450,25 @@ its count from that literal's conversion specifiers, and one whose format does
 not resolve refuses, which is what the second call above should be doing today
 instead of inventing a fourth argument.
 
+Both deltas in that run are now accounted for, and the record has been re-taken
+against the merged tree so the next change is measured against reality rather
+than against a state nobody will return to.
+
+`tooManyBlocks` falling from 0.156 to 0.148 is the second `fprintf` above,
+gaining an argument it should refuse over.
+
+`bsClose` going from rendered to refusing is **not a loss**, and it is worth
+being exact about why, because the count of decompiled functions fell from eight
+to seven and that reads badly. It refuses with `unrepresentable operation`, from
+the linearizer, which is the guard this branch added for a transfer that leaves
+the function. Before the guard it rendered a `goto` to a label the function
+never defines, which does not compile, and it scored 0.000. It scores nothing
+now. No information was lost: a wrong answer was replaced by an honest refusal,
+and the guard already carries a comment naming the commit that must delete it,
+which is the one that gives such a transfer a callsite and renders it as a
+terminal call. When that lands, `bsClose` should return, and this time with a
+score.
+
 This is the case the per-function record was built for, and it is worth saying
 what would have happened without it. The aggregate went up. A run that reported
 only `byte_match 0.111 → 0.140` would have read as progress, and both the lost

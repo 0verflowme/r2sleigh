@@ -1,17 +1,13 @@
 {
   "functions": {
     "bzip2recover/O0::bsClose": {
-      "decompiled": true,
+      "decompiled": false,
       "reference": {
         "byte_match": 0.8472222222222222,
         "ged": 8.0,
         "type_match": 0.5
       },
-      "scores": {
-        "byte_match": 0.0,
-        "ged": 8.0,
-        "type_match": 0.0
-      }
+      "scores": {}
     },
     "bzip2recover/O0::bsGetBit": {
       "decompiled": false,
@@ -48,7 +44,7 @@
         "type_match": 0.6666666666666666
       },
       "scores": {
-        "byte_match": 0.052884615384615384,
+        "byte_match": 0.05339805825242718,
         "ged": 5.0,
         "type_match": 0.0
       }
@@ -79,7 +75,7 @@
         "type_match": 1.0
       },
       "scores": {
-        "byte_match": 0.08780487804878048,
+        "byte_match": 0.08866995073891626,
         "ged": 25.0,
         "type_match": 0.5
       }
@@ -108,7 +104,7 @@
         "type_match": 1.0
       },
       "scores": {
-        "byte_match": 0.16071428571428573,
+        "byte_match": 0.18181818181818182,
         "ged": 0.0,
         "type_match": 0.0
       }
@@ -120,7 +116,7 @@
         "ged": 0.0
       },
       "scores": {
-        "byte_match": 0.21428571428571427,
+        "byte_match": 0.2549019607843137,
         "ged": 0.0
       }
     },
@@ -146,7 +142,7 @@
         "type_match": 1.0
       },
       "scores": {
-        "byte_match": 0.15584415584415584,
+        "byte_match": 0.14814814814814814,
         "ged": 0.0,
         "type_match": 0.0
       }
@@ -158,7 +154,7 @@
         "ged": 0.0
       },
       "scores": {
-        "byte_match": 0.21428571428571427,
+        "byte_match": 0.2549019607843137,
         "ged": 0.0
       }
     }
@@ -166,16 +162,16 @@
   "schema_version": 1,
   "summary": {
     "byte_match": {
-      "mean": 0.11072742044540825,
-      "n": 8
-    },
-    "ged": {
-      "mean": 5.428571428571429,
+      "mean": 0.1402626086466144,
       "n": 7
     },
+    "ged": {
+      "mean": 5.0,
+      "n": 6
+    },
     "type_match": {
-      "mean": 0.1,
-      "n": 5
+      "mean": 0.125,
+      "n": 4
     }
   }
 }
