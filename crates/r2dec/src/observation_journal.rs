@@ -1588,6 +1588,7 @@ impl LegacyObservationJournal {
                 // it, and names the carrier it means, which is that proof. A
                 // restore the convention does not speak for is declined
                 // exactly as an unproven program copy is.
+                let is_call_restore = matches!(op, r2ssa::SSAOp::CallRestore { .. });
                 let src = match op {
                     r2ssa::SSAOp::Copy { src, .. } => src,
                     r2ssa::SSAOp::CallRestore { src, dst }
@@ -1595,7 +1596,12 @@ impl LegacyObservationJournal {
                     {
                         src
                     }
-                    _ => continue,
+                    _ => {
+                        if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!("call restore at {site:?} has no preserved-carrier fact");
+                        }
+                        continue;
+                    }
                 };
                 // A restore's source is the carrier as the function was
                 // entered with it whenever the call is the first one, and that
@@ -1638,10 +1644,18 @@ impl LegacyObservationJournal {
                         program_copy = Some(*inst);
                         None
                     }
-                    None => continue,
+                    None => {
+                        if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!("call restore at {site:?} has no normalization origin");
+                        }
+                        continue;
+                    }
                 };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
                 let Some(output) = projection.output else {
+                    if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!("call restore at {site:?} has no output projection");
+                    }
                     continue;
                 };
                 let input = match incoming {
@@ -1652,6 +1666,9 @@ impl LegacyObservationJournal {
                     None => projection.inputs.first(),
                 };
                 let Some(input) = input else {
+                    if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!("call restore at {site:?} has no input projection");
+                    }
                     continue;
                 };
                 // A restore states the convention rather than performing a
@@ -1666,8 +1683,18 @@ impl LegacyObservationJournal {
                 {
                     continue;
                 }
+                let dispositions = (
+                    plan.disposition(input.value),
+                    plan.disposition(output.value),
+                );
+                if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "call restore at {site:?} projects input {:?} {:?}, output {:?} {:?}",
+                        input.value, dispositions.0, output.value, dispositions.1
+                    );
+                }
                 if matches!(
-                    (plan.disposition(input.value), plan.disposition(output.value)),
+                    dispositions,
                     (
                         Some(ValueDisposition::Bound { binding: input }),
                         Some(ValueDisposition::Bound { binding: output }),
@@ -1902,7 +1929,7 @@ impl LegacyObservationJournal {
                 }
             }
         }
-        let refused_uses = self
+        let mut refused_uses = self
             .plan
             .machine_projection()
             .use_dispositions()
@@ -1921,7 +1948,7 @@ impl LegacyObservationJournal {
                     })
             })
             .collect::<Vec<_>>();
-        let refused_writes = self
+        let mut refused_writes = self
             .plan
             .machine_projection()
             .write_dispositions()
@@ -2037,6 +2064,20 @@ impl LegacyObservationJournal {
             )
             .map_err(|()| LegacyObservationJournalError::ConflictingValue(value))?;
         }
+        // A refusal says that a use or write cannot be rendered. It is not a
+        // second answer for a cell a source certificate has already proved has
+        // no occurrence. Stack-frame setup is the concrete overlap: its memory
+        // operand has no standalone memory context, but the whole instruction
+        // disappears under the exact frame round-trip certificate, so there is
+        // nothing left for that missing context to refuse.
+        //
+        // Filter per cell, after every certificate and normalization elision
+        // has been assembled. Filtering by instruction kind would suppress live
+        // uses beside an elided one; filtering values would let an elision hide
+        // a different rendered occurrence. The maps are the zero-occurrence
+        // proof domain and therefore the only admissible precedence rule.
+        retain_only_unanswered_refusals(&mut refused_uses, &elided_uses);
+        retain_only_unanswered_refusals(&mut refused_writes, &elided_writes);
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
         }
@@ -3617,6 +3658,13 @@ fn record_same<T: Copy + Eq>(slot: &mut Option<T>, observation: T) -> Result<(),
     }
 }
 
+fn retain_only_unanswered_refusals<T: Ord>(
+    refused: &mut Vec<T>,
+    elided: &BTreeMap<T, r2ssa::ledger::ElisionReason>,
+) {
+    refused.retain(|cell| !elided.contains_key(cell));
+}
+
 fn classify_value_node(
     value: ValueId,
     node: RenderObservationNode<'_>,
@@ -3961,6 +4009,24 @@ mod tests {
         StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
     };
     use crate::symbol::{ExternalKind, SymbolRole};
+
+    #[test]
+    fn exact_zero_occurrence_answer_precedes_refusal_per_use() {
+        let elided = UseSite {
+            inst: InstId(7),
+            input_idx: 0,
+        };
+        let still_refused = UseSite {
+            inst: InstId(7),
+            input_idx: 1,
+        };
+        let mut refused = vec![elided, still_refused];
+        let elisions = BTreeMap::from([(elided, r2ssa::ledger::ElisionReason::StackFrame)]);
+
+        retain_only_unanswered_refusals(&mut refused, &elisions);
+
+        assert_eq!(refused, vec![still_refused]);
+    }
 
     fn source_owned() -> SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
