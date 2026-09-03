@@ -10274,3 +10274,42 @@ the addition fold and the name appear. Doing that in the late fold would put
 a second answerer beside the binding plan for "does this value render
 inline", which is the duplication this project keeps removing, so it belongs
 to the inlining work and not here.
+
+## A test that reads a spelling as the fact, for the third time
+
+The one differential failure left on the integration branch, `arm64_O0 pearson`,
+was the harness. `verify_rendering.py` maps an image address into a blob so the
+recompiled C reads the real table, and `certified_image_literals` recognised the
+binding of such an address by matching `name = (uint64_t)0x100001000`, with the
+conversion required, because every rendering used to spell one. The cast work
+states a type only where the type changes, so the statement became
+`name = 0x100001000`, the pattern stopped matching, the address stayed absolute
+and the program segfaulted on eighteen of eighteen cases.
+
+The comment directly above that code records the previous time the same test had
+to stop reading a spelling as the fact, when recognising `*(uint8_t *)p` but not
+`*p` made a better rendering look unmapped. It is now three, counting the pass
+that matched an expression directly and so did nothing on any statement carrying
+a render marker.
+
+Two hypotheses were wrong and the output disproved both without a bisect. It was
+not the register families rekeyed on geometry: the rendered C computes
+`0x100001000 + 0xe6c + index` and returns the correct hash on all eighteen
+inputs, so the `adrp` result and the `add` operand are agreed to be the same
+storage. Had the pairing broken, the arithmetic would be wrong rather than
+merely unnamed. And it was not an object lookup missing an interior address:
+`sym._pearson_tab` is at `0x100001e6c`, exactly the base plus the offset, so the
+lookup would hit as it does on x64.
+
+**The lookup never runs.** It needs the address as one literal expression, and
+on this cell the page base is bound to a local rather than inlined, so the fold
+that would recombine them never sees a literal. x64 names the table because the
+address arrives as a single literal. That makes this one of the eighty remaining
+`literal_only_declarations`, and inlining it would make the fold happen and the
+name appear. It was deliberately not fixed in the fold: constant propagation
+there would stand a second answerer beside the binding plan for whether a value
+renders inline. It belongs to the inlining work.
+
+Note this is a different fact from the `adrp` page base found in the thunk work,
+where radare2's own reference points at the page rather than the slot. Here the
+page base is correct and simply un-recombined.
