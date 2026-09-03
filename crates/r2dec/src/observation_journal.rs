@@ -3203,6 +3203,9 @@ impl LegacyObservationJournal {
         })?;
 
         if let Some(error) = binding_failure {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!("observation binding failure: {error:?}");
+            }
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
 
