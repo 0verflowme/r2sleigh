@@ -1169,14 +1169,8 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Application)?;
-        for binding in removals.bindings {
-            for occurrence in occurrences.writes().iter().filter(|w| w.binding == binding) {
-                self.journal.placement_elided_writes.insert(occurrence.inst);
-            }
-        }
         self.journal
-            .placement_elided_observations
-            .extend(removals.observations);
+            .record_placement_removals(removals, occurrences.writes());
         let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&self.function);
         if !undeclared.is_empty() {
             return Err(NativePlacementFailure::UndeclaredNames {
@@ -1382,6 +1376,41 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
+    fn expr_has_value_observation(&self, expr: &CExpr, value: ValueId) -> bool {
+        let mut found = false;
+        expr.visit_render_observations(&mut |id| {
+            found |= matches!(
+                self.targets.get(id.index() as usize),
+                Some(ObservationTarget::Value(observed)) if *observed == value
+            );
+        });
+        found
+    }
+
+    /// Consume placement's complete removal report as one cell contract.
+    ///
+    /// The removed binding identifies every defining instruction whose
+    /// statement disappeared. The exact removed markers identify the value,
+    /// use, write, and effect cells those statements carried. Keeping the
+    /// report opaque until this method consumes both halves prevents a caller
+    /// from forwarding only the cell family it happened to remember.
+    fn record_placement_removals(
+        &mut self,
+        removals: crate::placement::PlacementRemovals,
+        writes: &[crate::placement::FinalBindingWrite],
+    ) {
+        let (bindings, observations) = removals.into_contract();
+        for binding in bindings {
+            self.placement_elided_writes.extend(
+                writes
+                    .iter()
+                    .filter(|write| write.binding == binding)
+                    .map(|write| write.inst),
+            );
+        }
+        self.placement_elided_observations.extend(observations);
+    }
+
     pub(crate) fn checkpoint(&self) -> ObservationJournalCheckpoint {
         ObservationJournalCheckpoint {
             target_len: self.targets.len(),
@@ -2257,6 +2286,7 @@ impl LegacyObservationJournal {
     /// Mark the base SSA value before any per-use machine projection is
     /// applied. This keeps one value disposition independent from the several
     /// exact widths or slices at which that value may be consumed.
+    #[cfg(test)]
     pub(crate) fn observe_normalized_input_value_expr(
         &mut self,
         site: NormalizedOpSite,
@@ -2285,47 +2315,40 @@ impl LegacyObservationJournal {
     /// boundary contract, while the lifted `Return` operand itself is the
     /// control target. This marker carries that exact `(ValueId, InstId)` into
     /// final declaration placement without inventing an operand index.
-    /// Mark every cell the accounting requires of the instructions a rendered
-    /// expression discharges.
+    /// Derive every cell one rendered replacement owns.
     ///
-    /// Rendering `expr` where `value` is read stands for every instruction in
-    /// `discharged`: the value's own definition, and any instruction whose
-    /// result the expression absorbed on the way. None of them has a statement
-    /// of its own any more, and the audit asks three things of the tree that a
-    /// vanished statement fails unless they are answered together: every
-    /// value has a cell, every recorded use has one, and every instruction
-    /// with an output has a write cell. So each discharged instruction, in
-    /// canonical order, has its write, every operand it read and the value it
-    /// produced marked on the one occurrence that now renders them. The cells
-    /// are exact -- rendered by equivalence, not elided.
-    pub(crate) fn observe_discharged_expr(
+    /// The opaque input says what the replacement rendered and carries the
+    /// complete set of definitions and effects derived by operation lowering.
+    /// No other production module can construct it. This owner derives the
+    /// value, use, write, and literal targets from the source graph, validates
+    /// the effect targets against the source inventory, and attaches every
+    /// target to the same concrete occurrence.
+    ///
+    /// A replaced producer must be inline in the sealed plan. Duplicability is
+    /// not a rendering disposition: accepting a bound output here would mark
+    /// its write both on its own assignment and on the replacement. Refusing
+    /// the contract at this boundary prevents that second answerer.
+    ///
+    /// Values without definitions need explicit derivation. A folded literal
+    /// can never occur in `replaced`, but it is still an operand of one of
+    /// those instructions and has no other occurrence after replacement. Its
+    /// value cell is therefore part of this same contract, deduplicated with
+    /// the root and produced values.
+    pub(crate) fn observe_rendered_replacement_expr(
         &mut self,
-        value: ValueId,
-        discharged: &[InstId],
-        expr: CExpr,
+        contract: crate::fold::op_lower::RenderedReplacementContract,
     ) -> Result<CExpr, LegacyObservationJournalError> {
+        let (expr, value, replaced, obligations) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(value, discharged)?);
-        let mut marked = expr;
-        for id in self.allocate_many(targets)? {
-            marked = CExpr::observed(id, marked);
-        }
-        Ok(marked)
-    }
-
-    /// The cells each discharged instruction still owes, in canonical order:
-    /// its write, the value it produced unless that is the `rendered` value
-    /// the caller has already marked, and every operand it read.
-    fn discharged_instruction_targets(
-        &mut self,
-        rendered: ValueId,
-        discharged: &[InstId],
-    ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
-        let mut targets = Vec::new();
-        let mut order = discharged.to_vec();
+        let mut represented_values = BTreeSet::from([value]);
+        let mut order = replaced;
         order.sort_unstable();
         order.dedup();
+        let produced = order
+            .iter()
+            .filter_map(|definition| self.source.graph().inst(*definition)?.output)
+            .collect::<BTreeSet<_>>();
         for definition in order {
             let block = self
                 .source
@@ -2340,13 +2363,21 @@ impl LegacyObservationJournal {
             // The write the vanished statement performed. Its result is part
             // of the expression now standing in the reader's place.
             if let Some(output) = inst.output {
+                if output != value
+                    && !matches!(
+                        self.plan.disposition(output),
+                        Some(ValueDisposition::Inline { .. })
+                    )
+                {
+                    return Err(LegacyObservationJournalError::RenderedValueRequired(output));
+                }
                 let observation = self.rendered_write_observation(definition)?;
                 targets.push(ObservationTarget::Write {
                     inst: definition,
                     observation,
                     block,
                 });
-                if output != rendered {
+                if represented_values.insert(output) {
                     self.value_slot(output)?;
                     targets.push(ObservationTarget::Value(output));
                 }
@@ -2363,28 +2394,51 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
+                let input = inst.inputs[input_idx];
+                if !produced.contains(&input) {
+                    let needs_value_target = match self.plan.disposition(input) {
+                        Some(ValueDisposition::Bound { .. }) => true,
+                        Some(ValueDisposition::Inline { .. })
+                            if self.source.graph().def_inst(input).is_none() =>
+                        {
+                            true
+                        }
+                        Some(ValueDisposition::Inline { .. })
+                            if self.expr_has_value_observation(&expr, input) =>
+                        {
+                            false
+                        }
+                        Some(ValueDisposition::Inline { .. })
+                        | Some(ValueDisposition::Elided { .. })
+                        | Some(ValueDisposition::Refused { .. })
+                        | None => {
+                            return Err(LegacyObservationJournalError::RenderedValueRequired(
+                                input,
+                            ));
+                        }
+                    };
+                    if needs_value_target && represented_values.insert(input) {
+                        self.value_slot(input)?;
+                        targets.push(ObservationTarget::Value(input));
+                    }
+                }
             }
         }
-        Ok(targets)
-    }
 
-    /// Mark the value an inlined expression produces, where it is rendered.
-    ///
-    /// A value is accounted for by being rendered somewhere. A value rendered
-    /// where it is read has no statement of its own, so the site it is rendered
-    /// at is the only place its cell can be marked.
-    pub(crate) fn observe_inlined_value_expr(
-        &mut self,
-        value: ValueId,
-        expr: CExpr,
-    ) -> Result<CExpr, LegacyObservationJournalError> {
-        self.value_slot(value)?;
-        let id = self
-            .allocate_many(vec![ObservationTarget::Value(value)])?
-            .into_iter()
-            .next()
-            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
-        Ok(CExpr::observed(id, expr))
+        for obligation in obligations {
+            if !self.effect_occurrences.contains_key(&obligation) {
+                return Err(LegacyObservationJournalError::InvalidEffectObligation(
+                    obligation,
+                ));
+            }
+            targets.push(ObservationTarget::Effect(obligation));
+        }
+
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
     }
 
     pub(crate) fn observe_certified_value_read_expr(
@@ -2535,7 +2589,7 @@ impl LegacyObservationJournal {
     /// carrier whose complete use domain is independently elided has no C
     /// occurrence instead, just as the coalesced copy case below does not.
     ///
-    /// This is the sibling of `observe_discharged_expr`, which accepts that a
+    /// This is the sibling of `observe_rendered_replacement_expr`, which accepts that a
     /// discharged instruction's cells are filled at the site rendering its
     /// replacement. The two cannot share a path, and the difference is worth
     /// stating: that function has an expression to hang markers on, because
@@ -2639,22 +2693,46 @@ impl LegacyObservationJournal {
         Ok(())
     }
 
-    fn account_materialized_phi_occurrences(&mut self) {
+    fn record_removed_value(
+        slot: &mut Option<LegacyValueObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyValueObservation::Elided(reason));
+        }
+    }
+
+    fn record_removed_use(
+        slot: &mut Option<LegacyUseObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyUseObservation::Elided(reason));
+        }
+    }
+
+    fn record_removed_write(
+        slot: &mut Option<LegacyWriteObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyWriteObservation::Elided(reason));
+        }
+    }
+
+    fn account_removed_occurrences(&mut self) {
         let graph = self.source.graph();
         for inst in self.materialized_removed_phis.clone() {
             let reason = r2ssa::ledger::ElisionReason::MaterializedPhiEdges;
-            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                && slot.is_none()
-            {
-                *slot = Some(LegacyWriteObservation::Elided(reason));
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                Self::record_removed_write(slot, reason);
             }
             let inputs = graph.inst(inst).map_or(0, |inst| inst.inputs.len());
             for input_idx in 0..inputs {
                 if let Some(row) = self.uses.get_mut(inst.0 as usize)
                     && let Some(slot) = row.get_mut(input_idx)
-                    && slot.is_none()
                 {
-                    *slot = Some(LegacyUseObservation::Elided(reason));
+                    Self::record_removed_use(slot, reason);
                 }
             }
         }
@@ -2666,26 +2744,22 @@ impl LegacyObservationJournal {
         // are closed out.
         let reason = r2ssa::ledger::ElisionReason::DeadUnusedTemporary;
         for inst in self.placement_elided_writes.clone() {
-            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                && slot.is_none()
-            {
-                *slot = Some(LegacyWriteObservation::Elided(reason));
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                Self::record_removed_write(slot, reason);
             }
             let Some(instruction) = graph.inst(inst) else {
                 continue;
             };
             if let Some(output) = instruction.output
                 && let Some(slot) = self.values.get_mut(output.0 as usize)
-                && slot.is_none()
             {
-                *slot = Some(LegacyValueObservation::Elided(reason));
+                Self::record_removed_value(slot, reason);
             }
             for input_idx in 0..instruction.inputs.len() {
                 if let Some(row) = self.uses.get_mut(inst.0 as usize)
                     && let Some(slot) = row.get_mut(input_idx)
-                    && slot.is_none()
                 {
-                    *slot = Some(LegacyUseObservation::Elided(reason));
+                    Self::record_removed_use(slot, reason);
                 }
             }
         }
@@ -2707,25 +2781,20 @@ impl LegacyObservationJournal {
             };
             match target {
                 ObservationTarget::Value(value) => {
-                    if let Some(slot) = self.values.get_mut(value.0 as usize)
-                        && slot.is_none()
-                    {
-                        *slot = Some(LegacyValueObservation::Elided(reason));
+                    if let Some(slot) = self.values.get_mut(value.0 as usize) {
+                        Self::record_removed_value(slot, reason);
                     }
                 }
                 ObservationTarget::Use { site, .. } => {
                     if let Some(row) = self.uses.get_mut(site.inst.0 as usize)
                         && let Some(slot) = row.get_mut(site.input_idx)
-                        && slot.is_none()
                     {
-                        *slot = Some(LegacyUseObservation::Elided(reason));
+                        Self::record_removed_use(slot, reason);
                     }
                 }
                 ObservationTarget::Write { inst, .. } => {
-                    if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                        && slot.is_none()
-                    {
-                        *slot = Some(LegacyWriteObservation::Elided(reason));
+                    if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                        Self::record_removed_write(slot, reason);
                     }
                 }
                 // A stack access answers through the object it addresses, and a
@@ -2780,9 +2849,24 @@ impl LegacyObservationJournal {
                 )
             });
             if unobserved && let Some(slot) = self.values.get_mut(index) {
-                *slot = Some(LegacyValueObservation::Elided(reason));
+                Self::record_removed_value(slot, reason);
             }
         }
+    }
+
+    /// Apply all absent-occurrence answers in their required dependency order.
+    ///
+    /// Placement's exact removal report must close its cells before an
+    /// identity merge or coalesced copy asks whether every consumer vanished.
+    /// Keeping that order behind one call prevents sealing from classifying a
+    /// removed consumer as an undeclared object.
+    fn apply_absent_occurrence_contracts(
+        &mut self,
+        symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    ) -> Result<(), LegacyObservationJournalError> {
+        self.account_removed_occurrences();
+        self.account_values_rendered_by_binding(symbol_bindings)?;
+        self.account_coalesced_copy_outputs(symbol_bindings)
     }
 
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
@@ -3033,19 +3117,6 @@ impl LegacyObservationJournal {
         let mut marked = stmt;
         for id in self.allocate_effect_targets(obligation_ids)? {
             marked = CStmt::observed(id, marked);
-        }
-        Ok(marked)
-    }
-
-    /// Expression twin of [`Self::observe_effect_stmt`].
-    pub(crate) fn observe_effect_expr(
-        &mut self,
-        obligation_ids: &BTreeSet<SemanticObligationId>,
-        expr: CExpr,
-    ) -> Result<CExpr, LegacyObservationJournalError> {
-        let mut marked = expr;
-        for id in self.allocate_effect_targets(obligation_ids)? {
-            marked = CExpr::observed(id, marked);
         }
         Ok(marked)
     }
@@ -3418,9 +3489,7 @@ impl LegacyObservationJournal {
         // exact removals before deciding whether a coalesced output has any
         // rendered consumer; doing this in the opposite order mistakes a
         // consumer placement removed for an undeclared C object.
-        self.account_materialized_phi_occurrences();
-        self.account_values_rendered_by_binding(&symbol_bindings)?;
-        if let Err(error) = self.account_coalesced_copy_outputs(&symbol_bindings) {
+        if let Err(error) = self.apply_absent_occurrence_contracts(&symbol_bindings) {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
         if let Some(error) = self.first_unaccounted_render_observation() {
@@ -4773,6 +4842,64 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_use_elision_reasons_refuse_instead_of_picking_one() {
+        let mut slot = None;
+        record_same(
+            &mut slot,
+            LegacyUseObservation::Elided(r2ssa::ledger::ElisionReason::CoalescedCopy),
+        )
+        .expect("the first proof owns the empty use cell");
+        assert_eq!(
+            record_same(
+                &mut slot,
+                LegacyUseObservation::Elided(r2ssa::ledger::ElisionReason::RedundantPhiEdge),
+            ),
+            Err(()),
+            "a second, different elision proof may not replace the first"
+        );
+    }
+
+    #[test]
+    fn placement_effect_elision_is_considered_only_at_zero_occurrences() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligation = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .find(|id| matches!(id.instruction.site, r2ssa::CanonicalInstructionSite::Op(_)))
+            .expect("fixture has an operation-backed obligation");
+        let removed = journal
+            .allocate_many(vec![ObservationTarget::Effect(obligation)])
+            .expect("one removed effect observation")[0];
+        journal.placement_elided_observations.insert(removed);
+        journal.account_removed_occurrences();
+
+        let obligations = BTreeSet::from([obligation]);
+        function.body.push(
+            journal
+                .observe_effect_stmt(&obligations, CStmt::Return(None))
+                .expect("one surviving effect occurrence"),
+        );
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("effect observations seal independently of V/U/W");
+        assert!(effects.placement_removed_effect(obligation));
+        assert_eq!(effects.occurrence_count(obligation), Some(1));
+
+        let origins =
+            NormalizationOrigins::for_unchanged(source.source().function(), source.source());
+        let ledger =
+            crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
+        assert!(matches!(
+            ledger.outcome(&obligation),
+            r2ssa::ledger::Outcome::Rendered { .. }
+        ));
+    }
+
+    #[test]
     fn residual_memory_effect_is_a_typed_refusal_not_a_rendered_occurrence() {
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Store {
@@ -4878,8 +5005,16 @@ mod tests {
         obligation.instruction.block_addr ^= 1;
         let obligations = BTreeSet::from([obligation]);
 
+        let (value, _binding, _site, _input_idx) = first_bound_rendered_input(&_plan, &source);
         assert_eq!(
-            journal.observe_effect_expr(&obligations, CExpr::UIntLit(0)),
+            journal.observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::UIntLit(0),
+                    value,
+                    Vec::new(),
+                    obligations,
+                )
+            ),
             Err(LegacyObservationJournalError::InvalidEffectObligation(
                 obligation
             ))
@@ -5705,7 +5840,14 @@ mod tests {
             .next()
             .expect("fixture has a source effect");
         let marked = journal
-            .observe_effect_expr(&BTreeSet::from([obligation]), marked)
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    marked,
+                    _value,
+                    Vec::new(),
+                    BTreeSet::from([obligation]),
+                ),
+            )
             .expect("independent effect marker");
         function.body = vec![CStmt::Expr(marked)];
 
@@ -5828,12 +5970,28 @@ mod tests {
             .inst(reader)
             .and_then(|inst| inst.output)
             .expect("the reader defines a value");
+        let obligations = [reader, folded_definition]
+            .iter()
+            .flat_map(|inst| {
+                source
+                    .source()
+                    .obligations()
+                    .instruction_for_inst(*inst)
+                    .expect("discharged instruction has a disposition")
+                    .obligations
+                    .iter()
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
         let before = journal.targets.len();
         let marked = journal
-            .observe_discharged_expr(
-                value,
-                &[reader, folded_definition],
-                CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+                    value,
+                    vec![reader, folded_definition],
+                    obligations.clone(),
+                ),
             )
             .expect("a two-instruction discharge");
 
@@ -5841,8 +5999,13 @@ mod tests {
         // rendered, then for each instruction in canonical order its write,
         // the value it produced, and every operand it read.
         let mut expected = vec![ObservationTarget::Value(value)];
+        let mut represented_values = BTreeSet::from([value]);
         let mut order = [reader, folded_definition];
         order.sort_unstable();
+        let produced = order
+            .iter()
+            .filter_map(|inst| graph.inst(*inst)?.output)
+            .collect::<BTreeSet<_>>();
         for inst_id in order {
             let inst = graph.inst(inst_id).expect("discharged instruction");
             let block = source
@@ -5862,7 +6025,7 @@ mod tests {
                 block,
             });
             let output = inst.output.expect("pure definition has an output");
-            if output != value {
+            if represented_values.insert(output) {
                 expected.push(ObservationTarget::Value(output));
             }
             for input_idx in 0..inst.inputs.len() {
@@ -5884,8 +6047,13 @@ mod tests {
                     observation,
                     block,
                 });
+                let input = inst.inputs[input_idx];
+                if !produced.contains(&input) && represented_values.insert(input) {
+                    expected.push(ObservationTarget::Value(input));
+                }
             }
         }
+        expected.extend(obligations.iter().copied().map(ObservationTarget::Effect));
         assert_eq!(&journal.targets[before..], expected.as_slice());
         assert_eq!(
             journal
@@ -5902,32 +6070,16 @@ mod tests {
                 .iter()
                 .filter(|target| matches!(target, ObservationTarget::Value(_)))
                 .count(),
-            2,
-            "both values the discharged instructions produced have a cell"
+            represented_values.len(),
+            "produced values and definitionless literals all have cells"
         );
 
         // The effects the two instructions answered for move with the
         // expression, and each is rendered exactly once.
-        let obligations = [reader, folded_definition]
-            .iter()
-            .flat_map(|inst| {
-                source
-                    .source()
-                    .obligations()
-                    .instruction_for_inst(*inst)
-                    .expect("discharged instruction has a disposition")
-                    .obligations
-                    .iter()
-                    .copied()
-            })
-            .collect::<BTreeSet<_>>();
         assert!(
             !obligations.is_empty(),
             "a pure definition carries a live-value obligation"
         );
-        let marked = journal
-            .observe_effect_expr(&obligations, marked)
-            .expect("effects move with the expression");
         function.body = vec![CStmt::Expr(marked)];
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
         let effects = journal
@@ -5940,5 +6092,124 @@ mod tests {
                 "obligation {obligation:?} is rendered once by the discharge"
             );
         }
+    }
+
+    #[test]
+    fn nested_replacement_requires_and_reuses_the_inner_value_occurrence() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let (folded, folded_definition) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                ) {
+                    return None;
+                }
+                Some((value.id, graph.def_inst(value.id)?))
+            })
+            .expect("fixture folds one computed value into its reader");
+        let [use_site] = graph.use_sites(folded) else {
+            panic!("a folded value has exactly one reader");
+        };
+        let reader = use_site.inst;
+        let rendered = graph
+            .inst(reader)
+            .and_then(|inst| inst.output)
+            .expect("the reader defines a value");
+
+        assert_eq!(
+            journal.observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::IntLit(3),
+                    rendered,
+                    vec![reader],
+                    BTreeSet::new(),
+                ),
+            ),
+            Err(LegacyObservationJournalError::RenderedValueRequired(folded)),
+            "an outer replacement cannot silently claim a defined inline operand"
+        );
+
+        let inner = journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+                    folded,
+                    vec![folded_definition],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the inner replacement owns the folded value occurrence");
+        let before_outer = journal.targets.len();
+        journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, inner, CExpr::IntLit(4)),
+                    rendered,
+                    vec![reader],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the outer replacement composes the finalized inner expression");
+
+        assert!(
+            !journal.targets[before_outer..].contains(&ObservationTarget::Value(folded)),
+            "the outer replacement must not become a second answerer for the inner value"
+        );
+        assert_eq!(
+            journal
+                .targets
+                .iter()
+                .filter(|target| **target == ObservationTarget::Value(folded))
+                .count(),
+            1,
+            "the nested expression carries exactly one folded-value occurrence"
+        );
+    }
+
+    #[test]
+    fn replacement_rejects_a_bound_intermediate_producer() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let rendered = graph
+            .values
+            .iter()
+            .find(|value| {
+                matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                )
+            })
+            .map(|value| value.id)
+            .expect("fixture has an inline value");
+        let (bound, definition) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Bound { .. })
+                ) {
+                    return None;
+                }
+                Some((value.id, graph.def_inst(value.id)?))
+            })
+            .expect("fixture has a bound computed value");
+
+        assert_eq!(
+            journal.observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::IntLit(1),
+                    rendered,
+                    vec![definition],
+                    BTreeSet::new(),
+                ),
+            ),
+            Err(LegacyObservationJournalError::RenderedValueRequired(bound)),
+            "a replacement cannot absorb a producer the plan still renders separately"
+        );
     }
 }

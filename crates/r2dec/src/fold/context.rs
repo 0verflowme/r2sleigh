@@ -307,34 +307,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    pub(crate) fn observe_optional_normalized_input_value_expr(
-        &self,
-        site: Option<crate::normalize::NormalizedOpSite>,
-        input_idx: usize,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let Some(site) = site else {
-            self.retain_first_observation_error(
-                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
-            );
-            return expr;
-        };
-        let fallback = expr.clone();
-        match journal
-            .borrow_mut()
-            .observe_normalized_input_value_expr(site, input_idx, expr)
-        {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
     pub(crate) fn observe_optional_normalized_input_uses_expr(
         &self,
         site: Option<crate::normalize::NormalizedOpSite>,
@@ -377,68 +349,6 @@ impl<'a> FoldingContext<'a> {
         value: Option<ValueId>,
     ) -> BTreeSet<SemanticObligationId> {
         self.exact_value_obligations(kind, source_inst, value.as_slice())
-    }
-
-    /// Mark every cell the instructions a rendered expression discharges still
-    /// owe, and the effects they answered for.
-    ///
-    /// Nothing asks a statement that is not emitted for its obligations, and
-    /// the ledger scores an obligation nobody asked about as refused; so the
-    /// effects move with the expression, exactly as its cells do.
-    pub(crate) fn observe_discharged_expr(
-        &self,
-        value: r2ssa::ValueId,
-        discharged: &[r2ssa::InstId],
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let fallback = expr.clone();
-        let marked = match journal
-            .borrow_mut()
-            .observe_discharged_expr(value, discharged, expr)
-        {
-            Ok(marked) => marked,
-            Err(error) => {
-                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
-                    eprintln!(
-                        "could not mark discharged value {value:?} definitions={discharged:?}: {error:?}"
-                    );
-                }
-                self.retain_first_observation_error(error);
-                return fallback;
-            }
-        };
-        let mut obligations = BTreeSet::new();
-        for definition in discharged {
-            let output = self
-                .inputs
-                .prepared_ssa
-                .and_then(|prepared| prepared.graph().inst(*definition))
-                .and_then(|inst| inst.output);
-            obligations.extend(self.exact_effect_obligations_for_source_inst(
-                EffectOccurrenceKind::Expression,
-                *definition,
-                output,
-            ));
-        }
-        self.observe_effect_expr(&obligations, marked)
-    }
-
-    /// Mark the value an inlined expression produces.
-    pub(crate) fn observe_inlined_value_expr(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        let fallback = expr.clone();
-        match journal.borrow_mut().observe_inlined_value_expr(value, expr) {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
     }
 
     pub(crate) fn observe_certified_value_read_expr(
@@ -552,31 +462,6 @@ impl<'a> FoldingContext<'a> {
         match journal
             .borrow_mut()
             .observe_effect_stmt(obligation_ids, stmt)
-        {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                fallback
-            }
-        }
-    }
-
-    /// Expression twin of [`Self::observe_effect_stmt`].
-    pub(crate) fn observe_effect_expr(
-        &self,
-        obligation_ids: &BTreeSet<SemanticObligationId>,
-        expr: CExpr,
-    ) -> CExpr {
-        let Some(journal) = self.inputs.observation_journal else {
-            return expr;
-        };
-        if obligation_ids.is_empty() {
-            return expr;
-        }
-        let fallback = expr.clone();
-        match journal
-            .borrow_mut()
-            .observe_effect_expr(obligation_ids, expr)
         {
             Ok(marked) => marked,
             Err(error) => {

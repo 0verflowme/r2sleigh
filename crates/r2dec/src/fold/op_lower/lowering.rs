@@ -9,6 +9,91 @@ fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
 }
 
 impl<'a> FoldingContext<'a> {
+    /// Turn one opaque rendering result into the complete source-cell set it
+    /// replaces. This is the only extractor for [`PendingReplacementExpr`].
+    ///
+    /// A plain value read replaces no instruction. An inlined value replaces
+    /// its definition when one exists. Canonical memory rewrites replace
+    /// exactly the instructions recorded by the authority-bound access term.
+    /// Callers cannot pass any of those instruction lists.
+    pub(super) fn finish_replacement_expr(&self, pending: PendingReplacementExpr) -> CExpr {
+        let PendingReplacementExpr {
+            expr,
+            value,
+            source,
+        } = pending;
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let invalid = || {
+            crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(value)
+        };
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            self.retain_first_observation_error(invalid());
+            return expr;
+        };
+        let replaced = match source {
+            ReplacementSource::RenderedValue => Vec::new(),
+            ReplacementSource::PlannedInline => {
+                prepared.graph().def_inst(value).into_iter().collect()
+            }
+            ReplacementSource::CanonicalAccess(access) => {
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(rewrite) = names.plan().canonical().access(access) else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let replaced = rewrite
+                    .discharges
+                    .iter()
+                    .filter_map(|id| match id.site {
+                        r2ssa::CanonicalInstructionSite::Op(ordinal) => {
+                            usize::try_from(ordinal).ok().and_then(|op_idx| {
+                                prepared.graph().inst_id_for_op_site(id.block_addr, op_idx)
+                            })
+                        }
+                        r2ssa::CanonicalInstructionSite::Phi(_)
+                        | r2ssa::CanonicalInstructionSite::NativeSpan { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if replaced.len() != rewrite.discharges.len() {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                }
+                replaced
+            }
+        };
+        let obligations = replaced
+            .iter()
+            .flat_map(|definition| {
+                let output = prepared
+                    .graph()
+                    .inst(*definition)
+                    .and_then(|inst| inst.output);
+                self.exact_effect_obligations_for_source_inst(
+                    EffectOccurrenceKind::Expression,
+                    *definition,
+                    output,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let fallback = expr.clone();
+        let contract = RenderedReplacementContract::new(expr, value, replaced, obligations);
+        match journal
+            .borrow_mut()
+            .observe_rendered_replacement_expr(contract)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     fn observation_lowering_refusal(
         error: &crate::observation_journal::LegacyObservationJournalError,
     ) -> OpLoweringRefusal {
@@ -373,7 +458,9 @@ impl<'a> FoldingContext<'a> {
                 if constant == value {
                     rendered
                 } else {
-                    self.observe_inlined_value_expr(constant, rendered)
+                    self.finish_replacement_expr(PendingReplacementExpr::planned_inline(
+                        constant, rendered,
+                    ))
                 }
             }
             Kind::Source { binding, .. } => {
@@ -381,29 +468,7 @@ impl<'a> FoldingContext<'a> {
                 if source == value {
                     return Err(invalid());
                 }
-                let rendered = self.planned_value_expr(source)?;
-                // The read is authorised by the use the discharged definition
-                // recorded: this leaf is one of its operands, and that use is
-                // marked on the expression the leaf now sits in. What the leaf
-                // still owes here is the value's own cell, when the leaf names
-                // an object -- a value that is itself rendered where it is read
-                // produced an expression rather than a name, and marked its
-                // cell on the way.
-                let names_a_symbol = self
-                    .inputs
-                    .binding_names
-                    .and_then(|names| names.disposition_for_value(source))
-                    .is_some_and(|disposition| {
-                        matches!(
-                            disposition,
-                            crate::binding_plan::ValueDisposition::Bound { .. }
-                        )
-                    });
-                if names_a_symbol {
-                    self.observe_inlined_value_expr(source, rendered)
-                } else {
-                    rendered
-                }
+                self.planned_value_expr(source)?
             }
             Kind::Copy { input } => child(0, *input)?,
             Kind::Arithmetic {
@@ -498,7 +563,12 @@ impl<'a> FoldingContext<'a> {
             );
         };
         match names.require_value(value) {
-            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => Ok(CExpr::Var(symbol)),
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
+                Ok(self.finish_replacement_expr(PendingReplacementExpr::rendered_value(
+                    value,
+                    CExpr::Var(symbol),
+                )))
+            }
             Ok(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => {
                 let Some(machine_expr) = names.inline_expr(expr) else {
                     return Err(
@@ -570,12 +640,9 @@ impl<'a> FoldingContext<'a> {
                         }
                     },
                 };
-                // A constant has no defining instruction and owes no write or
-                // operand cells, but it still owes its own.
-                let Some(definition) = definition else {
-                    return Ok(self.observe_inlined_value_expr(value, rendered));
-                };
-                Ok(self.observe_discharged_expr(value, &[definition], rendered))
+                Ok(self.finish_replacement_expr(PendingReplacementExpr::planned_inline(
+                    value, rendered,
+                )))
             }
             Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
@@ -741,21 +808,13 @@ impl<'a> FoldingContext<'a> {
             // Synthetic preservation inputs have no original graph use and
             // therefore no source-owned projection to apply.
             return Ok((
-                self.observe_optional_normalized_input_value_expr(
-                    frame.normalized_site,
-                    input_idx,
-                    self.planned_value_expr(input.value)?,
-                ),
+                self.planned_value_expr(input.value)?,
                 self.value_type(input.value),
             ));
         };
         match first_disposition {
             r2ssa::MachineUseDisposition::Exact(slice) => {
-                let base = self.observe_optional_normalized_input_value_expr(
-                    frame.normalized_site,
-                    input_idx,
-                    self.planned_value_expr(input.value)?,
-                );
+                let base = self.planned_value_expr(input.value)?;
                 let base_type = self.value_type(input.value);
                 super::projection::project_machine_use_of(
                     base,

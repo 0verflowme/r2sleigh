@@ -7,12 +7,11 @@
 //! canonicalises to a `Subscript` renders as `base[index]`, and this module
 //! only spells the term and accounts for what the spelling stands in for.
 //!
-//! The accounting is the one every rendered equivalence pays. The producers
-//! the term absorbed are discharged on the subscript, cells and effects both;
-//! a constant the term folded away still owes its own cell and is marked on
-//! the subscript too; and a leaf that names a bound object marks that object's
-//! cell as any read of it does. The access's own address operand is marked by
-//! the caller, exactly as it is for a dereference.
+//! This module does not account cells. It returns an opaque pending replacement
+//! containing the rendered syntax and the structural access identity. The one
+//! finalizer derives the absorbed producers from that access and marks their
+//! values, inputs, writes, definitionless literals, and effects together with
+//! the address value. The expression cannot be extracted before that happens.
 //!
 //! # Why there is no tie-break between a declared member and a proven stride
 //!
@@ -44,10 +43,8 @@
 //! is worth revisiting only on a measurement showing such accesses are common
 //! enough to cost `type_match`.
 
-use r2rewrite::{TermArena, TermId, TermKind};
-use r2ssa::CanonicalInstructionSite;
-
 use super::*;
+use r2rewrite::{TermArena, TermId, TermKind};
 
 impl<'a> FoldingContext<'a> {
     /// The access as `base[index]`, when the rewriter proved the cell is an
@@ -57,7 +54,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: &CType,
-    ) -> Option<CExpr> {
+    ) -> Option<PendingReplacementExpr> {
         // A declared aggregate outranks a proven address equivalence. Both
         // statements are true -- the cell at `p + 8` is `((T *)p)[1]` -- but
         // the source says that cell is a named struct field, and spelling it
@@ -82,85 +79,7 @@ impl<'a> FoldingContext<'a> {
             base: Box::new(base_expr),
             index: Box::new(index_expr),
         };
-
-        self.observe_certified_address_replacement(fact, expr)
-    }
-
-    /// Move the exact cells owned by an address computation to the structured
-    /// access that replaced it.
-    ///
-    /// Both the rewriter's subscript and the typed scalar-array renderer spell
-    /// the same canonical access. The latter used to omit this transfer, so its
-    /// base and index appeared as bare names beneath only the memory effect and
-    /// address-use markers. Neither marker authorises the bindings read by the
-    /// eliminated multiply/add chain.
-    pub(super) fn observe_certified_address_replacement(
-        &self,
-        fact: &r2types::MemoryAccessRenderFact,
-        mut expr: CExpr,
-    ) -> Option<CExpr> {
-        let names = self.inputs.binding_names?;
-        let access = names.plan().canonical().access(fact.access)?;
-        let graph = self.prepared_ssa()?.graph();
-        let discharged: Vec<r2ssa::InstId> = access
-            .discharges
-            .iter()
-            .filter_map(|id| match id.site {
-                CanonicalInstructionSite::Op(ordinal) => usize::try_from(ordinal)
-                    .ok()
-                    .and_then(|op_idx| graph.inst_id_for_op_site(id.block_addr, op_idx)),
-                CanonicalInstructionSite::Phi(_) | CanonicalInstructionSite::NativeSpan { .. } => {
-                    None
-                }
-            })
-            .collect();
-        if discharged.len() != access.discharges.len() {
-            return None;
-        }
-        // A literal operand of an instruction this term consumed is rendered
-        // here too, and it is the one cell `observe_discharged_expr` cannot
-        // fill. That function marks each discharged instruction's write, its
-        // output value, and its operands' *uses*; a constant has no defining
-        // instruction, so it is nobody's output and never appears in the
-        // discharged set at all, while its only occurrence was inside the
-        // address expression this subscript replaced.
-        //
-        // The earlier attempt looked for these among the term's leaves and
-        // found none, because import turns a constant into `TermKind::Literal`
-        // and `leaves` collects only `Leaf` and `Opaque`. Asking the graph for
-        // the instruction's operands avoids depending on how a constant
-        // happens to be represented in a term. Deduplicated, because one
-        // literal may be an operand of two consumed instructions and would
-        // otherwise be counted as two occurrences of one execution.
-        let mut folded_literals = std::collections::BTreeSet::new();
-        for inst in &discharged {
-            let graph_inst = graph.inst(*inst)?;
-            for input in graph_inst.inputs.iter().copied() {
-                if graph.def_inst(input).is_some() {
-                    continue;
-                }
-                if matches!(
-                    names.disposition_for_value(input),
-                    Some(crate::binding_plan::ValueDisposition::Inline { .. })
-                ) {
-                    folded_literals.insert(input);
-                }
-            }
-        }
-        for literal in folded_literals {
-            expr = self.observe_inlined_value_expr(literal, expr);
-        }
-
-        // Always, even when the term absorbed nothing. The subscript is where
-        // this address is rendered: the dereference path marks the address
-        // value on its way through `certified_memory_address_expr`, and this
-        // path does not go through it, so the cell has no other answerer.
-        //
-        // An empty discharge set is not the rare case. `constant_stride`
-        // absorbs the add and the multiply, so the set is non-empty;
-        // `pointer_walk` rewrites a bare merge leaf and absorbs nothing, so
-        // the set is empty and the address would go unaccounted.
-        Some(self.observe_discharged_expr(fact.address, &discharged, expr))
+        Some(PendingReplacementExpr::canonical_access(fact, expr))
     }
 
     /// The base at the type the subscript reads through.
@@ -240,30 +159,18 @@ impl<'a> FoldingContext<'a> {
                 match plan.machine_projection().expr(expr)?.kind() {
                     r2ssa::MachineExprKind::Source { binding, .. } => {
                         let value = binding.value();
-                        let rendered = match self.planned_value_expr(value) {
-                            Ok(rendered) => rendered,
-                            Err(error) => {
-                                self.retain_first_observation_error(error);
-                                return None;
-                            }
+                        let crate::binding_plan::ValueDisposition::Bound { binding } =
+                            names.disposition_for_value(value)?
+                        else {
+                            // An inline producer belongs in the canonical
+                            // access's discharge set, not as a second nested
+                            // renderer. Elided and refused values cannot be
+                            // occurrences at all.
+                            return None;
                         };
-                        // A leaf that names a bound object owes that object's
-                        // cell here, as any read of it does; a value rendered
-                        // where it is read marked its own on the way.
-                        let names_a_symbol = matches!(
-                            names.disposition_for_value(value),
-                            Some(crate::binding_plan::ValueDisposition::Bound { .. })
-                        );
-                        if names_a_symbol {
-                            self.observe_inlined_value_expr(value, rendered)
-                        } else {
-                            rendered
-                        }
+                        CExpr::Var(names.symbol_for_binding(*binding)?)
                     }
-                    r2ssa::MachineExprKind::Constant { binding, value } => {
-                        let rendered = literal_expr(value.bits());
-                        self.observe_inlined_value_expr(binding.value(), rendered)
-                    }
+                    r2ssa::MachineExprKind::Constant { value, .. } => literal_expr(value.bits()),
                     _ => return None,
                 }
             }

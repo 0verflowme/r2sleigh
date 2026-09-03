@@ -5,6 +5,7 @@
 //! only when those plans authorize them; lowering itself does not infer either
 //! policy from use counts, names, or expression shape.
 
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
 
@@ -122,6 +123,103 @@ enum LoweredOp {
     FinalizedStmt(CStmt),
     Expr(CExpr),
     None,
+}
+
+/// An expression that cannot leave operation lowering until its complete
+/// replacement contract has been turned into render cells.
+///
+/// The payload is deliberately opaque outside this module: a renderer may
+/// produce syntax and identify the source-owned thing it replaces, but only
+/// [`FoldingContext::finish_replacement_expr`] can recover the `CExpr`.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "a pending replacement must be finalized into render cells"]
+struct PendingReplacementExpr {
+    expr: CExpr,
+    value: ValueId,
+    source: ReplacementSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementSource {
+    RenderedValue,
+    PlannedInline,
+    CanonicalAccess(r2ssa::StructuredAccessId),
+}
+
+impl PendingReplacementExpr {
+    fn rendered_value(value: ValueId, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::RenderedValue,
+        }
+    }
+
+    fn planned_inline(value: ValueId, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::PlannedInline,
+        }
+    }
+
+    fn canonical_access(fact: &r2types::MemoryAccessRenderFact, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value: fact.address,
+            source: ReplacementSource::CanonicalAccess(fact.access),
+        }
+    }
+}
+
+/// Complete, one-shot input to the observation journal's cell derivation.
+///
+/// Production construction is private to operation lowering. Render helpers
+/// can return [`PendingReplacementExpr`], but no other module can assemble an
+/// ad hoc value/instruction/effect tuple and present it as a replacement.
+#[derive(Debug)]
+pub(crate) struct RenderedReplacementContract {
+    expr: CExpr,
+    value: ValueId,
+    replaced: Vec<r2ssa::InstId>,
+    obligations: BTreeSet<r2ssa::SemanticObligationId>,
+}
+
+impl RenderedReplacementContract {
+    fn new(
+        expr: CExpr,
+        value: ValueId,
+        replaced: Vec<r2ssa::InstId>,
+        obligations: BTreeSet<r2ssa::SemanticObligationId>,
+    ) -> Self {
+        Self {
+            expr,
+            value,
+            replaced,
+            obligations,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CExpr,
+        ValueId,
+        Vec<r2ssa::InstId>,
+        BTreeSet<r2ssa::SemanticObligationId>,
+    ) {
+        (self.expr, self.value, self.replaced, self.obligations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        expr: CExpr,
+        value: ValueId,
+        replaced: Vec<r2ssa::InstId>,
+        obligations: BTreeSet<r2ssa::SemanticObligationId>,
+    ) -> Self {
+        Self::new(expr, value, replaced, obligations)
+    }
 }
 
 pub(crate) type OpLoweringResult<T> = Result<T, OpLoweringRefusal>;

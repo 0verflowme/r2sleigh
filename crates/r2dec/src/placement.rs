@@ -2426,14 +2426,23 @@ fn apply_decisions_once(
 /// What applying the decisions actually removed.
 ///
 /// Both halves are needed. The bindings say which writes lost their statements,
-/// which is what the effect ledger keys on. The observations say which cells
-/// those statements carried, which is the only way to reach a caller-supplied
-/// value: it is version zero with no defining instruction, so no write answers
-/// for it.
+/// while the observations say which value, use, write, and effect cells those
+/// statements carried. The latter is also the only way to reach a
+/// caller-supplied value: it is version zero with no defining instruction, so
+/// no write answers for it.
 #[derive(Debug, Default)]
 pub(crate) struct PlacementRemovals {
-    pub(crate) bindings: BTreeSet<BindingId>,
-    pub(crate) observations: BTreeSet<RenderObservationId>,
+    bindings: BTreeSet<BindingId>,
+    observations: BTreeSet<RenderObservationId>,
+}
+
+impl PlacementRemovals {
+    /// Consume both halves as one contract. A caller cannot apply the removed
+    /// writes while forgetting the observations that carried value, use,
+    /// write, stack, certified-read, and effect cells beside them.
+    pub(crate) fn into_contract(self) -> (BTreeSet<BindingId>, BTreeSet<RenderObservationId>) {
+        (self.bindings, self.observations)
+    }
 }
 
 fn insert_region_declarations(
