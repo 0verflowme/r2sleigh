@@ -1541,23 +1541,34 @@ impl LegacyObservationJournal {
                 if src.version == 0 && !copy_source_is_a_parameter(&plan, graph, src) {
                     continue;
                 }
+                let mut program_copy = None;
                 let incoming = match origins.origin(site) {
                     Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => Some(origin.incoming),
                     Some(NormalizedOpOrigin::RelocatedInitializer(_)) => None,
-                    // One of the program's own copies is deliberately not
-                    // coalesced here. Both sides being one binding makes the
-                    // copy *look* redundant, and for a copy normalization
-                    // introduced it is: nothing else can have touched the
-                    // object between a merge edge's two ends. A program copy
-                    // has a position, and the object can be written between
-                    // the source's definition and the copy -- a save and
-                    // restore around a clobber is exactly that shape. The
-                    // interference tests decline to coalesce such values, so
-                    // the two sides should not be one binding at all; three
-                    // corpus cells say otherwise and compute the wrong answer
-                    // when the copy is dropped. Until that disagreement is
-                    // settled the copy keeps its statement.
-                    Some(NormalizedOpOrigin::Original(_)) => continue,
+                    // A copy the program itself made needs more than both
+                    // sides being one binding. A copy normalization
+                    // introduced sits at a merge edge, where nothing can have
+                    // touched the object between the edge's two ends; one the
+                    // program made has a position, and the object can be
+                    // written between the source's definition and the copy --
+                    // a save and restore around a clobber is exactly that
+                    // shape, and dropping the restore loses the value. Three
+                    // corpus cells computed the wrong answer when every such
+                    // copy was dropped on the strength of the coalescing
+                    // alone.
+                    //
+                    // So the question is asked at the copy rather than of the
+                    // coalescing: nothing wrote this object between the value
+                    // being produced and the copy of it. That is checkable
+                    // here and does not depend on the interference test having
+                    // been right. `subs x1, x1, #1` -- a subtraction into a
+                    // temporary and a copy of the temporary into `x1` -- is
+                    // the shape it admits, and it is the shape the ledger
+                    // already names.
+                    Some(NormalizedOpOrigin::Original(inst)) => {
+                        program_copy = Some(*inst);
+                        None
+                    }
                     None => continue,
                 };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
@@ -1574,6 +1585,11 @@ impl LegacyObservationJournal {
                 let Some(input) = input else {
                     continue;
                 };
+                if let Some(inst) = program_copy
+                    && !nothing_wrote_the_object_between(&plan, graph, inst, input.value)
+                {
+                    continue;
+                }
                 if matches!(
                     (plan.disposition(input.value), plan.disposition(output.value)),
                     (
@@ -3391,6 +3407,50 @@ fn classify_value_node(
     } else {
         Ok(LegacyValueObservation::InlineNonLiteral)
     }
+}
+
+/// Whether the object a copy writes went untouched between the value it
+/// copies being produced and the copy itself.
+///
+/// Both sides of the copy resolve to one binding, so the copy re-states a
+/// write the object has already had -- provided nothing else wrote that
+/// object in between. Asked here rather than of the coalescing, because the
+/// answer is local and exact: the source's definition and the copy are two
+/// positions in one block, and every write to the binding is an instruction
+/// whose output belongs to it.
+///
+/// A source defined in another block declines. Reaching it means crossing a
+/// control edge, and what may have written the object on the way is a
+/// liveness question this deliberately does not ask.
+fn nothing_wrote_the_object_between(
+    plan: &BindingPlan,
+    graph: &r2ssa::SsaGraph,
+    copy: InstId,
+    source: ValueId,
+) -> bool {
+    let Some(ValueDisposition::Bound { binding }) = plan.disposition(source) else {
+        return false;
+    };
+    let Some(copy_inst) = graph.inst(copy) else {
+        return false;
+    };
+    let Some(source_inst) = graph.def_inst(source).and_then(|inst| graph.inst(inst)) else {
+        return false;
+    };
+    if source_inst.block != copy_inst.block || source_inst.ordinal > copy_inst.ordinal {
+        return false;
+    }
+    !graph.insts.iter().any(|inst| {
+        inst.block == copy_inst.block
+            && inst.ordinal > source_inst.ordinal
+            && inst.ordinal < copy_inst.ordinal
+            && inst.output.is_some_and(|written| {
+                matches!(
+                    plan.disposition(written),
+                    Some(ValueDisposition::Bound { binding: other }) if other == binding
+                )
+            })
+    })
 }
 
 /// Whether a copy's undefined source is a value the signature declares.
