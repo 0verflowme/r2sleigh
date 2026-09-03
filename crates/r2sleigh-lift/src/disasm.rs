@@ -3937,6 +3937,112 @@ mod tests {
     }
 
     #[test]
+    fn fixed_value_pcode_uses_the_typed_sleigh_translation() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let address_spaces = disassembler.address_spaces();
+        let constant_space = address_spaces
+            .iter()
+            .find(|space| space.space_type == libsla::AddressSpaceType::Constant)
+            .expect("constant space")
+            .clone();
+        let register_space = address_spaces
+            .iter()
+            .find(|space| space.name == "register")
+            .expect("register space")
+            .clone();
+        let address = Address::new(
+            disassembler.default_code_space(),
+            PINNED_X86_CONDITIONAL_RETURN_ADDR,
+        );
+        let copy = PcodeInstruction {
+            address: address.clone(),
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(
+                Address::new(constant_space.clone(), 42),
+                8,
+            )],
+            output: Some(VarnodeData::new(Address::new(register_space.clone(), 0), 8)),
+        };
+        let add = PcodeInstruction {
+            address,
+            op_code: OpCode::Int(IntOp::Add),
+            inputs: vec![
+                VarnodeData::new(Address::new(register_space.clone(), 0), 4),
+                VarnodeData::new(Address::new(constant_space, 1), 4),
+            ],
+            output: Some(VarnodeData::new(Address::new(register_space, 0), 4)),
+        };
+
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&copy)
+                .expect("COPY translation"),
+            Some(R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(42, 8),
+            })
+        );
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&add)
+                .expect("INT_ADD translation"),
+            Some(R2ILOp::IntAdd {
+                dst: Varnode::register(0, 4),
+                a: Varnode::register(0, 4),
+                b: Varnode::constant(1, 4),
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_ram_copy_is_canonical_memory_io() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let ram_space = disassembler.default_code_space();
+        let register_space = disassembler
+            .address_spaces()
+            .into_iter()
+            .find(|space| space.name == "register")
+            .expect("register space");
+        let address_size = u32::try_from(ram_space.address_size).expect("r2il address size");
+        let address = Address::new(ram_space.clone(), PINNED_X86_CONDITIONAL_RETURN_ADDR);
+        let write = PcodeInstruction {
+            address: address.clone(),
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(Address::new(register_space.clone(), 0), 4)],
+            output: Some(VarnodeData::new(Address::new(ram_space.clone(), 0x4000), 4)),
+        };
+        let read = PcodeInstruction {
+            address,
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(Address::new(ram_space, 0x4000), 4)],
+            output: Some(VarnodeData::new(Address::new(register_space, 0), 4)),
+        };
+
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&write)
+                .expect("fixed RAM write translation"),
+            Some(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x4000, address_size),
+                val: Varnode::register(0, 4),
+            })
+        );
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&read)
+                .expect("fixed RAM read translation"),
+            Some(R2ILOp::Load {
+                dst: Varnode::register(0, 4),
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x4000, address_size),
+            })
+        );
+    }
+
+    #[test]
     fn callother_translation_preserves_numeric_id_and_operands() {
         let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
             .expect("trusted x86-64 disassembler");
@@ -3974,6 +4080,73 @@ mod tests {
                 inputs: vec![Varnode::constant(0xfeed_face, 8)],
             })
         );
+    }
+
+    #[test]
+    fn callother_translation_rejects_ids_that_do_not_fit_r2il() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let constant_space = disassembler
+            .address_spaces()
+            .into_iter()
+            .find(|space| space.space_type == libsla::AddressSpaceType::Constant)
+            .expect("constant space");
+        let invalid_userop = u64::from(u32::MAX) + 1;
+        let instruction = PcodeInstruction {
+            address: Address::new(
+                disassembler.default_code_space(),
+                PINNED_X86_CONDITIONAL_RETURN_ADDR,
+            ),
+            op_code: OpCode::Pseudo(PseudoOp::CallOther),
+            inputs: vec![VarnodeData::new(
+                Address::new(constant_space, invalid_userop),
+                8,
+            )],
+            output: None,
+        };
+
+        let error = disassembler
+            .translate_pcode_op(&instruction)
+            .expect_err("oversized CallOther id must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported feature: Sleigh CALLOTHER id does not fit r2il: {invalid_userop}")
+        );
+    }
+
+    #[test]
+    fn analysis_pcode_is_invalid_at_the_machine_lift_boundary() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let address = Address::new(
+            disassembler.default_code_space(),
+            PINNED_X86_CONDITIONAL_RETURN_ADDR,
+        );
+
+        for operation in [
+            libsla::AnalysisOp::MultiEqual,
+            libsla::AnalysisOp::CopyIndirect,
+            libsla::AnalysisOp::PointerAdd,
+            libsla::AnalysisOp::PointerSubcomponent,
+            libsla::AnalysisOp::Cast,
+            libsla::AnalysisOp::Insert,
+            libsla::AnalysisOp::Extract,
+            libsla::AnalysisOp::SegmentOp,
+        ] {
+            let instruction = PcodeInstruction {
+                address: address.clone(),
+                op_code: OpCode::Analysis(operation),
+                inputs: Vec::new(),
+                output: None,
+            };
+            assert!(
+                matches!(
+                    disassembler.translate_pcode_op(&instruction),
+                    Err(LiftError::Unsupported(_))
+                ),
+                "analysis operation {operation:?} must be refused at the machine lift boundary"
+            );
+        }
     }
 
     #[test]
