@@ -81,7 +81,7 @@ enum ObservationTarget {
     Value(ValueId),
     CertifiedValueRead {
         value: ValueId,
-        at: InstId,
+        source: crate::binding_plan::CertifiedValueReadSource,
         binding: crate::binding_plan::BindingId,
         symbol: SymbolId,
     },
@@ -1412,13 +1412,13 @@ impl LegacyObservationJournal {
         match self.targets.get(id.index() as usize)? {
             ObservationTarget::CertifiedValueRead {
                 value,
-                at,
+                source,
                 binding,
                 symbol,
             } => Some(
                 crate::placement::PlacementObservationTarget::CertifiedValueRead {
                     value: *value,
-                    at: *at,
+                    source: *source,
                     binding: *binding,
                     symbol: *symbol,
                 },
@@ -2290,12 +2290,45 @@ impl LegacyObservationJournal {
         symbol: SymbolId,
         expr: CExpr,
     ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.observe_certified_read_expr(
+            value,
+            crate::binding_plan::CertifiedValueReadSource::Boundary(at),
+            symbol,
+            expr,
+        )
+    }
+
+    pub(crate) fn observe_certified_address_read_expr(
+        &mut self,
+        value: ValueId,
+        access: r2ssa::StructuredAccessId,
+        symbol: SymbolId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.observe_certified_read_expr(
+            value,
+            crate::binding_plan::CertifiedValueReadSource::Address(access),
+            symbol,
+            expr,
+        )
+    }
+
+    fn observe_certified_read_expr(
+        &mut self,
+        value: ValueId,
+        source: crate::binding_plan::CertifiedValueReadSource,
+        symbol: SymbolId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
         // The same boundary record the final placement audit will consult.
         // Two tables answering for one read is how a marker survives here and
         // is refused there, so they ask one question.
-        if !crate::binding_plan::certified_boundary_read(&self.source, value, at) {
-            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead { value, at });
+        if !crate::binding_plan::certified_value_read(&self.source, value, source) {
+            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                value,
+                at: source.inst(),
+            });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
             return Err(LegacyObservationJournalError::RenderedValueRequired(value));
@@ -2308,7 +2341,7 @@ impl LegacyObservationJournal {
                 ObservationTarget::Value(value),
                 ObservationTarget::CertifiedValueRead {
                     value,
-                    at,
+                    source,
                     binding: *binding,
                     symbol,
                 },

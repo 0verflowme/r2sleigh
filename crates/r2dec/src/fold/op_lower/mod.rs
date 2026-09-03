@@ -5,11 +5,10 @@
 //! only when those plans authorize them; lowering itself does not infer either
 //! policy from use counts, names, or expression shape.
 
-use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
 
-use r2ssa::{DecompilePrepFacts, SSAOp, SSAVar, SsaArtifact, ValueId};
+use r2ssa::{SSAOp, SSAVar, SsaArtifact, ValueId};
 #[cfg(test)]
 use r2types::normalize_callee_name;
 use r2types::{
@@ -59,6 +58,7 @@ impl<'a> PlannedLoweringInput<'a> {
     }
 }
 
+#[cfg(test)]
 fn certified_compare_truth_relation(
     target: (r2ssa::CompareKind, r2ssa::SemanticId, r2ssa::SemanticId),
     predicate: (r2ssa::CompareKind, r2ssa::SemanticId, r2ssa::SemanticId),

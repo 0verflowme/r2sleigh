@@ -75,17 +75,33 @@ impl<'a> FoldingContext<'a> {
         let TermKind::Subscript { base, index } = arena.term(access.canonical).kind else {
             return None;
         };
-        let prepared = self.prepared_ssa()?;
-        let graph = prepared.graph();
-
         let base_expr = self.render_subscript_term(arena, base)?;
         let base_expr = self.subscript_base_at_element_type(arena, base, base_expr, elem_ty);
         let index_expr = self.render_subscript_term(arena, index)?;
-        let mut expr = CExpr::Subscript {
+        let expr = CExpr::Subscript {
             base: Box::new(base_expr),
             index: Box::new(index_expr),
         };
 
+        self.observe_certified_address_replacement(fact, expr)
+    }
+
+    /// Move the exact cells owned by an address computation to the structured
+    /// access that replaced it.
+    ///
+    /// Both the rewriter's subscript and the typed scalar-array renderer spell
+    /// the same canonical access. The latter used to omit this transfer, so its
+    /// base and index appeared as bare names beneath only the memory effect and
+    /// address-use markers. Neither marker authorises the bindings read by the
+    /// eliminated multiply/add chain.
+    pub(super) fn observe_certified_address_replacement(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+        mut expr: CExpr,
+    ) -> Option<CExpr> {
+        let names = self.inputs.binding_names?;
+        let access = names.plan().canonical().access(fact.access)?;
+        let graph = self.prepared_ssa()?.graph();
         let discharged: Vec<r2ssa::InstId> = access
             .discharges
             .iter()
@@ -144,8 +160,7 @@ impl<'a> FoldingContext<'a> {
         // absorbs the add and the multiply, so the set is non-empty;
         // `pointer_walk` rewrites a bare merge leaf and absorbs nothing, so
         // the set is empty and the address would go unaccounted.
-        expr = self.observe_discharged_expr(fact.address, &discharged, expr);
-        Some(expr)
+        Some(self.observe_discharged_expr(fact.address, &discharged, expr))
     }
 
     /// The base at the type the subscript reads through.

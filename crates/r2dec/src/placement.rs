@@ -17,8 +17,8 @@ use crate::ast::{
     inspect_render_observations,
 };
 use crate::binding_plan::{
-    BindingId, BindingNameResolution, PlacementRead, PlacementRefusal, ValueDisposition,
-    certified_boundary_read,
+    BindingId, BindingNameResolution, CertifiedValueReadSource, PlacementRead, PlacementRefusal,
+    ValueDisposition, certified_value_read,
 };
 use crate::structured_region::{RegionId, SealedStructuredRegionArtifact};
 use r2ssa::{InstId, SSAFunction, UseSite};
@@ -79,7 +79,7 @@ pub(crate) enum PlacementObservationTarget {
     },
     CertifiedValueRead {
         value: r2ssa::ValueId,
-        at: InstId,
+        source: CertifiedValueReadSource,
         binding: BindingId,
         symbol: crate::symbol::SymbolId,
     },
@@ -144,13 +144,16 @@ pub(crate) fn collect_final_placement_occurrences(
             .ok_or(PlacementAnalysisError::MissingObservationTarget { observation: id })?;
         if let PlacementObservationTarget::CertifiedValueRead {
             value,
-            at,
+            source: read_source,
             binding,
             symbol,
         } = target
         {
-            if !certified_value_read_matches(source, names, value, at, binding, symbol) {
-                return Err(PlacementAnalysisError::InvalidCertifiedValueRead { value, at });
+            if !certified_value_read_matches(source, names, value, read_source, binding, symbol) {
+                return Err(PlacementAnalysisError::InvalidCertifiedValueRead {
+                    value,
+                    at: read_source.inst(),
+                });
             }
             let RenderObservationNode::Expr(expr) = node else {
                 return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
@@ -283,10 +286,11 @@ pub(crate) fn collect_final_placement_occurrences(
             }
             PlacementObservationTarget::CertifiedValueRead {
                 value,
-                at,
+                source: read_source,
                 binding,
                 symbol: _,
             } => {
+                let at = read_source.inst();
                 let inst = graph
                     .inst(at)
                     .ok_or(PlacementAnalysisError::InvalidWrite { inst: at })?;
@@ -1791,7 +1795,7 @@ fn target_authorizes_binding(
         (
             PlacementObservationTarget::CertifiedValueRead {
                 value,
-                at,
+                source: read_source,
                 binding: certified_binding,
                 symbol,
             },
@@ -1802,7 +1806,7 @@ fn target_authorizes_binding(
                     source,
                     names,
                     value,
-                    at,
+                    read_source,
                     certified_binding,
                     symbol,
                 )
@@ -1889,19 +1893,19 @@ fn target_authorizes_binding(
 }
 
 /// Revalidate the complete source-to-render identity chain carried by a
-/// certified value-read marker. The boundary certificate owns `(ValueId,
-/// InstId)`; the sealed binding plan owns `ValueId -> BindingId`; and name
+/// certified value-read marker. The boundary or address certificate owns the
+/// read identity; the sealed binding plan owns `ValueId -> BindingId`; and name
 /// resolution owns `BindingId -> SymbolId`. No one of those links is a
 /// substitute for the others.
 fn certified_value_read_matches(
     source: &r2ssa::SsaArtifact,
     names: &BindingNameResolution,
     value: r2ssa::ValueId,
-    at: InstId,
+    read_source: CertifiedValueReadSource,
     binding: BindingId,
     symbol: crate::symbol::SymbolId,
 ) -> bool {
-    certified_boundary_read(source, value, at)
+    certified_value_read(source, value, read_source)
         && matches!(
             names.disposition_for_value(value),
             Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
