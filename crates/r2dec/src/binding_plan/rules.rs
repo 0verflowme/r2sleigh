@@ -559,7 +559,7 @@ pub(super) fn inlinable_values(
         .filter(|component| component.members.len() == 1)
         .filter_map(|component| component.members.first().copied())
         .collect::<BTreeSet<_>>();
-    let admitted = duplicable_bound_literals(projection, source_owned, &alone);
+    let admitted = duplicable_bound_literals(projection, source_owned, &alone, &conservative);
     if admitted.is_empty() {
         return conservative;
     }
@@ -577,13 +577,14 @@ fn duplicable_bound_literals(
     projection: &r2ssa::MachineProjection,
     source_owned: &SourceOwnedFunctionFacts,
     alone: &BTreeSet<ValueId>,
+    conservative: &BTreeSet<ValueId>,
 ) -> BTreeSet<ValueId> {
     let graph = source_owned.source().graph();
     let mut expr_by_value = std::collections::BTreeMap::new();
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
     }
-    graph
+    let literal_candidates = graph
         .values
         .iter()
         .filter(|value| alone.contains(&value.id))
@@ -593,30 +594,42 @@ fn duplicable_bound_literals(
                 .copied()
                 .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
         })
+        .map(|value| value.id)
+        .collect::<BTreeSet<_>>();
+    literal_candidates
+        .iter()
+        .copied()
         // And something must still be rendered where the definition was. A
-        // literal whose readers all sit in other blocks leaves its own block
-        // with no statement, and a block that renders nothing cannot answer
-        // for the instructions in it -- the ledger says `BlockNotRendered`
-        // and refuses the function, which is what `murmur3_32` did at x86-64
-        // -O1 and -O2. One reader in the defining block is enough to keep the
-        // block on the page, and it is the same reason the single-use path
-        // already requires its reader to follow the definition in the same
-        // block.
+        // block that renders nothing cannot answer for the instructions in
+        // it: the ledger reports `BlockNotRendered` and refuses the function,
+        // which is what `murmur3_32` did at x86-64 -O1 and -O2 once bound
+        // literals became inlinable.
+        //
+        // A reader in the same block is not enough, and assuming it was is
+        // what the first attempt got wrong: that reader can itself be a value
+        // the plan inlines, and the block empties anyway. What keeps a block
+        // on the page is an instruction whose output is bound, and the only
+        // extra inlining this pass performs is the candidates themselves --
+        // so an instruction bound under the conservative answer and not a
+        // candidate is bound under this one too, and its statement is the
+        // one that keeps the block.
         .filter(|value| {
             let Some(definition) = graph
-                .def_inst(value.id)
+                .def_inst(*value)
                 .and_then(|inst| graph.inst(inst))
                 .map(|inst| inst.block)
             else {
                 return false;
             };
-            graph.use_sites(value.id).iter().any(|site| {
-                graph
-                    .inst(site.inst)
-                    .is_some_and(|inst| inst.block == definition)
+            graph.insts.iter().any(|inst| {
+                inst.block == definition
+                    && inst.output.is_some_and(|output| {
+                        output != *value
+                            && !conservative.contains(&output)
+                            && !literal_candidates.contains(&output)
+                    })
             })
         })
-        .map(|value| value.id)
         .collect()
 }
 
