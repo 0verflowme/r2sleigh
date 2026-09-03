@@ -279,6 +279,38 @@ NOINL uint64_t value_abs_minmax(uint64_t a, uint64_t b) {
     return folded;
 }
 
+/* ---- 13. One value used at two widths, beside a chain that is not. ----
+   The settled rule is that a type asserted from use evidence declines *per
+   value*: where two uses disagree, that value alone keeps the honest uint64_t
+   default and the rest of the function keeps its types. `shape_signed_divmod`
+   refuses the whole function on ConflictingUse, which would contradict that --
+   but it also has a variable divisor and a division refusal to hide behind, so
+   it cannot say which rule fired.
+
+   This is the same conflict with nothing else in the way. `conflicted` is
+   compared signed at 32 bits, compared signed at 64, shifted unsigned at 64,
+   and truncated to 32: four uses that cannot all be one type. `a` is used
+   twice and `b` once, both unsigned at 64 bits, and the `clean` chain
+   disagrees with nothing.
+
+   A rendering that declines only `conflicted` is the documented behaviour, and
+   the value stays right because the uint64_t default reproduces the machine.
+   A rendering that declines the function is a defect against a decision that
+   is already on the record. */
+NOINL uint64_t value_width_conflict(uint64_t a, uint64_t b) {
+    uint64_t conflicted = a * 0x9e3779b97f4a7c15ull + b;
+    uint64_t folded = 0;
+    folded = folded * 5u + ((int32_t)(uint32_t)conflicted < 0 ? 1u : 2u);
+    folded = folded * 5u + ((int64_t)conflicted < 0 ? 3u : 4u);
+    folded = folded * 5u + (conflicted >> 17);
+    folded = folded * 5u + (uint64_t)(uint32_t)(conflicted >> 32);
+
+    uint64_t clean = a ^ 0xcbf29ce484222325ull;
+    clean = clean * 0x100000001b3ull;
+    clean = clean + (clean >> 29);
+    return folded ^ clean;
+}
+
 /* A main so the corpus binary links, and so nothing is dead-stripped. */
 int main(void) {
     uint64_t a = 0x0123456789abcdefull;
@@ -295,5 +327,6 @@ int main(void) {
     printf("%016llx\n", (unsigned long long)value_count_bits(a, b));
     printf("%016llx\n", (unsigned long long)value_overflow_flags(a, b));
     printf("%016llx\n", (unsigned long long)value_abs_minmax(a, b));
+    printf("%016llx\n", (unsigned long long)value_width_conflict(a, b));
     return 0;
 }

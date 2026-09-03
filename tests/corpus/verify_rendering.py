@@ -430,6 +430,7 @@ VALUE_SPECS: dict[str, ScalarSpec] = {
         "value_count_bits",
         "value_overflow_flags",
         "value_abs_minmax",
+        "value_width_conflict",
     )
 }
 

@@ -43,6 +43,7 @@ static const struct entry entries[] = {
     {"value_count_bits", value_count_bits},
     {"value_overflow_flags", value_overflow_flags},
     {"value_abs_minmax", value_abs_minmax},
+    {"value_width_conflict", value_width_conflict},
 };
 
 static void usage(const char *program) {
