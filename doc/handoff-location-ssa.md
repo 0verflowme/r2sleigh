@@ -10973,3 +10973,50 @@ derived-width results are all real readers with no use site, and they now share
 one canonical path. Every one of them was a value that would have looked dead
 and was not, so the zero-reader count is only safe to act on because they are
 counted.
+
+## The gates had Linux ELF coverage and it was the wrong ELF coverage
+
+A merge candidate passed the fifty-four-cell corpus at 54 of 54, with the
+differential agreeing against a source-built oracle, and rendered **zero of
+fifteen functions** on the benchmark binary. Only the external benchmark caught
+it, and only because it was run before merging rather than after.
+
+The two pinned ELF programs did not catch it. They are compiled from the hash
+and branch corpora, whose functions barely call anything, and the defect is at
+the call boundary, so fifty-two of their sixty-eight functions kept rendering
+while the platform was broken end to end. Two of them did regress, and those two
+were judged minor against three hundred and twenty-eight rendering elsewhere.
+They were the only call-boundary ELF cells in the tree and they were telling the
+truth.
+
+`shapes.c` compiled for ELF is now the third pinned program, and it is the gate
+that has the sensitivity the others lack:
+
+| population | rendered |
+| --- | --- |
+| macOS corpus binaries | 281 of 449 |
+| pinned ELF, call-light | 52 of 68 |
+| **pinned ELF, call-heavy** | **13 of 39** |
+
+What it refuses on is the whole remaining defect list at once, which is why it is
+the right canary: four projection authorisations from op lowering, four
+`ExactUseRequiresRenderedOccurrence`, three `RenderedValueRequired`, three
+`missing_definition`, three `unobserved_binding_write`, two
+`unprovable_execution_order`, and two more projection authorisations from the
+memory renderer and the call lowering.
+
+Every one of those families has an owner already, and each was found on macOS.
+The value of this cell is that it reproduces them **locally, without the VM**,
+on the platform the project is scored against.
+
+Two rules follow.
+
+**Coverage of a platform is not coverage of a shape.** Three ELF programs is not
+three times the confidence if all three are compiled from sources with the same
+control-flow vocabulary. Ask what a corpus *exercises*, not what it targets.
+
+**A change reverted for failing one measurement re-lands on that measurement.**
+The call-restore work was reverted because the benchmark fell from seven
+functions to one. A real defect in it was then found and fixed, the macOS corpus
+went green, and it was reapplied on that evidence alone. The benchmark was never
+re-run, and the regression it had been reverted for was still there.
