@@ -21,14 +21,61 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 host=${R2SLEIGH_DECBENCH_HOST:-contabo}
 baseline="$root/tests/decbench/baseline.json"
 accept=0
+gc_force=0
+run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
 project=${R2SLEIGH_DECBENCH_PROJECT:-projects/sailr/bzip2.toml}
 opt=${R2SLEIGH_DECBENCH_OPT:-O0}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --accept-baseline) accept=1; shift ;;
+        --gc-force) gc_force=1; shift; set -- --gc "$@" ;;
+        --gc)
+            # Remove finished run directories, and only those. A directory
+            # whose marker is still present belongs to a run that has not
+            # reported, so it is left alone however old it looks; a marker
+            # older than a day is treated as a crash and collected.
+            ssh "${host}" "GC_FORCE='${gc_force}' GC_ROOT='${run_root}' bash -s" <<'GC'
+set -euo pipefail
+now=$(date -u +%s)
+force=${GC_FORCE:-0}
+# Only this script's own run root. Runs used to live beside unrelated
+# directories under /root, which is how a sweep aimed at stale logs deleted a
+# live build; they were moved out of that namespace, and the collector follows
+# them rather than staying behind to tidy someone else's directories.
+for dir in "${GC_ROOT:?}"/*/; do
+    [ -d "$dir" ] || continue
+    marker="$dir/.running"
+    age=$(( now - $(stat -c %Y "$dir" 2>/dev/null || echo "$now") ))
+    if [ -f "$marker" ]; then
+        started=$(cat "$marker" 2>/dev/null || echo "$now")
+        if [ $(( now - started )) -lt 86400 ]; then
+            echo "live, left alone: $dir"
+            continue
+        fi
+        why="marker older than a day"
+    elif [ "$age" -lt 86400 ]; then
+        # No marker and recent. This is either a run that started before
+        # markers existed or one someone else made by hand, and "unknown" is
+        # not "finished". Deleting one of these once killed a live build and
+        # looked exactly like a compiler error to the agent that owned it.
+        echo "no marker but recent, left alone: $dir"
+        continue
+    else
+        why="no marker and older than a day"
+    fi
+    if [ "$force" != "1" ]; then
+        echo "would collect ($why): $dir"
+        continue
+    fi
+    rm -rf "$dir"
+    echo "collected ($why): $dir"
+done
+GC
+            exit 0
+            ;;
         --host) host=$2; shift 2 ;;
-        *) echo "usage: $0 [--accept-baseline] [--host <ssh alias>]" >&2; exit 64 ;;
+        *) echo "usage: $0 [--accept-baseline] [--gc] [--gc-force] [--host <ssh alias>]" >&2; exit 64 ;;
     esac
 done
 
@@ -43,7 +90,6 @@ run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
 # which is a live run's tree: two runs here were deleted mid-build by one, and
 # the script reported the failure as a missing install log, which reads like a
 # build error rather than the tree being pulled out from under it.
-run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
 remote="$run_root/$run_id"
 private_home="$remote/home"
 fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
@@ -56,6 +102,14 @@ witness="r2sleigh-witness-$(git -C "$root" rev-parse --short HEAD)-$(date -u +%s
 
 echo "run     $run_id"
 echo "witness $witness"
+
+# A marker that says this directory is in use, removed when the run finishes.
+# Several runs share the host, and a blanket `rm -rf /root/decbench-*` to clear
+# stale ones deleted a live run mid-build, which looks exactly like a build
+# failure and is not one. `--gc` below removes only directories without a live
+# marker, and nobody should be deleting them by hand instead.
+ssh "$host" "mkdir -p '$remote' && date -u +%s > '$remote/.running'"
+trap 'ssh "$host" "rm -f '"'$remote/.running'"'" 2>/dev/null || true' EXIT
 
 ssh "$host" "mkdir -p '$remote/tree'"
 git -C "$root" ls-files -z | rsync -a --files-from=- --from0 "$root/" "$host:$remote/tree/"
@@ -108,6 +162,12 @@ set -euo pipefail
 mkdir -p '$private_home'
 export HOME='$private_home'
 cd '$remote/tree'
+# One build directory for every run on this host. Each run copies its own tree,
+# so without this each of them compiles the whole dependency graph from nothing,
+# and eight of those on four cores is slower in aggregate than the same eight
+# taking turns. Cargo's own lock does the taking turns; the crates that differ
+# between two trees are the only ones recompiled.
+export CARGO_TARGET_DIR=\${R2SLEIGH_DECBENCH_TARGET:-/root/decbench-shared-target}
 LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
     # A missing log here does not mean the build failed to write one: the
     # host is shared, and this run's whole tree can be removed underneath it
