@@ -2686,8 +2686,17 @@ impl LegacyObservationJournal {
                 let value = ValueId(index as u32);
                 if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                     let graph = self.source.graph();
+                    let targets = self
+                        .targets
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(id, target)| {
+                            matches!(target, ObservationTarget::Value(target) if *target == value)
+                                .then_some(id)
+                        })
+                        .collect::<Vec<_>>();
                     eprintln!(
-                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?} readers={readers:?}",
+                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?} readers={readers:?} targets={targets:?}",
                         self.plan.disposition(value),
                         graph
                             .def_inst(value)
@@ -2731,8 +2740,21 @@ impl LegacyObservationJournal {
                 if observation.is_none() {
                     if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                         let graph = self.source.graph();
+                        let site = UseSite {
+                            inst: InstId(inst as u32),
+                            input_idx,
+                        };
+                        let targets = self
+                            .targets
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(id, target)| {
+                                matches!(target, ObservationTarget::Use { site: target, .. } if *target == site)
+                                    .then_some(id)
+                            })
+                            .collect::<Vec<_>>();
                         eprintln!(
-                            "unaccounted use inst={inst} input={input_idx} payload={:?}",
+                            "unaccounted use inst={inst} input={input_idx} payload={:?} targets={targets:?}",
                             graph.inst(InstId(inst as u32)).map(|inst| format!(
                                 "{:?}",
                                 inst.payload
