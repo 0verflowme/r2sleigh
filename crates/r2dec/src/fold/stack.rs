@@ -3,6 +3,13 @@ use r2ssa::ObjectId;
 
 use super::context::FoldingContext;
 
+fn frame_object_address_expr(object_expr: CExpr, ty: CType) -> (CExpr, CType) {
+    match ty {
+        CType::Array(_, _) => (object_expr, ty),
+        _ => (CExpr::addr_of(object_expr), CType::Pointer(Box::new(ty))),
+    }
+}
+
 impl<'a> FoldingContext<'a> {
     pub(super) fn certified_stack_var_expr_for_object(&self, object: ObjectId) -> Option<CExpr> {
         let names = self.inputs.binding_names?;
@@ -41,10 +48,7 @@ impl<'a> FoldingContext<'a> {
         };
         let ty = names.plan().binding(binding)?.declaration_type().clone();
         let object_expr = self.certified_stack_var_expr_for_object(object)?;
-        Some(match ty {
-            CType::Array(_, _) => (object_expr, ty),
-            _ => (CExpr::addr_of(object_expr), CType::Pointer(Box::new(ty))),
-        })
+        Some(frame_object_address_expr(object_expr, ty))
     }
 
     /// Whether a copy restates a write the block has already rendered.
@@ -73,5 +77,29 @@ impl<'a> FoldingContext<'a> {
         journal
             .borrow()
             .is_coalesced_carrier_copy(crate::normalize::NormalizedOpSite { block, op_idx })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::symbol::{SymbolRole, SymbolTable};
+
+    #[test]
+    fn frame_object_addresses_use_address_of_except_for_array_decay() {
+        let mut symbols = SymbolTable::new();
+        let scalar = CType::uint(64);
+        let scalar_symbol = symbols.declare("scalar", scalar.clone(), SymbolRole::StackLocal(-8));
+        let (scalar_expr, scalar_address_ty) =
+            frame_object_address_expr(CExpr::Var(scalar_symbol), scalar.clone());
+        assert_eq!(scalar_expr, CExpr::addr_of(CExpr::Var(scalar_symbol)));
+        assert_eq!(scalar_address_ty, CType::Pointer(Box::new(scalar)));
+
+        let array = CType::Array(Box::new(CType::uint(8)), Some(160));
+        let array_symbol = symbols.declare("buffer", array.clone(), SymbolRole::StackLocal(-160));
+        let (array_expr, array_address_ty) =
+            frame_object_address_expr(CExpr::Var(array_symbol), array.clone());
+        assert_eq!(array_expr, CExpr::Var(array_symbol));
+        assert_eq!(array_address_ty, array);
     }
 }
