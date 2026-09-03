@@ -9676,6 +9676,80 @@ is why it has stayed unowned while smaller causes were traced. Name the argument
 index and the value first, then the cause will be a short read rather than a
 hunt.
 
+### The argument was already known, and the missing projection was not the cause
+
+The collector is a loop now. On its first `None` it writes one line on the
+existing refusal-evidence channel before constructing the same typed refusal:
+
+    refusal evidence call-argument-spelling ...:
+      callsite=(0x10000173c, 3) argument_index=1 value=ValueId(185)
+
+The callsite, index and `ValueId` are structural. No spelling or symbol name is
+used as identity. With tracing off the line is not evaluated; with it on the
+reader gets the operands at the predicate that discarded them. The traversal is
+still one bounded pass over the certified argument list and still stops at the
+first failure.
+
+The locked whole-binary trace has ten `calls.rs` projection refusals. Nine are
+the argument collector and one is the declaration-conflict site. The nine
+arguments split into two causes:
+
+| functions | first predicate that fails | what the other owners say |
+| --- | --- | --- |
+| 8 | `CertifiedRenderPlan::call_arg_admission` sees the argument's `ExpressionRenderFact` as `renderable: false` | all eight have an exact binding-plan disposition: seven `Bound`, one `Inline`; all eight prepared call views and `CallsiteRenderFact.proof_values` agree on the indexed `ValueId` |
+| 1 | the expression fact is renderable, but the prepared call view has only the one-argument prefix `[ValueId(571)]` while the render fact proves `[ValueId(571), ValueId(580)]` | argument 1, `ValueId(580)`, has an exact binding-plan `Inline` disposition |
+
+The first row is `branchy` `main` at all three x64 levels, `hashes` `main` at
+all three x64 levels, pinned GCC `combined`, and
+`/bin/ls` `fcn_1000016d4`. The second is `hashes` `main` at arm64 O0. Six of
+the first row's values are zero-extended return-register values, the `ls` value
+is a copied return-register value, and the pinned value is a copied saved
+argument. That variety is useful: this is not a register-name rule and must not
+be fixed as one.
+
+So none of the nine traces establishes a genuinely unspellable argument. Eight
+are stopped by a general expression-renderability gate before the binding plan
+is asked for its exact answer. The ninth is stopped by
+`PreparedSemanticView`'s separate call-argument expression reconstruction even
+though the later binding plan has the answer. `CallsiteRenderFact` owns which
+structural values the call passes and the binding plan owns how those values are
+spelled; the two earlier gates are parallel answers that can drift from them.
+
+This change does **not** fix those nine refusals and does not reduce the refusal
+count. It fixes the diagnostic defect that erased their subjects. Fixing the
+underlying refusals reaches a design fork:
+
+1. Make the binding plan the sole spelling authority. Keep the callsite and
+   render facts as the ordered value proof, remove expression renderability and
+   the prepared view's reconstructed argument prefix from call-argument
+   admission, and let `planned_value_expr` either spell or refuse each value.
+2. Strengthen an upstream typed call-argument renderability contract, including
+   return-derived values and a complete ordered argument projection, then make
+   both the prepared view and binding plan consume that one answer instead of
+   reconstructing it independently.
+
+The first is the smaller and cleaner owner shape, but no behavior change was
+made here: each option needs a pipeline test that proves all nine exact values
+render and that the observation/effect ledgers still close. Guessing a missing
+argument, or dropping it, is not an option.
+
+Refusing the whole function remains right when an argument is *actually*
+unspellable. A call with one positional argument omitted is executable C with
+different behavior, not a partial answer, and emitting it would turn absence of
+evidence into a confident wrong result. The current native route has no
+executable-C spelling for an unresolved call effect that would preserve the
+rest of the function honestly, so the function must refuse until such a
+contract exists.
+
+The two contextual sites were measured too. `/bin/ls` `fcn_100003698` is the
+one `calls.rs:144` refusal: two callsites need incompatible declarations for one
+callee identity, so it correctly remains refused. `memory_renderer.rs:81`
+contributes zero in the current trace. Its store-target predicate still calls
+`unobserved()` and therefore sees through the observation marker; the four
+memory-renderer entries in the older baseline have moved to their next causes.
+There is also one `lowering.rs` projection refusal in the coverage report; it is
+outside these three sites and was not changed.
+
 ## Candidate: the install lock is held about four times longer than it needs to be
 
 `locked_run.sh` wraps a whole command, so `run_matrix.sh` holds the lock across
