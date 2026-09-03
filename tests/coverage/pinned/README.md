@@ -1,9 +1,24 @@
 # Pinned binaries
 
 Two programs the repository ships as bytes rather than as sources to rebuild.
-They are compiled from `tests/corpus/branchy.c` and `tests/corpus/hashes.c` with
-GCC 13.3.0 on Linux x86-64, at `-O0` and `-O2` respectively, with
-`-g0 -fno-pie -no-pie`.
+They are compiled from `tests/corpus/branchy.c`, `tests/corpus/hashes.c` and
+`tests/corpus/shapes.c` with GCC 13.3.0 on Linux x86-64, at `-O0`, `-O2` and
+`-O0` respectively, with `-g0 -fno-pie -no-pie`.
+
+`shapes_gcc_x64_O0` was added after a change passed the fifty-four-cell corpus
+at 54 of 54, with the differential agreeing against a source-built oracle, and
+rendered **nothing at all** on Linux ELF: zero of fifteen functions on the
+benchmark binary. The two other pinned programs did not catch it, because they
+are compiled from sources whose functions barely call anything, and the defect
+was at the call boundary. Fifty-two of their sixty-eight functions kept
+rendering while the platform was completely broken.
+
+So the third program is deliberately the call-heavy one. `shapes.c` exists to
+exercise what the hash corpus cannot -- variadic calls at differing argument
+counts, calls in sequence with address-taken locals read after each, direct and
+mutual recursion, a struct returned across two registers, a call through a
+function pointer -- and compiled for ELF it is the only local gate that would
+have failed on that change.
 
 They exist for two reasons the compiled corpus cannot serve.
 
