@@ -21,14 +21,57 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 host=${R2SLEIGH_DECBENCH_HOST:-contabo}
 baseline="$root/tests/decbench/baseline.json"
 accept=0
+gc_force=0
 project=${R2SLEIGH_DECBENCH_PROJECT:-projects/sailr/bzip2.toml}
 opt=${R2SLEIGH_DECBENCH_OPT:-O0}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --accept-baseline) accept=1; shift ;;
+        --gc-force) gc_force=1; shift; set -- --gc "$@" ;;
+        --gc)
+            # Remove finished run directories, and only those. A directory
+            # whose marker is still present belongs to a run that has not
+            # reported, so it is left alone however old it looks; a marker
+            # older than a day is treated as a crash and collected.
+            ssh "${host}" "GC_FORCE='${gc_force}' bash -s" <<'GC'
+set -euo pipefail
+now=$(date -u +%s)
+force=${GC_FORCE:-0}
+for dir in /root/decbench-*/; do
+    [ -d "$dir" ] || continue
+    case "$dir" in /root/decbench-out/|/root/decbench/|/root/decbench-shared-target/) continue ;; esac
+    marker="$dir/.running"
+    age=$(( now - $(stat -c %Y "$dir" 2>/dev/null || echo "$now") ))
+    if [ -f "$marker" ]; then
+        started=$(cat "$marker" 2>/dev/null || echo "$now")
+        if [ $(( now - started )) -lt 86400 ]; then
+            echo "live, left alone: $dir"
+            continue
+        fi
+        why="marker older than a day"
+    elif [ "$age" -lt 86400 ]; then
+        # No marker and recent. This is either a run that started before
+        # markers existed or one someone else made by hand, and "unknown" is
+        # not "finished". Deleting one of these once killed a live build and
+        # looked exactly like a compiler error to the agent that owned it.
+        echo "no marker but recent, left alone: $dir"
+        continue
+    else
+        why="no marker and older than a day"
+    fi
+    if [ "$force" != "1" ]; then
+        echo "would collect ($why): $dir"
+        continue
+    fi
+    rm -rf "$dir"
+    echo "collected ($why): $dir"
+done
+GC
+            exit 0
+            ;;
         --host) host=$2; shift 2 ;;
-        *) echo "usage: $0 [--accept-baseline] [--host <ssh alias>]" >&2; exit 64 ;;
+        *) echo "usage: $0 [--accept-baseline] [--gc] [--gc-force] [--host <ssh alias>]" >&2; exit 64 ;;
     esac
 done
 
@@ -49,6 +92,14 @@ witness="r2sleigh-witness-$(git -C "$root" rev-parse --short HEAD)-$(date -u +%s
 
 echo "run     $run_id"
 echo "witness $witness"
+
+# A marker that says this directory is in use, removed when the run finishes.
+# Several runs share the host, and a blanket `rm -rf /root/decbench-*` to clear
+# stale ones deleted a live run mid-build, which looks exactly like a build
+# failure and is not one. `--gc` below removes only directories without a live
+# marker, and nobody should be deleting them by hand instead.
+ssh "$host" "mkdir -p '$remote' && date -u +%s > '$remote/.running'"
+trap 'ssh "$host" "rm -f '"'$remote/.running'"'" 2>/dev/null || true' EXIT
 
 ssh "$host" "mkdir -p '$remote/tree'"
 git -C "$root" ls-files -z | rsync -a --files-from=- --from0 "$root/" "$host:$remote/tree/"
