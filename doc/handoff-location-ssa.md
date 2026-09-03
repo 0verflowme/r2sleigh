@@ -10495,3 +10495,87 @@ Until then the branch is red on two of fifty-four on `--gate differential`,
 with no wrong answers -- both cells refuse rather than miscompute. Reverting
 `6f0cd8d..be06880` returns the corpus to 54 of 54 and gives up the naming and
 the thirty-three literal declarations.
+
+
+## The fixed point, green: the refusal was placement, not the admission
+
+The two cells the bound-literal admission cost are green, and the cause was
+none of the five things read into it. It was found by printing the mapping
+the coordinator asked for and then one more trace, and both should be kept.
+
+**The coordinate mapping.** The refusal is reported in source coordinates and
+every other view of the instruction in graph coordinates, and nothing
+reconciled them, so five hypotheses were argued about an instruction nobody
+had confirmed was the right one. The refusal evidence now prints both, and
+the answer was that the assumption had been correct all along:
+
+    kind=LiveValueProducer component=Op(34) block=0x10000085c
+    source_inst=Some(InstId(329)) graph_block=Some((BlockId(3), 110))
+    output=Some((ValueId(417), "R9_1"))
+
+`(BlockId(3), 110)` and `ValueId(417)` are exactly the admitted value's
+definition. The instruction was right; every proposed cause was wrong.
+
+**What it actually was.** Placement removes a binding nothing reads and
+reports the observations that went with it. The journal fills the value, use
+and write cells of those observations with `DeadUnreadBinding`; for an effect
+it did nothing, with a comment saying an effect answers to the effect ledger.
+That is right, and nothing was telling the ledger. The obligation was left
+with zero occurrences, no rule claimed it, and the default refusal fired.
+The two traces name the same obligation to the instruction, kind and
+component:
+
+    PLACEMENT_ELIDED_EFFECT  LiveValueProducer  0x10000085c Op(34)
+    zero-occurrence-outcome  LiveValueProducer  0x10000085c Op(34)
+
+So the obligation is dead with the statement, for the same fact the three
+cells beside it already record, and it is elided with the same reason. The
+rule can only fire on an obligation with no occurrences at all, so it cannot
+hide a live effect.
+
+The admission exposed this rather than caused it: inlining a literal moves its
+occurrence onto a reader's statement, and if placement later finds that
+statement's object unread, the occurrence goes with it. Any change that moves
+an occurrence onto another statement can reach the same hole.
+
+**Ruled out by experiment, not by reading.** The program-copy elision is not
+involved -- disabling it left the refusal unchanged. The defining block
+emptying is not the mechanism -- requiring a reader in that block, and then an
+instruction in it that provably still renders, both left the refusal in place,
+and both filters were removed again. Filtering on the `LiveValueProducer`
+obligation *kind* turned away every candidate including the page base, because
+that kind is seeded by a transitive closure over inputs and not only at
+boundaries; the filter that remains names the values a return boundary spells
+through its own path, which is the set `seed_value_definition` is called on
+there.
+
+**Where it lands.**
+
+    predicate                    start    now
+    same_type_casts               3395     185
+    cast_chains                      8       1
+    self_assignments               225     155
+    literal_only_declarations      103      75
+
+    column               result
+    binding_audit        54 / 54
+    effect_obligations   54 / 54
+    placement_audit      54 / 54
+    render_refusal       54 / 54
+    raw                  54 / 54
+    differential         54 / 54
+
+`--gate differential` exits zero. The workspace suite is 2,119 green. And
+`arm64_O0 pearson` names its table:
+
+    #define _pearson_tab__r2sleigh_addr 0x100001e6cULL
+    extern char _pearson_tab[];
+    uint64_t tmp_11f80_2 = (uint64_t)&_pearson_tab;
+
+The raw baseline is re-blessed, because the rendering changed on purpose.
+
+**One thing left on the table.** The return-boundary filter was added while
+chasing the wrong cause and kept because it is defensible on its own terms --
+a value the boundary spells through its own path should not be inlined -- but
+it was never shown to be *necessary* once the placement hole was closed.
+Removing it may admit more literals. That is one corpus run to find out.
