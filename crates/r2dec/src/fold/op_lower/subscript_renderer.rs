@@ -144,7 +144,7 @@ impl<'a> FoldingContext<'a> {
         // absorbs the add and the multiply, so the set is non-empty;
         // `pointer_walk` rewrites a bare merge leaf and absorbs nothing, so
         // the set is empty and the address would go unaccounted.
-        expr = self.observe_discharged_expr(fact.address, &discharged, expr);
+        expr = self.observe_rendered_replacement_expr(fact.address, &discharged, expr);
         Some(expr)
     }
 

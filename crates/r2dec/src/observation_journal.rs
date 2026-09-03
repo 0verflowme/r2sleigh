@@ -2181,45 +2181,35 @@ impl LegacyObservationJournal {
     /// boundary contract, while the lifted `Return` operand itself is the
     /// control target. This marker carries that exact `(ValueId, InstId)` into
     /// final declaration placement without inventing an operand index.
-    /// Mark every cell the accounting requires of the instructions a rendered
-    /// expression discharges.
+    /// Derive every cell one rendered replacement owns.
     ///
-    /// Rendering `expr` where `value` is read stands for every instruction in
-    /// `discharged`: the value's own definition, and any instruction whose
-    /// result the expression absorbed on the way. None of them has a statement
-    /// of its own any more, and the audit asks three things of the tree that a
-    /// vanished statement fails unless they are answered together: every
-    /// value has a cell, every recorded use has one, and every instruction
-    /// with an output has a write cell. So each discharged instruction, in
-    /// canonical order, has its write, every operand it read and the value it
-    /// produced marked on the one occurrence that now renders them. The cells
-    /// are exact -- rendered by equivalence, not elided.
-    pub(crate) fn observe_discharged_expr(
+    /// `value` is what the replacement renders and `replaced` is the complete
+    /// set of definitions whose statements the replacement supersedes. Those
+    /// are the only facts a rendering path supplies. This owner derives the
+    /// value, use, write, literal, and effect targets from the source graph and
+    /// attaches them to the same concrete occurrence.
+    ///
+    /// A replaced producer must be inline in the sealed plan. Duplicability is
+    /// not a rendering disposition: accepting a bound output here would mark
+    /// its write both on its own assignment and on the replacement. Refusing
+    /// the contract at this boundary prevents that second answerer.
+    ///
+    /// Values without definitions need explicit derivation. A folded literal
+    /// can never occur in `replaced`, but it is still an operand of one of
+    /// those instructions and has no other occurrence after replacement. Its
+    /// value cell is therefore part of this same contract, deduplicated with
+    /// the root and produced values.
+    pub(crate) fn observe_rendered_replacement_expr(
         &mut self,
         value: ValueId,
-        discharged: &[InstId],
+        replaced: &[InstId],
+        obligations: &BTreeSet<SemanticObligationId>,
         expr: CExpr,
     ) -> Result<CExpr, LegacyObservationJournalError> {
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(value, discharged)?);
-        let mut marked = expr;
-        for id in self.allocate_many(targets)? {
-            marked = CExpr::observed(id, marked);
-        }
-        Ok(marked)
-    }
-
-    /// The cells each discharged instruction still owes, in canonical order:
-    /// its write, the value it produced unless that is the `rendered` value
-    /// the caller has already marked, and every operand it read.
-    fn discharged_instruction_targets(
-        &mut self,
-        rendered: ValueId,
-        discharged: &[InstId],
-    ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
-        let mut targets = Vec::new();
-        let mut order = discharged.to_vec();
+        let mut represented_values = BTreeSet::from([value]);
+        let mut order = replaced.to_vec();
         order.sort_unstable();
         order.dedup();
         for definition in order {
@@ -2236,13 +2226,21 @@ impl LegacyObservationJournal {
             // The write the vanished statement performed. Its result is part
             // of the expression now standing in the reader's place.
             if let Some(output) = inst.output {
+                if output != value
+                    && !matches!(
+                        self.plan.disposition(output),
+                        Some(ValueDisposition::Inline { .. })
+                    )
+                {
+                    return Err(LegacyObservationJournalError::RenderedValueRequired(output));
+                }
                 let observation = self.rendered_write_observation(definition)?;
                 targets.push(ObservationTarget::Write {
                     inst: definition,
                     observation,
                     block,
                 });
-                if output != rendered {
+                if represented_values.insert(output) {
                     self.value_slot(output)?;
                     targets.push(ObservationTarget::Value(output));
                 }
@@ -2259,9 +2257,34 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
+                let input = inst.inputs[input_idx];
+                if self.source.graph().def_inst(input).is_none()
+                    && matches!(
+                        self.plan.disposition(input),
+                        Some(ValueDisposition::Inline { .. })
+                    )
+                    && represented_values.insert(input)
+                {
+                    self.value_slot(input)?;
+                    targets.push(ObservationTarget::Value(input));
+                }
             }
         }
-        Ok(targets)
+
+        for obligation in obligations {
+            if !self.effect_occurrences.contains_key(obligation) {
+                return Err(LegacyObservationJournalError::InvalidEffectObligation(
+                    *obligation,
+                ));
+            }
+            targets.push(ObservationTarget::Effect(*obligation));
+        }
+
+        let mut marked = expr;
+        for id in self.allocate_many(targets)? {
+            marked = CExpr::observed(id, marked);
+        }
+        Ok(marked)
     }
 
     /// Mark the value an inlined expression produces, where it is rendered.
@@ -2398,7 +2421,7 @@ impl LegacyObservationJournal {
     /// carrier whose complete use domain is independently elided has no C
     /// occurrence instead, just as the coalesced copy case below does not.
     ///
-    /// This is the sibling of `observe_discharged_expr`, which accepts that a
+    /// This is the sibling of `observe_rendered_replacement_expr`, which accepts that a
     /// discharged instruction's cells are filled at the site rendering its
     /// replacement. The two cannot share a path, and the difference is worth
     /// stating: that function has an expression to hang markers on, because
@@ -5477,11 +5500,25 @@ mod tests {
             .inst(reader)
             .and_then(|inst| inst.output)
             .expect("the reader defines a value");
+        let obligations = [reader, folded_definition]
+            .iter()
+            .flat_map(|inst| {
+                source
+                    .source()
+                    .obligations()
+                    .instruction_for_inst(*inst)
+                    .expect("discharged instruction has a disposition")
+                    .obligations
+                    .iter()
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
         let before = journal.targets.len();
         let marked = journal
-            .observe_discharged_expr(
+            .observe_rendered_replacement_expr(
                 value,
                 &[reader, folded_definition],
+                &obligations,
                 CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
             )
             .expect("a two-instruction discharge");
@@ -5490,6 +5527,7 @@ mod tests {
         // rendered, then for each instruction in canonical order its write,
         // the value it produced, and every operand it read.
         let mut expected = vec![ObservationTarget::Value(value)];
+        let mut represented_values = BTreeSet::from([value]);
         let mut order = [reader, folded_definition];
         order.sort_unstable();
         for inst_id in order {
@@ -5511,7 +5549,7 @@ mod tests {
                 block,
             });
             let output = inst.output.expect("pure definition has an output");
-            if output != value {
+            if represented_values.insert(output) {
                 expected.push(ObservationTarget::Value(output));
             }
             for input_idx in 0..inst.inputs.len() {
@@ -5533,8 +5571,19 @@ mod tests {
                     observation,
                     block,
                 });
+                let input = inst.inputs[input_idx];
+                if graph.def_inst(input).is_none()
+                    && matches!(
+                        plan.disposition(input),
+                        Some(ValueDisposition::Inline { .. })
+                    )
+                    && represented_values.insert(input)
+                {
+                    expected.push(ObservationTarget::Value(input));
+                }
             }
         }
+        expected.extend(obligations.iter().copied().map(ObservationTarget::Effect));
         assert_eq!(&journal.targets[before..], expected.as_slice());
         assert_eq!(
             journal
@@ -5551,32 +5600,16 @@ mod tests {
                 .iter()
                 .filter(|target| matches!(target, ObservationTarget::Value(_)))
                 .count(),
-            2,
-            "both values the discharged instructions produced have a cell"
+            represented_values.len(),
+            "produced values and definitionless literals all have cells"
         );
 
         // The effects the two instructions answered for move with the
         // expression, and each is rendered exactly once.
-        let obligations = [reader, folded_definition]
-            .iter()
-            .flat_map(|inst| {
-                source
-                    .source()
-                    .obligations()
-                    .instruction_for_inst(*inst)
-                    .expect("discharged instruction has a disposition")
-                    .obligations
-                    .iter()
-                    .copied()
-            })
-            .collect::<BTreeSet<_>>();
         assert!(
             !obligations.is_empty(),
             "a pure definition carries a live-value obligation"
         );
-        let marked = journal
-            .observe_effect_expr(&obligations, marked)
-            .expect("effects move with the expression");
         function.body = vec![CStmt::Expr(marked)];
         let mut ready = crate::codegen::prepare_function_for_emission(&function);
         let effects = journal
@@ -5589,5 +5622,46 @@ mod tests {
                 "obligation {obligation:?} is rendered once by the discharge"
             );
         }
+    }
+
+    #[test]
+    fn replacement_rejects_a_bound_intermediate_producer() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let rendered = graph
+            .values
+            .iter()
+            .find(|value| {
+                matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                )
+            })
+            .map(|value| value.id)
+            .expect("fixture has an inline value");
+        let (bound, definition) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Bound { .. })
+                ) {
+                    return None;
+                }
+                Some((value.id, graph.def_inst(value.id)?))
+            })
+            .expect("fixture has a bound computed value");
+
+        assert_eq!(
+            journal.observe_rendered_replacement_expr(
+                rendered,
+                &[definition],
+                &BTreeSet::new(),
+                CExpr::IntLit(1),
+            ),
+            Err(LegacyObservationJournalError::RenderedValueRequired(bound)),
+            "a replacement cannot absorb a producer the plan still renders separately"
+        );
     }
 }

@@ -378,34 +378,23 @@ impl<'a> FoldingContext<'a> {
         self.exact_value_obligations(kind, source_inst, value.as_slice())
     }
 
-    /// Mark every cell the instructions a rendered expression discharges still
-    /// owe, and the effects they answered for.
+    /// Derive every cell and effect one rendered replacement owns.
     ///
     /// Nothing asks a statement that is not emitted for its obligations, and
     /// the ledger scores an obligation nobody asked about as refused; so the
     /// effects move with the expression, exactly as its cells do.
-    pub(crate) fn observe_discharged_expr(
+    pub(crate) fn observe_rendered_replacement_expr(
         &self,
         value: r2ssa::ValueId,
-        discharged: &[r2ssa::InstId],
+        replaced: &[r2ssa::InstId],
         expr: CExpr,
     ) -> CExpr {
         let Some(journal) = self.inputs.observation_journal else {
             return expr;
         };
         let fallback = expr.clone();
-        let marked = match journal
-            .borrow_mut()
-            .observe_discharged_expr(value, discharged, expr)
-        {
-            Ok(marked) => marked,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                return fallback;
-            }
-        };
         let mut obligations = BTreeSet::new();
-        for definition in discharged {
+        for definition in replaced {
             let output = self
                 .inputs
                 .prepared_ssa
@@ -417,7 +406,18 @@ impl<'a> FoldingContext<'a> {
                 output,
             ));
         }
-        self.observe_effect_expr(&obligations, marked)
+        match journal.borrow_mut().observe_rendered_replacement_expr(
+            value,
+            replaced,
+            &obligations,
+            expr,
+        ) {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
     }
 
     /// Mark the value an inlined expression produces.

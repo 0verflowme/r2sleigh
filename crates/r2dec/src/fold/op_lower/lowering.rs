@@ -561,7 +561,7 @@ impl<'a> FoldingContext<'a> {
                 let Some(definition) = definition else {
                     return Ok(self.observe_inlined_value_expr(value, rendered));
                 };
-                Ok(self.observe_discharged_expr(value, &[definition], rendered))
+                Ok(self.observe_rendered_replacement_expr(value, &[definition], rendered))
             }
             Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
