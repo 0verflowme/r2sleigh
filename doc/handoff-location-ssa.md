@@ -8868,3 +8868,151 @@ same one this document already gives for the corpus: verify the artifact you
 measured is the artifact you built. `run-placement.sh` on the host now copies
 the freshly built library itself and prints whether a string only this tree
 contains is present in the installed one.
+
+## The `aa` path measured directly, and the figure it replaces
+
+The last section named the `aa` path as the dominant remaining cost, at about
+55 milliseconds per function across `sleigh_analyze_fcn`, `sleigh_get_data_refs`
+and `sleigh_op`. **That figure was wrong and the method that produced it was
+wrong.** It came from `(aaa - aa)` differencing, on the assumption that the
+proof sweep is what `aaa` adds to `aa`. radare2 runs the plugin's
+`post_analysis` hook during `aa` as well, so the subtraction cancelled most of
+the sweep instead of isolating it, and what was left over got attributed to
+callbacks that turn out to cost almost nothing.
+
+Each callback now counts and times itself, printed under `R2SLEIGH_TIMING`.
+bzip2recover, `aaa`, on a quiet VM:
+
+    site                calls    total      mean
+    analyze_fcn            32     2.6ms    81us
+    get_data_refs          38    14.9ms   392us
+    op                      0        --      --
+    eligible               72     320ms   4.4ms
+      context.create        1     302ms   302ms
+      context.regprofile   73     0.5ms   6.5us
+    post_analysis           1    1494ms
+      snapshot.walk        39     448ms  11.5ms
+      snapshot.reuse       43       9us   209ns
+      proof.engine         22     387ms  17.6ms
+
+Three things fall out that no amount of differencing would have given.
+
+**The three callbacks named in the brief cost 17.5 milliseconds between them,
+and `sleigh_op` is never called at all.** radare2 decodes this binary through
+another arch plugin, so the per-instruction path that looked like the obvious
+suspect does not run. Every per-instruction worry about `get_context` --
+the multi-kilobyte register-profile `strcmp`, the two FFI calls per instruction
+-- was about a function that is not on the path. `context.regprofile` is 73
+calls and half a millisecond in total.
+
+**What `eligible` costs is one Sleigh context creation.** radare2 asks the
+plugin's `eligible` hook per function, 72 times here, and 302 of the 320
+milliseconds is a single `sleigh_v2_context_create` -- the same compiled `.sla`
+parse the previous section moved off the lift path, on the other of the two
+paths that load one. The Rust side now shares a loaded profile through
+`shared_trusted_profile`; the C `R2ILContext` does not share with it, so a
+session that both analyses and decompiles parses the specification twice. That
+is one call and 0.3 seconds, and it is the cheapest item left.
+
+**Everything else is the sweep**, at 1.49 seconds, and the largest thing in it
+was the same function's snapshot being collected three times.
+
+### One walk per function instead of three
+
+`r_core_function_snapshot_at` collects the function, its blocks, its bytes, its
+type graph and the bodies of everything it calls. Three places asked for one
+per function and each kept a different part: `sleigh_artifact_plan_init` walked
+it all to read a single 64-bit revision, once for the proof plan and again for
+the taint plan, and `sleigh_proven_facts_json` walked it a third time for the
+wire buffer. 82 walks per `aaa` on a 38-function binary.
+
+One held capture keyed by the address and both dirty epochs brings that to 39
+walks and 43 reuses at 209 nanoseconds. One entry rather than a per-program
+cache, because the three readers are consecutive for one function, so a second
+entry buys no hit while holding whole snapshots for a program would hold the
+program twice over. The wire buffer is always built, because the walk is the
+cost -- 44.5ms with the buffer against 50.6ms without is the same number twice
+-- so making it conditional would only add a way for the entry to miss.
+
+**What that is worth, and a measurement that had to be thrown away.** Run as
+two blocks, before then after, the same two builds read 13.20s against 3.12s
+for `aaa` and 8.67s against 1.49s for post-analysis: a four- to sixfold win.
+It is not real. The before block ran while the machine was busy and the after
+block did not. Interleaved, three rounds, alternating:
+
+    round   before aaa   after aaa   before post   after post
+      1        2.79s       2.92s        1518ms       1249ms
+      2        2.87s       3.11s        1596ms       1245ms
+      3        3.26s       2.44s        1545ms       1378ms
+    bzip2     22.51s      21.30s
+
+So `aaa` is unchanged within noise and post-analysis falls about nineteen per
+cent, from 1.55s to 1.25s. That is 43 walks removed at the 11.5ms they actually
+cost on a quiet machine, not the 34 to 50ms the loaded runs reported. The
+proofs are identical either way: 22 functions, 16 skipped, the same two
+unreachable blocks.
+
+This is the seventh measurement this project has had to correct for measuring
+the wrong thing, and the second in two days. The rule that keeps working is to
+interleave the columns rather than run them in blocks, because a machine's load
+drifts over minutes and a block is minutes long. Private `HOME` per column
+stops another agent overwriting the plugin; interleaving stops the machine
+overwriting the answer.
+
+### The budget is now the program's size, not a number
+
+The sweep was governed by three whole-program constants -- two, ten and thirty
+seconds by analysis mode -- derived from nothing. Ten seconds is not a fact
+about a program. bzip2recover, 38 functions, finishes in 1.5 seconds and never
+touches it; bzip2, 154 functions, was stopped by it after a third of the
+program on every run. One number cannot be right for both, because the work
+scales with the function count and the number did not.
+
+The budget is now the function count times the project's own per-function
+performance bar, the one already agreed: under 100 milliseconds net per
+function. That is not a fresh judgement about how long is too long, it is the
+bar the sweep is already held to multiplied by the work in front of it. A
+function that exceeds it is a defect to fix rather than a budget to widen. The
+analysis mode is deliberately no longer a factor: a mode decides how much work
+each function gets, not how long a wall clock may run, and stating the same
+policy in two places is what let the two disagree.
+
+    bzip2               before              after
+      budget            10.0s               15.4s (154 x 100ms)
+      exhausted         yes, every run      no
+      functions reached 35 to 42 of 154     all 154
+      proved            35 to 42            46
+      skipped           0                   104
+      unreachable found 0                   2
+      aaa               21.3s               25.4s
+
+Finishing the program costs about four seconds more than being cut off two
+thirds of the way through, and buys 46 proved functions instead of 42 plus two
+unreachable blocks the sweep had never reached. bzip2recover is unchanged at
+2.88 seconds with the budget never binding.
+
+### What is left, in the order the measurement puts it
+
+**About 0.66 seconds of bzip2recover's 1.49-second sweep is still
+unattributed** -- post-analysis minus the snapshot walks and the proof engine.
+That is artifact submission, the taint plan path, and the budget checks, none
+of which is separated yet. It is now the largest unmeasured thing the plugin
+does and the next site to split.
+
+**The proof engine is 17.6 milliseconds per function** across 22 functions.
+That is the engine doing real work on a real snapshot and it is within the
+project's bar, so it is a target only after the unattributed remainder.
+
+**The C `R2ILContext` and the Rust trusted profile load the same specification
+separately**, 0.3 seconds once per session. Sharing one loaded Sleigh between
+`r2il_arch_init` and `shared_trusted_profile` removes it. Small, contained, and
+the last of the three places this project has found the same parse.
+
+**The structurer was not reached.** `main` in bzip2recover spends 2.27 seconds
+there and then refuses, against 2.77 for every other r2dec stage combined. The
+suspected cause is unchanged: the BDD safety budget at blocks times 128,
+consumed in whatever order the proofs run, so a late block gets what earlier
+ones left; `varying_predicates` in `structure.rs` already narrows the set the
+bound should come from, and the refusal at `consume_safety_budget` compares a
+counter against a limit fixed at construction to that same counter, so it can
+never fire.
