@@ -1328,6 +1328,18 @@ struct DerivedTypeWritebackSemanticInputs<'a> {
     local_field_accesses: &'a [LocalFieldAccessFact],
 }
 
+struct PreparedMachineVarProfile {
+    architecture: r2ssa::MachineArchitectureFamily,
+    pointer_arg_slots: HashMap<String, usize>,
+}
+
+struct ScalarArrayMachineProfile<'a> {
+    arch_name: Option<&'a str>,
+    architecture: Option<r2ssa::MachineArchitectureFamily>,
+    pointer_arg_slots: Option<&'a HashMap<String, usize>>,
+    ptr_bits: u32,
+}
+
 #[cfg(test)]
 type TypeWritebackAnalysisInput<'a> = DerivedTypeWritebackAnalysisInput<'a>;
 #[cfg(test)]
@@ -4009,6 +4021,7 @@ fn build_type_writeback_analysis_inner(
     mut input: DerivedTypeWritebackAnalysisInput<'_>,
     semantic_inputs: Option<DerivedTypeWritebackSemanticInputs<'_>>,
     prep_facts: Option<&r2ssa::DecompilePrepFacts>,
+    machine_profile: Option<&PreparedMachineVarProfile>,
     registers: &crate::RegisterIdentity,
 ) -> DerivedTypeWritebackAnalysis {
     if input.parsed_context.stack_slots.is_empty()
@@ -4267,12 +4280,16 @@ fn build_type_writeback_analysis_inner(
         &type_db,
         merged_signature.as_ref(),
         &local_structs.slot_element_strides,
-        if input.inferred_signature.arch.is_empty() {
-            input.parsed_context.callconv.as_deref()
-        } else {
-            Some(input.inferred_signature.arch.as_str())
+        ScalarArrayMachineProfile {
+            arch_name: if input.inferred_signature.arch.is_empty() {
+                input.parsed_context.callconv.as_deref()
+            } else {
+                Some(input.inferred_signature.arch.as_str())
+            },
+            architecture: machine_profile.map(|profile| profile.architecture),
+            pointer_arg_slots: machine_profile.map(|profile| &profile.pointer_arg_slots),
+            ptr_bits: input.ptr_bits,
         },
-        input.ptr_bits,
     );
     array_index_certificates.extend(scalar_array_access_certificates.array_index);
     let mut scalar_array_render_candidates = exact_indexed_access_certificates.render_candidates;
@@ -4516,7 +4533,7 @@ fn aarch64_register_identity() -> crate::RegisterIdentity {
 fn build_type_writeback_analysis(
     input: DerivedTypeWritebackAnalysisInput<'_>,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None, None, &x86_64_register_identity())
+    build_type_writeback_analysis_inner(input, None, None, None, &x86_64_register_identity())
 }
 
 #[cfg(test)]
@@ -4524,7 +4541,13 @@ fn build_type_writeback_analysis_with_prep_facts(
     input: DerivedTypeWritebackAnalysisInput<'_>,
     prep_facts: &r2ssa::DecompilePrepFacts,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None, Some(prep_facts), &x86_64_register_identity())
+    build_type_writeback_analysis_inner(
+        input,
+        None,
+        Some(prep_facts),
+        None,
+        &x86_64_register_identity(),
+    )
 }
 
 #[cfg(test)]
@@ -4535,6 +4558,7 @@ fn build_type_writeback_analysis_with_semantics(
     build_type_writeback_analysis_inner(
         input,
         Some(semantic_inputs),
+        None,
         None,
         &x86_64_register_identity(),
     )
@@ -4570,6 +4594,10 @@ pub fn build_source_owned_type_writeback_analysis(
     let recovered_vars = crate::prepare::recover_vars_from_prepared_ssa(source.as_ref(), ptr_bits);
     let mut diagnostics = TypeWritebackDiagnostics::default();
     let arch_name = crate::prepare::prepared_arch_name(source.as_ref());
+    let machine_profile = PreparedMachineVarProfile {
+        architecture: source.machine_context().architecture_family(),
+        pointer_arg_slots: collect_prepared_pointer_arg_slot_map(source.as_ref()),
+    };
     let local_structs = infer_local_struct_artifacts_from_prepared_ssa(
         source.as_ref(),
         arch_name,
@@ -4606,6 +4634,7 @@ pub fn build_source_owned_type_writeback_analysis(
         derived_input,
         semantic_inputs,
         source.decompile_prep_facts(),
+        Some(&machine_profile),
         &crate::RegisterIdentity::from_prepared(source.as_ref()),
     );
     let mut function_facts = derived.function_facts;
@@ -5187,15 +5216,14 @@ impl InferredLocalFieldType {
     }
 }
 
-fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
-    let arch_name = arch_name.unwrap_or_default().to_ascii_lowercase();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
-    let is_x86_64 = arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || arch_name.contains("x64");
-    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+fn collect_pointer_arg_slot_map(
+    architecture: r2ssa::MachineArchitectureFamily,
+    ptr_bits: u32,
+) -> HashMap<String, usize> {
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
+    let is_x86_64 = matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64);
+    let is_riscv64 = matches!(architecture, r2ssa::MachineArchitectureFamily::RiscV64);
 
     let mut out = HashMap::new();
     for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
@@ -5222,6 +5250,27 @@ fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashM
         for alias in *aliases {
             if include_alias(alias) {
                 out.insert((*alias).to_string(), idx);
+            }
+        }
+    }
+    out
+}
+
+fn collect_prepared_pointer_arg_slot_map(prepared: &SsaArtifact) -> HashMap<String, usize> {
+    let context = prepared.machine_context();
+    let abi = context.abi_model();
+    if !abi.is_available() || !abi.is_coherent() {
+        return HashMap::new();
+    }
+
+    let mut out = HashMap::new();
+    for slot in abi.argument_registers() {
+        let Ok(index) = usize::try_from(slot.index()) else {
+            continue;
+        };
+        for (name, storage) in context.register_storages_by_name() {
+            if *storage == slot.storage() {
+                out.insert(name.to_ascii_lowercase(), index);
             }
         }
     }
@@ -5675,7 +5724,17 @@ pub fn infer_local_struct_artifacts_from_ssa(
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_local_blocks(ssa_blocks);
-    infer_local_struct_artifacts_from_blocks(&blocks, None, arch_name, ptr_bits, diagnostics)
+    let architecture = crate::prepare::legacy_architecture_family(arch_name);
+    let pointer_arg_slots = collect_pointer_arg_slot_map(architecture, ptr_bits);
+    infer_local_struct_artifacts_from_blocks(
+        &blocks,
+        None,
+        arch_name,
+        architecture,
+        &pointer_arg_slots,
+        ptr_bits,
+        diagnostics,
+    )
 }
 
 fn infer_local_struct_artifacts_from_prepared_ssa(
@@ -5686,10 +5745,14 @@ fn infer_local_struct_artifacts_from_prepared_ssa(
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_function_blocks(prepared.function().blocks().cloned());
     let memory_versions = LocalMemoryVersionFacts::from_prepared(prepared);
+    let architecture = prepared.machine_context().architecture_family();
+    let pointer_arg_slots = collect_prepared_pointer_arg_slot_map(prepared);
     let mut artifacts = infer_local_struct_artifacts_from_blocks(
         &blocks,
         Some(&memory_versions),
         arch_name,
+        architecture,
+        &pointer_arg_slots,
         ptr_bits,
         diagnostics,
     );
@@ -5746,11 +5809,12 @@ fn infer_local_struct_artifacts_from_blocks(
     ssa_blocks: &[LocalStructInferenceBlock],
     memory_versions: Option<&LocalMemoryVersionFacts>,
     arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
+    pointer_arg_slot_map: &HashMap<String, usize>,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
-    let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
-    let type_slots = local_struct_type_slots(ssa_blocks, &pointer_arg_slot_map, ptr_bits);
+    let type_slots = local_struct_type_slots(ssa_blocks, pointer_arg_slot_map, ptr_bits);
     let scalar_signedness = infer_scalar_signedness(
         ssa_blocks.iter().flat_map(|block| block.ops.iter()),
         ssa_blocks.iter().flat_map(|block| {
@@ -5763,7 +5827,7 @@ fn infer_local_struct_artifacts_from_blocks(
     );
     let pointer_pointee_types =
         local_pointer_pointee_types(ssa_blocks, ptr_bits, &scalar_signedness);
-    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
     let mut addr_exprs: HashMap<SSAVar, LocalAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<SSAVar, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), LocalAddrExpr> = HashMap::new();
@@ -6723,12 +6787,23 @@ fn scalar_array_access_certificates_from_ssa(
     type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
     local_element_strides: &HashMap<usize, u64>,
-    arch_name: Option<&str>,
-    ptr_bits: u32,
+    machine: ScalarArrayMachineProfile<'_>,
 ) -> ScalarArrayAccessCertificates {
-    let arch_name = arch_name.filter(|name| !name.is_empty());
-    let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
-    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let arch_name = machine.arch_name.filter(|name| !name.is_empty());
+    let architecture = machine
+        .architecture
+        .unwrap_or_else(|| crate::prepare::legacy_architecture_family(arch_name));
+    let detached_pointer_arg_slots;
+    let pointer_arg_slot_map = match machine.pointer_arg_slots {
+        Some(slots) => slots,
+        None => {
+            detached_pointer_arg_slots =
+                collect_pointer_arg_slot_map(architecture, machine.ptr_bits);
+            &detached_pointer_arg_slots
+        }
+    };
+    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
+    let ptr_bits = machine.ptr_bits;
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_addr_offset_names: HashMap<String, Option<i64>> = HashMap::new();
     let mut pointer_values: HashMap<String, ScalarPointerValue> = HashMap::new();
@@ -6780,7 +6855,7 @@ fn scalar_array_access_certificates_from_ssa(
                             type_db,
                             merged_signature,
                             ptr_bits,
-                            pointer_arg_slot_map: &pointer_arg_slot_map,
+                            pointer_arg_slot_map,
                             local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
@@ -6839,7 +6914,7 @@ fn scalar_array_access_certificates_from_ssa(
                             type_db,
                             merged_signature,
                             ptr_bits,
-                            pointer_arg_slot_map: &pointer_arg_slot_map,
+                            pointer_arg_slot_map,
                             local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
@@ -6907,7 +6982,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6935,7 +7010,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6977,7 +7052,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -7018,7 +7093,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -7092,7 +7167,7 @@ fn scalar_array_access_certificates_from_ssa(
                         type_db,
                         merged_signature,
                         ptr_bits,
-                        pointer_arg_slot_map: &pointer_arg_slot_map,
+                        pointer_arg_slot_map,
                         local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
@@ -7146,7 +7221,7 @@ fn scalar_array_access_certificates_from_ssa(
                         type_db,
                         merged_signature,
                         ptr_bits,
-                        pointer_arg_slot_map: &pointer_arg_slot_map,
+                        pointer_arg_slot_map,
                         local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
@@ -20475,6 +20550,8 @@ mod tests {
             &blocks,
             None,
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );
@@ -20542,6 +20619,8 @@ mod tests {
             &blocks,
             None,
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );
@@ -20992,6 +21071,8 @@ mod tests {
             &blocks,
             Some(&memory_versions),
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );

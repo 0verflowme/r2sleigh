@@ -3265,16 +3265,11 @@ fn collect_pointer_arg_slot_map(
     arch: Option<&ArchSpec>,
     ptr_bits: u32,
 ) -> std::collections::HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch.map(|spec| spec.name.as_str()));
-    let arch_name = arch
-        .map(|a| a.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
-    let is_x86_64 = arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || arch_name.contains("x64");
-    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(arch);
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
+    let is_x86_64 = matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64);
+    let is_riscv64 = matches!(architecture, r2ssa::MachineArchitectureFamily::RiscV64);
 
     let mut out = std::collections::HashMap::new();
     for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
@@ -6071,6 +6066,17 @@ mod tests {
             vars.get(&80).and_then(|v| v.base.legacy_name()),
             Some("rsp".to_string())
         );
+    }
+
+    #[test]
+    fn x86_32_pointer_slots_do_not_inherit_sysv64_argument_registers() {
+        let mut arch = ArchSpec::new("x86");
+        arch.addr_size = 4;
+
+        let slots = collect_pointer_arg_slot_map(Some(&arch), 32);
+
+        assert!(slots.is_empty());
+        assert!(!slots.contains_key("ecx"));
     }
 
     #[test]

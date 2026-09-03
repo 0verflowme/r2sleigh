@@ -174,30 +174,55 @@ const GENERIC_STACK_BASES: &[&str] = &["sp", "fp", "bp", "s0", "x2", "x8", "rbp"
 const GENERIC_FRAME_BASES: &[&str] = &["fp", "bp", "s0", "x8", "rbp"];
 
 pub fn recover_vars_arch_profile(
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> (ArgAliasMap, BaseRegList, BaseRegList) {
-    let Some(arch_name) = arch_name else {
-        return (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES);
-    };
+    use r2ssa::MachineArchitectureFamily;
 
-    let arch_name = arch_name.to_ascii_lowercase();
-    if arch_name.contains("x86") {
-        return (X86_ARG_REGS, X86_STACK_BASES, X86_FRAME_BASES);
+    match architecture {
+        MachineArchitectureFamily::X86 => (&[], X86_STACK_BASES, X86_FRAME_BASES),
+        MachineArchitectureFamily::X86_64 => (X86_ARG_REGS, X86_STACK_BASES, X86_FRAME_BASES),
+        MachineArchitectureFamily::Arm => (ARM32_ARG_REGS, ARM32_STACK_BASES, ARM32_FRAME_BASES),
+        MachineArchitectureFamily::AArch64 => {
+            (ARM64_ARG_REGS, ARM64_STACK_BASES, ARM64_FRAME_BASES)
+        }
+        MachineArchitectureFamily::RiscV32 | MachineArchitectureFamily::RiscV64 => {
+            (RISCV_ARG_REGS, RISCV_STACK_BASES, RISCV_FRAME_BASES)
+        }
+        MachineArchitectureFamily::Mips32 | MachineArchitectureFamily::Mips64 => {
+            (MIPS_ARG_REGS, MIPS_STACK_BASES, MIPS_FRAME_BASES)
+        }
+        MachineArchitectureFamily::PowerPc32
+        | MachineArchitectureFamily::PowerPc64
+        | MachineArchitectureFamily::Unknown => (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES),
     }
-    if arch_name.contains("aarch64") || arch_name.contains("arm64") {
-        return (ARM64_ARG_REGS, ARM64_STACK_BASES, ARM64_FRAME_BASES);
-    }
-    if arch_name == "arm" || arch_name.starts_with("armv") {
-        return (ARM32_ARG_REGS, ARM32_STACK_BASES, ARM32_FRAME_BASES);
-    }
-    if arch_name.contains("riscv") || arch_name.starts_with("rv") {
-        return (RISCV_ARG_REGS, RISCV_STACK_BASES, RISCV_FRAME_BASES);
-    }
-    if arch_name.contains("mips") {
-        return (MIPS_ARG_REGS, MIPS_STACK_BASES, MIPS_FRAME_BASES);
-    }
+}
 
-    (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES)
+pub(crate) fn legacy_architecture_family(
+    arch_name: Option<&str>,
+) -> r2ssa::MachineArchitectureFamily {
+    use r2ssa::MachineArchitectureFamily;
+
+    match arch_name
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("x86") | Some("x86-32") | Some("i386") | Some("i686") => {
+            MachineArchitectureFamily::X86
+        }
+        Some("x86-64") | Some("x86_64") | Some("x64") | Some("amd64") => {
+            MachineArchitectureFamily::X86_64
+        }
+        Some("arm") => MachineArchitectureFamily::Arm,
+        Some("aarch64") | Some("arm64") => MachineArchitectureFamily::AArch64,
+        Some("riscv32") | Some("rv32") => MachineArchitectureFamily::RiscV32,
+        Some("riscv64") | Some("rv64") => MachineArchitectureFamily::RiscV64,
+        Some("mips") | Some("mips32") => MachineArchitectureFamily::Mips32,
+        Some("mips64") => MachineArchitectureFamily::Mips64,
+        Some("ppc") | Some("powerpc") | Some("powerpc32") => MachineArchitectureFamily::PowerPc32,
+        Some("ppc64") | Some("powerpc64") => MachineArchitectureFamily::PowerPc64,
+        _ => MachineArchitectureFamily::Unknown,
+    }
 }
 
 fn arch_is_x86_64_sysv_like(arch_name: Option<&str>) -> bool {
@@ -399,7 +424,7 @@ pub fn collect_signature_type_evidence_context_with_arch(
     ssa_blocks: &[SSABlock],
     arch_name: Option<&str>,
 ) -> SignatureTypeEvidenceContext {
-    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let pointer_pointee_width_bytes =
         infer_pointer_pointee_width_bytes(ssa_blocks, &pointer_vars, stack_bases);
@@ -426,7 +451,7 @@ pub fn recover_signature_params_from_ssa(
     semantic_metadata_enabled: bool,
     ptr_bits: u32,
 ) -> Vec<RecoveredSignatureParam> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
+    let (arg_regs, _, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
     if arg_regs.is_empty() {
         return Vec::new();
     }
@@ -764,7 +789,8 @@ pub fn recover_vars_from_ssa_with_prep_facts(
     let mut vars = Vec::new();
     let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
-    let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let (arg_regs, stack_bases, frame_bases) =
+        recover_vars_arch_profile(legacy_architecture_family(arch_name));
     let ptr_bits = if arch_is_x86_64_sysv_like(arch_name) {
         64
     } else {
@@ -2114,7 +2140,7 @@ fn infer_usage_register_type_hints(
     ssa_blocks: &[SSABlock],
     arch_name: Option<&str>,
 ) -> (HashMap<String, TypeHint>, HashSet<String>) {
-    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, _) = recover_vars_arch_profile(legacy_architecture_family(arch_name));
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let mut hints = HashMap::new();
 
@@ -2327,6 +2353,19 @@ mod tests {
 
         assert_eq!(hint.rank, TypeHintRank::Pointer);
         assert_eq!(hint.ty, "void *");
+    }
+
+    #[test]
+    fn x86_argument_profile_is_selected_by_typed_machine_family() {
+        let (x86_args, x86_stack, _) =
+            recover_vars_arch_profile(r2ssa::MachineArchitectureFamily::X86);
+        let (x86_64_args, x86_64_stack, _) =
+            recover_vars_arch_profile(r2ssa::MachineArchitectureFamily::X86_64);
+
+        assert!(x86_args.is_empty());
+        assert_eq!(x86_stack, X86_STACK_BASES);
+        assert_eq!(x86_64_args, X86_ARG_REGS);
+        assert_eq!(x86_64_stack, X86_STACK_BASES);
     }
 
     #[test]
