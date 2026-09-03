@@ -4,6 +4,39 @@ use super::projection::project_machine_write;
 use super::*;
 use r2rewrite::CValue;
 
+/// Every definition the sealed inline plan would have nested under `value`.
+///
+/// Ordinary inline lowering records these through nested replacement
+/// expressions. A frame-object address replaces the whole expression with one
+/// program-object spelling, so it has no nested AST on which to carry those
+/// contracts and must collect the same closure up front.
+fn planned_inline_definition_closure(
+    prepared: &r2ssa::SsaArtifact,
+    names: &crate::binding_plan::BindingNameResolution,
+    value: ValueId,
+) -> Option<Vec<r2ssa::InstId>> {
+    let mut pending = vec![value];
+    let mut seen = BTreeSet::new();
+    let mut definitions = BTreeSet::new();
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value)
+            || !matches!(
+                names.plan().disposition(value),
+                Some(crate::binding_plan::ValueDisposition::Inline { .. })
+            )
+        {
+            continue;
+        }
+        let Some(definition) = prepared.graph().def_inst(value) else {
+            continue;
+        };
+        let instruction = prepared.graph().inst(definition)?;
+        definitions.insert(definition);
+        pending.extend(instruction.inputs.iter().copied());
+    }
+    Some(definitions.into_iter().collect())
+}
+
 fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
     op.dst().is_some()
 }
@@ -65,10 +98,18 @@ impl<'a> FoldingContext<'a> {
                 }
                 (replaced, None)
             }
-            ReplacementSource::EscapedStackAddress(frame_address) => (
-                prepared.graph().def_inst(value).into_iter().collect(),
-                Some(frame_address),
-            ),
+            ReplacementSource::EscapedStackAddress(frame_address) => {
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(replaced) = planned_inline_definition_closure(prepared, names, value)
+                else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                (replaced, Some(frame_address))
+            }
         };
         let obligations = replaced
             .iter()

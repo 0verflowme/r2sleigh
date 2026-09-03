@@ -2378,7 +2378,12 @@ impl LegacyObservationJournal {
         let (expr, value, replaced, obligations, frame_address) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
+        targets.extend(self.discharged_instruction_targets(
+            Some(value),
+            &replaced,
+            Some(&expr),
+            frame_address.is_some(),
+        )?);
 
         if let Some(frame_address) = frame_address {
             let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
@@ -2461,7 +2466,7 @@ impl LegacyObservationJournal {
         discharged: &[InstId],
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let targets = self.discharged_instruction_targets(None, discharged, None)?;
+        let targets = self.discharged_instruction_targets(None, discharged, None, false)?;
         let mut marked = stmt;
         for id in self.allocate_many(targets)? {
             marked = CStmt::observed(id, marked);
@@ -2485,6 +2490,7 @@ impl LegacyObservationJournal {
         rendered: Option<ValueId>,
         discharged: &[InstId],
         expr: Option<&CExpr>,
+        abstracts_frame_base: bool,
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
@@ -2547,6 +2553,13 @@ impl LegacyObservationJournal {
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
+                        // `&frame_object` semantically contains the frame base
+                        // and displacement without spelling either as a C
+                        // value. Their exact use cells are owned by this
+                        // replacement, but a bound value cell must remain on
+                        // an occurrence of its own symbol rather than being
+                        // misclassified as the frame-object binding.
+                        Some(ValueDisposition::Bound { .. }) if abstracts_frame_base => false,
                         Some(ValueDisposition::Bound { .. }) => true,
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>

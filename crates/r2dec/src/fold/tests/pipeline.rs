@@ -2667,9 +2667,13 @@ mod tests {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntSub {
-            dst: Varnode::register(0x10, 8),
+            dst: Varnode::unique(0x20, 8),
             a: Varnode::register(0x28, 8),
             b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::unique(0x20, 8),
         });
         entry.push(R2ILOp::Store {
             space: SpaceId::Ram,

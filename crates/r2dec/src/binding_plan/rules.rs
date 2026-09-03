@@ -717,14 +717,15 @@ fn duplicable_bound_literals(
     literal_candidates.iter().copied().collect()
 }
 
-/// The frame object base whose one exact call-boundary reader may replace this value.
+/// The frame object base whose exact call-boundary readers may replace this value.
 ///
 /// This is deliberately narrower than a generic multi-reader exception.  The
 /// graph readers must all be certified load/store address cells for the same
-/// object, and there must be exactly one graphless boundary reader containing
-/// exactly one occurrence of the value.  That one call expression can then own
-/// the address producer's discharged cells; admitting a second call would give
-/// those cells two render owners.
+/// object, and every graphless boundary reader must contain the value in an
+/// exact call-argument cell. Repeating a pure frame address across calls does
+/// not repeat a program effect; each occurrence carries the same value/use/write
+/// classification, while the effect ledger still rejects any duplicated live
+/// obligation.
 fn frame_object_address_replacement(
     source: &r2ssa::SsaArtifact,
     projection: &r2ssa::MachineProjection,
@@ -732,23 +733,34 @@ fn frame_object_address_replacement(
     use_sites: &[UseSite],
     boundary_readers: &[InstId],
 ) -> Option<r2ssa::ObjectId> {
-    let [call] = boundary_readers else {
-        return None;
-    };
-    let call_site = source.certificates().callsites_by_inst.get(call)?;
-    let certificate = source.certificates().callsites.get(call_site)?;
-    let mut argument_indices = certificate
-        .argument_values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| (*argument == value).then_some(index));
-    let argument_index = argument_indices.next()?;
-    if argument_indices.next().is_some() {
+    if boundary_readers.is_empty() {
         return None;
     }
-    let object = super::certified_frame_object_call_argument(source, *call, argument_index, value)?;
-    (!use_sites.is_empty()
-        && use_sites.iter().all(|site| {
+    let mut object = None;
+    for call in boundary_readers {
+        let call_site = source.certificates().callsites_by_inst.get(call)?;
+        let certificate = source.certificates().callsites.get(call_site)?;
+        let mut matched = false;
+        for (argument_index, argument) in certificate.argument_values.iter().enumerate() {
+            if *argument != value {
+                continue;
+            }
+            let candidate =
+                super::certified_frame_object_call_argument(source, *call, argument_index, value)?;
+            if object.is_some_and(|object| object != candidate) {
+                return None;
+            }
+            object = Some(candidate);
+            matched = true;
+        }
+        if !matched {
+            return None;
+        }
+    }
+    let object = object?;
+    use_sites
+        .iter()
+        .all(|site| {
             let Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) =
                 projection.use_disposition(*site)
             else {
@@ -767,8 +779,8 @@ fn frame_object_address_replacement(
                         && memory.object == object
                         && source.objects().object_for_value(value, memory.space) == Some(object)
                 })
-        }))
-    .then_some(object)
+        })
+        .then_some(object)
 }
 
 fn inlinable_core(
