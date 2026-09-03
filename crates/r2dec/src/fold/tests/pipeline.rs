@@ -705,6 +705,8 @@ mod tests {
                             .enumerate()
                             .map(|(index, value)| r2types::CallArgumentValueFact { index, value })
                             .collect(),
+                        variadic: cert.variadic,
+                        fixed_argument_count: cert.fixed_argument_count,
                         register_argument_locations,
                         stack_argument_locations,
                     },

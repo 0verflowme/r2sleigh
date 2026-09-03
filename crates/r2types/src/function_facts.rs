@@ -1162,6 +1162,14 @@ pub struct CallsiteArgumentFacts {
     pub target: r2ssa::ValueId,
     pub direct_target: Option<u64>,
     pub argument_values: Vec<CallArgumentValueFact>,
+    /// Whether the callee takes a variadic tail, as the source's prototype for
+    /// it says. Two call sites of one variadic callee legitimately pass
+    /// different numbers of arguments, and the declaration a rendering owes
+    /// the callee has to say so or it cannot describe both.
+    pub variadic: bool,
+    /// How many leading `argument_values` the callee's prototype names, where
+    /// a prototype described the call. The rest are the variadic tail.
+    pub fixed_argument_count: Option<usize>,
     pub register_argument_locations: Vec<RegisterCallArgumentLocationFact>,
     pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
 }
@@ -3362,6 +3370,8 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                     target: cert.target,
                     direct_target: cert.direct_target,
                     argument_values,
+                    variadic: cert.variadic,
+                    fixed_argument_count: cert.fixed_argument_count,
                     register_argument_locations,
                     stack_argument_locations,
                 },
@@ -5225,6 +5235,8 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
@@ -5381,6 +5393,8 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
                     register_argument_locations: Vec::new(),
                     stack_argument_locations: Vec::new(),
                 },
@@ -5498,6 +5512,8 @@ mod tests {
                 index: 0,
                 value: register_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
@@ -5729,6 +5745,8 @@ mod tests {
                 index: 0,
                 value: sentinel_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
             register_argument_locations: Vec::new(),
             stack_argument_locations: Vec::new(),
         };
