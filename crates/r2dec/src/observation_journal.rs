@@ -1966,6 +1966,56 @@ impl LegacyObservationJournal {
                     .map(|obligation| obligation.id),
             );
         }
+
+        // An inline value is normally accounted where its expression is
+        // inserted. A dead definition is never built, so an inline source
+        // whose every reader is one of those definitions has zero rendered
+        // occurrences and no marker that could close its value cell. Literal
+        // constants are the common case: once a dead flag definition is
+        // removed, the constant it read must not force the journal to refuse
+        // merely because there is nowhere left to spell it.
+        //
+        // This is deliberately narrower than "all currently empty values".
+        // Every graph read must already have the exact dead-definition reason,
+        // and a certified boundary read disqualifies the value because that
+        // read is absent from the graph. Defined inline expressions still owe
+        // their own write, input and effect cells independently; this closes
+        // only the value occurrence proved to be absent.
+        let certified_boundary_values = graph
+            .insts
+            .iter()
+            .flat_map(|inst| {
+                crate::binding_plan::certified_boundary_read_values(source.source(), inst.id)
+            })
+            .collect::<BTreeSet<_>>();
+        let dead_inline_values = graph
+            .values
+            .iter()
+            .filter(|value| {
+                matches!(
+                    self.plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                )
+            })
+            .filter(|value| !certified_boundary_values.contains(&value.id))
+            .filter(|value| {
+                graph.use_sites(value.id).iter().all(|site| {
+                    matches!(
+                        elided_uses.get(site),
+                        Some(r2ssa::ledger::ElisionReason::DeadUnusedTemporary)
+                    )
+                })
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        for value in dead_inline_values {
+            let slot = self.value_slot_mut(value)?;
+            record_same(
+                slot,
+                LegacyValueObservation::Elided(r2ssa::ledger::ElisionReason::DeadUnusedTemporary),
+            )
+            .map_err(|()| LegacyObservationJournalError::ConflictingValue(value))?;
+        }
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
         }
@@ -3958,6 +4008,19 @@ mod tests {
             .expect("defined CF value")
             .id;
         let definition = graph.def_inst(dead).expect("CF definition");
+        let dead_literal = graph
+            .values
+            .iter()
+            .find(|value| {
+                value.var.constant_bits() == Some(1)
+                    && !graph.use_sites(value.id).is_empty()
+                    && graph
+                        .use_sites(value.id)
+                        .iter()
+                        .all(|site| site.inst == definition)
+            })
+            .expect("constant read only by the dead CF definition")
+            .id;
         let (source, plan, _function, journal) = journal_fixture_for_source(source);
 
         assert!(
@@ -3980,6 +4043,20 @@ mod tests {
         assert_eq!(
             journal.writes[definition.0 as usize],
             Some(LegacyWriteObservation::Elided(
+                r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+            ))
+        );
+        assert!(
+            matches!(
+                plan.disposition(dead_literal),
+                Some(ValueDisposition::Inline { .. })
+            ),
+            "unexpected literal disposition: {:?}",
+            plan.disposition(dead_literal)
+        );
+        assert_eq!(
+            journal.values[dead_literal.0 as usize],
+            Some(LegacyValueObservation::Elided(
                 r2ssa::ledger::ElisionReason::DeadUnusedTemporary
             ))
         );
