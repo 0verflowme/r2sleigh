@@ -255,6 +255,9 @@ struct Importer<'a> {
     entry_never_redefined: BTreeSet<ValueId>,
     /// Values the machine arena types as an address at some use.
     address_typed: BTreeSet<ValueId>,
+    /// Parameters some address reaches memory through, so a pointer rather
+    /// than an integer that happens to be a parameter.
+    pointer_parameters: BTreeSet<usize>,
     /// One integer-typed source node per value the arena reads, so a
     /// certificate that names a value can be stated over a leaf.
     source_nodes: BTreeMap<ValueId, MachineExprId>,
@@ -298,6 +301,20 @@ pub fn import_with(
             MachineType::Bool { .. } => {}
         }
     }
+    // A parameter is a pointer because some certified access reads or writes
+    // through an address derived from it. Being a parameter proves nothing on
+    // its own: `arr_sum(const uint32_t *a, size_t n)` has parameter address
+    // provenance for `n` as well as for `a`, and calling both pointers leaves
+    // every one-byte access with two candidate bases and no way to choose.
+    // Neither does having an object: one is made for every parameter that
+    // appears in any address expression, `n` included.
+    let pointer_parameters = artifact
+        .structured()
+        .memory_accesses
+        .values()
+        .filter_map(|access| artifact.addresses().parameter_expression(access.address))
+        .map(|expression| expression.parameter)
+        .collect();
     let mut importer = Importer {
         artifact,
         projection,
@@ -307,6 +324,7 @@ pub fn import_with(
         in_progress: HashSet::new(),
         entry_never_redefined,
         address_typed,
+        pointer_parameters,
         source_nodes,
         walks: BTreeMap::new(),
     };
@@ -836,13 +854,7 @@ impl Importer<'_> {
     /// Everything the certificates say about the value a leaf reads, put on
     /// the leaf, because a rule sees the leaf and not the value.
     fn declare_leaf_facts(&mut self, leaf: TermId, value: ValueId) {
-        if self
-            .artifact
-            .addresses()
-            .parameter_expression(value)
-            .is_some()
-            || self.address_typed.contains(&value)
-        {
+        if self.value_is_pointer(value) {
             self.arena.declare_pointer(leaf);
         }
         if let Some(root) = self.stack_root_of(value) {
@@ -851,6 +863,31 @@ impl Importer<'_> {
         if let Some(walk) = self.walk_of(value) {
             self.arena.declare_walk(leaf, walk);
         }
+    }
+
+    /// Whether the certificates prove this value is a pointer.
+    ///
+    /// Two proofs, and each is a use rather than a declaration. The machine
+    /// arena types a value as an address exactly where a certified access
+    /// reads or writes through it. And the address provenance pass propagates
+    /// a parameter base through arithmetic and proven stack spills, so a
+    /// value that is a pointer parameter with no index added to it is that
+    /// pointer however many stack homes it passed through -- which is what a
+    /// `-O0` build does to every parameter before its first use.
+    ///
+    /// A value with terms added is a pointer too, and is not a *base*: it is
+    /// the whole address, and an address that is its own base leaves no index.
+    fn value_is_pointer(&self, value: ValueId) -> bool {
+        if self.address_typed.contains(&value) {
+            return true;
+        }
+        self.artifact
+            .addresses()
+            .parameter_expression(value)
+            .is_some_and(|expression| {
+                expression.terms.is_empty()
+                    && self.pointer_parameters.contains(&expression.parameter)
+            })
     }
 
     /// The frame position `value` holds, through the copies that carried it.
@@ -902,13 +939,7 @@ impl Importer<'_> {
         if stride == 0 {
             return None;
         }
-        let init_is_pointer = self
-            .artifact
-            .addresses()
-            .parameter_expression(fact.init)
-            .is_some()
-            || self.address_typed.contains(&fact.init);
-        if !init_is_pointer {
+        if !self.value_is_pointer(fact.init) {
             return None;
         }
         let graph = self.artifact.graph();
