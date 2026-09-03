@@ -6365,7 +6365,6 @@ mod tests {
             size: 8,
         };
         let rsp = Varnode::register(0x28, 8);
-        let rax = Varnode::register(0x00, 8);
         let mut ops: Vec<R2ILOp> = Vec::new();
         let mut meta = std::collections::BTreeMap::new();
         // call: push the return address, transfer.
@@ -6388,22 +6387,6 @@ mod tests {
                 i,
                 r2il::OpMetadata {
                     instruction_addr: Some(0x1000),
-                    ..Default::default()
-                },
-            );
-        }
-        // a read of the stack pointer after the call, feeding the result
-        let second = ops.len();
-        ops.push(R2ILOp::IntAdd {
-            dst: rax.clone(),
-            a: rsp.clone(),
-            b: Varnode::constant(0x10, 8),
-        });
-        for i in second..ops.len() {
-            meta.insert(
-                i,
-                r2il::OpMetadata {
-                    instruction_addr: Some(0x1005),
                     ..Default::default()
                 },
             );
@@ -6445,9 +6428,7 @@ mod tests {
             b"restore-fixture".to_vec(),
             "sysv64",
             std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
-            r2ssa::SourceFunctionReturn::Register {
-                storage: storage(0),
-            },
+            r2ssa::SourceFunctionReturn::Void,
             std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
         )
         .and_then(|i| i.with_return_address_storage(storage(0x30)))

@@ -3045,24 +3045,46 @@ impl LegacyObservationJournal {
             RenderObservationInspectError::Observer(error) => error,
         })?;
 
-        // A value defined by an elided program copy is rendered by its
-        // binding. The copy said nothing because both sides are one object,
-        // and the statement that produced the source is what writes that
-        // object, so the value's cell is the binding's -- exactly the answer
-        // the symmetric merge case gives, where a merge coalesced to one
-        // binding is rendered by that binding rather than by a write of its
-        // own. Looking for an occurrence on the statement that no longer
-        // exists would ask the rendering to carry a mark for a statement it
-        // was right not to emit.
+        // A value defined by an elided program copy has no occurrence on the
+        // copy itself. Usually its binding is declared elsewhere, and that
+        // declaration answers for the value -- exactly as for a merge
+        // coalesced to one binding. A carrier used only by certified machine
+        // plumbing is the other case: no C object is declared, and every use
+        // has its own justified elision, so the copy's coalescing proof also
+        // answers that its output has no rendered occurrence.
+        //
+        // These are the only two answers. An undeclared binding with any use
+        // that is not already proved elided still refuses; otherwise this
+        // would turn a missing occurrence into an accounting exemption.
         for value in &self.coalesced_copy_outputs {
             let slot = value.0 as usize;
             if values.get(slot).is_some_and(Option::is_none)
                 && let Some(symbol) = names.symbol_for_value(*value)
             {
-                match classify_symbol(*value, symbol, &symbol_bindings) {
-                    Ok(observation) => values[slot] = Some(observation),
-                    Err(error) => return Ok(LegacyObservationSeal::BindingFailure(error)),
+                if let Some(binding) = symbol_bindings.get(&symbol).copied() {
+                    values[slot] = Some(LegacyValueObservation::Bound { binding });
+                    continue;
                 }
+                let every_use_is_elided =
+                    self.source.graph().use_sites(*value).iter().all(|site| {
+                        matches!(
+                            uses.get(site.inst.0 as usize)
+                                .and_then(|row| row.get(site.input_idx)),
+                            Some(Some(LegacyUseObservation::Elided(_)))
+                        )
+                    });
+                if every_use_is_elided {
+                    values[slot] = Some(LegacyValueObservation::Elided(
+                        r2ssa::ledger::ElisionReason::CoalescedCopy,
+                    ));
+                    continue;
+                }
+                return Ok(LegacyObservationSeal::BindingFailure(
+                    LegacyObservationJournalError::UnownedBindingSymbol {
+                        value: *value,
+                        symbol,
+                    },
+                ));
             }
         }
 
