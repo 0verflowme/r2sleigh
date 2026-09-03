@@ -204,33 +204,41 @@ for score in (
 # The per-cell map. This is the deliverable the gate exists for: what this
 # decompiler gets wrong outside hash functions, cell by cell.
 print()
-print("shape cells (raw / differential / first divergence):")
+print("shape cells (raw / differential / named cause):")
 for entry in sorted(entries, key=lambda item: (item["function"], item["config"])):
     key = f"{entry['config']}/{entry['function']}"
     differential = entry["differential"]
+    generation = entry["generation"]
     detail = ""
-    if entry["generation"]["status"] != "present":
-        detail = f"generation={entry['generation']['status']}"
-        error = str(entry["generation"].get("error", "")).strip().splitlines()
-        if error:
-            detail += f" :: {error[0][:160]}"
+    if generation["status"] != "present":
+        # The renderer names why it declined, in a comment where the function
+        # would have been. That name is the finding; "unparsable" is not.
+        detail = generation.get("fallback_reason") or (
+            f"{generation['status']}: "
+            + str(generation.get("error", "")).strip().splitlines()[0][:160]
+        )
+    elif entry["raw"]["status"] == "signature_mismatch":
+        detail = (
+            f"rendered arity {generation.get('rendered_arity')} for a function "
+            f"of {generation.get('expected_arity')}"
+        )
     elif entry["raw"]["status"] != "pass":
         detail = "raw=" + entry["raw"]["status"]
         for line in str(entry["raw"].get("stderr", "")).splitlines():
             if "error:" in line:
-                detail += f" :: {line.strip()[:160]}"
+                detail += " :: " + line.split("error:", 1)[1].strip()[:140]
                 break
-    else:
+    if differential["status"] not in {"pass", "blocked_generation", "blocked_signature"}:
         for case in differential.get("cases", []):
             if case.get("status") != "pass":
-                detail = (
-                    f"{case['case_id']} expected={case.get('expected')} "
-                    f"actual={case.get('actual')} status={case['status']}"
+                detail += (
+                    f" | {case['case_id']} expected={case.get('expected')} "
+                    f"actual={case.get('actual')} ({case['status']})"
                 )
                 break
     print(
         f"  {key:<40} raw={entry['raw']['status']:<20} "
-        f"diff={differential['status']:<16} {detail}"
+        f"diff={differential['status']:<20} {detail}"
     )
 print()
 print(f"matrix={matrix_path}")

@@ -1466,6 +1466,21 @@ def _matching_brace(text: str, opening: int) -> int | None:
     return None
 
 
+# The renderer, when it declines, emits one comment in place of the function and
+# names why. Reading it is the difference between a cell that says "unparsable"
+# and a cell that says which rule refused, which is the whole value of the gate
+# on a corpus where most cells refuse.
+FALLBACK_REASON_RE = re.compile(
+    r"/\* r2dec fallback: skipped decompilation for (?P<function>\S+) "
+    r"\((?P<reason>.*?)\) \*/"
+)
+
+
+def fallback_reason(section: str) -> str | None:
+    match = FALLBACK_REASON_RE.search(section)
+    return match.group("reason") if match else None
+
+
 def extract_function(section: str, name: str) -> tuple[str | None, str | None]:
     candidates: list[tuple[int, int]] = []
     for line_match in re.finditer(r"(?m)^.*$", section):
@@ -2377,7 +2392,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 else extraction_error
             )
             entry["generation"].update(
-                {"status": terminal_status, "error": terminal_error}
+                {
+                    "status": terminal_status,
+                    "error": terminal_error,
+                    "fallback_reason": fallback_reason(exact_section),
+                }
             )
             entry["raw"] = {"status": "blocked_generation"}
             entry["diagnostic"] = {"status": "blocked_generation", "rewrites": []}
