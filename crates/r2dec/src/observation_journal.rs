@@ -3037,6 +3037,38 @@ impl LegacyObservationJournal {
         Ok(marked)
     }
 
+    /// Attach only the implicit effects a composite statement's children do
+    /// not already own.
+    ///
+    /// A structured loop owns an implicit latch transfer, while an explicit
+    /// conditional latch inside its body owns its own predicate and transfer.
+    /// Both come from the same source loop fact. Reading the marker tree here
+    /// keeps the concrete child occurrence authoritative and prevents the
+    /// parent from placing a second marker on that one rendered control node.
+    pub(crate) fn observe_composite_effect_stmt(
+        &mut self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let mut already_owned = BTreeSet::new();
+        for id in crate::ast::stmt_render_observation_ids(&stmt) {
+            let target = self.targets.get(id.index() as usize).ok_or(
+                LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                    id,
+                    expected_count: self.targets.len(),
+                }),
+            )?;
+            if let ObservationTarget::Effect(obligation) = target {
+                already_owned.insert(*obligation);
+            }
+        }
+        let implicit = obligation_ids
+            .difference(&already_owned)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.observe_effect_stmt(&implicit, stmt)
+    }
+
     /// Expression twin of [`Self::observe_effect_stmt`].
     pub(crate) fn observe_effect_expr(
         &mut self,
@@ -4862,6 +4894,40 @@ mod tests {
             ledger.conflicts().collect::<Vec<_>>(),
             vec![(&obligation, 1)]
         );
+    }
+
+    #[test]
+    fn composite_effect_owner_adds_only_obligations_its_child_does_not_own() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligations = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .take(2)
+            .collect::<Vec<_>>();
+        let [child_obligation, implicit_obligation] = obligations.as_slice() else {
+            panic!("fixture needs two source obligations");
+        };
+        let child = journal
+            .observe_effect_stmt(&BTreeSet::from([*child_obligation]), CStmt::Return(None))
+            .expect("concrete child occurrence");
+        function.body = vec![
+            journal
+                .observe_composite_effect_stmt(
+                    &BTreeSet::from([*child_obligation, *implicit_obligation]),
+                    CStmt::while_loop(CExpr::UIntLit(1), child),
+                )
+                .expect("composite effect ownership"),
+        ];
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("final effect occurrences seal independently of V/U/W");
+        assert_eq!(effects.occurrence_count(*child_obligation), Some(1));
+        assert_eq!(effects.occurrence_count(*implicit_obligation), Some(1));
     }
 
     #[test]

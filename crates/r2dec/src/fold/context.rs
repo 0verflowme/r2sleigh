@@ -561,6 +561,32 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Attach a composite statement's implicit effects without duplicating an
+    /// exact effect marker already carried by one of its child statements.
+    pub(crate) fn observe_composite_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_composite_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     /// Expression twin of [`Self::observe_effect_stmt`].
     pub(crate) fn observe_effect_expr(
         &self,

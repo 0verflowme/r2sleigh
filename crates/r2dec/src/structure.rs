@@ -784,7 +784,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             )
             .collect::<Vec<_>>();
         let obligations = self.exact_control_obligations(anchors.iter().copied());
-        self.fold_ctx.observe_effect_stmt(&obligations, stmt)
+        self.fold_ctx
+            .observe_composite_effect_stmt(&obligations, stmt)
     }
 
     fn record_switch_render_proof(

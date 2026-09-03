@@ -1407,6 +1407,24 @@ pub(crate) fn stmt_has_render_observations(stmt: &CStmt) -> bool {
     }
 }
 
+/// Collect the observation identities already carried by one statement tree.
+///
+/// Composite constructs use this before claiming implicit source effects: a
+/// child statement that already owns an effect is the concrete occurrence, so
+/// attaching the same cell to the parent would create two accounting markers
+/// for one rendering.
+pub(crate) fn stmt_render_observation_ids(stmt: &CStmt) -> Vec<RenderObservationId> {
+    let mut ids = Vec::new();
+    let never = visit_stmt_observations(stmt, &mut |id| {
+        ids.push(id);
+        Ok::<_, std::convert::Infallible>(())
+    });
+    match never {
+        Ok(()) => ids,
+        Err(never) => match never {},
+    }
+}
+
 /// Validate every marker before exposing any final wrapped node to `inspect`.
 ///
 /// Marker-domain errors invoke no callback.  Callers can likewise accumulate
