@@ -13,29 +13,6 @@
 //! same rule are two answerers that can drift, and when they drift the seal
 //! rejects a plan that is correct. So the rules live here, once, and both
 //! derivations call them while keeping their own traversals.
-//!
-//! ## What may license a coalescing
-//!
-//! Three things, and they are proofs rather than exemptions. Two of them
-//! propose a set of values as one object in `construction`: a *storage span*,
-//! which says the values share a machine location, and a *certified entity*,
-//! which says an upstream certificate found them to be one object. The rules
-//! below then decline either proposal where it would put two values one
-//! instruction reads at once into one object, or where one member is still
-//! read after another has been given a new value.
-//!
-//! The third is newer and lives with the elision it licenses, in
-//! `observation_journal::boundary_restores_carrier`: the *convention's
-//! preserved-carrier statement*, which says a call leaves a named carrier
-//! where it found it. It matters because the declines above are declines for
-//! want of proof rather than prohibitions -- the comment beside the program
-//! copy rule names "a save and restore around a clobber" as the shape that
-//! must not fold, and the reason given is that nothing shows the object
-//! survived. A call boundary's restore is exactly that shape and the source
-//! does show it, naming the carrier it means, so the fold is admitted on the
-//! proof and declined without it. Anything widening this further should
-//! supply a fact of the same kind rather than a test on an operation's
-//! spelling, which is what would turn the rule into a hole.
 
 use std::collections::{BTreeMap, BTreeSet};
 

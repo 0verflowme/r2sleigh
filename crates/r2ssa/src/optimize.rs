@@ -1490,10 +1490,6 @@ where
             target: map(target),
         },
         CallDefine { dst } => CallDefine { dst: dst.clone() },
-        CallRestore { dst, src } => CallRestore {
-            dst: dst.clone(),
-            src: map(src),
-        },
         Return { target } => Return {
             target: map(target),
         },

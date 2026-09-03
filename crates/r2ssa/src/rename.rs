@@ -47,22 +47,6 @@ pub struct RenameContext {
 pub struct CallBoundaryConfig {
     /// Registers that must receive a fresh SSA definition after a call.
     pub defined_regs: Vec<CallBoundaryDef>,
-    /// The carrier the callee puts back where it found it.
-    ///
-    /// A call instruction's own p-code carries the whole architectural cost of
-    /// transferring control: on x86-64 that is `RSP = RSP - 8` and the store of
-    /// the return address, on AArch64 a write to the link register and nothing
-    /// on the stack. Whatever it spends, the callee's return refunds -- but the
-    /// callee is not part of this function, so nothing in the lifted body
-    /// refunds it, and the caller's stack pointer drifts by one return-address
-    /// slot at every call it makes. Two calls, sixteen bytes; three,
-    /// twenty-four. Every stack offset taken after the first call then names
-    /// the wrong slot, which is worse than naming none.
-    ///
-    /// The convention is what states the refund, so this carries a storage only
-    /// where the source stated it. `None` leaves the drift visible rather than
-    /// correcting it on a guess.
-    pub stack_pointer_restored_by_callee: Option<CanonicalStorageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,12 +215,6 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
         }
     }
 
-    // The convention names the carrier a call leaves alone; renaming needs the
-    // identity that carrier was lifted as.
-    let stack_pointer_identity = call_boundaries
-        .and_then(|boundary| boundary.stack_pointer_restored_by_callee)
-        .and_then(|storage| sole_identity_on_storage(definitions, storage));
-
     // Get block order (reverse postorder for dominator tree traversal)
     result.block_order = cfg.reverse_postorder();
 
@@ -275,29 +253,11 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
         &mut result,
         reg_names,
         call_boundaries,
-        stack_pointer_identity.as_ref(),
         control,
     )?;
 
     control.poll()?;
     Ok(result)
-}
-
-/// The one identity lifted onto this exact storage, when there is exactly one.
-///
-/// Storage is the structural identity and the name beside it is presentation.
-/// Two identities sharing a storage means the lift disagreed with itself about
-/// what that location is; restoring one of them would assert the callee wrote
-/// through a location it may not have, so this declines instead.
-fn sole_identity_on_storage(
-    definitions: &DefinitionSitesByIdentity,
-    storage: CanonicalStorageId,
-) -> Option<RenameIdentity> {
-    let mut matches = definitions
-        .keys()
-        .filter(|identity| identity.storage == storage);
-    let identity = matches.next()?;
-    matches.next().is_none().then(|| identity.clone())
 }
 
 /// Rename a block and its dominated descendants.
@@ -311,7 +271,6 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
     result: &mut RenamedFunction,
     reg_names: Option<&RegisterNameMap>,
     call_boundaries: Option<&CallBoundaryConfig>,
-    stack_pointer_identity: Option<&RenameIdentity>,
     control: &C,
 ) -> Result<(), SsaExecutionStopReason> {
     // An exit frame keeps each block's definitions live until all dominated
@@ -377,21 +336,8 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
 
         // 2. Rename operations in the block.
         if let Some(block) = cfg.get_block(block_addr) {
-            // The carrier as the call instruction found it, before that
-            // instruction's own p-code spent anything transferring control.
-            // Restoring to this needs no per-architecture quantity: whatever
-            // the machine moved is exactly what the callee brings back.
-            let mut instruction_addr: Option<u64> = None;
-            let mut carrier_entering_instruction: Option<SSAVar> = None;
-            for (op_idx, op) in block.ops.iter().enumerate() {
+            for op in &block.ops {
                 control.poll()?;
-                if let Some(identity) = stack_pointer_identity {
-                    let op_addr = block.op_instruction_addr(op_idx);
-                    if op_addr.is_some() && op_addr != instruction_addr {
-                        instruction_addr = op_addr;
-                        carrier_entering_instruction = Some(ctx.read_var(identity));
-                    }
-                }
                 let renamed_op = rename_op(op, ctx, &mut defined_vars, reg_names);
                 record_renamed_op_storage(op, &renamed_op, result);
                 result.blocks.get_mut(&block_addr).unwrap().push(renamed_op);
@@ -415,39 +361,6 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
                             storage,
                         );
                     }
-                }
-
-                // After the clobbers, not before them: the run of `CallDefine`
-                // directly following a call is how a result is found, and an
-                // operation in the middle of it ends that run early.
-                if matches!(op, r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. })
-                    && let (Some(identity), Some(entering)) = (
-                        stack_pointer_identity,
-                        carrier_entering_instruction.as_ref(),
-                    )
-                    && ctx.read_var(identity) != *entering
-                {
-                    // Only where this instruction moved the carrier. An
-                    // AArch64 `bl` writes the link register and leaves the
-                    // stack alone, so there is nothing to bring back; defining
-                    // the carrier anyway would add a definition to a block that
-                    // has none, which phi placement was computed without.
-                    let dst = ctx.write_var(identity);
-                    defined_vars.push(identity.clone());
-                    result
-                        .blocks
-                        .get_mut(&block_addr)
-                        .unwrap()
-                        .push(SSAOp::CallRestore {
-                            dst: dst.clone(),
-                            src: entering.clone(),
-                        });
-                    record_canonical_storage(
-                        &mut result.canonical_storage_by_var,
-                        &mut result.ambiguous_storage_vars,
-                        &dst,
-                        identity.storage,
-                    );
                 }
             }
         }

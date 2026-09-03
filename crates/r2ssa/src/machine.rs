@@ -3674,13 +3674,7 @@ impl MachineBuilder {
                     },
                 ))
             }
-            // A restore hands back the value it was given, so as an
-            // expression it is a copy. What it says beyond that -- that the
-            // value came back across a call boundary rather than from an
-            // instruction this function executed -- is carried by the
-            // operation's own kind, and read by the accounting rather than by
-            // the expression.
-            SSAOp::Copy { .. } | SSAOp::CallRestore { .. } => {
+            SSAOp::Copy { .. } => {
                 let inputs = self.operand_nodes(graph, inst, 1)?;
                 Ok((unsigned, MachineExprKind::Copy { input: inputs[0] }))
             }
@@ -4258,7 +4252,6 @@ fn machine_kind_matches_op(op: &SSAOp, kind: &MachineExprKind) -> bool {
         (SSAOp::Load { .. }, MachineExprKind::MemoryRead { .. })
             | (SSAOp::CallDefine { .. }, MachineExprKind::Source { .. })
             | (SSAOp::Copy { .. }, MachineExprKind::Copy { .. })
-            | (SSAOp::CallRestore { .. }, MachineExprKind::Copy { .. })
             | (
                 SSAOp::IntAdd { .. },
                 MachineExprKind::Arithmetic {
@@ -4503,7 +4496,6 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         }
         SSAOp::Load { .. }
         | SSAOp::Copy { .. }
-        | SSAOp::CallRestore { .. }
         | SSAOp::IntAdd { .. }
         | SSAOp::IntSub { .. }
         | SSAOp::IntMult { .. }

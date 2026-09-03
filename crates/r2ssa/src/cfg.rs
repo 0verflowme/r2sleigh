@@ -28,19 +28,6 @@ pub struct BasicBlock {
     /// Address attributed to the final operation by the source lifter. When
     /// metadata is absent this falls back to the block address.
     terminal_instruction_addr: Option<u64>,
-    /// Source instruction each operation was lifted from, parallel to `ops`.
-    ///
-    /// One machine instruction lifts to several operations, and the boundary
-    /// between two of them is not recoverable from the operations themselves.
-    /// Anything reasoning about what a whole instruction did -- as opposed to
-    /// what one operation did -- needs that boundary, and the lifter is the
-    /// only thing that ever saw it.
-    ///
-    /// Empty, or `None` at an index, where the lifter attached no metadata.
-    /// Nothing may then claim to know where an instruction begins, which is
-    /// the honest answer rather than assuming the block is one.
-    #[serde(default)]
-    op_instruction_addrs: Vec<Option<u64>>,
 }
 
 /// How a basic block terminates.
@@ -84,7 +71,6 @@ impl BasicBlock {
             terminator: BlockTerminator::None,
             switch_info: None,
             terminal_instruction_addr: None,
-            op_instruction_addrs: Vec::new(),
         }
     }
 
@@ -119,14 +105,6 @@ impl BasicBlock {
                     .and_then(|metadata| metadata.instruction_addr)
                     .unwrap_or(block.addr)
             }),
-            op_instruction_addrs: (0..block.ops.len())
-                .map(|index| {
-                    block
-                        .op_metadata
-                        .get(&index)
-                        .and_then(|metadata| metadata.instruction_addr)
-                })
-                .collect(),
         }
     }
 
@@ -134,14 +112,6 @@ impl BasicBlock {
     /// the lifter did not attach per-operation instruction metadata.
     pub const fn terminal_instruction_addr(&self) -> Option<u64> {
         self.terminal_instruction_addr
-    }
-
-    /// Source instruction the operation at this index was lifted from.
-    ///
-    /// `None` where the lifter attached no metadata for it, and then no caller
-    /// may treat the operation as beginning or continuing an instruction.
-    pub fn op_instruction_addr(&self, index: usize) -> Option<u64> {
-        self.op_instruction_addrs.get(index).copied().flatten()
     }
 
     /// Analyze the operations to determine the block terminator.

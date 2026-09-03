@@ -282,7 +282,6 @@ fn hash_op(writer: &mut FingerprintWriter, op: &SSAOp) {
         Call { .. } => writer.tag(48),
         CallInd { .. } => writer.tag(49),
         CallDefine { .. } => writer.tag(50),
-        CallRestore { .. } => writer.tag(84),
         Return { .. } => writer.tag(51),
         FloatAdd { .. } => writer.tag(52),
         FloatSub { .. } => writer.tag(53),

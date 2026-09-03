@@ -220,22 +220,6 @@ pub enum SSAOp {
     /// registers so later reads cannot reuse pre-call versions.
     CallDefine { dst: SSAVar },
 
-    /// The carrier a call boundary leaves holding the value it found there.
-    ///
-    /// The sibling of `CallDefine`, and the same kind of fact: both say what
-    /// the boundary did to a register, and neither is an operation this
-    /// function's code performs. Where `CallDefine` says the callee left a
-    /// register holding something unknowable, this says the callee put one
-    /// back.
-    ///
-    /// The stack pointer is why it exists. A call instruction's own p-code
-    /// spends whatever the architecture spends to transfer control -- on
-    /// x86-64 `RSP = RSP - 8` and the store of the return address -- and the
-    /// callee's return refunds it. The callee is not part of this function, so
-    /// without this the refund never happens and the caller's stack pointer
-    /// drifts by one return-address slot at every call it makes.
-    CallRestore { dst: SSAVar, src: SSAVar },
-
     /// Return from subroutine
     Return { target: SSAVar },
 
@@ -460,8 +444,7 @@ impl SSAOp {
             | Extract { dst, .. }
             | Insert { dst, .. }
             | Select { dst, .. }
-            | CallDefine { dst }
-            | CallRestore { dst, .. } => Some(dst),
+            | CallDefine { dst } => Some(dst),
 
             CallOther { output, .. } | StoreConditional { result: output, .. } => output.as_ref(),
 
@@ -641,8 +624,6 @@ impl SSAOp {
                     f(input);
                 }
             }
-
-            CallRestore { src, .. } => f(src),
 
             Fence { .. } | Nop | Unimplemented | Breakpoint | CpuId { .. } | CallDefine { .. } => {}
         }
@@ -843,7 +824,6 @@ impl std::fmt::Display for SSAOp {
             SSAOp::Call { target } => write!(f, "CALL {}", target),
             SSAOp::CallInd { target } => write!(f, "CALLIND {}", target),
             SSAOp::CallDefine { dst } => write!(f, "{} = CALLDEF", dst),
-            SSAOp::CallRestore { dst, src } => write!(f, "{} = CALLRESTORE {}", dst, src),
             SSAOp::Return { target } => write!(f, "RETURN {}", target),
             SSAOp::FloatAdd { dst, a, b } => write!(f, "{} = {} f+ {}", dst, a, b),
             SSAOp::FloatSub { dst, a, b } => write!(f, "{} = {} f- {}", dst, a, b),

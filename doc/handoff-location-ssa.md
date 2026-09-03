@@ -10630,37 +10630,3 @@ chasing the wrong cause and kept because it is defensible on its own terms --
 a value the boundary spells through its own path should not be inlined -- but
 it was never shown to be *necessary* once the placement hole was closed.
 Removing it may admit more literals. That is one corpus run to find out.
-### Adding an SSA operation: there are three tables, not two
-
-`SSAOp` has a catch-all in most of the matches that key on it, so a new variant
-compiles with every one of them missed. Three of those decide whether the
-operation reaches the renderer at all, and all three are needed:
-
-* `machine.rs`, the expression lowering itself, or the operation falls through
-  to `UnsupportedOperation`;
-* `machine.rs`, `machine_kind_matches_op`, which pairs the operation with the
-  expression kind it may produce;
-* `machine.rs`, `machine_type_matches_op`, which says what type that expression
-  has.
-
-Missing the third is the one that reads oddly. The shape check fails, no entity
-is built for the operation's output, and validation reports `EntityMismatch`
-naming an *instruction*, which sends a reader to look at the instruction rather
-than at a type table that has never heard of the operation. `CallRestore` cost
-two corpus cells that way -- `murmur3_32` and `xxhash32` at `x64_O0`, the only
-two corpus functions that call anything -- and the reading took a locked run
-while the fix was one line.
-
-Beside them, two more decide whether it renders correctly rather than at all:
-the statement lowering in `r2dec/fold/op_lower/implementation.rs`, and the
-accounting -- an operation that renders no statement must still say what
-happened to the values it read and wrote, or the seal refuses the function for
-an unaccounted use and then for a write with no rendered occurrence.
-
-The transferable part is that none of this needs the plugin. A regression in
-any of the five reproduces in a unit test that builds the blocks and asks for
-the machine projection, or for a rendering through
-`source_owned_decompiler_input`, with no radare2 and no install lock -- seconds
-rather than a ten-minute locked run. Both assertions now exist:
-`a_call_leaves_the_stack_pointer_where_the_convention_says_it_found_it` in
-`r2ssa::function` and `a_restored_stack_pointer_renders` in `r2dec`.
