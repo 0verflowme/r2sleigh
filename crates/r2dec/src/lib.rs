@@ -5504,17 +5504,35 @@ fn restate_string_conversions_in_expr(
         // saying otherwise would be a claim about a different thing.
         let address = CType::uint(pointer_bits);
         let converted_together = !matches!(op, BinaryOp::Shl | BinaryOp::Shr);
-        for (index, operand) in [left, right].into_iter().enumerate() {
+        // A comparison's operands are converted to each other rather than to
+        // the type the comparison is read at, which is a truth value. So the
+        // type a literal takes there is the other operand's, and the only
+        // other operand this pass can ask about is a name.
+        let comparison = matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        );
+        let peer = |other: &CExpr| match other.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        let peers = comparison.then(|| (peer(right), peer(left)));
+        for (index, operand) in [&mut *left, &mut *right].into_iter().enumerate() {
+            let peer_type = peers.as_ref().and_then(|(for_left, for_right)| {
+                if index == 0 { for_left } else { for_right }.clone()
+            });
             let wanted = if substituted_address_under_conversions(operand).is_some() {
-                Some(&address)
-            } else if (index == 0 || converted_together)
-                && crate::fold::op_lower::convert::literal_renders_as_signed(operand)
-            {
-                required
+                Some(address.clone())
+            } else if !crate::fold::op_lower::convert::literal_renders_as_signed(operand) {
+                None
+            } else if comparison {
+                peer_type
+            } else if index == 0 || converted_together {
+                required.cloned()
             } else {
                 None
             };
-            restate_string_conversions_in_expr(operand, pointer_bits, wanted, symbols);
+            restate_string_conversions_in_expr(operand, pointer_bits, wanted.as_ref(), symbols);
         }
         return;
     }
