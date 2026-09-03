@@ -457,8 +457,12 @@ impl<'a> FoldingContext<'a> {
             .and_then(|names| names.symbol_for_value(value))
         else {
             self.retain_first_observation_error(
-                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
                     value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedValueReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
                 ),
             );
             return fallback;
@@ -491,8 +495,12 @@ impl<'a> FoldingContext<'a> {
             .and_then(|names| names.symbol_for_value(value))
         else {
             self.retain_first_observation_error(
-                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
                     value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedAddressReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
                 ),
             );
             return fallback;

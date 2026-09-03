@@ -139,7 +139,11 @@ pub(crate) enum LegacyObservationJournalError {
     MissingNormalizedOutput(NormalizedOpSite),
     RefusedRenderedUse(UseSite),
     RefusedRenderedWrite(InstId),
-    RenderedValueRequired(ValueId),
+    RenderedValueRequired {
+        value: ValueId,
+        cause: RenderedValueRequirementCause,
+        disposition: Option<ValueDisposition>,
+    },
     PlannedElidedValueRendered {
         value: ValueId,
         reason: r2ssa::ledger::ElisionReason,
@@ -164,6 +168,48 @@ pub(crate) enum LegacyObservationJournalError {
     ConflictingUse(UseSite),
     ConflictingWrite(InstId),
     Markers(RenderObservationStripError),
+}
+
+/// Exact precondition behind the historically overloaded
+/// `RenderedValueRequired` refusal.
+///
+/// These sites deliberately remain one public refusal category: they all mean
+/// that the native tree cannot account for one planned value.  The internal
+/// cause names which producer/consumer contract failed so refusal tracing can
+/// lead back to the owner rather than treating the shared label as one bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderedValueRequirementCause {
+    CertifiedValueReadMissingSymbol,
+    CertifiedAddressReadMissingSymbol,
+    CertifiedReadDispositionNotBound,
+    CertifiedReadExpressionMissingSymbol,
+    UnobservedValueCellAtSeal,
+    NonrenderedValueDisposition,
+    PlannedValueNamesUnavailable,
+    PlannedInputNamesUnavailable,
+}
+
+impl LegacyObservationJournalError {
+    /// Build one rendered-value refusal and retain the predicate operands on
+    /// the standard opt-in evidence channel.
+    #[track_caller]
+    pub(crate) fn rendered_value_required(
+        value: ValueId,
+        cause: RenderedValueRequirementCause,
+        disposition: Option<&ValueDisposition>,
+    ) -> Self {
+        let disposition = disposition.cloned();
+        let demanded_at = std::panic::Location::caller();
+        r2il::refusal_evidence!(
+            "rendered-value-required",
+            "value={value:?} disposition={disposition:?} cause={cause:?} demanded_at={demanded_at}"
+        );
+        Self::RenderedValueRequired {
+            value,
+            cause,
+            disposition,
+        }
+    }
 }
 
 impl From<crate::binding_plan::CertificateElidedCellsError> for LegacyObservationJournalError {
@@ -471,7 +517,7 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             LegacyObservationJournalError::RefusedRenderedWrite(inst) => {
                 Self::RefusedRenderedWrite { inst: *inst }
             }
-            LegacyObservationJournalError::RenderedValueRequired(value) => {
+            LegacyObservationJournalError::RenderedValueRequired { value, .. } => {
                 Self::RenderedValueRequired { value: *value }
             }
             LegacyObservationJournalError::PlannedElidedValueRendered { value, .. } => {
@@ -2435,10 +2481,18 @@ impl LegacyObservationJournal {
             });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
-            return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadDispositionNotBound,
+                self.plan.disposition(value),
+            ));
         };
         if !crate::placement::expr_reads_symbol(&expr, symbol) {
-            return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadExpressionMissingSymbol,
+                self.plan.disposition(value),
+            ));
         }
         let mut ids = self
             .allocate_many(vec![
@@ -2870,7 +2924,11 @@ impl LegacyObservationJournal {
                         eprintln!("other unaccounted values: {other_unaccounted:?}");
                     }
                 }
-                return Some(LegacyObservationJournalError::RenderedValueRequired(value));
+                return Some(LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    RenderedValueRequirementCause::UnobservedValueCellAtSeal,
+                    self.plan.disposition(value),
+                ));
             }
         }
         for (inst, row) in self.uses.iter().enumerate() {
@@ -3062,7 +3120,11 @@ impl LegacyObservationJournal {
             }
             Some(ValueDisposition::Refused { reason }) => LegacyValueObservation::Refused(*reason),
             Some(ValueDisposition::Bound { .. } | ValueDisposition::Inline { .. }) | None => {
-                return Err(LegacyObservationJournalError::RenderedValueRequired(value));
+                return Err(LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    RenderedValueRequirementCause::NonrenderedValueDisposition,
+                    self.plan.disposition(value),
+                ));
             }
         };
         let slot = self.value_slot_mut(value)?;
@@ -4617,9 +4679,11 @@ mod tests {
                     symbol,
                     forged,
                 ),
-                Err(LegacyObservationJournalError::RenderedValueRequired(
-                    certificate.value
-                ))
+                Err(LegacyObservationJournalError::RenderedValueRequired {
+                    value: certificate.value,
+                    cause: RenderedValueRequirementCause::CertifiedReadExpressionMissingSymbol,
+                    disposition: plan.disposition(certificate.value).cloned(),
+                })
             );
         }
 
@@ -5448,7 +5512,11 @@ mod tests {
                 BindingObservationJournalFailure::RefusedRenderedWrite { inst: InstId(29) },
             ),
             (
-                LegacyObservationJournalError::RenderedValueRequired(ValueId(31)),
+                LegacyObservationJournalError::RenderedValueRequired {
+                    value: ValueId(31),
+                    cause: RenderedValueRequirementCause::UnobservedValueCellAtSeal,
+                    disposition: None,
+                },
                 BindingObservationJournalFailure::RenderedValueRequired { value: ValueId(31) },
             ),
             (
@@ -5561,7 +5629,11 @@ mod tests {
         let (value, _) = first_bound(&plan, &source);
         assert_eq!(
             journal.record_nonrendered_value(value),
-            Err(LegacyObservationJournalError::RenderedValueRequired(value))
+            Err(LegacyObservationJournalError::RenderedValueRequired {
+                value,
+                cause: RenderedValueRequirementCause::NonrenderedValueDisposition,
+                disposition: plan.disposition(value).cloned(),
+            })
         );
     }
 
