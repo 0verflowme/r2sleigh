@@ -291,20 +291,28 @@ impl<'a> FoldingContext<'a> {
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
 
         let render_plan = self.certified_render_plan(proof);
-        let args = indexed
-            .iter()
-            .copied()
-            .map(|(index, value)| {
-                self.certified_call_arg_expr_for_value_at_site(
-                    (block_addr, op_idx),
-                    index,
-                    value,
-                    render_plan.as_ref(),
-                )
-                .map(|expr| self.call_argument_as_machine_word(value, expr))
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let mut args = Vec::with_capacity(indexed.len());
+        for (index, value) in indexed.iter().copied() {
+            let Some(expr) = self.certified_call_arg_expr_for_value_at_site(
+                (block_addr, op_idx),
+                index,
+                value,
+                render_plan.as_ref(),
+            ) else {
+                // The typed refusal deliberately keeps only its stable kind
+                // and deciding site. The argument identity is per-call
+                // evidence, so keep it on the same diagnostic channel as the
+                // operands of every other refusing predicate. A collected
+                // `Option<Vec<_>>` discarded both operands here and made the
+                // reader reconstruct the one fact this loop already knew.
+                r2il::refusal_evidence!(
+                    "call-argument-spelling",
+                    "callsite=({block_addr:#x}, {op_idx}) argument_index={index} value={value:?}"
+                );
+                return Err(OpLoweringRefusal::missing_machine_projection());
+            };
+            args.push(self.call_argument_as_machine_word(value, expr));
+        }
         Ok(CertifiedCallArgs {
             args,
             values: indexed.into_iter().map(|(_, value)| value).collect(),
