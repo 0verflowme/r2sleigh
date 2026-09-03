@@ -3173,8 +3173,26 @@ impl LegacyObservationJournal {
                     }
                     ObservationTarget::Use {
                         site, observation, ..
-                    } => record_same(&mut uses[site.inst.0 as usize][site.input_idx], observation)
-                        .map_err(|()| LegacyObservationJournalError::ConflictingUse(site)),
+                    } => {
+                        let slot = &mut uses[site.inst.0 as usize][site.input_idx];
+                        if record_same(slot, observation).is_err() {
+                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                eprintln!(
+                                    "conflicting use {site:?}: recorded {slot:?}, rendered {observation:?}, payload={:?}",
+                                    self.source.graph().inst(site.inst).map(|inst| format!(
+                                        "{:?}",
+                                        inst.payload
+                                    )
+                                    .chars()
+                                    .take(120)
+                                    .collect::<String>())
+                                );
+                            }
+                            Err(LegacyObservationJournalError::ConflictingUse(site))
+                        } else {
+                            Ok(())
+                        }
+                    }
                     ObservationTarget::Write {
                         inst, observation, ..
                     } => record_same(&mut writes[inst.0 as usize], observation)
