@@ -11061,3 +11061,78 @@ The locked result was 387 of 556 rendered: pinned 76 of 107, compiled 281 of
 313, and system 30 of 136. The relevant evidence line is uniformly of the form
 `cause=UnobservedValueCellAtSeal`, with the exact `ValueId`, `Bound` or `Inline`
 disposition, and the call site of invariant I1 beside it.
+
+### The dominant source cluster is a policy fork; the next cluster was fixed upstream
+
+The cause split above is deliberately a journal-precondition split, not yet a
+source split. Tracing the 121 values back through their sole uses divides them
+as follows:
+
+| count | source shape | disposition at the seal |
+| ---: | --- | --- |
+| 111 | import thunk ending in an indirect transfer through the loaded target | 94 `Inline`, 17 `Bound` |
+| 6 | AArch64 conditional-compare instruction whose internal skip escaped as a machine `CBranch` | 6 `Inline` |
+| 2 | `branchy_x64` `main`, with a bound stack-address chain removed before rendering | 2 `Bound` |
+| 1 | system function `1000019f8`, ending in a computed indirect transfer | 1 `Inline` |
+| 1 | system function `100003278`, with a bound phi/copy carrier absent from the body | 1 `Bound` |
+
+The 111 import thunks dominate. Their final indirect transfer has an exact typed
+tail-slot callsite fact, but emitting executable C still requires a policy
+choice the existing facts do not settle. Rendering only fixed, complete,
+nonvariadic prototypes is sound but leaves unknown and variadic forwarding
+refused. Rendering every thunk improves the number but invents arity and
+variadic forwarding. Refusing every thunk is the current conservative policy.
+No choice was made here.
+
+The next cluster was the six conditional-compare cells: `and_chain`,
+`gate_three`, and `paired_sum_diff` at AArch64 `-O1` and `-O2`. Each function
+had exactly one planned value with no observed occurrence. The wrong answer was
+upstream of every binding table: `r2sleigh-lift` recognized only
+constant-space relative P-code labels as instruction-local control, while the
+AArch64 Sleigh specification spells these skips as the RAM address of the next
+instruction. The nonterminal `CBranch` consequently entered SSA as native
+machine control in the middle of a single-instruction block. Its condition was
+correctly planned `Inline`, but only a terminal branch can render a machine CFG
+condition, so the seal correctly reported that its promised occurrence did not
+exist.
+
+The repair recognizes only the resolved next-instruction RAM target while
+operations remain after the branch. It threads the guarded operations through
+fresh candidates and selects only values live at the local target; terminal RAM
+branches remain machine control. A `Select` is admitted as boolean only when
+both value arms have boolean producers. This is an `O(n)` pass over one
+instruction's P-code, with maps used only for indexed lookup and no
+order-dependent iteration.
+
+There are nine downstream answer surfaces: the `SsaGraph` value and use tables;
+the `MachineProjection` entity and use-disposition tables; binding-plan
+component eligibility, value dispositions, and canonical roots; the independent
+seal oracle; `BindingNameResolution`; and the journal's value/use/write cells.
+None received a compensating answer. They all rebuild from the normalized lift,
+so the corrected canonical operation and def-use graph reach both plan
+construction and the independent seal without creating a second authority.
+
+Manual inspection used this exact locked command:
+
+```
+./tests/locked_run.sh bash -c 'make -C r2plugin RUST_FEATURES=all-archs install >/dev/null && r2 -q -e bin.relocs.apply=true -c "aaa; s sym._gate_three; pdd" tests/coverage/artifacts/bin/branchy_arm64_O1'
+```
+
+The first attempted rewrite exposed an uninitialized self-preserving temporary
+and was rejected. With candidate threading, `pdd` computes the three equality
+flags in order and returns their conjunction; it reports 26 source obligations,
+25 rendered, one elided, zero refused, and 12 statements. The clean C is
+therefore backed by normalized instruction-local control and SSA def-use, not
+by a summary template.
+
+The post-repair traced sweep is 397 of 556 rendered: pinned 77 of 107, compiled
+290 of 313, and system 30 of 136. `RenderedValueRequired` falls from 121 to 115:
+
+| count | `RenderedValueRequirementCause` | disposition |
+| ---: | --- | --- |
+| 115 | `UnobservedValueCellAtSeal` | 95 `Inline`, 20 `Bound` |
+| 0 | every other named cause | none |
+
+All 111 import thunks remain, plus the four non-import shapes in the table. Of
+the historical 119 members, 109 still reproduce with this label; the other six
+current members are later population/cause drift already enumerated above.
