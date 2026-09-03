@@ -8868,3 +8868,444 @@ same one this document already gives for the corpus: verify the artifact you
 measured is the artifact you built. `run-placement.sh` on the host now copies
 the freshly built library itself and prints whether a string only this tree
 contains is present in the installed one.
+
+## The effect-ledger refusals, split by layer
+
+The effect ledger is the largest single cause of refusal among real functions,
+26 of them across the coverage baseline, and until now the cause line said only
+"N refused, N unaccounted, N conflicts". `R2SLEIGH_DEBUG_UNOWNED=1` writes a
+per-function ledger line to `/tmp/r2sleigh_unowned.log` naming the layer, the
+reason and the obligation ids, and it splits them cleanly. Swept over 78
+functions in three binaries, four had a refused obligation:
+
+| count | layer and reason | obligation kind |
+| --- | --- | --- |
+| 22 | `ssa/unsupported-effect` | `volatile-or-unknown` |
+| 5 | `codegen/block-not-rendered` | `live-value-producer` |
+
+The two are different problems and only one of them is about the decompiler's
+ability to read a program.
+
+**`ssa/unsupported-effect`** was written up here as a scope question about
+compiler stubs. That was wrong, and tracing it took twenty minutes. It is one
+unimplemented rule, and the same rule accounts for three other symptoms this
+branch is chasing separately.
+
+The obligations refuse at `crates/r2dec/src/effect_ledger.rs:78`, which turns
+`VolatileOrUnknownEffect` into a refusal unconditionally. That is the report,
+not the cause. The kind is minted at `crates/r2ssa/src/obligation.rs:519`,
+whenever a call boundary is not `complete`. And a boundary becomes complete in
+exactly one place, `crates/r2ssa/src/semantic.rs:3144`, reached only when
+`machine_context.call_site_interface` returns an interface for the site. The
+field's own comment says so: "Only an exact source-owned callsite interface may
+change this state to complete."
+
+So a call radare2 could not resolve to a callee has no interface, never
+completes, and every obligation it carries is refused. The refusing stub is
+precisely that shape. `sym._init` in the pinned GCC binary disassembles to
+`endbr64; sub rsp,8; mov rax,[rip+0x2fd1]; test rax,rax; je +2; call rax;
+add rsp,8; ret` — the `ff d0` at `0x401014` is an indirect call through a
+register, the standard `__gmon_start__` guard. Nothing about it is a compiler
+oddity worth excusing.
+
+The owner settled the second path years of this branch have needed: a call
+whose signature nothing knows takes its arity from the convention's argument
+registers that are provably written before the call and live into it. That rule
+would complete such a boundary. It is not implemented, and its absence is the
+single cause behind four things counted separately until now: these 22 refused
+obligations, the call that renders `f()` with an empty argument list under a
+proof line saying nothing was refused, the import thunks that transfer through
+a value, and the direct tail call. They are one defect seen from four sides.
+
+**`codegen/block-not-rendered`** is the real one. A block exists in the SSA,
+produces live values, and never reached the output, so the obligations of the
+values it produces have nowhere to be discharged. `siphash24` at x64-O1 is the
+clearest case: 435 obligations, 393 rendered, 40 elided, and exactly two
+refused, both `live-value-producer` on the same block. Anything that drops a
+block after the plan is fixed produces this, so the trace runs from the
+structurer's region handling and the linearizer through placement's statement
+removal.
+
+Note that the elision profile of that same function is healthy and worth
+keeping as a reference for what a well-accounted function looks like:
+21 coalesced identity phis, 6 coalesced copies, 3 dead stack bases,
+3 materialized phi edges, 3 stack frame, 2 return control, 1 direct control
+target and 1 with no native semantics.
+## A second semantic gate, and the first map of what breaks outside hash functions
+
+The differential column was the project's strongest correctness evidence and it
+covered nine hash functions of one shape, a loop over bytes accumulating an
+integer. Three defects found by the external benchmark were invisible to it,
+not because the gate was lenient but because none of them can occur in that
+shape. A gate that cannot see a defect is the deeper problem, so there is now a
+second corpus.
+
+`tests/corpus/shapes.c` holds thirteen scored functions, each
+`uint64_t shape_*(uint64_t, uint64_t)` so the harness hands it two integers and
+compares one back. The shape under test lives in the body and in the noinline
+helpers it calls, not in the interface, which is why the harness needs to know
+nothing about structs or frames to score them: a variadic libc callee reached
+with one, two, three and five variable arguments; a variadic callee of our own;
+calls in sequence with address-taken locals read after each; a struct of four
+field widths passed by pointer and by value; an array of structs indexed by a
+loop counter; a stack buffer written and read back out of order; direct and
+mutual recursion; signed division and remainder at two widths with negative
+operands; a struct returned by value across two registers; a pointer to a
+pointer; and a call through a function pointer held in a variable. Every result
+is a pure function of the two arguments, so no address reaches the value
+compared, and all six target configurations produce identical values.
+
+`tests/corpus/shapes_oracle.c` includes `shapes.c` the way `oracle.c` includes
+`hashes.c`: the expected value comes from the original source, built by the
+same compiler for the same target. It is never adjusted to match a rendering.
+
+### How the harness grew
+
+`FunctionSpec` could describe one thing -- a byte buffer, a length, and
+optionally a seed -- so nothing outside that shape was expressible. `ScalarSpec`
+is the second description: N unsigned 64-bit arguments in, one unsigned integer
+out, with the argument vectors named per spec so the division shape gets a
+negative dividend and `INT64_MIN` over minus one. `cases_for`, `runner_source`
+and `oracle_case` dispatch on which description a function has;
+`verify_rendering.py --corpus shapes` selects the table, and the artifact
+paths, baseline manifest and result files are namespaced so the two corpora
+cannot overwrite each other's evidence.
+
+Two things had to change for the shapes to be reachable at all.
+`callee_definitions` now closes transitively over the definitions it pulls in
+and excludes the scored function itself: a helper that calls a second helper
+needs that one too, and mutual recursion needs both, so direct callees alone
+left the translation unit short of a definition for reasons that had nothing to
+do with the rendering. And the scored-function list now lives in one place --
+`corpus_names.py` reads it out of `verify_rendering.py` for both the sweep and
+the run script -- because three copies drift and the failure that produces is
+misleading: a function added to the specs but not to the sweep measures as
+`missing` for a reason that is not about the decompiler.
+
+`tests/corpus/run_shapes.sh` is a separate gate with its own names, run through
+`tests/corpus/locked_shapes.sh`. The 54 hash cells keep gating merges unchanged.
+Its gates are `shapes-measurement` (every cell produced a record -- the one that
+can be required today), `shapes-snapshot`, `shapes-raw` and
+`shapes-differential`; a shape is promoted by adding it to
+`REQUIRED_DIFFERENTIAL` once its six cells pass, and when all thirteen are
+listed there the per-shape list goes and `shapes-differential` becomes the gate.
+Snapshot is deliberately *not* implied by the correctness gates: sixty-four of
+these cells are refusal comments today, and pinning their text as the expected
+rendering would make every improvement read as a regression.
+
+### The tally, measured under the install lock
+
+Seventy-eight cells, thirteen shapes across the six configurations.
+
+| column | result |
+| --- | --- |
+| generation | 14 present, 64 refused |
+| raw | 6 pass, 5 compile failures, 3 signature mismatches, 64 blocked |
+| differential | 8 pass, 1 failed, 2 blocked on compile, 3 blocked on signature, 64 blocked |
+
+Six cells are green on every correctness column with `basis=raw`:
+`shape_recurse_direct` at x64_O1, x64_O2, arm64_O1 and arm64_O2, and
+`shape_struct_array` at x64_O2 and arm64_O2. Two more agree with the oracle only
+on the diagnostic basis (`shape_struct_value` at arm64_O1 and arm64_O2), which
+is not proof about emitted C. Direct recursion and an array of structs indexed
+by a loop counter therefore both work at higher optimization levels, which is
+more than the hash corpus could have told us.
+
+### The named cause for every red cell
+
+The decompiler almost always declines rather than answering wrongly, and it
+names the rule that declined. That is the honest result and it is what makes
+this list actionable.
+
+**`shape_variadic` -- all six configurations, `declaration placement refused:
+missing_definition`.** Four `snprintf` callsites with one, two, three and five
+variadic arguments. This is the defect another agent owns: the variadic call.
+Here it refuses at placement rather than dropping arguments, so the corpus sees
+it as a refusal, not as a wrong answer.
+
+**`shape_variadic_local` -- the one confidently wrong rendering in the set.** At
+x64 O0/O1/O2 it refuses with `missing machine projection authorization:
+OpLowering(calls.rs:144)`, which is the arm that refuses when two callsites of
+one name need different declarations -- exactly what four `vfold` calls of
+differing arity produce, and the right answer. At arm64_O1 and arm64_O2 it
+refuses on effect obligations (2 refused). At **arm64_O0 it renders**, and the
+rendering is wrong: every callsite becomes `sym__vfold((uint64_t)1)`,
+`sym__vfold((uint64_t)2)`, `sym__vfold((uint64_t)3)`, `sym__vfold((uint64_t)5)`
+-- the fixed argument only, with one, two, three and five variadic arguments
+silently gone, the callee declared `uint64_t sym__vfold(uint64_t)` and not
+marked variadic, under a proof line reading `0 refused`. On Darwin arm64 the
+variadic arguments go on the stack, so the argument-area stores are not
+recognised as arguments at all. All 16 differential cases fail. `raw` also fails
+to compile, for a second reason worth its own line.
+
+**`vfold`'s own rendering declares the stack pointer as an uninitialized
+local.** `uint64_t SP_0; SP_0 = (uint64_t)SP_0 - (uint64_t)48;` and then
+`(int64_t *)((uint64_t)SP_0 + 48)` for the `va_arg` area. `-Wuninitialized`
+rejects it, and the diagnostic executable segfaults (exit -11) rather than
+printing a wrong number. The same `SP_0` shape appears in
+`arm64_O1/shape_struct_array`. This is adjacent to the stack-pointer defect
+another agent owns -- `call` lowering never returning the eight bytes -- but it
+is a distinct failure: SP has no definition at all here, so it becomes a local
+with no initializer rather than a frame base off by eight.
+
+**`shape_call_chain` -- calls in sequence with locals read after each.**
+`unobserved_binding_write` at x64_O0 and arm64_O0, `missing_definition` at
+x64_O1, x64_O2 and arm64_O2. At **arm64_O1 it renders
+`uint64_t sym__shape_call_chain(void)`** -- arity 0 for a function of two
+arguments, which the harness reports as `signature_mismatch`. That is the third
+benchmark defect's shape: a call boundary the decompiler could not establish
+producing an argument-free signature, here caught because the corpus knows the
+function takes two arguments and has values to pass.
+
+**`shape_recurse_mutual`** refuses at placement on four configurations
+(`unobserved_binding_write` at O0, `missing_definition` at x64_O1/O2) and at
+arm64_O1 and arm64_O2 renders arity 1 for a function of two -- the same
+argument-recovery gap as `shape_call_chain`.
+
+**`shape_struct_pointer` -- a struct read and written through a pointer.**
+`missing program-variable authorization` at both O0 levels;
+`missing machine projection authorization: OpLowering(memory_renderer.rs:81)` at
+the four higher levels. That site is the certified-memory-fact lookup: no fact
+matches the block, op, space, address, value, direction and width of the access,
+so the field access has no projection. Field accesses of four different widths
+off one base are the shape it cannot certify.
+
+**`shape_struct_value` -- a 16-byte struct passed in two registers.**
+`unobserved_binding_write` at O0, `missing_definition` at x64_O1/O2. At arm64_O1
+and arm64_O2 it renders and *agrees with the oracle*, but `raw` fails to compile
+on `stack_m48` and `stack_m40` set but never used and `X22_0` uninitialized, so
+the agreement rests on the diagnostic build and is not evidence about emitted C.
+
+**`shape_struct_array` -- the best-behaved aggregate shape.** Green at x64_O2
+and arm64_O2. `RenderedValueRequired` at x64_O0, `missing_definition` at x64_O1,
+effect obligations (2 refused) at arm64_O0, and at arm64_O1 a raw compile
+failure with three distinct causes: a `uint32_t` to `int32_t` implicit signedness
+change, a non-void path with no return, and `SP_0` uninitialized again.
+
+**`shape_stack_buffer` -- a 64-byte frame array written and read back.** Effect
+obligations refused everywhere on arm64 (5, 5 and 3 refused at O0/O1/O2) and at
+x64_O0 (1 refused); `RenderedValueRequired` at x64_O2. At x64_O1 it renders but
+`raw` will not compile: a non-void function with a path that returns nothing.
+This is the frame-object array recovery that was already recorded as producing
+nothing; the gate now measures it.
+
+**`shape_recurse_direct`** is green at the four higher levels and refuses at O0
+only: `read_before_assignment` at x64_O0, `missing_definition` at arm64_O0.
+
+**`shape_signed_divmod` -- refuses on all six.** `observation journal:
+ConflictingUse` on every x64 level, and `missing machine projection
+authorization: OpLowering(lowering.rs:30)` on every arm64 level, which is the
+catch-all arm that turns any other journal error into a projection refusal. A
+value used as both a signed dividend at 64 bits and at 32 bits is a conflicting
+use, and the per-value refusal rule then declines the whole function rather than
+that value. Nothing here is a wrong answer, which is the important part: signed
+division was the shape where a wrong answer would have been silent.
+
+**`shape_multiword_return` -- refuses on all six.**
+`unobserved_binding_write` at both O0 levels, and
+`OpLowering(calls.rs:308)` at the other four -- the argument-projection
+collector, which refuses when any one argument of a certified call has no
+expression the plan can spell.
+
+**`shape_pointer_to_pointer` -- refuses on all six.**
+`unobserved_binding_write` at three levels, `calls.rs:308` at x64_O2 and
+arm64_O2, effect obligations (6 refused) at arm64_O1.
+
+**`shape_function_pointer` -- refuses on all six.** `missing_definition` on
+every x64 level; on arm64, `memory_renderer.rs:81` at O0 and
+`RenderedValueRequired` at O1 and O2. An indirect call through a table entry is
+the one shape here whose callees are not declared, so even a rendering would
+have had no definitions to link against.
+
+### What the map says, taken together
+
+Five causes account for sixty-four of the seventy-eight cells:
+`declaration placement refused: unobserved_binding_write` and
+`missing_definition` (30 cells between them),
+`missing machine projection authorization` at three sites --
+`calls.rs:308`, `memory_renderer.rs:81`, `calls.rs:144` (16),
+`effect obligations refused` (7), and the observation journal's
+`ConflictingUse` and `RenderedValueRequired` (8). Placement is the largest
+single blocker outside hash functions, and it is not shape-specific: it refuses
+on the call chain, on mutual recursion, on both struct shapes and on the
+function-pointer table alike.
+
+Only one cell in seventy-eight produced a confidently wrong rendering, and it is
+the variadic one. That is the decompiler behaving as designed, and it is also
+why the hash corpus could pass 54 of 54 while the benchmark found three wrong
+answers: the shapes that break here mostly refuse, and a refusal is invisible to
+a corpus that never asks the question.
+
+### What was verified alongside it
+
+`cargo test --workspace` is green: 2198 tests, no failures.
+
+`tests/corpus/locked_matrix.sh --gate differential` still measures the 54 hash
+cells at `generation: 54 present`, `raw: 54 pass`, `differential: 54 pass` with
+`basis=raw` in every cell. Nothing in this work touches Rust; the diff from the
+branch point is `tests/corpus/` and this document only.
+
+Two things in that run are worth writing down so the next reader does not chase
+them:
+
+- The gate exits non-zero on `snapshot: 37 match, 17 mismatch`. Those seventeen
+  section hashes are byte-for-byte the ones `arch/expression-engine` has since
+  re-accepted into `raw-baseline-sha256.json`; the branch point this work was
+  cut from carries the older manifest. Checked key by key: the mismatch set and
+  the re-accepted set are the same seventeen, and this run's hashes equal the
+  newer manifest's. It is base drift, not a rendering change.
+- One cell reports `diagnostic: infrastructure_error` -- `x64_O2/fnv1a32`. The
+  *oracle* timed out at three seconds under six agents building at once. Its
+  differential passed, because the differential re-runs the oracle per case. A
+  measurement taken on a loaded machine can produce this on any cell.
+
+The shape run was executed twice under the lock and produced identical column
+totals both times, so the fourteen renderings and the eight differential passes
+are reproducible rather than a scheduling artifact.
+## The `aa` path measured directly, and the figure it replaces
+
+The last section named the `aa` path as the dominant remaining cost, at about
+55 milliseconds per function across `sleigh_analyze_fcn`, `sleigh_get_data_refs`
+and `sleigh_op`. **That figure was wrong and the method that produced it was
+wrong.** It came from `(aaa - aa)` differencing, on the assumption that the
+proof sweep is what `aaa` adds to `aa`. radare2 runs the plugin's
+`post_analysis` hook during `aa` as well, so the subtraction cancelled most of
+the sweep instead of isolating it, and what was left over got attributed to
+callbacks that turn out to cost almost nothing.
+
+Each callback now counts and times itself, printed under `R2SLEIGH_TIMING`.
+bzip2recover, `aaa`, on a quiet VM:
+
+    site                calls    total      mean
+    analyze_fcn            32     2.6ms    81us
+    get_data_refs          38    14.9ms   392us
+    op                      0        --      --
+    eligible               72     320ms   4.4ms
+      context.create        1     302ms   302ms
+      context.regprofile   73     0.5ms   6.5us
+    post_analysis           1    1494ms
+      snapshot.walk        39     448ms  11.5ms
+      snapshot.reuse       43       9us   209ns
+      proof.engine         22     387ms  17.6ms
+
+Three things fall out that no amount of differencing would have given.
+
+**The three callbacks named in the brief cost 17.5 milliseconds between them,
+and `sleigh_op` is never called at all.** radare2 decodes this binary through
+another arch plugin, so the per-instruction path that looked like the obvious
+suspect does not run. Every per-instruction worry about `get_context` --
+the multi-kilobyte register-profile `strcmp`, the two FFI calls per instruction
+-- was about a function that is not on the path. `context.regprofile` is 73
+calls and half a millisecond in total.
+
+**What `eligible` costs is one Sleigh context creation.** radare2 asks the
+plugin's `eligible` hook per function, 72 times here, and 302 of the 320
+milliseconds is a single `sleigh_v2_context_create` -- the same compiled `.sla`
+parse the previous section moved off the lift path, on the other of the two
+paths that load one. The Rust side now shares a loaded profile through
+`shared_trusted_profile`; the C `R2ILContext` does not share with it, so a
+session that both analyses and decompiles parses the specification twice. That
+is one call and 0.3 seconds, and it is the cheapest item left.
+
+**Everything else is the sweep**, at 1.49 seconds, and the largest thing in it
+was the same function's snapshot being collected three times.
+
+### One walk per function instead of three
+
+`r_core_function_snapshot_at` collects the function, its blocks, its bytes, its
+type graph and the bodies of everything it calls. Three places asked for one
+per function and each kept a different part: `sleigh_artifact_plan_init` walked
+it all to read a single 64-bit revision, once for the proof plan and again for
+the taint plan, and `sleigh_proven_facts_json` walked it a third time for the
+wire buffer. 82 walks per `aaa` on a 38-function binary.
+
+One held capture keyed by the address and both dirty epochs brings that to 39
+walks and 43 reuses at 209 nanoseconds. One entry rather than a per-program
+cache, because the three readers are consecutive for one function, so a second
+entry buys no hit while holding whole snapshots for a program would hold the
+program twice over. The wire buffer is always built, because the walk is the
+cost -- 44.5ms with the buffer against 50.6ms without is the same number twice
+-- so making it conditional would only add a way for the entry to miss.
+
+**What that is worth, and a measurement that had to be thrown away.** Run as
+two blocks, before then after, the same two builds read 13.20s against 3.12s
+for `aaa` and 8.67s against 1.49s for post-analysis: a four- to sixfold win.
+It is not real. The before block ran while the machine was busy and the after
+block did not. Interleaved, three rounds, alternating:
+
+    round   before aaa   after aaa   before post   after post
+      1        2.79s       2.92s        1518ms       1249ms
+      2        2.87s       3.11s        1596ms       1245ms
+      3        3.26s       2.44s        1545ms       1378ms
+    bzip2     22.51s      21.30s
+
+So `aaa` is unchanged within noise and post-analysis falls about nineteen per
+cent, from 1.55s to 1.25s. That is 43 walks removed at the 11.5ms they actually
+cost on a quiet machine, not the 34 to 50ms the loaded runs reported. The
+proofs are identical either way: 22 functions, 16 skipped, the same two
+unreachable blocks.
+
+This is the seventh measurement this project has had to correct for measuring
+the wrong thing, and the second in two days. The rule that keeps working is to
+interleave the columns rather than run them in blocks, because a machine's load
+drifts over minutes and a block is minutes long. Private `HOME` per column
+stops another agent overwriting the plugin; interleaving stops the machine
+overwriting the answer.
+
+### The budget is now the program's size, not a number
+
+The sweep was governed by three whole-program constants -- two, ten and thirty
+seconds by analysis mode -- derived from nothing. Ten seconds is not a fact
+about a program. bzip2recover, 38 functions, finishes in 1.5 seconds and never
+touches it; bzip2, 154 functions, was stopped by it after a third of the
+program on every run. One number cannot be right for both, because the work
+scales with the function count and the number did not.
+
+The budget is now the function count times the project's own per-function
+performance bar, the one already agreed: under 100 milliseconds net per
+function. That is not a fresh judgement about how long is too long, it is the
+bar the sweep is already held to multiplied by the work in front of it. A
+function that exceeds it is a defect to fix rather than a budget to widen. The
+analysis mode is deliberately no longer a factor: a mode decides how much work
+each function gets, not how long a wall clock may run, and stating the same
+policy in two places is what let the two disagree.
+
+    bzip2               before              after
+      budget            10.0s               15.4s (154 x 100ms)
+      exhausted         yes, every run      no
+      functions reached 35 to 42 of 154     all 154
+      proved            35 to 42            46
+      skipped           0                   104
+      unreachable found 0                   2
+      aaa               21.3s               25.4s
+
+Finishing the program costs about four seconds more than being cut off two
+thirds of the way through, and buys 46 proved functions instead of 42 plus two
+unreachable blocks the sweep had never reached. bzip2recover is unchanged at
+2.88 seconds with the budget never binding.
+
+### What is left, in the order the measurement puts it
+
+**About 0.66 seconds of bzip2recover's 1.49-second sweep is still
+unattributed** -- post-analysis minus the snapshot walks and the proof engine.
+That is artifact submission, the taint plan path, and the budget checks, none
+of which is separated yet. It is now the largest unmeasured thing the plugin
+does and the next site to split.
+
+**The proof engine is 17.6 milliseconds per function** across 22 functions.
+That is the engine doing real work on a real snapshot and it is within the
+project's bar, so it is a target only after the unattributed remainder.
+
+**The C `R2ILContext` and the Rust trusted profile load the same specification
+separately**, 0.3 seconds once per session. Sharing one loaded Sleigh between
+`r2il_arch_init` and `shared_trusted_profile` removes it. Small, contained, and
+the last of the three places this project has found the same parse.
+
+**The structurer was not reached.** `main` in bzip2recover spends 2.27 seconds
+there and then refuses, against 2.77 for every other r2dec stage combined. The
+suspected cause is unchanged: the BDD safety budget at blocks times 128,
+consumed in whatever order the proofs run, so a late block gets what earlier
+ones left; `varying_predicates` in `structure.rs` already narrows the set the
+bound should come from, and the refusal at `consume_safety_budget` compares a
+counter against a limit fixed at construction to that same counter, so it can
+never fire.

@@ -825,11 +825,10 @@ pub fn post_analysis_plan_for_policy(
     policy: EngineAnalysisPolicy,
     function_count: usize,
 ) -> EnginePostAnalysisPlan {
-    let post_budget_us = match policy.mode {
-        EngineAnalysisMode::Fast => POST_ANALYSIS_FAST_BUDGET_USEC,
-        EngineAnalysisMode::Balanced => POST_ANALYSIS_BALANCED_BUDGET_USEC,
-        EngineAnalysisMode::Full => POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC,
-    };
+    // Derived from the work in front of the sweep rather than fixed per mode;
+    // see `post_analysis_budget_usec` for why one whole-program constant could
+    // not be right for both a 38-function binary and a 154-function one.
+    let post_budget_us = post_analysis_budget_usec(function_count);
     let xref_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
     let taint_enabled = policy.mode == EngineAnalysisMode::Full;
     let signature_writeback_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
@@ -6954,7 +6953,7 @@ mod tests {
     fn post_analysis_plan_owns_mode_budgets_and_focus_thresholds() {
         let fast = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC, 512);
         assert_eq!(fast.policy.mode, EngineAnalysisMode::Fast);
-        assert_eq!(fast.post_budget_us, POST_ANALYSIS_FAST_BUDGET_USEC);
+        assert_eq!(fast.post_budget_us, post_analysis_budget_usec(512));
         assert!(!fast.xref_enabled);
         assert!(!fast.taint_enabled);
         assert!(!fast.signature_writeback_enabled);
@@ -6966,7 +6965,7 @@ mod tests {
 
         let balanced = post_analysis_plan_for_radare2_depth(0, 1);
         assert_eq!(balanced.policy.mode, EngineAnalysisMode::Balanced);
-        assert_eq!(balanced.post_budget_us, POST_ANALYSIS_BALANCED_BUDGET_USEC);
+        assert_eq!(balanced.post_budget_us, post_analysis_budget_usec(1));
         assert!(balanced.xref_enabled);
         assert!(!balanced.taint_enabled);
         assert!(balanced.signature_writeback_enabled);
@@ -6978,7 +6977,7 @@ mod tests {
 
         let full = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_AGGRESSIVE, 129);
         assert_eq!(full.policy.mode, EngineAnalysisMode::Full);
-        assert_eq!(full.post_budget_us, POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC);
+        assert_eq!(full.post_budget_us, post_analysis_budget_usec(129));
         assert!(full.xref_enabled);
         assert!(full.taint_enabled);
         assert!(full.signature_writeback_enabled);
