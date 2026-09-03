@@ -11573,3 +11573,37 @@ The post-repair traced sweep is 397 of 556 rendered: pinned 77 of 107, compiled
 All 111 import thunks remain, plus the four non-import shapes in the table. Of
 the historical 119 members, 109 still reproduce with this label; the other six
 current members are later population/cause drift already enumerated above.
+
+## DecBench's `type_match` strips qualifiers, and that removes two blockers
+
+Read from `/root/decbench/decbench/metrics/type_match.py` on the benchmark host
+rather than assumed. Two facts change what the type work has to do.
+
+**`const` is stripped before comparison.** The metric holds
+
+    QUALIFIERS = ["unsigned", "signed", "const", "volatile", "register", "static", "extern"]
+
+and removes each one from both the decompiled spelling and the DWARF spelling
+before matching. So `uint8_t*` against a ground truth of `const uint8_t *` is a
+**match** on this metric. Adding a qualifier variant to `CTypeLike` was recorded
+here as a prerequisite for type recovery; it is not one for the benchmark. It
+remains a prerequisite for the corpus `typed_recovery` column, which compares
+spellings as raw strings — and that is a difference between our column and the
+thing we are trying to beat, not a difference in the renderer.
+
+**`size_t` and `uint64_t` normalise to the same thing.** `TYPE_MAP` sends both
+`size_t` and `uint64_t` to `long long`, along with `ssize_t`, `ulong` and plain
+`long` under LP64. So minting `size_t` — which `admit_declaration`'s `_ => false`
+arm refuses anyway, and which the owner's standing decision on unplaceable type
+spellings would independently forbid — buys nothing on this metric either.
+
+What the metric *does* separate is width and pointer-ness: `uint64_t` maps to
+`long long` and `uint32_t` to `int`, so declaring a 32-bit value 64-bit is a
+miss, and a pointer declared as an integer is a miss. That is exactly the pair
+the parameter work targets, and it means the honest reading of `type_match 0.083`
+is that we get widths and pointers wrong, not that we spell types unfashionably.
+
+The practical consequence for reading progress: the corpus column is **stricter**
+than the benchmark, so a change can move `type_match` while leaving
+`parameters_match` at zero. Report both, and do not treat the corpus column's
+zero as evidence that the benchmark did not move.
