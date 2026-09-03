@@ -11020,3 +11020,75 @@ The call-restore work was reverted because the benchmark fell from seven
 functions to one. A real defect in it was then found and fixed, the macOS corpus
 went green, and it was reapplied on that evidence alone. The benchmark was never
 re-run, and the regression it had been reverted for was still there.
+
+## The Sleigh instance cannot be shared, and the commit that shared it was wrong
+
+The per-function cost was traced to `Disassembler::from_trusted_profile`
+re-parsing the whole compiled `.sla` on every lift, and the fix was to load each
+embedded profile once. **That fix is withdrawn. It returned wrong instructions.**
+
+A `GhidraSleigh` instance caches decoded instructions by address. Sharing one
+across lifts therefore returns the *first* decode whenever a later lift asks
+about the same address with different bytes:
+
+    one instance,   0x1000, 88 d8  (mov al, bl)  ->  AL
+    one instance,   0x1000, 88 dc  (mov ah, bl)  ->  AL     wrong
+    fresh instance, 0x2000, 88 dc  (mov ah, bl)  ->  AH
+
+Two of this crate's own tests state exactly this and both failed the moment the
+sharing moved into the constructor they exercise.
+`x86_byte_register_writes_do_not_invent_full_carrier_zero_extensions` builds a
+disassembler per loop iteration and lifts both instructions at 0x1000;
+`genuine_lift_binds_full_bytes_to_one_opaque_session` asserts two loads do not
+share a session. The original sharing commit passed every gate because it cached
+in a *separate function* that only `lift_owned_function` called, leaving the
+constructor the tests exercise parsing its own copy. **A cache one layer below
+the guard is a cache the guard cannot see**, and that is the transferable
+lesson: put a cache where the existing tests already look, or the tests are
+measuring the uncached path.
+
+It is reachable in production wherever one process sees one address twice with
+different bytes: a second binary opened in the same radare2 session, two
+position-independent executables both based at zero, or bytes patched and
+re-analysed. Single-binary analysis never repeats an address, which is why the
+corpus and coverage gates could not have caught it -- each cell is its own
+process and its own binary. The gates are not a substitute for the unit tests
+here, and this is the second time in two days that a defect was invisible to
+them.
+
+**The decision this leaves.** The parse is where the time is:
+
+    x86-64, per load        parse   register table   architecture extraction
+                          84-295ms       1.4-67ms                    3-9ms
+
+So sharing only the immutable derived tables saves almost nothing, and the speed
+can only come back by flushing the decode cache rather than duplicating the
+instance. `ghidra::Sleigh::clearCache` does precisely that; the `libsla-sys`
+bridge this project pins does not expose it. Three ways forward, and the choice
+is the owner's because two of them change a dependency this project forks:
+
+1. *Expose `clearCache` in the `libsla-sys` fork and call it per lift.* Correct
+   and fast, one small commit to `0verflowme/libsla-sys`. The clear is cheap
+   next to a parse. This is the fix at the cause.
+2. *Track, per shared specification, the address ranges already decoded, and
+   reload the instance when one is asked for again with different bytes.*
+   In-tree and sound -- it never returns a stale decode -- but it is machinery
+   in this repository to work around a missing upstream call, and the memory is
+   one entry per decoded block.
+3. *Leave it unshared,* which is where the tree is now: correct, and paying the
+   parse per lift.
+
+Until one is taken, the per-function cost the previous section attributed to the
+profile load is back. What is *not* withdrawn is the structural half:
+`LoadedSpecification` separates what a specification derives from what a caller
+derives, so `create_disassembler_for_arch` now gets its architecture and its
+disassembler from one load rather than two hand-written parses of the same
+bytes, and the lift authority is minted from that one load. Immutable derived
+data can be shared; the decoder cannot.
+
+**Every uninterleaved before-and-after on the shared host is unproven**, this
+document's profile-load figures included. They were taken as two blocks minutes
+apart and the machine's load drifts over minutes; the one interleaved comparison
+run here turned an apparent fourfold win into nineteen per cent. A private
+`HOME` per column stops another agent overwriting the plugin, and only
+interleaving stops the machine overwriting the answer.
