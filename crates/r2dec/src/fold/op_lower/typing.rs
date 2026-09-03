@@ -51,8 +51,17 @@ impl FoldingContext<'_> {
     /// then the one conversion that is still certain is the one C never
     /// performs on its own: an integer does not become a pointer unless the
     /// program says so.
+    ///
+    /// `Unknown` is that absence wearing a type's clothes. A callee with no
+    /// recovered prototype has `CType::Unknown` for its return, and passing
+    /// that on as a recorded fact says "this expression has a type, and the
+    /// type is one nothing can convert" -- which silenced the conversion
+    /// instead of leaving it to the rule above. A call whose result is
+    /// assigned to a pointer-declared object rendered
+    /// `uint8_t *X0_9 = sym__rotl32(...)` on exactly that path.
     pub(super) fn convert_from(&self, expr: CExpr, from: Option<&CValue>, to: &CType) -> CExpr {
-        match from {
+        let recorded = from.filter(|from| !matches!(from.as_type(), Some(CType::Unknown)));
+        match recorded {
             Some(from) => self.convert(expr, from, to),
             None if matches!(to, CType::Pointer(_)) => CExpr::cast(to.clone(), expr),
             None => expr,
