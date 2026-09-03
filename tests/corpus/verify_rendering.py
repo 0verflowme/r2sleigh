@@ -2100,7 +2100,6 @@ def cases_for(name: str, spec: FunctionSpec | ScalarSpec) -> list[dict[str, Any]
 
 def scalar_case_arguments(
     case: dict[str, Any],
-    spec: ScalarSpec,
     *,
     diagnostic: bool,
     declared_parameters: list[str] | None,
@@ -2149,7 +2148,6 @@ def runner_source(
         if isinstance(spec, ScalarSpec):
             args = scalar_case_arguments(
                 case,
-                spec,
                 diagnostic=diagnostic,
                 declared_parameters=declared_parameters,
             )

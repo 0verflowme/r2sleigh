@@ -9073,3 +9073,30 @@ the variadic one. That is the decompiler behaving as designed, and it is also
 why the hash corpus could pass 54 of 54 while the benchmark found three wrong
 answers: the shapes that break here mostly refuse, and a refusal is invisible to
 a corpus that never asks the question.
+
+### What was verified alongside it
+
+`cargo test --workspace` is green: 2198 tests, no failures.
+
+`tests/corpus/locked_matrix.sh --gate differential` still measures the 54 hash
+cells at `generation: 54 present`, `raw: 54 pass`, `differential: 54 pass` with
+`basis=raw` in every cell. Nothing in this work touches Rust; the diff from the
+branch point is `tests/corpus/` and this document only.
+
+Two things in that run are worth writing down so the next reader does not chase
+them:
+
+- The gate exits non-zero on `snapshot: 37 match, 17 mismatch`. Those seventeen
+  section hashes are byte-for-byte the ones `arch/expression-engine` has since
+  re-accepted into `raw-baseline-sha256.json`; the branch point this work was
+  cut from carries the older manifest. Checked key by key: the mismatch set and
+  the re-accepted set are the same seventeen, and this run's hashes equal the
+  newer manifest's. It is base drift, not a rendering change.
+- One cell reports `diagnostic: infrastructure_error` -- `x64_O2/fnv1a32`. The
+  *oracle* timed out at three seconds under six agents building at once. Its
+  differential passed, because the differential re-runs the oracle per case. A
+  measurement taken on a loaded machine can produce this on any cell.
+
+The shape run was executed twice under the lock and produced identical column
+totals both times, so the fourteen renderings and the eight differential passes
+are reproducible rather than a scheduling artifact.
