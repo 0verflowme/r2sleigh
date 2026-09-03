@@ -2042,8 +2042,14 @@ impl LegacyObservationJournal {
         }
         for (site, reason) in elided_uses {
             let slot = self.use_slot_mut(site)?;
-            record_same(slot, LegacyUseObservation::Elided(reason))
-                .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))?;
+            if record_same(slot, LegacyUseObservation::Elided(reason)).is_err() {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "conflicting use {site:?}: recorded {slot:?}, elision reason {reason:?}"
+                    );
+                }
+                return Err(LegacyObservationJournalError::ConflictingUse(site));
+            }
         }
         for (inst, reason) in elided_writes {
             let slot = self.write_slot_mut(inst)?;
@@ -2919,8 +2925,14 @@ impl LegacyObservationJournal {
             }
         };
         let slot = self.use_slot_mut(site)?;
-        record_same(slot, observation)
-            .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))
+        if record_same(slot, observation).is_err() {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!("conflicting use {site:?}: recorded {slot:?}, refusal {observation:?}");
+            }
+            Err(LegacyObservationJournalError::ConflictingUse(site))
+        } else {
+            Ok(())
+        }
     }
 
     /// Record an upstream refusal for a write that therefore has no AST node.
