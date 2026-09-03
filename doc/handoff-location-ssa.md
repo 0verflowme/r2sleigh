@@ -10229,3 +10229,48 @@ compute wrong values are the repair heuristics mis-firing on output whose shape
 improved, not the decompiler getting an answer wrong: the same eight cells pass
 the differential on the raw basis. A column that only reports on a fallback
 nobody takes is measuring itself.
+## `arm64_O0 pearson`: the harness read a cast as a fact, and the naming gap behind it
+
+The differential scored this cell a wrong answer on every non-empty input,
+with `rendered_exit -11`. The decompiler was right and the harness was wrong,
+and the two are worth separating because the second half is still open.
+
+**The wrong answer was the harness.** `verify_rendering.py` maps an image
+address into a blob so the recompiled C reads the real table, and
+`certified_image_literals` recognised the binding of such an address to a
+name by matching `name = (uint64_t)0x100001000` -- with the conversion
+required, because every rendering used to spell one. This branch states a
+type only where the type changes, so the statement became
+`name = 0x100001000`, the test stopped recognising it, the address was left
+absolute and the program segfaulted. The conversion is now optional; the
+evidence it rests on is unchanged. All eighteen cases now return the right
+hash. This is the second time this one test has had to stop reading a
+spelling as the fact it carries, and the comment above it records the first.
+
+**The register-family hypothesis is disproven by the output.** The rendered C
+computes `0x100001000 + 0xe6c + index` and returns the correct Pearson hash on
+all eighteen inputs, so the `adrp` result and the `add` operand *are* agreed
+to be the same storage. If the pairing were broken the arithmetic would be
+wrong, not merely unnamed.
+
+**What is still open is naming, and it is not a lookup question.** Measured
+across the three architectures:
+
+    x64_O0     `0x1000019a0` arrives as one literal -> looked up ->
+               `&_pearson_tab`, with `extern char _pearson_tab[];` emitted
+    arm64_O1   neither the name nor the page base appears; the table is
+               reached by another path
+    arm64_O0   `X8_5 = 0x100001000;` then `X8_5 + 0xe6c` -- two statements
+
+The object table is not missing an entry and is not being asked about an
+interior address. `sym._pearson_tab` sits at `0x100001e6c`, which is exactly
+`0x100001000 + 0xe6c`, and radare2 has a flag there. The lookup would hit the
+way x64's does. It never runs, because the fold that performs it needs the
+address as one literal expression and the page base is *bound to a local*.
+
+So this is the `literal_only_declarations` column, not a new question: eighty
+literal-only bindings remain, and this is one of them. Inlining it would make
+the addition fold and the name appear. Doing that in the late fold would put
+a second answerer beside the binding plan for "does this value render
+inline", which is the duplication this project keeps removing, so it belongs
+to the inlining work and not here.

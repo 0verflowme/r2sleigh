@@ -1918,8 +1918,18 @@ def certified_image_literals(
         # reaches a dereference in the same rendering. All three are required,
         # and the evidence is recorded under its own kind so the mapping stays
         # auditable rather than widening the two syntactic rules.
+        # The conversion is optional. It was required here because every
+        # rendering used to spell one, and the renderer now states a type only
+        # where the type changes, so `X8_5 = (uint64_t)0x100001000;` became
+        # `X8_5 = 0x100001000;` -- the same binding of the same image address
+        # to the same name. Keying the evidence on the cast made a rendering
+        # that says less look like an unmapped address, and the differential
+        # scored the decompiler wrong for the harness's own recognition rule.
+        # That is the second time this test has had to stop reading a spelling
+        # as the fact it carries.
         assignment = re.search(
-            r"\b([A-Za-z_]\w*)\s*=\s*\(\s*(?:__)?u?int(?:8|16|32|64|128)_t\s*\)\s*$",
+            r"\b([A-Za-z_]\w*)\s*=\s*"
+            r"(?:\(\s*(?:__)?u?int(?:8|16|32|64|128)_t\s*\)\s*)?$",
             prefix,
         )
         if assignment and re.match(r"(?:[uUlL]{0,3})\s*;", suffix):
