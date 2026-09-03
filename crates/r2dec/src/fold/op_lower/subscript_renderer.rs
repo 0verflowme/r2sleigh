@@ -13,6 +13,36 @@
 //! the subscript too; and a leaf that names a bound object marks that object's
 //! cell as any read of it does. The access's own address operand is marked by
 //! the caller, exactly as it is for a dereference.
+//!
+//! # Why there is no tie-break between a declared member and a proven stride
+//!
+//! A declared struct member and a proven constant stride look like two
+//! authorities over one access, and they are not: they cannot both answer.
+//! `certified_member_fact_for_memory` returns a fact only when it matches
+//! this access's object, its access id *and* its width, and only when exactly
+//! one such fact exists. So the member fact is either a description of this
+//! very access or it is absent, and the three reachable states are disjoint:
+//!
+//! - a member fact matches, and the member owns the access -- the subscript
+//!   path declines, because `p->hash` and `((uint64_t *)p)[1]` are both true
+//!   of the address and only the first is true of the *object*, which is what
+//!   scoring recovered types against DWARF asks;
+//! - the widths differ, or two facts match, in which case no member fact is
+//!   returned at all and there is nothing to outrank the proven stride;
+//! - neither exists, and the rewriter's subscript answers if it proved one.
+//!
+//! This is one owner per access rather than a ranking, so do not add a
+//! tie-break here: a tie cannot occur, and code to resolve one would be a
+//! second answerer for a question that already has exactly one.
+//!
+//! One case is decided rather than derived. Where a member fact matches but
+//! the member renderer cannot build an expression -- the C address carries no
+//! base identity to split around -- the access renders as a dereference and
+//! not as a subscript. Asserting an array shape that a declared type
+//! contradicts is worse than declining to name the shape at all, which is the
+//! same reason a conflicting type refuses per value instead of guessing. It
+//! is worth revisiting only on a measurement showing such accesses are common
+//! enough to cost `type_match`.
 
 use r2rewrite::{TermArena, TermId, TermKind};
 use r2ssa::CanonicalInstructionSite;
