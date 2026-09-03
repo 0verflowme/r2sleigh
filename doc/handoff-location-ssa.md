@@ -9211,6 +9211,74 @@ rather than picking an operand. The corpus's own shape indexes by a local
 initialised to a constant, which the pass does resolve, so this is a real
 limitation with no corpus cost yet measured.
 
+### Measured: zero subscripts to twenty-one, and two accounting defects
+
+On the fifty-four hash cells, counted exactly before and after:
+
+    subscript expressions        0 -> 21   (in 11 of 54 cells)
+    array declarations           0 ->  0
+    for loops                    0 ->  0
+    while headers               17 -> 17
+    do-while                    43 -> 43
+
+All fifty-four cells pass generation, raw, diagnostic, differential, binding
+audit, effect obligations, placement audit and render refusal. The snapshot
+column reports exactly eleven mismatches, and they are the same eleven cells
+that gained a subscript, which is the corroboration worth having: the output
+that changed is precisely the output that was meant to.
+
+What it looks like. `xxhash32` reads its lanes as
+`((uint32_t *)RDI_0)[1]` where it used to spell `*(uint32_t *)(p + 4)`, and
+`pearson` indexes its table as `((uint8_t *)RCX_2)[RDX_2]` with a variable
+index. Both are `constant_stride`; the `-O2` cells index because the compiler
+unrolled the byte loop into `p + i + k` forms, which is the shape the rule was
+written for.
+
+Array declarations and `for` loops are still zero. Stack buffers and
+region-level `for` construction were not reached, and nothing here should be
+read as evidence about either.
+
+**Two accounting defects, both found by the gates and neither by reading.**
+They are worth keeping because both are the same mistake in different clothes:
+the subscript path does not go through the code that used to answer for a
+cell, so it has to answer for that cell itself, and twice it did not.
+
+The first refused six `x64_O2` cells with `RenderedValueRequired`. The
+dereference path marks the address value inside
+`certified_memory_address_expr`; the subscript path bypasses that function, and
+marked the address only when the canonical term had absorbed a producer. That
+made the accounting depend on which rule fired rather than on what was
+rendered -- `constant_stride` absorbs the add and the multiply so the cell was
+filled by luck, `pointer_walk` absorbs nothing so it was not filled at all.
+
+Marking the address unconditionally did *not* clear those six cells, and the
+failure to clear was the useful part: it proved the address was never the
+missing thing. `R2DEC_TRACE_REFUSAL` then named the value outright --
+`ValueId(378)`, `Inline`, one use, **no defining instruction**, constant
+storage, read by the `IntAdd` that formed the address.
+`observe_discharged_expr` marks each consumed instruction's write, its output
+value and its operands' *uses*; a constant is nobody's output, so it never
+appears in a discharged set, and its only occurrence was inside the expression
+the subscript replaced.
+
+An earlier attempt at that same cell searched the term's leaves and found
+nothing, because import turns a constant into `TermKind::Literal` and `leaves`
+collects only `Leaf` and `Opaque`. Asking the graph for each consumed
+instruction's operands does not depend on how a constant happens to be
+represented in a term, which was the right question from the start. The marks
+are deduplicated: one literal can be an operand of two consumed instructions,
+and two marks would count one execution twice.
+
+The second defect refused every store to a proven element.
+`expr_is_store_target_candidate` saw through `Paren` but not `Observed`, and
+had never needed to, because the dereference path hands it an unmarked
+`CExpr::Deref` while the subscript path marks the address it renders. It now
+asks `unobserved()`, the idiom the rest of the tree already uses.
+
+The lesson for whoever adds the next rendering path: the cells a path must
+fill are not the cells its author thinks about, they are the cells the path it
+replaced used to fill. Diff the two.
+
 ### Declared member and proven stride are one owner, not a ranking
 
 These look like two authorities over one access and cannot both answer.
