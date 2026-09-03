@@ -10342,3 +10342,33 @@ minutes, and it should be handed to whoever holds the structurer's safety
 budget, since a budget of block count times 128 consumed in proof order is the
 standing suspect. Run one config with a timeout and per-function timing to find
 which of the thirteen it is before running the whole matrix again.
+
+## The structurer pathology, reduced to one function
+
+The value-hazard corpus held the install lock for forty minutes without
+finishing one of six configurations. Timing its thirteen leaf functions
+individually, with the plugin already installed and no lock involved, says why.
+Eleven finish in under eight seconds. Three do not:
+
+| function | time |
+| --- | --- |
+| `value_overflow_flags` | exceeds 60 s, did not finish |
+| `value_signed_compare` | exceeds 60 s, did not finish |
+| `value_width_conflict` | 21 s, finishes |
+
+These are leaf functions with no calls, no loops over memory and no aggregates,
+so whatever is superlinear is superlinear on straight-line flag arithmetic and
+signed comparison, which is where the reaching-path predicates multiply. They
+also have very few blocks, and still exhaust whatever budget they are given,
+which is direct evidence that a budget of block count times 128 is the wrong
+shape rather than merely an unprincipled constant.
+
+`value_overflow_flags` is therefore a one-function reproduction that iterates in
+a minute, against the 2.27 seconds inside `main` in `bzip2recover` that the
+work was originally scoped against. Time those three before and after any change
+to the safety budget; it costs seconds and needs no plugin install and no lock.
+
+Method worth reusing: install once, then run the decompiler per function with a
+timeout, outside the lock. Identifying which function is pathological does not
+need an exclusive plugin, and taking the lock for a hang is how a forty-minute
+hold happened in the first place.
