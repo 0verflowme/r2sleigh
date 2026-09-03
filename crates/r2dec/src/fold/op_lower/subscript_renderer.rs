@@ -74,12 +74,67 @@ impl<'a> FoldingContext<'a> {
         };
         let base_expr = self.render_subscript_term(arena, base)?;
         let base_expr = self.subscript_base_at_element_type(arena, base, base_expr, elem_ty);
-        let index_expr = self.render_subscript_term(arena, index)?;
+        let mut index_expr = self.render_subscript_term(arena, index)?;
+        if let Some(value) = self.certified_stack_array_index_value(fact, arena, index) {
+            index_expr = self.observe_certified_array_index_expr(fact.access, value, index_expr);
+        }
         let expr = CExpr::Subscript {
             base: Box::new(base_expr),
             index: Box::new(index_expr),
         };
         Some(PendingReplacementExpr::canonical_access(fact, expr))
+    }
+
+    /// The exact bound value an array-layout certificate substituted for this
+    /// access's byte address.
+    ///
+    /// Ordinary subscript leaves are already operands of the machine address
+    /// expression and carry their graph-use marker through the rewrite. A
+    /// bound stack-array cell is different: its canonical term replaces the
+    /// completed address with the certified element index while leaving the
+    /// address producer intact. Naming that earlier value here therefore
+    /// needs the certificate-owned placement read installed by the caller.
+    fn certified_stack_array_index_value(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+        arena: &TermArena,
+        index: TermId,
+    ) -> Option<r2ssa::ValueId> {
+        let TermKind::Leaf(node) = arena.term(index).kind else {
+            return None;
+        };
+        let r2ssa::MachineExprKind::Source { binding, .. } = self
+            .inputs
+            .binding_names?
+            .plan()
+            .machine_projection()
+            .expr(node)?
+            .kind()
+        else {
+            return None;
+        };
+        let value = binding.value();
+        let prepared = self.prepared_ssa()?;
+        let memory = prepared.structured().memory_accesses.get(&fact.access)?;
+        let layout = prepared
+            .certificates()
+            .stack_slots
+            .get(&memory.object)
+            .and_then(|slot| match &slot.array_layout {
+                r2ssa::StackArrayLayoutDisposition::Proven(layout) => Some(layout),
+                r2ssa::StackArrayLayoutDisposition::NotIndexed
+                | r2ssa::StackArrayLayoutDisposition::Refused(_) => None,
+            })?;
+        layout
+            .indexed_elements
+            .iter()
+            .find(|element| element.address == fact.address)
+            .and_then(|element| match element.element_index {
+                Some(r2ssa::StackArrayElementIndex::Value(index)) if index == value => Some(value),
+                Some(r2ssa::StackArrayElementIndex::Value(_))
+                | Some(r2ssa::StackArrayElementIndex::Constant(_))
+                | None => None,
+            })
     }
 
     /// The base at the type the subscript reads through.

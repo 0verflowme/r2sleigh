@@ -213,7 +213,6 @@ struct FoldedBlock {
 #[derive(Debug, Clone)]
 struct CertifiedForRegion {
     loop_id: LoopId,
-    prefix: Vec<CStmt>,
     init: CStmt,
     update: CExpr,
 }
@@ -853,23 +852,11 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         (latches.into_iter().collect(), exits.into_iter().collect())
     }
 
-    fn collect_counted_loop_region_pairs(
-        region: &Region,
-        pairs: &mut Vec<(u64, u64, BTreeSet<u64>)>,
-    ) {
+    fn collect_pre_test_loop_regions(region: &Region, loops: &mut Vec<(u64, BTreeSet<u64>)>) {
         match region {
             Region::Sequence(regions) => {
-                for window in regions.windows(2) {
-                    if let [
-                        Region::Block(initializer),
-                        Region::WhileLoop { header, body },
-                    ] = window
-                    {
-                        pairs.push((*initializer, *header, body.blocks().into_iter().collect()));
-                    }
-                }
                 for child in regions {
-                    Self::collect_counted_loop_region_pairs(child, pairs);
+                    Self::collect_pre_test_loop_regions(child, loops);
                 }
             }
             Region::IfThenElse {
@@ -877,22 +864,24 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 else_region,
                 ..
             } => {
-                Self::collect_counted_loop_region_pairs(then_region, pairs);
+                Self::collect_pre_test_loop_regions(then_region, loops);
                 if let Some(else_region) = else_region {
-                    Self::collect_counted_loop_region_pairs(else_region, pairs);
+                    Self::collect_pre_test_loop_regions(else_region, loops);
                 }
             }
-            Region::WhileLoop { body, .. }
-            | Region::DoWhileLoop { body, .. }
-            | Region::MultiExit { head: body, .. } => {
-                Self::collect_counted_loop_region_pairs(body, pairs);
+            Region::WhileLoop { header, body } => {
+                loops.push((*header, body.blocks().into_iter().collect()));
+                Self::collect_pre_test_loop_regions(body, loops);
+            }
+            Region::DoWhileLoop { body, .. } | Region::MultiExit { head: body, .. } => {
+                Self::collect_pre_test_loop_regions(body, loops);
             }
             Region::Switch { cases, default, .. } => {
                 for (_, case) in cases {
-                    Self::collect_counted_loop_region_pairs(case, pairs);
+                    Self::collect_pre_test_loop_regions(case, loops);
                 }
                 if let Some(default) = default {
-                    Self::collect_counted_loop_region_pairs(default, pairs);
+                    Self::collect_pre_test_loop_regions(default, loops);
                 }
             }
             Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => {}
@@ -914,12 +903,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(names) = self.fold_ctx.inputs.binding_names else {
             return Ok(());
         };
-        let mut pairs = Vec::new();
-        Self::collect_counted_loop_region_pairs(region, &mut pairs);
-        pairs.sort();
-        pairs.dedup();
+        let mut region_loops = Vec::new();
+        Self::collect_pre_test_loop_regions(region, &mut region_loops);
+        region_loops.sort();
+        region_loops.dedup();
         let mut seen_headers = BTreeSet::new();
-        for (initializer_block, header, body_blocks) in pairs {
+        for (header, body_blocks) in region_loops {
             if !seen_headers.insert(header) {
                 continue;
             }
@@ -932,10 +921,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let Some((loop_id, certificate)) = loops.next() else {
                 continue;
             };
-            if loops.next().is_some()
-                || certificate.initializer.predecessor != initializer_block
-                || !body_blocks.contains(&certificate.latch)
-            {
+            if loops.next().is_some() || !body_blocks.contains(&certificate.latch) {
                 continue;
             }
             let same_binding = match (
@@ -954,6 +940,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             let Some(sites) = origins.for_loop_sites(certificate, prepared) else {
                 continue;
             };
+            let initializer_block = certificate.initializer.predecessor;
             let Some(initializer_addr) = prepared
                 .graph()
                 .block(sites.initializer.block)
@@ -989,12 +976,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 continue;
             }
             let initializer = initializer_entries.remove(initializer_index).stmt;
-            let prefix = initializer_entries
-                .into_iter()
-                .take(initializer_index)
-                .map(|entry| entry.stmt)
-                .filter(|stmt| !matches!(stmt.unobserved(), CStmt::Empty))
-                .collect();
             let update = self
                 .folded_block_entries(update_ssa, update_addr)?
                 .into_iter()
@@ -1013,7 +994,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 header,
                 CertifiedForRegion {
                     loop_id,
-                    prefix,
                     init: initializer,
                     update,
                 },
@@ -1336,41 +1316,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             Region::Block(addr) => self.structure_block(*addr)?,
             Region::Sequence(regions) => {
                 let mut stmts = Vec::with_capacity(regions.len());
-                let mut index = 0;
-                while index < regions.len() {
-                    if let (
-                        Some(Region::Block(_initializer)),
-                        Some(Region::WhileLoop { header, body }),
-                    ) = (regions.get(index), regions.get(index + 1))
-                        && let Some(for_region) = self.certified_for_regions.remove(header)
-                    {
-                        let mut pair = for_region.prefix.clone();
-                        pair.push(self.structure_pre_test_loop(*header, body, Some(for_region))?);
-                        let stmt = if pair.len() == 1 {
-                            pair.pop().unwrap_or(CStmt::Empty)
-                        } else {
-                            CStmt::Block(pair)
-                        };
-                        if !matches!(stmt.unobserved(), CStmt::Empty) {
-                            stmts.push(stmt);
-                        }
-                        let loop_region = &regions[index + 1];
-                        if let Some(next) = regions.get(index + 2)
-                            && let Some(condition_block) =
-                                self.normal_loop_exit_condition_block(loop_region, next.entry())
-                            && let Err(reason) =
-                                self.push_exact_edge_guard(condition_block, next.entry())
-                        {
-                            self.safety_reason = Some(format!(
-                                "loop condition at 0x{condition_block:x} cannot certify sequential exit 0x{:x}: {reason}",
-                                next.entry()
-                            ));
-                            return Ok(CStmt::Empty);
-                        }
-                        index += 2;
-                        continue;
-                    }
-                    let region = &regions[index];
+                for (index, region) in regions.iter().enumerate() {
                     let deferred_merge = Self::sequence_owned_merge(regions, index);
                     if let Some(merge) = deferred_merge {
                         self.deferred_merge_blocks.push(merge);
@@ -1396,7 +1342,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         ));
                         return Ok(CStmt::Empty);
                     }
-                    index += 1;
                 }
                 if stmts.is_empty() {
                     CStmt::Empty
@@ -1483,7 +1428,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             Region::WhileLoop { header, body } => {
-                self.structure_pre_test_loop(*header, body, None)?
+                let counted = self.certified_for_regions.remove(header);
+                self.structure_pre_test_loop(*header, body, counted)?
             }
             Region::DoWhileLoop { body, cond_block } => {
                 let (cond, predicate, condition_value) =

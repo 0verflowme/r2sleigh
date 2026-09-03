@@ -871,6 +871,10 @@ pub(crate) enum PlacementRead {
         value: ValueId,
         at: InstId,
     },
+    ArrayIndex {
+        access: r2ssa::StructuredAccessId,
+        value: ValueId,
+    },
     StackAccess(r2ssa::StructuredAccessId),
     /// A read of stack storage at an offset the machine computes.
     ///
