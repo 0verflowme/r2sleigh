@@ -57,6 +57,14 @@ pub fn konst(value: u64, size: u32) -> Varnode {
 }
 
 pub fn artifact(ops: Vec<R2ILOp>) -> SsaArtifact {
+    artifact_with_parameters(ops, &[])
+}
+
+/// An artifact whose interface declares the registers in `parameters`, in
+/// order, as the function's parameters: a value read from one of them has
+/// parameter address provenance, which is what makes it a pointer the
+/// subscript rules can call a base.
+pub fn artifact_with_parameters(ops: Vec<R2ILOp>, parameters: &[u64]) -> SsaArtifact {
     let mut block = R2ILBlock::new(0x1000, 4);
     for op in ops {
         block.push(op);
@@ -69,7 +77,9 @@ pub fn artifact(ops: Vec<R2ILOp>) -> SsaArtifact {
     let interface = r2ssa::SourceFunctionInterface::new_exact(
         b"r2rewrite-fixture".to_vec(),
         "sysv64",
-        std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+        parameters.iter().enumerate().map(|(index, offset)| {
+            r2ssa::SourceAbiParameterSpec::new(index as u32, storage(*offset))
+        }),
         r2ssa::SourceFunctionReturn::Register {
             storage: storage(RAX),
         },

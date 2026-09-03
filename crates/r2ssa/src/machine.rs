@@ -1086,7 +1086,7 @@ impl MachineProjection {
                 return Err(MachineBuildError::TopologyMismatch);
             }
             let Some(output_id) = inst.output else {
-                builder.lower_outputless_inst(graph, inst)?;
+                builder.lower_outputless_inst(artifact, inst)?;
                 write_dispositions.push(None);
                 continue;
             };
@@ -1164,6 +1164,7 @@ impl MachineProjection {
                 },
                 entity_index_by_output: entity_index_by_output(&entities, graph.values.len()),
                 entities: entities.into_boxed_slice(),
+                store_addresses: builder.store_addresses.into_iter().collect(),
             },
             failures: failures.into_boxed_slice(),
             value_geometries: value_geometries.into_boxed_slice(),
@@ -1186,6 +1187,12 @@ impl MachineProjection {
 
     pub const fn entities(&self) -> &[MachineEntity] {
         self.machine.entities()
+    }
+
+    /// The typed address leaf of the store performing `access`, if the store
+    /// was projected. See [`MachineFunction::store_address`].
+    pub fn store_address(&self, access: StructuredAccessId) -> Option<MachineExprId> {
+        self.machine.store_address(access)
     }
 
     pub const fn failures(&self) -> &[MachineProjectionFailure] {
@@ -2319,6 +2326,16 @@ fn machine_use_slice_for_input(
 pub struct MachineFunction {
     arena: MachineExprArena,
     entities: Box<[MachineEntity]>,
+    /// The typed address leaf of every store, keyed by the access it writes,
+    /// in access order.
+    ///
+    /// A load's address is the child of its `MemoryRead` root, typed with the
+    /// object it reaches. A store has no root, so its address had no node,
+    /// and a consumer reasoning about the cell a store writes -- the
+    /// rewriter, which spells `p[i] = v` by the rule that spells `v = p[i]`
+    /// -- had nothing to start from. Interned under the same key as a load's
+    /// address, so a value both read and written through is one leaf.
+    store_addresses: Box<[(StructuredAccessId, MachineExprId)]>,
     /// Dense by `ValueId`: the position in `entities` of the entity whose
     /// output is that value, or `NO_ENTITY`. Derived from `entities`, so it is
     /// not serialised and not part of what two functions are compared on.
@@ -2362,6 +2379,20 @@ impl MachineFunction {
 
     pub const fn entities(&self) -> &[MachineEntity] {
         &self.entities
+    }
+
+    /// The typed address leaf of the store performing `access`, if the store
+    /// was projected.
+    pub fn store_address(&self, access: StructuredAccessId) -> Option<MachineExprId> {
+        self.store_addresses
+            .binary_search_by_key(&access, |(id, _)| *id)
+            .ok()
+            .map(|index| self.store_addresses[index].1)
+    }
+
+    /// Every projected store's address leaf, in access order.
+    pub const fn store_addresses(&self) -> &[(StructuredAccessId, MachineExprId)] {
+        &self.store_addresses
     }
 
     pub fn expr(&self, id: MachineExprId) -> Option<&MachineExpr> {
@@ -2452,6 +2483,62 @@ impl MachineFunction {
         Ok(by_output)
     }
 
+    /// Every store address leaf names the address of exactly the store it is
+    /// keyed by, at the type a load's address to the same object would have.
+    fn validate_store_addresses(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
+        let graph = artifact.graph();
+        let mut previous = None;
+        for (access, node) in self.store_addresses.iter() {
+            if previous.is_some_and(|last| last >= *access) {
+                return Err(MachineBuildError::TopologyMismatch);
+            }
+            previous = Some(*access);
+            let inst = graph
+                .inst(access.inst)
+                .ok_or(MachineBuildError::MissingInstruction(access.inst))?;
+            let fact = artifact
+                .facts()
+                .structured
+                .memory_accesses
+                .get(access)
+                .filter(|fact| {
+                    fact.id == *access
+                        && fact.provenance_complete
+                        && fact.is_write
+                        && fact.id.ordinal == 0
+                        && inst.inputs.first() == Some(&fact.address)
+                })
+                .ok_or(MachineBuildError::EntityMismatch(access.inst))?;
+            let source_space = artifact
+                .machine_context()
+                .memory_space_at(fact.block_addr, fact.op_index)
+                .ok_or(MachineBuildError::MachineContextMismatch)?;
+            let source_model = artifact.machine_context().memory_model();
+            let space_model = source_model
+                .space(source_space)
+                .filter(|_| source_model.is_available() && source_model.is_coherent())
+                .ok_or(MachineBuildError::MachineContextMismatch)?;
+            let expected_type = MachineType::Address {
+                width_bits: space_model.address_bits(),
+                space: MachineAddressSpace::from(source_space),
+                provenance: machine_address_provenance(artifact, fact.object),
+            };
+            let expr = self
+                .arena
+                .get(*node)
+                .ok_or(MachineBuildError::EntityMismatch(access.inst))?;
+            let named = match expr.kind() {
+                MachineExprKind::Source { binding, .. }
+                | MachineExprKind::Constant { binding, .. } => binding.value(),
+                _ => return Err(MachineBuildError::EntityMismatch(access.inst)),
+            };
+            if named != fact.address || *expr.ty() != expected_type {
+                return Err(MachineBuildError::EntityMismatch(access.inst));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_arena(&self, artifact: &SsaArtifact) -> Result<(), MachineBuildError> {
         let address_nodes = self
             .arena
@@ -2460,7 +2547,9 @@ impl MachineFunction {
                 MachineExprKind::MemoryRead { address, .. } => Some(*address),
                 _ => None,
             })
+            .chain(self.store_addresses.iter().map(|(_, node)| *node))
             .collect::<BTreeSet<_>>();
+        self.validate_store_addresses(artifact)?;
         for (id, expr) in self.arena.iter() {
             for child in expr.kind.children() {
                 if child.index() >= id.index() || self.arena.get(child).is_none() {
@@ -2844,6 +2933,7 @@ struct MachineBuilder {
     nodes: Vec<MachineExpr>,
     value_nodes: BTreeMap<(ValueId, MachineType), MachineExprId>,
     address_nodes: BTreeMap<(ValueId, ObjectId, MachineAddressSpace), MachineExprId>,
+    store_addresses: BTreeMap<StructuredAccessId, MachineExprId>,
     use_dispositions: Vec<Vec<MachineUseDisposition>>,
 }
 
@@ -2951,9 +3041,10 @@ impl MachineBuilder {
 
     fn lower_outputless_inst(
         &mut self,
-        graph: &SsaGraph,
+        artifact: &SsaArtifact,
         inst: &GraphInst,
     ) -> Result<(), MachineBuildError> {
+        let graph = artifact.graph();
         for (input_idx, input) in inst.inputs.iter().copied().enumerate() {
             let graph_value = graph
                 .value(input)
@@ -2963,6 +3054,81 @@ impl MachineBuilder {
             }
             self.record_whole_use(graph, inst, input_idx)?;
         }
+        if let InstPayload::Op(op @ SSAOp::Store { .. }) = &inst.payload {
+            self.intern_store_address(artifact, inst, op)?;
+        }
+        Ok(())
+    }
+
+    /// Intern the address a store writes through, typed as a load's address
+    /// is. See [`MachineFunction::store_addresses`].
+    ///
+    /// A store whose access the facts cannot state exactly gets no node. That
+    /// is a decline rather than a failure: the store's operand reads are
+    /// already recorded, and the only consumer of the node is one that may
+    /// rewrite the cell, which it then does not.
+    fn intern_store_address(
+        &mut self,
+        artifact: &SsaArtifact,
+        inst: &GraphInst,
+        op: &SSAOp,
+    ) -> Result<(), MachineBuildError> {
+        let graph = artifact.graph();
+        let accesses = artifact
+            .facts()
+            .structured
+            .memory_accesses
+            .values()
+            .filter(|access| access.id.inst == inst.id)
+            .collect::<Vec<_>>();
+        let [access] = accesses.as_slice() else {
+            return Ok(());
+        };
+        let source_space = artifact
+            .machine_context()
+            .memory_space_at(access.block_addr, access.op_index);
+        let model = artifact.machine_context().memory_model();
+        let space_model = source_space.and_then(|space| model.space(space));
+        let prepared_op = artifact
+            .function()
+            .get_block(access.block_addr)
+            .and_then(|block| block.ops.get(access.op_index));
+        if !access.provenance_complete
+            || !access.is_write
+            || access.id.ordinal != 0
+            || prepared_op.is_none_or(|prepared_op| {
+                source_space.is_none_or(|source_space| {
+                    !memory_access_authorities_match(
+                        graph,
+                        artifact.objects(),
+                        op,
+                        prepared_op,
+                        source_space,
+                        access,
+                    )
+                })
+            })
+            || inst.inputs.first() != Some(&access.address)
+            || !model.is_available()
+            || !model.is_coherent()
+        {
+            return Ok(());
+        }
+        let Some(space_model) = space_model else {
+            return Ok(());
+        };
+        let address = graph
+            .value(access.address)
+            .ok_or(MachineBuildError::MissingGraphValue(access.address))?;
+        let space = MachineAddressSpace::from(space_model.space());
+        let node = self.intern_address(
+            artifact,
+            address,
+            access.object,
+            space,
+            space_model.address_bits(),
+        )?;
+        self.store_addresses.insert(access.id, node);
         Ok(())
     }
 

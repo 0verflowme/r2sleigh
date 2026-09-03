@@ -33,6 +33,8 @@ pub enum RuleGroup {
     Affine,
     /// Masks.
     Mask,
+    /// Memory accesses as array elements.
+    Subscript,
 }
 
 /// The component of the termination measure a rule strictly decreases.
@@ -40,6 +42,9 @@ pub enum RuleGroup {
 pub enum Measure {
     /// Non-leaf nodes of the term, counted as a tree.
     NonLeafNodes,
+    /// Memory reads spelled by address: a subscript rule turns one into an
+    /// element read, which is not one.
+    Loads,
     /// Select and compare nodes: the ones a boolean normal form removes
     /// without changing the node count.
     Selections,
@@ -56,6 +61,7 @@ pub enum Measure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MeasureVector {
     pub non_leaf_nodes: u64,
+    pub loads: u64,
     pub selections: u64,
     pub cast_width: u64,
     pub literals_not_last: u64,
@@ -66,6 +72,7 @@ impl MeasureVector {
     pub fn component(&self, measure: Measure) -> u64 {
         match measure {
             Measure::NonLeafNodes => self.non_leaf_nodes,
+            Measure::Loads => self.loads,
             Measure::Selections => self.selections,
             Measure::CastWidth => self.cast_width,
             Measure::LiteralPosition => self.literals_not_last,
@@ -90,6 +97,7 @@ fn measure_memo(
     let term = arena.term(id);
     let mut m = MeasureVector {
         non_leaf_nodes: 0,
+        loads: 0,
         selections: 0,
         cast_width: 0,
         literals_not_last: 0,
@@ -103,6 +111,9 @@ fn measure_memo(
         }
     } else {
         m.non_leaf_nodes = 1;
+        if matches!(term.kind, TermKind::Load { .. }) {
+            m.loads = 1;
+        }
         if matches!(
             term.kind,
             TermKind::Select { .. } | TermKind::Compare { .. }
@@ -123,6 +134,7 @@ fn measure_memo(
         for child in children {
             let c = measure_memo(arena, child, memo);
             m.non_leaf_nodes = m.non_leaf_nodes.saturating_add(c.non_leaf_nodes);
+            m.loads = m.loads.saturating_add(c.loads);
             m.selections = m.selections.saturating_add(c.selections);
             m.cast_width = m.cast_width.saturating_add(c.cast_width);
             m.literals_not_last = m.literals_not_last.saturating_add(c.literals_not_last);
@@ -162,6 +174,7 @@ pub mod identity;
 pub mod literal;
 pub mod mask;
 pub mod shift;
+pub mod subscript;
 
 /// A literal of `value` at the type of `like`.
 pub(crate) fn literal_like(arena: &mut TermArena, like: TermId, value: u64) -> TermId {
@@ -268,6 +281,9 @@ pub static RULES: &[&Rule] = &[
     &affine::ADD_NEG,
     &affine::SUB_NEG,
     &affine::NEG_SUB,
+    &subscript::STACK_ELEMENT,
+    &subscript::POINTER_WALK,
+    &subscript::CONSTANT_STRIDE,
 ];
 
 pub fn rule(id: RuleId) -> Option<&'static Rule> {

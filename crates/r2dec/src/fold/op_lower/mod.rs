@@ -111,6 +111,7 @@ mod calls;
 mod lowering;
 mod memory_renderer;
 mod projection;
+mod subscript_renderer;
 
 #[derive(Debug, Clone, PartialEq)]
 enum LoweredOp {
