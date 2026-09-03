@@ -311,7 +311,8 @@ impl SsaArtifact {
         control.poll()?;
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
-        let graph = SsaGraph::from_function_with_storage(&function);
+        let mut graph = SsaGraph::from_function_with_storage(&function);
+        crate::semantic::ensure_source_formal_parameter_values(&mut graph, &machine_context);
         let formal_parameters =
             crate::semantic::collect_source_formal_parameter_facts(&graph, &machine_context);
         function.install_exact_formal_parameters(&graph, &formal_parameters);
@@ -1227,6 +1228,7 @@ fn unique_call_site_identity(
     }
 }
 
+#[derive(Clone)]
 struct CorrelatedCallSites {
     tail_jumps: Vec<SourceCallSiteIdentity>,
     interfaces: Vec<SourceCallSiteInterface>,
@@ -1374,9 +1376,25 @@ impl TrustedSsaArtifact {
                     );
                     break 'recovered None;
                 };
-                let Some(recovered) = crate::recover_interface::recover_interface(
+                // Function-interface recovery must see the same exact call
+                // boundaries as final preparation. In particular, a tail
+                // transfer is the function's result boundary, and an argument
+                // handed straight through it is still an entry parameter even
+                // though no explicit machine read names that value.
+                let provisional_machine_context =
+                    SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+                        blocks.as_slice(),
+                        Some(&arch),
+                        None,
+                        *source.machine_roles(),
+                        Some(source.convention_slots().clone()),
+                        correlated_call_sites.interfaces.clone(),
+                        correlated_call_sites.tail_jumps.clone(),
+                    );
+                let Some(recovered) = crate::recover_interface::recover_interface_with_context(
                     &preliminary,
                     source.convention_slots(),
+                    &provisional_machine_context,
                 ) else {
                     break 'recovered None;
                 };
@@ -5339,7 +5357,10 @@ mod tests {
 
     #[test]
     fn tail_jump_is_a_terminal_callsite_without_call_clobbers() {
-        let target = make_const(0x5000, 8);
+        // Direct code targets lifted from a real branch retain RAM storage;
+        // unlike an arithmetic literal, their SSA variable has no
+        // `constant_bits` payload.
+        let target = make_ram(0x5000, 8);
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Branch {
             target: target.clone(),

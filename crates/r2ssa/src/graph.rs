@@ -459,6 +459,44 @@ impl SsaGraph {
         self.values.get(id.0 as usize)
     }
 
+    /// Materialize a source-declared entry value that no explicit operation
+    /// reads.
+    ///
+    /// Calls consume register arguments implicitly. A parameter passed
+    /// straight through to a call therefore has no operation from which graph
+    /// construction could discover it, but the exact function interface still
+    /// proves that value exists at entry. It is a boundary value, not a
+    /// synthetic instruction: it has no definition and no use until a
+    /// certified call boundary names it.
+    pub(crate) fn ensure_entry_value(
+        &mut self,
+        var: SSAVar,
+        storage: CanonicalStorageId,
+    ) -> Option<ValueId> {
+        if var.version != 0
+            || var.size != storage.size
+            || storage.space != CanonicalStorageSpace::Register
+            || storage.size == 0
+        {
+            return None;
+        }
+        if let Some(id) = self.value_by_var.get(&var).copied() {
+            let value = self.value(id)?;
+            return (self.def_inst(id).is_none() && value.canonical_storage == Some(storage))
+                .then_some(id);
+        }
+        let id = ValueId(u32::try_from(self.values.len()).ok()?);
+        self.values.push(GraphValue {
+            id,
+            var: var.clone(),
+            canonical_storage: Some(storage),
+        });
+        self.value_by_var.insert(var, id);
+        self.def_of.push(None);
+        self.uses_of.push(Vec::new());
+        Some(id)
+    }
+
     pub fn def_inst(&self, id: ValueId) -> Option<InstId> {
         self.def_of.get(id.0 as usize).copied().flatten()
     }

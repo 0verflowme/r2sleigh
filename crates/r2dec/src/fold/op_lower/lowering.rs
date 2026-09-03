@@ -1153,10 +1153,7 @@ impl<'a> FoldingContext<'a> {
                         SSAOp::Branch { target }
                             if frame.source_call_site.is_some_and(|(block_addr, op_idx)| {
                                 self.certified_call_render_fact_for_op(block_addr, op_idx)
-                                    .is_some_and(|fact| {
-                                        fact.disposition
-                                            == r2types::CallsiteRenderDisposition::TerminalReturn
-                                    })
+                                    .is_some_and(|fact| fact.disposition.is_terminal_return())
                             }) =>
                         {
                             let Some((source_block, source_op_idx)) = frame.source_call_site else {
@@ -1164,9 +1161,7 @@ impl<'a> FoldingContext<'a> {
                             };
                             let (cert, render_fact) =
                                 self.admitted_callsite(source_block, source_op_idx)?;
-                            if render_fact.disposition
-                                != r2types::CallsiteRenderDisposition::TerminalReturn
-                            {
+                            if !render_fact.disposition.is_terminal_return() {
                                 return Err(OpLoweringRefusal::missing_machine_projection());
                             }
                             let func_expr =
@@ -1184,9 +1179,15 @@ impl<'a> FoldingContext<'a> {
                                 func_expr,
                                 certified_args.args,
                             );
-                            return self.finish_lowering_transaction(LoweredOp::FinalizedStmt(
-                                CStmt::Return(Some(call)),
-                            ));
+                            let stmt = if render_fact.disposition
+                                == r2types::CallsiteRenderDisposition::TerminalVoidReturn
+                            {
+                                CStmt::Block(vec![CStmt::Expr(call), CStmt::Return(None)])
+                            } else {
+                                CStmt::Return(Some(call))
+                            };
+                            return self
+                                .finish_lowering_transaction(LoweredOp::FinalizedStmt(stmt));
                         }
                         _ => {}
                     }
@@ -1224,9 +1225,7 @@ impl<'a> FoldingContext<'a> {
             || matches!(op, SSAOp::Branch { .. })
                 && source_site.is_some_and(|(block_addr, op_idx)| {
                     self.certified_call_render_fact_for_op(block_addr, op_idx)
-                        .is_some_and(|fact| {
-                            fact.disposition == r2types::CallsiteRenderDisposition::TerminalReturn
-                        })
+                        .is_some_and(|fact| fact.disposition.is_terminal_return())
                 });
         if carries_callsite && source_site.is_none() {
             return Ok(Some(self.certified_residual_comment(format!(

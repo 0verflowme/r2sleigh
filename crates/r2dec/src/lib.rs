@@ -4212,9 +4212,7 @@ impl Decompiler {
             let terminal_call = block.ops.iter().enumerate().any(|(op_idx, _)| {
                 fold_ctx
                     .certified_call_render_fact_for_op(block.addr, op_idx)
-                    .is_some_and(|fact| {
-                        fact.disposition == r2types::CallsiteRenderDisposition::TerminalReturn
-                    })
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
             });
             func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
                 !terminal_call
@@ -4314,9 +4312,7 @@ impl Decompiler {
             && block.ops.iter().enumerate().any(|(op_idx, _)| {
                 fold_ctx
                     .certified_call_render_fact_for_op(block.addr, op_idx)
-                    .is_some_and(|fact| {
-                        fact.disposition == r2types::CallsiteRenderDisposition::TerminalReturn
-                    })
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
             })
         {
             return None;

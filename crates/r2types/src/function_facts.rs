@@ -190,10 +190,18 @@ pub enum CallsiteRenderDisposition {
     SideEffectStatement,
     AssignedResult,
     NestedExpression,
-    /// The callee returns directly to this function's caller.
+    /// A value-returning callee returns directly to this function's caller.
     TerminalReturn,
+    /// A void callee returns directly to this function's caller.
+    TerminalVoidReturn,
     Suppressed,
     Residualized,
+}
+
+impl CallsiteRenderDisposition {
+    pub const fn is_terminal_return(self) -> bool {
+        matches!(self, Self::TerminalReturn | Self::TerminalVoidReturn)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3436,7 +3444,22 @@ fn prepared_call_render_facts(
             // value, so the call rendered as a bare statement *and* as its
             // definition's right-hand side, and one site was evaluated twice.
             let disposition = if cert.transfer == r2ssa::CallSiteTransfer::TailCall {
-                CallsiteRenderDisposition::TerminalReturn
+                match prepared
+                    .facts()
+                    .boundaries
+                    .calls
+                    .get(&cert.call_site)
+                    .filter(|boundary| boundary.complete && boundary.at == cert.at)
+                    .and_then(|boundary| boundary.result_kind)
+                {
+                    Some(r2ssa::SourceCallResult::Register { .. }) => {
+                        CallsiteRenderDisposition::TerminalReturn
+                    }
+                    Some(r2ssa::SourceCallResult::Void) => {
+                        CallsiteRenderDisposition::TerminalVoidReturn
+                    }
+                    None => CallsiteRenderDisposition::Residualized,
+                }
             } else if call_results.owner_for_site(callsite).is_some() {
                 CallsiteRenderDisposition::AssignedResult
             } else {

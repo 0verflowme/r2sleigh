@@ -732,8 +732,7 @@ impl<'a> FoldingContext<'a> {
                     ) => {
                         obligation.id.kind == ObligationKind::ControlTransfer
                             || rendered_call.is_some_and(|fact| {
-                                fact.disposition
-                                    == r2types::CallsiteRenderDisposition::TerminalReturn
+                                fact.disposition.is_terminal_return()
                                     && (obligation.id.kind == ObligationKind::Call
                                         || (obligation.id.kind == ObligationKind::CallArgument
                                             && !obligation.inputs.is_empty()
