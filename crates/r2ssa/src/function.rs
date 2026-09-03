@@ -6866,6 +6866,16 @@ mod tests {
         let facts = function.decompile_prep_facts().expect("prep facts");
         let block = function.get_block(0x4000).expect("entry block");
 
+        // The projection is the layer a new operation is most easily missed
+        // in: three separate tables key on the operation kind, and all three
+        // are needed before an entity exists for the restore's output. Two of
+        // them refuse loudly and one -- the type table -- refuses as an entity
+        // that was never built, which reads as a mismatch a long way from its
+        // cause. Asserting it here costs nothing and is what the corpus took a
+        // locked run to say.
+        crate::machine::MachineFunction::from_artifact(&prepared)
+            .expect("a restore is an ordinary machine expression");
+
         // Every restore the boundary states, in order. Three calls, three of
         // them, and the last one is what the return sees.
         let restored = block

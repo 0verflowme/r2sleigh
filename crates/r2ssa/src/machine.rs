@@ -4483,6 +4483,7 @@ fn machine_type_matches_op(op: &SSAOp, ty: &MachineType, output_bits: u32) -> bo
         }
         SSAOp::Load { .. }
         | SSAOp::Copy { .. }
+        | SSAOp::CallRestore { .. }
         | SSAOp::IntAdd { .. }
         | SSAOp::IntSub { .. }
         | SSAOp::IntMult { .. }
