@@ -5496,6 +5496,12 @@ fn restate_string_conversions_in_expr(
                 | BinaryOp::BitAnd
                 | BinaryOp::BitOr
                 | BinaryOp::BitXor
+                | BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
         )
     {
         // An address takes the address integer, because arithmetic on an
@@ -6019,6 +6025,41 @@ fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compared_mask_takes_the_type_of_what_it_is_compared_with() {
+        // `tmp < -0x4` where `tmp` is a `uint64_t`. The comparison is read as
+        // a truth value, so the type the mask needs is not the statement's --
+        // it is the other operand's, and `-0x4` is an `int` until something
+        // says otherwise.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "tmp_3ea80_2".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Lt,
+                CExpr::Var(name),
+                CExpr::UIntLit(0xffff_ffff_ffff_fffc),
+            ))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u8()), Some(&table));
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the comparison, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask takes the compared operand's type, not the flag's: {right:?}"
+        );
+    }
 
     #[test]
     fn a_mask_under_a_render_marker_still_takes_the_type_that_reads_it() {
