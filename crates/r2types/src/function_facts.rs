@@ -1668,7 +1668,14 @@ impl SourceOwnedFunctionFacts {
     }
 }
 
-fn exact_source_return_type(source: &r2ssa::SsaArtifact) -> Option<CTypeLike> {
+/// The logical return type licensed by the exact source interface and every
+/// certified machine return boundary.
+///
+/// This is independent of whether advisory type recovery happened to create a
+/// whole [`FunctionSignatureSpec`]. In particular, a tail-only function has no
+/// `SSAOp::Return` from which the decompiler could infer a type, while its exact
+/// tail-call boundary still proves the carrier returned on the caller's behalf.
+pub fn exact_source_return_type(source: &r2ssa::SsaArtifact) -> Option<CTypeLike> {
     let context = source.machine_context();
     let abi = context.abi_model();
     let memory = context.memory_model();

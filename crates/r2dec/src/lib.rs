@@ -4801,8 +4801,9 @@ impl Decompiler {
                 ));
             }
         };
-        let inferred_ret_type =
-            evidence_return_type(prepared, input.source_owned_facts().evidence_types());
+        let inferred_ret_type = r2types::exact_source_return_type(prepared).unwrap_or_else(|| {
+            evidence_return_type(prepared, input.source_owned_facts().evidence_types())
+        });
         let signature_ret_type = render_signature.and_then(|sig| sig.ret_type.clone());
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
