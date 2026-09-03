@@ -583,7 +583,7 @@ fn duplicable_bound_literals(
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
     }
-    let boundary_live_definitions = boundary_live_definitions(source_owned.source());
+    let boundary_rendered = boundary_rendered_values(source_owned.source());
     let literal_candidates = graph
         .values
         .iter()
@@ -627,26 +627,41 @@ fn duplicable_bound_literals(
         // This is also why a literal in a lowering temporary never had the
         // problem. A boundary is expressed in architectural storage, so the
         // lifter's own scratch is never live at one.
-        .filter(|value| {
-            !boundary_live_definitions.contains(&graph.def_inst(*value).unwrap_or(InstId(u32::MAX)))
-        })
+        .filter(|value| !boundary_rendered.contains(value))
         .collect()
 }
 
-/// Instructions a boundary requires to render, by the obligation it seeds.
-fn boundary_live_definitions(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
-    let obligations = source.obligations();
-    obligations
-        .obligations()
-        .keys()
-        .filter(|id| id.kind == r2ssa::SemanticObligationKind::LiveValueProducer)
-        .filter_map(|id| {
-            obligations
-                .instructions()
-                .get(&id.instruction)
-                .and_then(|disposition| disposition.source.graph_inst())
-        })
-        .collect()
+/// Values a return boundary spells through its own path.
+///
+/// These are exactly the values `seed_value_definition` seeds a
+/// `LiveValueProducer` obligation for at a return: the returned values, the
+/// pieces of a register composition, the return address, and the exit stack
+/// pointer. The obligation kind alone is far wider than this -- filtering on
+/// it turned away every candidate, including the page base that motivated
+/// the admission -- because the same kind is seeded elsewhere for values the
+/// inline machinery does render.
+fn boundary_rendered_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    let mut values = BTreeSet::new();
+    for boundary in source.facts().boundaries.returns.values() {
+        for value in &boundary.values {
+            values.insert(value.value);
+        }
+        for composition in &boundary.register_compositions {
+            values.insert(composition.base.value);
+            for overlay in &composition.overlays {
+                values.insert(overlay.definition.value);
+            }
+        }
+        if let Some(return_address) = boundary.return_address {
+            values.insert(return_address.value);
+        }
+        if let Some(r2ssa::SourceReturnStackPointerFact::ReachingValue { value, .. }) =
+            boundary.exit_stack_pointer
+        {
+            values.insert(value);
+        }
+    }
+    values
 }
 
 fn inlinable_core(
