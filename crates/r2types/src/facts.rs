@@ -667,6 +667,7 @@ pub struct FunctionTypeFacts {
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub external_type_db: ExternalTypeDb,
+    pub program_data_objects: crate::ProgramDataObjectTypeFacts,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub field_access_certificates: Vec<FieldAccessCertificate>,
@@ -689,6 +690,7 @@ pub struct FunctionTypeFactInputs {
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub external_type_db: ExternalTypeDb,
+    pub program_data_objects: crate::ProgramDataObjectTypeFacts,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
@@ -721,6 +723,7 @@ impl FunctionTypeFacts {
             && self.external_type_db.enums.is_empty()
             && self.external_type_db.typedefs.is_empty()
             && self.external_type_db.diagnostics.is_empty()
+            && self.program_data_objects == crate::ProgramDataObjectTypeFacts::default()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
             && self.field_access_certificates.is_empty()
@@ -743,6 +746,7 @@ impl FunctionTypeFacts {
             visible_bindings: self.visible_bindings,
             callee_facts: self.callee_facts,
             external_type_db: self.external_type_db,
+            program_data_objects: self.program_data_objects,
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
             local_field_accesses: Vec::new(),
@@ -1369,6 +1373,7 @@ impl FunctionTypeFactsBuilder {
             mut visible_bindings,
             callee_facts,
             external_type_db,
+            program_data_objects,
             slot_type_overrides,
             slot_field_profiles,
             mut signature_certificate,
@@ -1399,6 +1404,7 @@ impl FunctionTypeFactsBuilder {
             visible_bindings,
             callee_facts,
             external_type_db,
+            program_data_objects,
             slot_type_overrides,
             slot_field_profiles,
             field_access_certificates,

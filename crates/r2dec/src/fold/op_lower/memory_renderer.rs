@@ -501,6 +501,7 @@ impl<'a> FoldingContext<'a> {
             | CExpr::Unary { .. }
             | CExpr::Binary { .. }
             | CExpr::External { .. }
+            | CExpr::DataObject { .. }
             | CExpr::Ternary { .. }
             | CExpr::Cast { .. }
             | CExpr::Call { .. }

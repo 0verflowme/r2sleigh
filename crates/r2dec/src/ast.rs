@@ -79,6 +79,9 @@ pub enum CExpr {
         name: String,
         kind: crate::symbol::ExternalKind,
     },
+    /// A program-scope data object. Its address is the identity; `name` is
+    /// presentation only.
+    DataObject { address: u64, name: String },
     /// Unary operation.
     Unary { op: UnaryOp, operand: Box<CExpr> },
     /// Binary operation.
@@ -233,6 +236,16 @@ impl CExpr {
                     kind: right_kind,
                 },
             ) => left_name == right_name && left_kind == right_kind,
+            (
+                Self::DataObject {
+                    address: left_address,
+                    name: left_name,
+                },
+                Self::DataObject {
+                    address: right_address,
+                    name: right_name,
+                },
+            ) => left_address == right_address && left_name == right_name,
             (
                 Self::Unary {
                     op: left_op,
@@ -735,6 +748,7 @@ impl CExpr {
             | Self::CharLit(_)
             | Self::Var(_)
             | Self::External { .. }
+            | Self::DataObject { .. }
             | Self::SizeofType(_) => {}
             Self::Observed { .. } => unreachable!("handled before visiting semantic nodes"),
         }
@@ -1128,10 +1142,18 @@ pub struct CFunction {
     /// Named data objects the body refers to, declared so the rendering stays a
     /// self-contained translation unit.
     ///
-    /// The type is deliberately not claimed: the body only ever takes the
-    /// object's address, so an incomplete array of bytes declares exactly what
-    /// is known -- that a named object lives there -- and nothing more.
-    pub extern_objects: Vec<(String, u64)>,
+    /// An accepted type remains marked with its radare2 provenance. Without
+    /// one, the emitter keeps the honest incomplete-byte-array declaration.
+    pub extern_objects: Vec<CExternObject>,
+}
+
+/// One program data object used by this function's rendered body.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CExternObject {
+    pub name: String,
+    pub address: u64,
+    pub type_fact: Option<r2types::DataObjectTypeFact>,
+    pub type_refusal: Option<r2types::DataObjectTypeRefusal>,
 }
 
 /// A machine symbol spelled as a C identifier.
@@ -1514,6 +1536,7 @@ pub(crate) fn remap_render_observation_ids<E>(
             | CExpr::CharLit(_)
             | CExpr::Var(_)
             | CExpr::External { .. }
+            | CExpr::DataObject { .. }
             | CExpr::SizeofType(_) => {}
         }
         Ok(())
@@ -1665,6 +1688,7 @@ fn inspect_expr_observations<E>(
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
     Ok(())
@@ -1746,6 +1770,7 @@ fn visit_expr_observations<E>(
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
     Ok(())
@@ -1802,6 +1827,7 @@ fn strip_expr_observations(expr: &mut CExpr) {
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
 }

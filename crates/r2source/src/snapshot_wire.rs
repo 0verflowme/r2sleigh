@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 7;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 8;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -357,8 +357,8 @@ use crate::{
     AdvisoryCallPrototype, AdvisoryCallSite, AdvisoryCallTransfer, AdvisorySuccessor,
     AdvisorySuccessorKind, CapturedSourceFields, DiagnosticIdentity, FunctionIdentity,
     FunctionPresentation, MachineProfile, OwnedFunctionBlock, OwnedFunctionImage,
-    OwnedFunctionSnapshot, SnapshotValidationError, SourceCodePointerTable, SourceEndianness,
-    SourceSignatureParameter, SourceSignaturePresentation, SourceStackSlotName,
+    OwnedFunctionSnapshot, SnapshotValidationError, SourceCodePointerTable, SourceDataObject,
+    SourceEndianness, SourceSignatureParameter, SourceSignaturePresentation, SourceStackSlotName,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -1075,6 +1075,14 @@ pub fn write_image(
     writer: &mut SnapshotWireWriter,
     image: &OwnedFunctionImage,
 ) -> Result<(), SnapshotWireError> {
+    write_image_for_format(writer, image, SNAPSHOT_WIRE_FORMAT_VERSION)
+}
+
+fn write_image_for_format(
+    writer: &mut SnapshotWireWriter,
+    image: &OwnedFunctionImage,
+    format_version: u32,
+) -> Result<(), SnapshotWireError> {
     writer.u64(image.entry_address());
     let blocks =
         u32::try_from(image.blocks().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
@@ -1098,9 +1106,12 @@ pub fn write_image(
     let symbols =
         u32::try_from(image.data_symbols().len()).map_err(|_| SnapshotWireError::ValueTooWide)?;
     writer.u32(symbols);
-    for (addr, name) in image.data_symbols() {
-        writer.u64(*addr);
-        writer.string(name)?;
+    for object in image.data_symbols() {
+        writer.u64(object.address());
+        writer.string(object.name())?;
+        if format_version >= 8 {
+            writer.optional_string(object.type_spelling())?;
+        }
     }
     let tables = u32::try_from(image.code_pointer_tables().len())
         .map_err(|_| SnapshotWireError::ValueTooWide)?;
@@ -1145,7 +1156,13 @@ pub fn read_image(
     let mut data_symbols = Vec::with_capacity(symbol_count.min(4096));
     for _ in 0..symbol_count {
         let addr = reader.u64()?;
-        data_symbols.push((addr, reader.string()?.to_string()));
+        let name = reader.string()?;
+        let type_spelling = if reader.format_version() >= 8 {
+            reader.optional_string()?
+        } else {
+            None
+        };
+        data_symbols.push(SourceDataObject::new(addr, name, type_spelling));
     }
     let table_count = reader.u32()? as usize;
     let mut code_pointer_tables = Vec::with_capacity(table_count.min(64));
@@ -2184,6 +2201,53 @@ fn decode_snapshot_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_with_data_object(object: SourceDataObject) -> OwnedFunctionImage {
+        OwnedFunctionImage {
+            entry_address: 0x1000,
+            blocks: Box::new([]),
+            external_exits: Box::new([]),
+            string_literals: Box::new([]),
+            data_symbols: Box::new([object]),
+            code_pointer_tables: Box::new([]),
+            total_source_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn v8_data_object_type_round_trips_with_its_structural_address() {
+        let image = image_with_data_object(SourceDataObject::new(
+            0x7000,
+            "global_counter",
+            Some("int32_t"),
+        ));
+        let mut writer = SnapshotWireWriter::new();
+        write_image(&mut writer, &image).expect("write typed data object");
+        let buffer = writer.finish().expect("finish typed data object");
+        let mut reader = SnapshotWireReader::new(&buffer).expect("typed data header");
+        let decoded = read_image(&mut reader).expect("read typed data object");
+        assert_eq!(decoded.data_symbols(), image.data_symbols());
+        assert_eq!(decoded.data_symbols()[0].address(), 0x7000);
+        assert_eq!(decoded.data_symbols()[0].type_spelling(), Some("int32_t"));
+    }
+
+    #[test]
+    fn v7_data_object_decodes_without_inventing_a_type() {
+        let image = image_with_data_object(SourceDataObject::new(
+            0x7000,
+            "global_counter",
+            Some("int32_t"),
+        ));
+        let mut writer = SnapshotWireWriter::new();
+        write_image_for_format(&mut writer, &image, 7).expect("write v7 data object");
+        let mut buffer = writer.finish().expect("finish v7 data object");
+        buffer[4..8].copy_from_slice(&7u32.to_le_bytes());
+        let mut reader = SnapshotWireReader::new(&buffer).expect("v7 data header");
+        let decoded = read_image(&mut reader).expect("read v7 data object");
+        assert_eq!(decoded.data_symbols()[0].address(), 0x7000);
+        assert_eq!(decoded.data_symbols()[0].name(), "global_counter");
+        assert_eq!(decoded.data_symbols()[0].type_spelling(), None);
+    }
 
     #[test]
     fn a_pointer_table_round_trips_with_every_target() {
@@ -3328,7 +3392,7 @@ mod tests {
         write_machine_profile(&mut writer, snapshot.machine()).expect("machine");
         write_function_identity(&mut writer, snapshot.function());
         write_presentation(&mut writer, snapshot.presentation()).expect("presentation");
-        write_image(&mut writer, snapshot.image()).expect("image");
+        write_image_for_format(&mut writer, snapshot.image(), format_version).expect("image");
         writer.u32(snapshot.advisory_calls().len() as u32);
         for site in snapshot.advisory_calls() {
             write_call_site(&mut writer, site).expect("call site");

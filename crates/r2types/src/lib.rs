@@ -45,6 +45,9 @@ pub use context::{
     parse_external_assumption_payload_json, parse_external_context, parse_external_context_json,
 };
 pub use convert::{CTypeLike, parse_c_type_like, render_c_type_like, to_c_type_like};
+pub use data_object::{
+    DataObjectTypeFact, DataObjectTypeProvenance, DataObjectTypeRefusal, ProgramDataObjectTypeFacts,
+};
 pub use evidence::{EvidenceNode, EvidenceTypes, SourceEvidenceTypeOracle, solve_evidence_types};
 pub use external::{
     ExternalAggregateKind, ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb,
@@ -189,3 +192,4 @@ mod tests {
         );
     }
 }
+mod data_object;

@@ -1118,6 +1118,7 @@ fn collect_expr_observation_scopes(
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
 
@@ -1298,6 +1299,7 @@ fn visit_expr_observations(expr: &CExpr, visit: &mut impl FnMut(RenderObservatio
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
 }
@@ -1729,6 +1731,7 @@ fn audit_expr(
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => {}
     }
     Ok(())
@@ -1985,6 +1988,7 @@ pub(crate) fn expr_reads_symbol(expr: &CExpr, symbol: crate::symbol::SymbolId) -
         | CExpr::StringLit(_)
         | CExpr::CharLit(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::Sizeof(_)
         | CExpr::SizeofType(_)
         | CExpr::AddrOf(_) => false,

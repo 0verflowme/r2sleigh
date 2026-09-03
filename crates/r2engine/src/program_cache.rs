@@ -36,13 +36,22 @@
 //! request wants, and the analysis sweep this exists for asks about all of
 //! them.
 //!
-//! **Why one map rather than one per binary.** Reuse is gated on the input
+//! **Why one function map rather than one per binary.** Reuse is gated on the input
 //! bytes being identical, and a lift is a function of its input alone, so an
 //! entry matching byte for byte returns the artifact that binary's own
 //! snapshot would have produced, whichever binary recorded it. The address
 //! selects a candidate; the bytes are what makes reusing it sound. A
 //! per-binary handle would add a key that changes nothing about which answers
 //! are correct.
+//!
+//! Data object types are different: their scope is the program, while a
+//! snapshot and renderer are function-local. The cache therefore also holds a
+//! monotone program view keyed by object address. A missing or unplaceable
+//! observation cannot displace an accepted source fact, and two accepted types
+//! for one address poison that address into an explicit conflict. That makes
+//! accidental reuse across program sessions lose precision rather than render
+//! the wrong type. The map is bounded by the distinct data addresses observed
+//! in the session, which is the data that must clear it.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -162,7 +171,11 @@ impl<T: Clone> FunctionCache<T> {
     }
 }
 
-type ProgramCache = FunctionCache<Arc<r2ssa::TrustedSsaArtifact>>;
+#[derive(Default)]
+struct ProgramCache {
+    functions: FunctionCache<Arc<r2ssa::TrustedSsaArtifact>>,
+    data_objects: r2types::ProgramDataObjectTypeFacts,
+}
 
 fn program_cache() -> &'static Mutex<ProgramCache> {
     static CACHE: OnceLock<Mutex<ProgramCache>> = OnceLock::new();
@@ -186,7 +199,7 @@ pub fn cached_function_artifact(
     address: u64,
     input: &[u8],
 ) -> Option<Arc<r2ssa::TrustedSsaArtifact>> {
-    lock_program_cache().lookup(role, address, input)
+    lock_program_cache().functions.lookup(role, address, input)
 }
 
 /// Record a prepared artifact under the bytes that produced it, and return the
@@ -198,17 +211,28 @@ pub fn cache_function_artifact(
     artifact: &Arc<r2ssa::TrustedSsaArtifact>,
 ) -> u64 {
     let fingerprint = r2ssa::stable_ssa_semantic_fingerprint(artifact.artifact());
-    lock_program_cache().insert(role, address, input, Arc::clone(artifact), fingerprint);
+    lock_program_cache()
+        .functions
+        .insert(role, address, input, Arc::clone(artifact), fingerprint);
     fingerprint
 }
 
 /// The semantics recorded for this address, if anything is recorded for it.
 pub fn cached_function_fingerprint(role: PreparedRole, address: u64) -> Option<u64> {
-    lock_program_cache().fingerprint(role, address)
+    lock_program_cache().functions.fingerprint(role, address)
 }
 
 pub fn program_cache_stats() -> ProgramCacheStats {
-    lock_program_cache().stats()
+    lock_program_cache().functions.stats()
+}
+
+/// Add source-owned observations and return the complete program-scope view.
+pub fn cache_program_data_object_types(
+    observed: &r2types::ProgramDataObjectTypeFacts,
+) -> r2types::ProgramDataObjectTypeFacts {
+    let mut cache = lock_program_cache();
+    cache.data_objects.absorb(observed);
+    cache.data_objects.clone()
 }
 
 /// Drop everything, so a caller can measure a cold cache. Production never
@@ -286,5 +310,27 @@ mod tests {
         cache.insert(PreparedRole::Root, 0x1000, b"body-and-more", 99, 0xfeed);
         assert_eq!(cache.lookup(PreparedRole::Root, 0x1000, b"body"), None);
         assert_eq!(cache.stats().replacements, 1);
+    }
+
+    #[test]
+    fn a_data_object_type_survives_the_function_snapshot_that_carried_it() {
+        let observed = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, Some("int32_t"))],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let later_snapshot = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, None)],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let mut cache = ProgramCache::default();
+        cache.data_objects.absorb(&observed);
+        cache.data_objects.absorb(&later_snapshot);
+
+        assert_eq!(
+            cache.data_objects.get(0x7000).map(|fact| &fact.ty),
+            Some(&r2types::CTypeLike::i32())
+        );
     }
 }

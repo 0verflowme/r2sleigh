@@ -143,6 +143,7 @@ pub(crate) fn expr_is_side_effect_free(expr: &CExpr) -> bool {
         | CExpr::CharLit(_)
         | CExpr::Var(_)
         | CExpr::External { .. }
+        | CExpr::DataObject { .. }
         | CExpr::SizeofType(_) => true,
         CExpr::Paren(inner)
         | CExpr::AddrOf(inner)

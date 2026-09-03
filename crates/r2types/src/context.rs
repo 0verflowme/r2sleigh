@@ -45,6 +45,7 @@ pub struct ParsedExternalContext {
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub external_type_db: ExternalTypeDb,
+    pub program_data_objects: crate::ProgramDataObjectTypeFacts,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub assumptions: r2ssa::AssumptionSet,
     pub diagnostics: Vec<String>,
@@ -470,6 +471,7 @@ pub fn function_type_facts_from_parsed_context(
         register_params: parsed_context.register_params.clone(),
         stack_slots: parsed_context.stack_slots.clone(),
         external_type_db: parsed_context.external_type_db.clone(),
+        program_data_objects: parsed_context.program_data_objects.clone(),
         callee_facts: parsed_context.callee_facts.clone(),
         diagnostics: parsed_context.diagnostics.clone(),
         ..FunctionTypeFacts::default()

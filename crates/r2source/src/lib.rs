@@ -25,7 +25,7 @@ mod contracts;
 /// predecessor of the flat wire buffer. That module was 2,923 lines holding the
 /// largest concentration of `unsafe` in the tree, and nothing had called into
 /// it since the migration.
-pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 14;
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 16;
 
 /// Version of the snapshot transport contract itself.
 pub const RADARE_SNAPSHOT_CONTRACT_VERSION: u32 = 1;
@@ -348,14 +348,12 @@ pub struct OwnedFunctionImage {
     /// Display data: it tells a renderer what to print where a constant points
     /// at text, and carries no claim about behaviour.
     string_literals: Box<[(u64, String)]>,
-    /// Names radare2 already has for the data this function points at, with the
-    /// address each names.
+    /// Data objects radare2 already knows this function points at.
     ///
-    /// Display data, exactly like the string literals above: it tells a renderer
-    /// what to call an address, and carries no claim about what is stored there.
-    /// A rendering that uses one is depending on radare2's analysis rather than
-    /// on the machine, which is why the proof line records that it did.
-    data_symbols: Box<[(u64, String)]>,
+    /// The name is display data. An optional type spelling is a source-owned
+    /// analysis fact linked to the object's structural address; consumers must
+    /// still refuse a spelling their canonical type context cannot place.
+    data_symbols: Box<[SourceDataObject]>,
     /// Tables of function pointers the function indexes, with the addresses
     /// each table holds.
     ///
@@ -364,6 +362,43 @@ pub struct OwnedFunctionImage {
     /// range a caller can prove for the index.
     code_pointer_tables: Box<[SourceCodePointerTable]>,
     total_source_bytes: usize,
+}
+
+/// One program data object referenced by a captured function.
+///
+/// Address is identity. Name is presentation. The optional spelling is the
+/// exact address-linked type radare2 supplied and is not machine-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDataObject {
+    address: u64,
+    name: Box<str>,
+    type_spelling: Option<Box<str>>,
+}
+
+impl SourceDataObject {
+    pub fn new(
+        address: u64,
+        name: impl Into<Box<str>>,
+        type_spelling: Option<impl Into<Box<str>>>,
+    ) -> Self {
+        Self {
+            address,
+            name: name.into(),
+            type_spelling: type_spelling.map(Into::into),
+        }
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
+    }
 }
 
 /// One table of function pointers, read where the function points at it.
@@ -401,7 +436,7 @@ impl OwnedFunctionImage {
         self.entry_address
     }
 
-    pub fn data_symbols(&self) -> &[(u64, String)] {
+    pub fn data_symbols(&self) -> &[SourceDataObject] {
         &self.data_symbols
     }
 
