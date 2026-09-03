@@ -39,6 +39,7 @@ done
 run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
 remote="/root/$run_id"
 private_home="$remote/home"
+fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
 
 # A string only this tree contains, so a build that failed to install cannot be
 # mistaken for a change with no effect. That has already cost two measurements:
@@ -51,6 +52,39 @@ echo "witness $witness"
 
 ssh "$host" "mkdir -p '$remote/tree'"
 git -C "$root" ls-files -z | rsync -a --files-from=- --from0 "$root/" "$host:$remote/tree/"
+
+# The plugin's C is compiled against the radare2 fork, and this project changes
+# that fork. A tree whose C calls an API the host's fork does not have fails to
+# build, so the fork travels with the plugin rather than being assumed current.
+# The build check below turns that into a loud failure rather than a measurement
+# of whatever was installed before, but only if the fork is actually brought up
+# to date first.
+fork_local=${R2SLEIGH_R2_FORK:-$(cd "$root/.." && pwd)/radare2}
+if [ -d "$fork_local/.git" ]; then
+    # The comparison is against a stamp this script writes, not against the
+    # host's git HEAD: only tracked files are copied, so the host's `.git` never
+    # advances and its HEAD would always disagree.
+    want=$(git -C "$fork_local" rev-parse HEAD)
+    have=$(ssh "$host" "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
+    if [ "$want" != "$have" ]; then
+        echo "radare2 fork: host at ${have:-none}, this tree wants $want; syncing and rebuilding"
+        git -C "$fork_local" ls-files -z \
+            | rsync -a --files-from=- --from0 "$fork_local/" "$host:$fork_remote/"
+        ssh "$host" bash -s <<EOF
+set -euo pipefail
+cd '$fork_remote'
+git config --global --add safe.directory '$fork_remote' 2>/dev/null || true
+find . -name '*.o' -newer configure -delete 2>/dev/null || true
+./configure --prefix=/usr/local >/tmp/r2-configure.log 2>&1 || { tail -20 /tmp/r2-configure.log; exit 70; }
+make -j4 >/tmp/r2-make.log 2>&1 || { tail -30 /tmp/r2-make.log; exit 70; }
+make install >/tmp/r2-install.log 2>&1 || { tail -20 /tmp/r2-install.log; exit 70; }
+printf '%s\n' '$want' > '$fork_remote/.r2sleigh-synced-from'
+radare2 -v | head -1
+EOF
+    else
+        echo "radare2 fork: host already at $want"
+    fi
+fi
 ssh "$host" "printf 'pub const DECBENCH_WITNESS: &str = \"%s\";\n' '$witness' >> $remote/tree/crates/r2engine/src/lib.rs"
 
 ssh "$host" bash -s <<EOF
@@ -58,7 +92,7 @@ set -euo pipefail
 mkdir -p '$private_home'
 export HOME='$private_home'
 cd '$remote/tree'
-LOCAL_R2_DIR=/root/r2sleigh-fork-radare2 make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
+LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
     tail -20 '$remote/install.log'; exit 70; }
 lib=\$(find '$private_home/.local/share/radare2/plugins' -name 'libr2sleigh_plugin.*' | head -1)
 if [ -z "\$lib" ]; then echo "no plugin library was installed" >&2; exit 70; fi
