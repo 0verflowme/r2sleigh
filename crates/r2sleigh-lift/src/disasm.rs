@@ -49,8 +49,6 @@ struct LoadedSleigh {
     reg_name_map: HashMap<(u64, u32), String>,
     /// Exact mapping extracted with the architecture metadata for this session.
     space_map: HashMap<AddressSpaceId, SpaceId>,
-    /// Register the processor spec names as the program counter.
-    program_counter: String,
     /// Architecture metadata extracted during this parse.
     arch: Arc<r2il::ArchSpec>,
     /// Authority retained by the owner and handed only to certifying views.
@@ -1364,7 +1362,8 @@ impl Disassembler {
             .map_err(|e| LiftError::Parse(format!("Failed to load .sla: {}", e)))?;
 
         let reg_name_map = build_register_name_map(&sleigh);
-        let extracted = crate::sleigh::extract_architecture(&sleigh, arch_name)?;
+        let mut extracted = crate::sleigh::extract_architecture(&sleigh, arch_name)?;
+        extracted.arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
         let arch = Arc::new(extracted.arch);
         let genuine_authority = trusted_profile.map(|_| {
             GenuineLiftAuthority::new(
@@ -1376,7 +1375,6 @@ impl Disassembler {
         });
 
         Ok(Rc::new(LoadedSleigh {
-            program_counter: program_counter_from_pspec(pspec),
             sleigh,
             arch_name: arch_name.to_string(),
             reg_name_map,
@@ -1642,7 +1640,7 @@ impl Disassembler {
     /// Writing a branch target to the wrong name leaves the branch with no
     /// effect at all.
     pub fn program_counter(&self) -> &str {
-        &self.loaded.program_counter
+        self.loaded.arch.program_counter.as_deref().unwrap_or("pc")
     }
 
     /// Get the default code address space.
@@ -2835,28 +2833,6 @@ fn is_stack_register(arch_name: &str, reg: &str) -> bool {
             "sp" | "rsp" | "esp" | "bp" | "rbp" | "ebp" | "fp" | "s0" | "x2" | "x8"
         )
     }
-}
-
-/// Read `<programcounter register="..."/>` out of a Ghidra processor spec.
-fn program_counter_from_pspec(pspec: &str) -> String {
-    const KEY: &str = "programcounter";
-    let Some(rest) = pspec.split_once(KEY).map(|(_, rest)| rest) else {
-        return "pc".to_string();
-    };
-    let Some(rest) = rest.split_once("register=").map(|(_, rest)| rest) else {
-        return "pc".to_string();
-    };
-    let rest = rest.trim_start();
-    let quote = match rest.chars().next() {
-        Some(c @ ('"' | '\'')) => c,
-        _ => return "pc".to_string(),
-    };
-    rest[1..]
-        .split(quote)
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("pc")
-        .to_string()
 }
 
 fn is_pc_register(reg: &str) -> bool {
