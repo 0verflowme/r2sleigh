@@ -301,6 +301,14 @@ fn upstream_zero_occurrence_outcome(
                     .unwrap_or_default(),
             )
         });
+    // Placement removed the statement this obligation's only occurrence sat
+    // on, because nothing reads the object that statement wrote. The value,
+    // use and write cells are already answered with that same fact; the
+    // obligation is dead with the statement rather than unaccounted for.
+    if effects.placement_removed_effect(id) {
+        return Outcome::Elided(ElisionReason::DeadUnreadBinding);
+    }
+
     r2il::refusal_evidence!(
         "zero-occurrence-outcome",
         "kind={:?} component={:?} block={:#x} source_inst={source_inst:?}          graph_block={:?} output={refused_output:?} inputs={:?}",
