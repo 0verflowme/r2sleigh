@@ -311,8 +311,7 @@ impl SsaArtifact {
         control.poll()?;
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
-        let mut graph = SsaGraph::from_function_with_storage(&function);
-        crate::semantic::ensure_source_formal_parameter_values(&mut graph, &machine_context);
+        let graph = SsaGraph::from_function_with_storage(&function);
         let formal_parameters =
             crate::semantic::collect_source_formal_parameter_facts(&graph, &machine_context);
         function.install_exact_formal_parameters(&graph, &formal_parameters);
@@ -1378,9 +1377,7 @@ impl TrustedSsaArtifact {
                 };
                 // Function-interface recovery must see the same exact call
                 // boundaries as final preparation. In particular, a tail
-                // transfer is the function's result boundary, and an argument
-                // handed straight through it is still an entry parameter even
-                // though no explicit machine read names that value.
+                // transfer is the function's result boundary.
                 let provisional_machine_context =
                     SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
                         blocks.as_slice(),

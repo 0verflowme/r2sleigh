@@ -257,9 +257,17 @@ fn recover_interface_inner(
     // A carrier passed straight to a call is read by that call, so it belongs
     // in the same evidence as an explicit entry read. The prefix rule below is
     // unchanged and still stops at the first candidate slot nothing observes.
-    for storage in passed_through_entry_storages(&facts.boundaries) {
-        if !reads.contains(&storage) {
-            reads.push(storage);
+    // Context-free recovery historically has no exact call interfaces, but
+    // retain its boundary projection as a local analysis facility. Production
+    // contextual recovery uses the call boundary only for the tail result:
+    // making an implicit preserved argument into a formal parameter also
+    // requires every consumer to agree that its new graph value is spellable,
+    // which is a separate contract from terminal-transfer recovery.
+    if machine_context.is_none() {
+        for storage in passed_through_entry_storages(&facts.boundaries) {
+            if !reads.contains(&storage) {
+                reads.push(storage);
+            }
         }
     }
     let mut parameters = Vec::new();

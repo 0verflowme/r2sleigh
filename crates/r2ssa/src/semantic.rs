@@ -3404,47 +3404,6 @@ fn collect_source_boundary_facts(
 /// The single authoritative projection from source ABI parameter slots to
 /// entry SSA values. Preparation and published boundary facts consume this
 /// same answer; register spelling is never an identity input.
-pub(crate) fn ensure_source_formal_parameter_values(
-    graph: &mut SsaGraph,
-    machine_context: &SourceMachineContext,
-) {
-    let Some(interface) = machine_context.function_interface() else {
-        return;
-    };
-    for (parameter_position, parameter) in interface.parameters().iter().enumerate() {
-        let abi_storage = parameter.storage();
-        let logical_value = interface
-            .parameter_logical_values()
-            .get(parameter_position)
-            .copied();
-        let graph_storage = match (logical_value, interface.type_graph()) {
-            (Some(logical_value), Some(type_graph)) => {
-                let Some(storage) =
-                    projected_formal_parameter_storage(abi_storage, logical_value, type_graph)
-                else {
-                    continue;
-                };
-                storage
-            }
-            (None, None) => abi_storage,
-            (Some(_), None) | (None, Some(_)) => continue,
-        };
-        let already_present = graph.values.iter().any(|value| {
-            graph.def_inst(value.id).is_none()
-                && value.var.version == 0
-                && value.var.size == graph_storage.size
-                && value.canonical_storage == Some(graph_storage)
-        });
-        if already_present {
-            continue;
-        }
-        let name = machine_context
-            .register_name(graph_storage)
-            .unwrap_or_else(|| format!("reg:{:x}", graph_storage.offset));
-        let _ = graph.ensure_entry_value(SSAVar::initial(name, graph_storage.size), graph_storage);
-    }
-}
-
 pub(crate) fn collect_source_formal_parameter_facts(
     graph: &SsaGraph,
     machine_context: &SourceMachineContext,
@@ -3753,27 +3712,6 @@ fn reaching_variadic_tail_argument_in_block(
 }
 
 /// Resolve one call argument carrier, keeping the preserved-entry case.
-fn unique_entry_value_for_storage(
-    graph: &SsaGraph,
-    storage: CanonicalStorageId,
-) -> Option<ValueId> {
-    let candidates = graph
-        .values
-        .iter()
-        .filter(|value| {
-            graph.def_inst(value.id).is_none()
-                && value.var.version == 0
-                && value.var.size == storage.size
-                && value.canonical_storage == Some(storage)
-        })
-        .map(|value| value.id)
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [value] => Some(*value),
-        _ => None,
-    }
-}
-
 fn reaching_abi_argument_in_block(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -3792,9 +3730,7 @@ fn reaching_abi_argument_in_block(
         true,
     )
     .map(|state| match state {
-        ReachingAbiState::PreservedEntry => unique_entry_value_for_storage(graph, storage)
-            .map(SourceCallArgumentValue::Value)
-            .unwrap_or(SourceCallArgumentValue::PreservedEntry),
+        ReachingAbiState::PreservedEntry => SourceCallArgumentValue::PreservedEntry,
         ReachingAbiState::Value(value) => SourceCallArgumentValue::Value(value),
     })
 }
