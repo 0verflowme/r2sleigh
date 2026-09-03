@@ -3247,8 +3247,9 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
 /// duplicates a shared tail rather than jumping to it -- and then two
 /// occurrences of one binding carry the same block address while sitting in
 /// regions that are not nested. The read-before-assignment proof reasons per
-/// block, so it cannot tell the copies apart, and requiring the regions to nest
-/// is what kept it sound.
+/// block, so it cannot tell the copies apart. Nested regions are ordered, and
+/// regions under different arms of one certified selection are mutually
+/// exclusive; either fact is sufficient to keep the block proof sound.
 ///
 /// A copy that assigns the object before it reads it needs nothing from any
 /// other copy, so where it sits relative to them cannot make a read precede an
@@ -3283,6 +3284,7 @@ fn occurrence_regions_have_proven_order(
             block_regions.keys().all(|right| {
                 region_is_ancestor(regions, *left, *right)
                     || region_is_ancestor(regions, *right, *left)
+                    || regions.regions_are_exclusive(*left, *right)
             })
         })
     })
@@ -3903,6 +3905,103 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn duplicated_merge_reads_in_exclusive_arms_use_the_cfg_assignment_proof() {
+        let region = Region::IfThenElse {
+            cond_block: 0x1000,
+            then_region: Box::new(Region::Sequence(vec![
+                Region::Block(0x1010),
+                Region::Block(0x1030),
+            ])),
+            else_region: Some(Box::new(Region::Sequence(vec![
+                Region::Block(0x1020),
+                Region::Block(0x1030),
+            ]))),
+            merge_block: Some(0x1030),
+        };
+        let regions = StructuredRegionDraft::from_region(0x1000, &region)
+            .expect("duplicated merge-tail region")
+            .seal();
+        let cfg = diamond_cfg();
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let then_region = region_with_entry(&regions, 0x1010, StructuredRegionKind::Block);
+        let else_region = region_with_entry(&regions, 0x1020, StructuredRegionKind::Block);
+        let merge_regions = regions
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.entry() == 0x1030 && node.kind() == StructuredRegionKind::Block
+            })
+            .filter_map(|(_, node)| {
+                regions
+                    .node_for_anchor(regions.authority(), node.emission_anchor())
+                    .map(|(region, _)| region)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(merge_regions.len(), 2);
+        assert!(regions.regions_are_exclusive(merge_regions[0], merge_regions[1]));
+        let writes = [
+            FinalBindingWrite {
+                effectful: false,
+                binding,
+                inst: InstId(1),
+                region: then_region,
+                block: 0x1010,
+                order: FinalOccurrenceOrder(1),
+                observation: observation(1),
+                inline_eligible: true,
+            },
+            FinalBindingWrite {
+                effectful: false,
+                binding,
+                inst: InstId(2),
+                region: else_region,
+                block: 0x1020,
+                order: FinalOccurrenceOrder(3),
+                observation: observation(2),
+                inline_eligible: true,
+            },
+        ];
+        let reads = [
+            FinalBindingRead {
+                binding,
+                source: PlacementRead::Use(UseSite {
+                    inst: InstId(3),
+                    input_idx: 0,
+                }),
+                region: merge_regions[0],
+                block: 0x1030,
+                order: FinalOccurrenceOrder(2),
+            },
+            FinalBindingRead {
+                binding,
+                source: PlacementRead::Use(UseSite {
+                    inst: InstId(3),
+                    input_idx: 0,
+                }),
+                region: merge_regions[1],
+                block: 0x1030,
+                order: FinalOccurrenceOrder(4),
+            },
+        ];
+
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &writes,
+        )
+        .expect("placement");
+        assert!(matches!(
+            decisions.decision(binding),
+            Some(PlacementDecision::LexicalDeclaration { .. })
+        ));
     }
 
     #[test]
