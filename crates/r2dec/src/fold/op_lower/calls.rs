@@ -286,19 +286,12 @@ impl<'a> FoldingContext<'a> {
         let (cert, render_fact) = self.admitted_callsite(block_addr, op_idx)?;
         let indexed = exact_indexed_call_arguments(cert, render_fact)
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
-        let proof = self
-            .certified_render_context()
-            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
 
-        let render_plan = self.certified_render_plan(proof);
         let mut args = Vec::with_capacity(indexed.len());
         for (index, value) in indexed.iter().copied() {
-            let Some(expr) = self.certified_call_arg_expr_for_value_at_site(
-                (block_addr, op_idx),
-                index,
-                value,
-                render_plan.as_ref(),
-            ) else {
+            let Some(expr) =
+                self.certified_call_arg_expr_for_value_at_site((block_addr, op_idx), value)
+            else {
                 // The typed refusal deliberately keeps only its stable kind
                 // and deciding site. The argument identity is per-call
                 // evidence, so keep it on the same diagnostic channel as the
@@ -321,10 +314,13 @@ impl<'a> FoldingContext<'a> {
 
     /// One argument of a call, spelled by the plan and observed as a read.
     ///
-    /// The render plan says which value belongs at this index. The binding
-    /// plan says how that value is read, exactly as it does for an operand of
-    /// any other operation, so the argument is whatever the value's own
-    /// disposition renders as.
+    /// The callsite and render certificates have already agreed on the exact,
+    /// contiguous `(index, ValueId)` sequence before this method is entered.
+    /// The binding plan then says how that value is read, exactly as it does
+    /// for an operand of any other operation, so the argument is whatever the
+    /// value's own disposition renders as. `ExpressionRenderFact` remains the
+    /// authority for reconstructing an SSA expression, and `PreparedCallView`
+    /// remains an analysis cache; neither is a second spelling authority.
     ///
     /// The read itself has no `UseSite`: `SSAOp::Call` takes only the callee
     /// as an operand, so an argument value is consumed by the call boundary
@@ -335,13 +331,8 @@ impl<'a> FoldingContext<'a> {
     fn certified_call_arg_expr_for_value_at_site(
         &self,
         site: (u64, usize),
-        index: usize,
         value: r2ssa::ValueId,
-        render_plan: Option<&CertifiedRenderPlan<'_>>,
     ) -> Option<CExpr> {
-        if !render_plan?.admits_call_arg(site, index, value) {
-            return None;
-        }
         let expr = match self.planned_value_expr(value) {
             Ok(expr) => expr,
             Err(error) => {
