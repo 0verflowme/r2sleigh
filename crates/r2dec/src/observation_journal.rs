@@ -662,6 +662,7 @@ struct CoalescedCarrierEffectElisions {
     coalesced_carrier_phis: BTreeSet<InstId>,
     coalesced_copies: BTreeSet<InstId>,
     placement_elided_effects: BTreeSet<SemanticObligationId>,
+    dead_unused_value_effects: BTreeSet<SemanticObligationId>,
 }
 
 impl SurvivingEffectObservations {
@@ -717,6 +718,13 @@ impl SurvivingEffectObservations {
             .contains(&id)
     }
 
+    /// Whether a pre-placement dead definition owned this producer obligation.
+    pub(crate) fn dead_unused_value_effect(&self, id: SemanticObligationId) -> bool {
+        self.coalesced_carriers
+            .dead_unused_value_effects
+            .contains(&id)
+    }
+
     #[cfg(test)]
     pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences.iter().filter_map(|(id, occurrences)| {
@@ -766,6 +774,9 @@ pub(crate) struct LegacyObservationJournal {
     /// Obligations whose only occurrence placement removed with the statement
     /// that carried it.
     placement_elided_effects: BTreeSet<SemanticObligationId>,
+    /// Producer obligations owned by definitions the binding plan proved had
+    /// no graph or certified-boundary reader before lowering began.
+    dead_unused_value_effects: BTreeSet<SemanticObligationId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -1746,6 +1757,7 @@ impl LegacyObservationJournal {
             placement_elided_writes: BTreeSet::new(),
             placement_elided_observations: BTreeSet::new(),
             placement_elided_effects: BTreeSet::new(),
+            dead_unused_value_effects: BTreeSet::new(),
             symbols,
             value_is_literal,
             values,
@@ -1900,23 +1912,28 @@ impl LegacyObservationJournal {
             })
             .collect::<Vec<_>>();
 
-        // A value the obligation ledger certifies as structurally unused is
-        // defined by an instruction nothing can render: the ledger has already
-        // established that it is structural, owns no semantic obligation, and
-        // that the program never reads what it produces. An unused call
-        // clobber is the case -- `murmur3_32` at -O0 leaves nine of them at its
-        // one call -- and the write cell those definitions carry has no other
-        // answerer, because there is no statement to answer with. This is
-        // deliberately not done for every elided value: most elisions mean some
-        // other rendering answers for the value, and claiming its definition
-        // renders nothing would take the cell away from whatever does.
+        // Definitions whose values the plan proves nobody reads have no
+        // statement to carry their cells. The structural case owns no operands
+        // or semantic obligation; an unused call clobber is the example. A
+        // pre-placement dead computation also loses the operand reads and the
+        // LiveValueProducer obligation its statement would have carried. Only
+        // that dependency obligation is authorized here: any observable effect
+        // on the same instruction remains at zero occurrences and the effect
+        // ledger refuses it instead of relabelling it dead.
+        //
+        // This is deliberately not done for every elided value. Most elisions
+        // mean some other rendering answers for the value, and claiming its
+        // definition renders nothing would take the cells away from whatever
+        // does.
         for value in &nonrendered_values {
+            let Some(ValueDisposition::Elided { reason, .. }) = self.plan.disposition(*value)
+            else {
+                continue;
+            };
             if !matches!(
-                self.plan.disposition(*value),
-                Some(ValueDisposition::Elided {
-                    reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
-                    ..
-                })
+                reason,
+                r2ssa::ledger::ElisionReason::UnusedStructuralValue
+                    | r2ssa::ledger::ElisionReason::DeadUnusedTemporary
             ) {
                 continue;
             }
@@ -1926,9 +1943,78 @@ impl LegacyObservationJournal {
             if graph.inst(inst).and_then(|inst| inst.output) != Some(*value) {
                 continue;
             }
-            elided_writes
-                .entry(inst)
-                .or_insert(r2ssa::ledger::ElisionReason::UnusedStructuralValue);
+            elided_writes.entry(inst).or_insert(*reason);
+            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
+                continue;
+            }
+            let instruction = graph
+                .inst(inst)
+                .expect("the exact definition was validated above");
+            for input_idx in 0..instruction.inputs.len() {
+                elided_uses
+                    .entry(UseSite { inst, input_idx })
+                    .or_insert(*reason);
+            }
+            self.dead_unused_value_effects.extend(
+                source
+                    .source()
+                    .obligations()
+                    .obligations_for_inst(inst)
+                    .filter(|obligation| {
+                        obligation.id.kind == r2ssa::SemanticObligationKind::LiveValueProducer
+                    })
+                    .map(|obligation| obligation.id),
+            );
+        }
+
+        // An inline value is normally accounted where its expression is
+        // inserted. A dead definition is never built, so an inline source
+        // whose every reader is one of those definitions has zero rendered
+        // occurrences and no marker that could close its value cell. Literal
+        // constants are the common case: once a dead flag definition is
+        // removed, the constant it read must not force the journal to refuse
+        // merely because there is nowhere left to spell it.
+        //
+        // This is deliberately narrower than "all currently empty values".
+        // Every graph read must already have an exact elision reason, and a
+        // certified boundary read disqualifies the value because that read is
+        // absent from the graph. This includes a dead definition directly and
+        // a source-certified merge that was already absent from the normalized
+        // program. Defined inline expressions still owe their own write, input
+        // and effect cells independently; this closes only the value occurrence
+        // proved to be absent.
+        let certified_boundary_values = graph
+            .insts
+            .iter()
+            .flat_map(|inst| {
+                crate::binding_plan::certified_boundary_read_values(source.source(), inst.id)
+            })
+            .collect::<BTreeSet<_>>();
+        let dead_inline_values = graph
+            .values
+            .iter()
+            .filter(|value| {
+                matches!(
+                    self.plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                )
+            })
+            .filter(|value| !certified_boundary_values.contains(&value.id))
+            .filter(|value| {
+                graph
+                    .use_sites(value.id)
+                    .iter()
+                    .all(|site| elided_uses.contains_key(site))
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        for value in dead_inline_values {
+            let slot = self.value_slot_mut(value)?;
+            record_same(
+                slot,
+                LegacyValueObservation::Elided(r2ssa::ledger::ElisionReason::DeadUnusedTemporary),
+            )
+            .map_err(|()| LegacyObservationJournalError::ConflictingValue(value))?;
         }
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
@@ -2208,7 +2294,7 @@ impl LegacyObservationJournal {
         // The same boundary record the final placement audit will consult.
         // Two tables answering for one read is how a marker survives here and
         // is refused there, so they ask one question.
-        if !crate::placement::certified_boundary_read(&self.source, value, at) {
+        if !crate::binding_plan::certified_boundary_read(&self.source, value, at) {
             return Err(LegacyObservationJournalError::InvalidCertifiedValueRead { value, at });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
@@ -2951,6 +3037,7 @@ impl LegacyObservationJournal {
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
                 coalesced_copies: self.coalesced_copy_writes,
                 placement_elided_effects: self.placement_elided_effects,
+                dead_unused_value_effects: self.dead_unused_value_effects,
             }),
         })
     }
@@ -3331,6 +3418,7 @@ impl LegacyObservationJournal {
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
                 coalesced_copies: std::mem::take(&mut self.coalesced_copy_writes),
                 placement_elided_effects: std::mem::take(&mut self.placement_elided_effects),
+                dead_unused_value_effects: std::mem::take(&mut self.dead_unused_value_effects),
             }),
         };
         let snapshot = self.into_snapshot(source);
@@ -3789,8 +3877,8 @@ mod tests {
         RegisterProjection, RegisterProjectionDisposition, RegisterStorage, Varnode,
     };
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceFunctionInterface, SourceFunctionReturn,
-        SsaArtifact,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
+        SourceFunctionReturn, SsaArtifact,
     };
 
     use super::*;
@@ -3832,12 +3920,21 @@ mod tests {
     }
 
     fn source_owned_from_blocks(blocks: &[R2ILBlock]) -> SourceOwnedFunctionFacts {
+        source_owned_from_blocks_with_parameter(blocks, false)
+    }
+
+    fn source_owned_from_blocks_with_parameter(
+        blocks: &[R2ILBlock],
+        with_parameter: bool,
+    ) -> SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_space(AddressSpace::ram(8));
         arch.add_register(RegisterDef::new("RAX", 0, 8));
         arch.add_register(RegisterDef::new("RSP", 0x28, 8));
         arch.add_register(RegisterDef::new("RIP", 0x30, 8));
-        arch.register_projections = [(0, 8), (0x28, 8), (0x30, 8)]
+        arch.add_register(RegisterDef::new("RDI", 0x38, 8));
+        arch.add_register(RegisterDef::new("CF", 0x40, 1));
+        arch.register_projections = [(0, 8), (0x28, 8), (0x30, 8), (0x38, 8), (0x40, 1)]
             .into_iter()
             .map(|(offset, size)| RegisterProjection {
                 written: RegisterStorage { offset, size },
@@ -3858,7 +3955,9 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"observation-journal-test".to_vec(),
             "sysv64",
-            std::iter::empty(),
+            with_parameter
+                .then_some(SourceAbiParameterSpec::new(0, storage(0x38)))
+                .into_iter(),
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -3929,6 +4028,116 @@ mod tests {
         )
         .expect("authority-bound journal");
         (source, plan, function, journal)
+    }
+
+    #[test]
+    fn preplacement_dead_definition_closes_value_use_write_and_producer_effect() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::IntCarry {
+            dst: Varnode::register(0x40, 1),
+            a: Varnode::register(0x38, 8),
+            b: Varnode::constant(1, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let source = source_owned_from_blocks_with_parameter(&[block], true);
+        let graph = source.source().graph();
+        let dead = graph
+            .values
+            .iter()
+            .find(|value| {
+                value.canonical_storage.is_some_and(|storage| {
+                    storage.space == CanonicalStorageSpace::Register
+                        && storage.offset == 0x40
+                        && storage.size == 1
+                }) && graph.def_inst(value.id).is_some()
+            })
+            .expect("defined CF value")
+            .id;
+        let definition = graph.def_inst(dead).expect("CF definition");
+        let dead_literal = graph
+            .values
+            .iter()
+            .find(|value| {
+                value.var.constant_bits() == Some(1)
+                    && !graph.use_sites(value.id).is_empty()
+                    && graph
+                        .use_sites(value.id)
+                        .iter()
+                        .all(|site| site.inst == definition)
+            })
+            .expect("constant read only by the dead CF definition")
+            .id;
+        let (source, plan, _function, journal) = journal_fixture_for_source(source);
+
+        assert!(
+            matches!(
+                plan.disposition(dead),
+                Some(ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
+                    ..
+                })
+            ),
+            "unexpected dead disposition: {:?}",
+            plan.disposition(dead)
+        );
+        assert_eq!(
+            journal.values[dead.0 as usize],
+            Some(LegacyValueObservation::Elided(
+                r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+            ))
+        );
+        assert_eq!(
+            journal.writes[definition.0 as usize],
+            Some(LegacyWriteObservation::Elided(
+                r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+            ))
+        );
+        assert!(
+            matches!(
+                plan.disposition(dead_literal),
+                Some(ValueDisposition::Inline { .. })
+            ),
+            "unexpected literal disposition: {:?}",
+            plan.disposition(dead_literal)
+        );
+        assert_eq!(
+            journal.values[dead_literal.0 as usize],
+            Some(LegacyValueObservation::Elided(
+                r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+            ))
+        );
+        let input_count = source
+            .source()
+            .graph()
+            .inst(definition)
+            .expect("exact dead definition")
+            .inputs
+            .len();
+        for input_idx in 0..input_count {
+            assert_eq!(
+                journal.uses[definition.0 as usize][input_idx],
+                Some(LegacyUseObservation::Elided(
+                    r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+                ))
+            );
+        }
+        let producer_effects = source
+            .source()
+            .obligations()
+            .obligations_for_inst(definition)
+            .filter(|obligation| {
+                obligation.id.kind == r2ssa::SemanticObligationKind::LiveValueProducer
+            })
+            .map(|obligation| obligation.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(journal.dead_unused_value_effects, producer_effects);
+        assert!(
+            producer_effects
+                .iter()
+                .all(|effect| journal.effect_occurrences.get(effect) == Some(&0))
+        );
     }
 
     #[test]

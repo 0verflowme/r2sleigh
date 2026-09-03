@@ -174,6 +174,108 @@ pub(crate) enum ValueDisposition {
     },
 }
 
+/// Values read at one exact certified boundary despite having no graph use.
+///
+/// `SSAOp::Return` carries only its control target and `SSAOp::Call` only its
+/// callee. A switch dispatch likewise carries the computed branch target rather
+/// than the selector rendered in its heading, and a derived-width call result
+/// reads the identity carrier named by its result certificate. These
+/// certificates are therefore the source's complete record of boundary reads
+/// that cannot appear in `SsaGraph::use_sites`.
+///
+/// Keeping the four kinds in one predicate matters to dead-value planning: a
+/// graph-only zero count is not proof that a value is unread. The per-site
+/// query is `O(log n + k)`, where `k` is the number of values carried at the
+/// boundary, and a whole-function inventory remains a linear graph pass.
+pub(crate) fn certified_boundary_read_values(
+    source: &r2ssa::SsaArtifact,
+    at: InstId,
+) -> BTreeSet<ValueId> {
+    let graph = source.graph();
+    let Some(site) = graph.op_site_for_inst(at) else {
+        return BTreeSet::new();
+    };
+    let Some(inst) = graph.inst(at) else {
+        return BTreeSet::new();
+    };
+    let payload = &inst.payload;
+    let certificates = source.certificates();
+    let mut values = BTreeSet::new();
+
+    if let Some(certificate) = certificates
+        .returns_by_inst
+        .get(&at)
+        .and_then(|index| certificates.returns.get(*index))
+        .filter(|certificate| {
+            certificate.at == at
+                && (certificate.block_addr, certificate.op_index) == site
+                && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
+        })
+    {
+        values.extend(certificate.values());
+    }
+
+    // A derived-width result is defined by this instruction from the identity
+    // result of the same callsite. Its certificate, rather than an SSA
+    // operand, is the proof that the carrier is read here.
+    if let Some(slice) = inst
+        .output
+        .and_then(|defined| source.call_result_certificate_for_value(defined))
+        .filter(|slice| !slice.relation.is_identity())
+        && let Some(carriers) = certificates.call_results_by_callsite.get(&slice.call_site)
+    {
+        values.extend(carriers.iter().copied().filter(|value| {
+            certificates
+                .call_results
+                .get(value)
+                .is_some_and(|carrier| carrier.relation.is_identity())
+        }));
+    }
+
+    // A certified switch renders the selector at the indirect dispatch even
+    // though the dispatch operand is the computed target address.
+    if matches!(
+        payload,
+        r2ssa::InstPayload::Op(r2ssa::SSAOp::BranchInd { .. })
+    ) && let Some(selector) = graph
+        .block(inst.block)
+        .and_then(|block| certificates.switches.get(&block.addr))
+        .and_then(|certificate| certificate.selector)
+    {
+        values.insert(selector);
+    }
+
+    if matches!(
+        payload,
+        r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. })
+    ) && let Some(certificate) = certificates
+        .callsites_by_inst
+        .get(&at)
+        .and_then(|call_site| certificates.callsites.get(call_site))
+        .filter(|certificate| {
+            certificate.at == at && (certificate.block_addr, certificate.op_index) == site
+        })
+    {
+        values.extend(
+            certificate
+                .argument_certificates
+                .iter()
+                .map(|argument| argument.value),
+        );
+    }
+
+    values
+}
+
+/// Whether one exact source boundary certifies a graphless read of `value`.
+pub(crate) fn certified_boundary_read(
+    source: &r2ssa::SsaArtifact,
+    value: ValueId,
+    at: InstId,
+) -> bool {
+    certified_boundary_read_values(source, at).contains(&value)
+}
+
 /// Exact graph uses that consume a source-certified machine return target.
 ///
 /// This is a per-use answer. A return-address value may also have an ordinary

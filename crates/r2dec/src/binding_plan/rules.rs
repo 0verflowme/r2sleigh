@@ -204,7 +204,7 @@ pub(super) fn component_eligible_values(
     projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let inlinable = inlinable_values(source_owned, projection);
-    component_eligible_with(source_owned, &inlinable)
+    component_eligible_with(source_owned, projection, &inlinable)
 }
 
 /// The same answer from a stated inlining decision.
@@ -215,6 +215,7 @@ pub(super) fn component_eligible_values(
 /// computed in a stated order instead of one estimating the other.
 pub(super) fn component_eligible_with(
     source_owned: &SourceOwnedFunctionFacts,
+    projection: &r2ssa::MachineProjection,
     inlinable: &BTreeSet<ValueId>,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
@@ -226,6 +227,7 @@ pub(super) fn component_eligible_with(
     let direct_call_targets = certified_direct_call_target_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
+    let unread = unread_defined_values(source, projection);
     let structural_unused = source
         .obligations()
         .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
@@ -246,8 +248,64 @@ pub(super) fn component_eligible_with(
                 && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)
                 && !inlinable.contains(&value.id)
+                && !unread.contains(&value.id)
         })
         .collect())
+}
+
+/// Values defined in this function that no graph or certified boundary reads.
+///
+/// Entry values are deliberately outside this set: an exact interface can own
+/// an unused parameter declaration independently of a body read. Constants
+/// likewise have no defining instruction to remove. For a defined value, the
+/// graph use table plus the complete graphless boundary-reader inventory is the
+/// closed read domain, so membership is a linear pass with `O(log n)` indexed
+/// certificate lookups.
+pub(super) fn unread_defined_values(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+) -> BTreeSet<ValueId> {
+    let certified = certified_value_readers(source);
+    source
+        .graph()
+        .values
+        .iter()
+        .filter(|value| {
+            let Some(definition) = source.graph().def_inst(value.id) else {
+                return false;
+            };
+            matches!(
+                projection.write_disposition(definition),
+                Some(r2ssa::MachineWriteDisposition::Exact(_))
+            ) && source.graph().inst(definition).is_some_and(|instruction| {
+                (0..instruction.inputs.len()).all(|input_idx| {
+                    matches!(
+                        projection.use_disposition(r2ssa::UseSite {
+                            inst: definition,
+                            input_idx,
+                        }),
+                        Some(
+                            r2ssa::MachineUseDisposition::Exact(_)
+                                | r2ssa::MachineUseDisposition::MemoryAddress(_)
+                        )
+                    )
+                })
+            })
+        })
+        .filter(|value| source.graph().use_sites(value.id).is_empty())
+        .filter(|value| !certified.contains_key(&value.id))
+        .map(|value| value.id)
+        .collect()
+}
+
+fn certified_value_readers(source: &r2ssa::SsaArtifact) -> BTreeMap<ValueId, Vec<InstId>> {
+    let mut readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    for inst in &source.graph().insts {
+        for value in super::certified_boundary_read_values(source, inst.id) {
+            readers.entry(value).or_default().push(inst.id);
+        }
+    }
+    readers
 }
 
 /// The type one object is declared with.
@@ -570,7 +628,7 @@ pub(super) fn inlinable_values(
     // `merge_would_interfere` reads, so it can remove the interference
     // blocking a merge and make a component *grow*.
     let conservative = inlinable_core(source_owned, projection, &BTreeSet::new());
-    let Ok(eligible) = component_eligible_with(source_owned, &conservative) else {
+    let Ok(eligible) = component_eligible_with(source_owned, projection, &conservative) else {
         return conservative;
     };
     let Ok(components) = super::construction::binding_components_with(source_owned, &eligible)
@@ -666,19 +724,17 @@ fn inlinable_core(
 ) -> BTreeSet<ValueId> {
     let source = source_owned.source();
     let graph = source.graph();
-    // A call's arguments are readers the graph does not record. `SSAOp::Call`
-    // takes only the callee as an operand, so the value staged in `rdi` is
-    // consumed by the call boundary and has no `UseSite` at all: the callsite
-    // certificate is the source's record that the read happens, and it is the
-    // same record the renderer consults to spell the argument.
-    //
-    // Asked of the graph alone, such a value has no readers, and this function
-    // turned it away at the first gate -- so every argument a call stages
-    // stayed on the page as a local, whatever the single-use rule did. That is
-    // six statements of the fourteen `readError` renders for four lines of
-    // source, and it is the difference between naming a value and spelling it
-    // where it is used.
-    let mut call_arg_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    // Boundary certificates record reads that do not exist as SSA operands:
+    // return values, call arguments, switch selectors and identity call-result
+    // carriers read by derived-width results. A graph-only count made call
+    // arguments look dead here before that case was fixed; counting only that
+    // certificate kind would make the same mistake for the other three.
+    let certified_readers = certified_value_readers(source);
+    // Of those graphless reads, call arguments are the one kind the renderer
+    // can currently consume from an inline expression. Return, switch and
+    // derived-result markers require a binding symbol, so they count as reads
+    // for deadness but remain explicit inlining refusals below.
+    let mut call_arg_readers = BTreeMap::<ValueId, BTreeSet<InstId>>::new();
     if let Some(callsites) = source_owned.report().callsites() {
         for (site, facts) in &callsites.by_callsite {
             let Some(inst) = graph.inst_id_for_op_site(site.block_addr, site.op_index) else {
@@ -688,7 +744,7 @@ fn inlinable_core(
                 call_arg_readers
                     .entry(argument.value)
                     .or_default()
-                    .push(inst);
+                    .insert(inst);
             }
         }
     }
@@ -723,11 +779,11 @@ fn inlinable_core(
             }
         };
         let use_sites = graph.use_sites(value.id);
-        let arg_readers = call_arg_readers
+        let boundary_readers = certified_readers
             .get(&value.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let reader_count = use_sites.len() + arg_readers.len();
+        let reader_count = use_sites.len() + boundary_readers.len();
         if reader_count == 0 {
             rejected("no readers");
             continue;
@@ -781,9 +837,9 @@ fn inlinable_core(
         // corpus cells do this and five more refuse. See the handoff.
         if !literal_only && reader_count != 1 {
             rejected(&format!(
-                "{reader_count} readers ({} of them call arguments), of which {} sit in a \
+                "{reader_count} readers ({} of them certified boundary reads), of which {} sit in a \
                  certificate-elided instruction; root {root_kind}",
-                arg_readers.len(),
+                boundary_readers.len(),
                 use_sites
                     .iter()
                     .filter(|site| elided_reads.contains(&site.inst))
@@ -799,6 +855,14 @@ fn inlinable_core(
             rejected(&format!(
                 "expression kind does not render inline: {root_kind}"
             ));
+            continue;
+        }
+        if boundary_readers.iter().any(|reader| {
+            !call_arg_readers
+                .get(&value.id)
+                .is_some_and(|arguments| arguments.contains(reader))
+        }) {
+            rejected("a certified boundary reader requires a bound value");
             continue;
         }
         let Some(definition) = graph.def_inst(value.id) else {
@@ -846,7 +910,9 @@ fn inlinable_core(
         if use_sites
             .iter()
             .any(|site| elided_reads.contains(&site.inst))
-            || arg_readers.iter().any(|inst| elided_reads.contains(inst))
+            || boundary_readers
+                .iter()
+                .any(|inst| elided_reads.contains(inst))
         {
             rejected("a reader sits in a certificate-elided instruction");
             continue;
@@ -858,10 +924,10 @@ fn inlinable_core(
             inlinable.insert(value.id);
             continue;
         }
-        // The one reader, whether the graph recorded it or the callsite
+        // The one reader, whether the graph recorded it or a boundary
         // certificate did. Only its position is wanted from here on: which
         // block it sits in, and what runs between the definition and it.
-        let reader = match (use_sites, arg_readers) {
+        let reader = match (use_sites, boundary_readers) {
             ([site], []) => site.inst,
             ([], [inst]) => *inst,
             _ => unreachable!("a value that is not literal-only was required to have one reader"),
