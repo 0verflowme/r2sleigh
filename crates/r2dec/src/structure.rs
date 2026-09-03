@@ -4759,7 +4759,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             CExpr::Var(name) => {
                 out.insert(*name);
             }
-            CExpr::External { .. } => {}
+            CExpr::External { .. } | CExpr::DataObject { .. } => {}
             CExpr::AddrOf(inner) | CExpr::Deref(inner) => {
                 if let CExpr::Var(name) = Self::normalize_loop_expr_refs(inner) {
                     out.insert(*name);

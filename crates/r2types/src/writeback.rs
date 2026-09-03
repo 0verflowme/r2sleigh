@@ -4375,6 +4375,7 @@ fn build_type_writeback_analysis_inner(
             input.interproc_summary_set.as_ref(),
         ),
         external_type_db: type_db,
+        program_data_objects: input.parsed_context.program_data_objects.clone(),
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
         slot_field_profiles: local_structs.slot_field_profiles.clone(),
         local_field_accesses: semantic_inputs

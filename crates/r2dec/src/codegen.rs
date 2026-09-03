@@ -225,19 +225,27 @@ impl CodeGenerator {
         // A reader wants the name; a tool that has to resolve the object --
         // the corpus verifier maps image addresses into a captured blob --
         // needs the number the name replaced, and the name alone hides it.
-        for (name, address) in &func.extern_objects {
+        for object in &func.extern_objects {
             // The address the name stands for travels with the declaration, as
             // a define rather than a comment. A reader wants the name; a tool
             // that has to resolve the object -- the corpus verifier maps image
             // addresses into a captured blob -- needs the number the name
             // replaced, and a comment does not survive every rewrite the
             // verifier applies before it looks.
-            self.output
-                .push_str(&format!("#define {name}__r2sleigh_addr 0x{address:x}ULL\n"));
+            self.output.push_str(&format!(
+                "#define {}__r2sleigh_addr 0x{:x}ULL\n",
+                object.name, object.address
+            ));
             self.emit_indent();
-            self.output.push_str("extern char ");
-            self.output.push_str(name);
-            self.output.push_str("[];\n");
+            self.output.push_str("extern ");
+            if let Some(type_fact) = &object.type_fact {
+                self.emit_object_declaration(&type_fact.ty, &object.name);
+            } else {
+                self.output.push_str("char ");
+                self.output.push_str(&object.name);
+                self.output.push_str("[]");
+            }
+            self.output.push_str(";\n");
         }
         if !func.externs.is_empty() || !func.extern_objects.is_empty() {
             self.output.push('\n');
@@ -604,6 +612,9 @@ impl CodeGenerator {
             CExpr::External { name, .. } => {
                 self.output.push_str(name);
             }
+            CExpr::DataObject { name, .. } => {
+                self.output.push_str(name);
+            }
             CExpr::Unary { op, operand } => {
                 if op.is_postfix() {
                     self.emit_expr(operand, my_prec);
@@ -744,6 +755,28 @@ impl CodeGenerator {
     fn emit_type(&mut self, ty: &CType) {
         // Use the Display implementation
         self.output.push_str(&ty.to_string());
+    }
+
+    /// Emit the declarator for a data object. Arrays put their extent after
+    /// the name; the ordinary type renderer has no identifier to place there.
+    fn emit_object_declaration(&mut self, ty: &CType, name: &str) {
+        match ty {
+            CType::Array(element, len) => {
+                self.emit_type(element);
+                self.output.push(' ');
+                self.output.push_str(name);
+                self.output.push('[');
+                if let Some(len) = len {
+                    self.output.push_str(&len.to_string());
+                }
+                self.output.push(']');
+            }
+            _ => {
+                self.emit_type(ty);
+                self.output.push(' ');
+                self.output.push_str(name);
+            }
+        }
     }
 
     /// Emit indentation.

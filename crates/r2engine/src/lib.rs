@@ -24,8 +24,9 @@ mod program_cache;
 pub use json::*;
 pub use policy::*;
 pub use program_cache::{
-    PreparedRole, ProgramCacheStats, cache_function_artifact, cached_function_artifact,
-    cached_function_fingerprint, clear_program_cache, program_cache_stats,
+    PreparedRole, ProgramCacheStats, cache_function_artifact, cache_program_data_object_types,
+    cached_function_artifact, cached_function_fingerprint, clear_program_cache,
+    program_cache_stats,
 };
 
 mod route;
@@ -2116,6 +2117,18 @@ impl EngineAnalyzeRequest {
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
         let signature = trusted_source_signature(&trusted, self.ptr_bits);
+        let external_type_db = trusted_external_type_db(&trusted);
+        let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            trusted
+                .source()
+                .image()
+                .data_symbols()
+                .iter()
+                .map(|object| (object.address(), object.type_spelling())),
+            self.ptr_bits,
+            &external_type_db,
+        );
+        let program_data_objects = cache_program_data_object_types(&observed_data_objects);
         self.parsed_context = r2types::ParsedExternalContext {
             known_function_signatures: trusted_callee_signatures(&trusted, self.ptr_bits),
             stack_slots: trusted_stack_slot_names(&trusted, self.ptr_bits),
@@ -2125,7 +2138,8 @@ impl EngineAnalyzeRequest {
             noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
             current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
             merged_signature: signature.map(|(spec, _, _)| spec),
-            external_type_db: trusted_external_type_db(&trusted),
+            external_type_db,
+            program_data_objects,
             ..r2types::ParsedExternalContext::default()
         };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);

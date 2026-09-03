@@ -320,6 +320,15 @@ impl ExternalTypeDb {
             && self.resolve_typedef_aggregate(name).is_some()
     }
 
+    /// Whether the source type database actually declares this typedef name.
+    /// Parsing an identifier is not enough: callers use this to avoid minting
+    /// a more-specific type from an otherwise unplaceable spelling.
+    pub fn declares_typedef(&self, name: &str) -> bool {
+        aggregate_lookup_keys(name)
+            .iter()
+            .any(|key| self.typedefs.contains_key(key))
+    }
+
     pub fn resolve_aggregate_kind(&self, name: &str) -> Option<ExternalAggregateKind> {
         for key in aggregate_lookup_keys(name) {
             if self.structs.contains_key(&key) {

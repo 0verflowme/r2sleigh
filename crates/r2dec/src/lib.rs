@@ -1400,7 +1400,7 @@ fn note_unproven_constructs(
             n => format!("{n} constructs are marked below"),
         }
     };
-    let detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
+    let mut detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
         Some(closure) if closure.total > 0 => {
             let mut line = format!(
                 "{detail}; {} source obligations: {} rendered, {} elided, {} refused",
@@ -1423,6 +1423,39 @@ fn note_unproven_constructs(
         }
         _ => detail,
     };
+    let radare_typed_objects =
+        func.extern_objects
+            .iter()
+            .filter(|object| {
+                object.type_fact.as_ref().is_some_and(|fact| {
+                    fact.provenance == r2types::DataObjectTypeProvenance::Radare2
+                })
+            })
+            .count();
+    let refused_object_types = func
+        .extern_objects
+        .iter()
+        .filter(|object| object.type_fact.is_none() && object.type_refusal.is_some())
+        .count();
+    if radare_typed_objects > 0 {
+        let noun = if radare_typed_objects == 1 {
+            "data object type"
+        } else {
+            "data object types"
+        };
+        let _ = write!(
+            &mut detail,
+            "; {radare_typed_objects} {noun} supplied by radare2"
+        );
+    }
+    if refused_object_types > 0 {
+        let noun = if refused_object_types == 1 {
+            "data object type"
+        } else {
+            "data object types"
+        };
+        let _ = write!(&mut detail, "; {refused_object_types} {noun} refused");
+    }
     func.body.insert(
         0,
         CStmt::comment(sanitize_comment_text(&format!("r2dec proof: {detail}"))),
@@ -4982,17 +5015,24 @@ impl Decompiler {
         let display = self.context.function_facts.display_names();
         let strings = display.strings();
         let data_symbols = display.symbols();
-        let used_objects: std::cell::RefCell<std::collections::BTreeSet<(String, u64)>> =
-            std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let data_object_types = &self
+            .context
+            .function_facts
+            .type_facts()
+            .program_data_objects;
+        let used_objects: std::cell::RefCell<
+            std::collections::BTreeMap<u64, crate::ast::CExternObject>,
+        > = std::cell::RefCell::new(std::collections::BTreeMap::new());
         crate::stage_timing::mark("structure");
         fold_constant_arithmetic_in_function(
             &mut c_function,
             strings,
             data_symbols,
+            data_object_types,
             &used_objects,
             self.config.ptr_size,
         );
-        c_function.extern_objects = used_objects.into_inner().into_iter().collect();
+        c_function.extern_objects = used_objects.into_inner().into_values().collect();
 
         if let Err(error) =
             single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names)
@@ -5156,7 +5196,7 @@ pub(crate) fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symb
             out.insert(*name);
         }
         // Not a name this function declares, so not one it has to.
-        CExpr::External { .. } => {}
+        CExpr::External { .. } | CExpr::DataObject { .. } => {}
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Paren(operand)
@@ -5312,7 +5352,8 @@ fn fold_constant_arithmetic_in_function(
     func: &mut CFunction,
     strings: &std::collections::BTreeMap<u64, String>,
     symbols: &std::collections::BTreeMap<u64, String>,
-    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
     pointer_bits: u32,
 ) {
     let symbol_table = std::rc::Rc::clone(&func.symbols);
@@ -5321,6 +5362,7 @@ fn fold_constant_arithmetic_in_function(
             stmt,
             strings,
             symbols,
+            object_types,
             used,
             pointer_bits,
             Some(&symbol_table),
@@ -5360,25 +5402,26 @@ fn plain_char_type() -> CType {
 /// is declared `extern char name[]`, so `&name` is a pointer to an array of
 /// `char` -- not a `char *`, which is why converting it to one is a cast
 /// that C requires rather than noise.
-fn substituted_address_under_conversions(expr: &CExpr) -> Option<(&CExpr, CType)> {
+fn substituted_address_under_conversions<'a>(
+    expr: &'a CExpr,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) -> Option<(&'a CExpr, CType)> {
     match expr {
         CExpr::StringLit(_) => Some((expr, CType::ptr(plain_char_type()))),
-        CExpr::AddrOf(inner)
-            if matches!(
-                inner.unobserved(),
-                CExpr::External {
-                    kind: crate::symbol::ExternalKind::Global,
-                    ..
-                }
-            ) =>
-        {
-            Some((
-                expr,
-                CType::ptr(CType::Array(Box::new(plain_char_type()), None)),
-            ))
-        }
+        CExpr::AddrOf(inner) => match inner.unobserved() {
+            CExpr::DataObject { address, .. } => {
+                let object_type = used
+                    .borrow()
+                    .get(address)
+                    .and_then(|object| object.type_fact.as_ref())
+                    .map(|fact| fact.ty.clone())
+                    .unwrap_or_else(|| CType::Array(Box::new(plain_char_type()), None));
+                Some((expr, CType::ptr(object_type)))
+            }
+            _ => None,
+        },
         CExpr::Observed { expr, .. } | CExpr::Paren(expr) | CExpr::Cast { expr, .. } => {
-            substituted_address_under_conversions(expr)
+            substituted_address_under_conversions(expr, used)
         }
         _ => None,
     }
@@ -5403,8 +5446,9 @@ fn restate_string_conversions_in_expr(
     pointer_bits: u32,
     required: Option<&CType>,
     symbols: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
 ) {
-    if let Some((address, from)) = substituted_address_under_conversions(expr) {
+    if let Some((address, from)) = substituted_address_under_conversions(expr, used) {
         let required = match expr.unobserved() {
             CExpr::Cast { ty, .. } => Some(ty.clone()),
             _ => required.cloned(),
@@ -5444,7 +5488,7 @@ fn restate_string_conversions_in_expr(
     // whose right-hand side carries an occurrence marker -- which is most of
     // them -- was walked as though nothing had been asked of it.
     if let CExpr::Observed { expr, .. } | CExpr::Paren(expr) = expr {
-        restate_string_conversions_in_expr(expr, pointer_bits, required, symbols);
+        restate_string_conversions_in_expr(expr, pointer_bits, required, symbols, used);
         return;
     }
     // An assignment tells its right-hand side what is wanted: the type of
@@ -5471,8 +5515,8 @@ fn restate_string_conversions_in_expr(
             CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
             _ => None,
         };
-        restate_string_conversions_in_expr(left, pointer_bits, None, symbols);
-        restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols);
+        restate_string_conversions_in_expr(left, pointer_bits, None, symbols, used);
+        restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols, used);
         return;
     }
     // Arithmetic on an address is arithmetic on a number. C has one operator
@@ -5533,7 +5577,7 @@ fn restate_string_conversions_in_expr(
             let peer_type = peers.as_ref().and_then(|(for_left, for_right)| {
                 if index == 0 { for_left } else { for_right }.clone()
             });
-            let wanted = if substituted_address_under_conversions(operand).is_some() {
+            let wanted = if substituted_address_under_conversions(operand, used).is_some() {
                 Some(address.clone())
             } else if !crate::fold::op_lower::convert::literal_renders_as_signed(operand) {
                 None
@@ -5544,22 +5588,125 @@ fn restate_string_conversions_in_expr(
             } else {
                 None
             };
-            restate_string_conversions_in_expr(operand, pointer_bits, wanted.as_ref(), symbols);
+            restate_string_conversions_in_expr(
+                operand,
+                pointer_bits,
+                wanted.as_ref(),
+                symbols,
+                used,
+            );
         }
         return;
     }
     let taken = std::mem::replace(expr, CExpr::IntLit(0));
     *expr = taken.map_children(&mut |mut child| {
-        restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols);
+        restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols, used);
         child
     });
+}
+
+/// Replace a machine-width load through a substituted global address with the
+/// source-typed object itself.
+///
+/// The rewrite is authorized only when radare2 supplied the object's type and
+/// the machine load clears that type's storage width. The address and load are
+/// already proven by the ordinary memory path; this removes the byte-pointer
+/// cast that was needed only while the object had no type.
+fn simplify_typed_data_object_loads(
+    expr: &mut CExpr,
+    pointer_bits: u32,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) {
+    let taken = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = taken.map_children(&mut |mut child| {
+        simplify_typed_data_object_loads(&mut child, pointer_bits, used);
+        child
+    });
+
+    let CExpr::Deref(address) = expr.unobserved() else {
+        return;
+    };
+    let Some((object_address, name)) = data_object_under_conversions(address) else {
+        return;
+    };
+    let name = name.to_string();
+    let Some(object_type) = used
+        .borrow()
+        .get(&object_address)
+        .and_then(|object| object.type_fact.as_ref())
+        .map(|fact| fact.ty.clone())
+    else {
+        return;
+    };
+    let access_type =
+        pointer_target_under_conversions(address).unwrap_or_else(|| object_type.clone());
+    if access_type != object_type {
+        let Some(access_bits) = c_object_storage_bits(&access_type, pointer_bits) else {
+            return;
+        };
+        let Some(object_bits) = c_object_storage_bits(&object_type, pointer_bits) else {
+            return;
+        };
+        if access_bits != object_bits {
+            return;
+        }
+    }
+    let source = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = crate::ast::carry_all_expr_observations(
+        &source,
+        CExpr::DataObject {
+            address: object_address,
+            name,
+        },
+    );
+}
+
+fn data_object_under_conversions(expr: &CExpr) -> Option<(u64, &str)> {
+    match expr.unobserved() {
+        CExpr::AddrOf(inner) => match inner.unobserved() {
+            CExpr::DataObject { address, name } => Some((*address, name)),
+            _ => None,
+        },
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => data_object_under_conversions(expr),
+        _ => None,
+    }
+}
+
+fn pointer_target_under_conversions(expr: &CExpr) -> Option<CType> {
+    match expr.unobserved() {
+        CExpr::Cast {
+            ty: CType::Pointer(inner),
+            ..
+        } => Some(inner.as_ref().clone()),
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => pointer_target_under_conversions(expr),
+        _ => None,
+    }
+}
+
+fn c_object_storage_bits(ty: &CType, pointer_bits: u32) -> Option<u32> {
+    match ty {
+        CType::Bool => Some(8),
+        CType::Int { bits, .. } | CType::Float(bits) | CType::BitVector(bits) => Some(*bits),
+        CType::Pointer(_) | CType::Function { .. } => Some(pointer_bits),
+        CType::Array(element, Some(len)) => {
+            c_object_storage_bits(element, pointer_bits)?.checked_mul(u32::try_from(*len).ok()?)
+        }
+        CType::Void
+        | CType::Array(_, None)
+        | CType::Struct(_)
+        | CType::Union(_)
+        | CType::Enum(_)
+        | CType::Typedef(_)
+        | CType::Unknown => None,
+    }
 }
 
 fn fold_constant_arithmetic_in_stmt(
     stmt: &mut CStmt,
     strings: &std::collections::BTreeMap<u64, String>,
     symbols: &std::collections::BTreeMap<u64, String>,
-    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
     pointer_bits: u32,
     symbol_table: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
 ) {
@@ -5567,14 +5714,16 @@ fn fold_constant_arithmetic_in_stmt(
     // of one expression: a conversion can only be restated once the string
     // it converts is there to be seen.
     let fold_expr = |expr: &mut CExpr| {
-        fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
-        restate_string_conversions_in_expr(expr, pointer_bits, None, symbol_table);
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, object_types, used);
+        restate_string_conversions_in_expr(expr, pointer_bits, None, symbol_table, used);
+        simplify_typed_data_object_loads(expr, pointer_bits, used);
     };
     match stmt {
         CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(
             stmt,
             strings,
             symbols,
+            object_types,
             used,
             pointer_bits,
             symbol_table,
@@ -5583,6 +5732,7 @@ fn fold_constant_arithmetic_in_stmt(
             stmt,
             strings,
             symbols,
+            object_types,
             used,
             pointer_bits,
             symbol_table,
@@ -5596,8 +5746,15 @@ fn fold_constant_arithmetic_in_stmt(
         CStmt::Expr(expr) => fold_expr(expr),
         CStmt::Decl { ty, init, .. } => {
             if let Some(init) = init {
-                fold_constant_arithmetic_in_expr(init, strings, symbols, used);
-                restate_string_conversions_in_expr(init, pointer_bits, Some(ty), symbol_table);
+                fold_constant_arithmetic_in_expr(init, strings, symbols, object_types, used);
+                restate_string_conversions_in_expr(
+                    init,
+                    pointer_bits,
+                    Some(ty),
+                    symbol_table,
+                    used,
+                );
+                simplify_typed_data_object_loads(init, pointer_bits, used);
             }
         }
         CStmt::Return(expr) => {
@@ -5611,6 +5768,7 @@ fn fold_constant_arithmetic_in_stmt(
                     stmt,
                     strings,
                     symbols,
+                    object_types,
                     used,
                     pointer_bits,
                     symbol_table,
@@ -5627,6 +5785,7 @@ fn fold_constant_arithmetic_in_stmt(
                 then_body,
                 strings,
                 symbols,
+                object_types,
                 used,
                 pointer_bits,
                 symbol_table,
@@ -5636,6 +5795,7 @@ fn fold_constant_arithmetic_in_stmt(
                     else_body,
                     strings,
                     symbols,
+                    object_types,
                     used,
                     pointer_bits,
                     symbol_table,
@@ -5648,6 +5808,7 @@ fn fold_constant_arithmetic_in_stmt(
                 body,
                 strings,
                 symbols,
+                object_types,
                 used,
                 pointer_bits,
                 symbol_table,
@@ -5664,6 +5825,7 @@ fn fold_constant_arithmetic_in_stmt(
                     init,
                     strings,
                     symbols,
+                    object_types,
                     used,
                     pointer_bits,
                     symbol_table,
@@ -5679,6 +5841,7 @@ fn fold_constant_arithmetic_in_stmt(
                 body,
                 strings,
                 symbols,
+                object_types,
                 used,
                 pointer_bits,
                 symbol_table,
@@ -5696,6 +5859,7 @@ fn fold_constant_arithmetic_in_stmt(
                         stmt,
                         strings,
                         symbols,
+                        object_types,
                         used,
                         pointer_bits,
                         symbol_table,
@@ -5708,6 +5872,7 @@ fn fold_constant_arithmetic_in_stmt(
                         stmt,
                         strings,
                         symbols,
+                        object_types,
                         used,
                         pointer_bits,
                         symbol_table,
@@ -5733,10 +5898,11 @@ fn fold_constant_arithmetic_in_expr(
     expr: &mut CExpr,
     strings: &std::collections::BTreeMap<u64, String>,
     symbols: &std::collections::BTreeMap<u64, String>,
-    used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
 ) {
     if let CExpr::Observed { expr, .. } = expr {
-        fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, object_types, used);
         return;
     }
     let mut replacement = None;
@@ -5747,11 +5913,11 @@ fn fold_constant_arithmetic_in_expr(
         | CExpr::AddrOf(operand)
         | CExpr::Deref(operand)
         | CExpr::Paren(operand) => {
-            fold_constant_arithmetic_in_expr(operand, strings, symbols, used)
+            fold_constant_arithmetic_in_expr(operand, strings, symbols, object_types, used)
         }
         CExpr::Binary { op, left, right } => {
-            fold_constant_arithmetic_in_expr(left, strings, symbols, used);
-            fold_constant_arithmetic_in_expr(right, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(left, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(right, strings, symbols, object_types, used);
             if let (Some(lhs), Some(rhs)) = (literal_value(left), literal_value(right)) {
                 // Wrapping, because the program's arithmetic wraps; a fold that
                 // disagreed with the machine would be worse than no fold.
@@ -5770,26 +5936,26 @@ fn fold_constant_arithmetic_in_expr(
             then_expr,
             else_expr,
         } => {
-            fold_constant_arithmetic_in_expr(cond, strings, symbols, used);
-            fold_constant_arithmetic_in_expr(then_expr, strings, symbols, used);
-            fold_constant_arithmetic_in_expr(else_expr, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(cond, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(then_expr, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(else_expr, strings, symbols, object_types, used);
         }
         CExpr::Call { func, args, .. } => {
-            fold_constant_arithmetic_in_expr(func, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(func, strings, symbols, object_types, used);
             for arg in args {
-                fold_constant_arithmetic_in_expr(arg, strings, symbols, used);
+                fold_constant_arithmetic_in_expr(arg, strings, symbols, object_types, used);
             }
         }
         CExpr::Subscript { base, index } => {
-            fold_constant_arithmetic_in_expr(base, strings, symbols, used);
-            fold_constant_arithmetic_in_expr(index, strings, symbols, used);
+            fold_constant_arithmetic_in_expr(base, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(index, strings, symbols, object_types, used);
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            fold_constant_arithmetic_in_expr(base, strings, symbols, used)
+            fold_constant_arithmetic_in_expr(base, strings, symbols, object_types, used)
         }
         CExpr::Comma(items) => {
             for item in items {
-                fold_constant_arithmetic_in_expr(item, strings, symbols, used);
+                fold_constant_arithmetic_in_expr(item, strings, symbols, object_types, used);
             }
         }
         _ => {}
@@ -5819,15 +5985,23 @@ fn fold_constant_arithmetic_in_expr(
         && let Some(name) = symbols.get(&value)
     {
         let source = std::mem::replace(expr, CExpr::IntLit(0));
+        let rendered = c_identifier_for_data_symbol(name);
+        let type_fact = object_types.get(value).cloned();
+        let type_refusal = object_types.refused().get(&value).cloned();
+        used.borrow_mut().insert(
+            value,
+            crate::ast::CExternObject {
+                name: rendered.clone(),
+                address: value,
+                type_fact,
+                type_refusal,
+            },
+        );
         *expr = crate::ast::carry_all_expr_observations(
             &source,
-            CExpr::addr_of(CExpr::External {
-                name: {
-                    let rendered = c_identifier_for_data_symbol(name);
-                    used.borrow_mut().insert((rendered.clone(), value));
-                    rendered
-                },
-                kind: crate::symbol::ExternalKind::Global,
+            CExpr::addr_of(CExpr::DataObject {
+                address: value,
+                name: rendered,
             }),
         );
     }
@@ -6021,6 +6195,11 @@ fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet
 mod tests {
     use super::*;
 
+    fn no_extern_objects()
+    -> std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>> {
+        std::cell::RefCell::new(std::collections::BTreeMap::new())
+    }
+
     #[test]
     fn a_compared_mask_takes_the_type_of_what_it_is_compared_with() {
         // `tmp < -0x4` where `tmp` is a `uint64_t`. The comparison is read as
@@ -6043,7 +6222,13 @@ mod tests {
             ))
             .expect("the statement's own occurrence marker");
         let mut expr = marked;
-        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u8()), Some(&table));
+        restate_string_conversions_in_expr(
+            &mut expr,
+            64,
+            Some(&CType::u8()),
+            Some(&table),
+            &no_extern_objects(),
+        );
         let CExpr::Observed { expr: inner, .. } = &expr else {
             panic!("the marker must survive: {expr:?}");
         };
@@ -6075,7 +6260,13 @@ mod tests {
             .observe_expr(CExpr::binary(BinaryOp::BitAnd, CExpr::Var(name), mask))
             .expect("the statement's own occurrence marker");
         let mut expr = marked;
-        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u64()), Some(&table));
+        restate_string_conversions_in_expr(
+            &mut expr,
+            64,
+            Some(&CType::u64()),
+            Some(&table),
+            &no_extern_objects(),
+        );
         let CExpr::Observed { expr: inner, .. } = &expr else {
             panic!("the marker must survive: {expr:?}");
         };
@@ -6106,7 +6297,7 @@ mod tests {
                 text.clone(),
             ),
         );
-        restate_string_conversions_in_expr(&mut expr, 64, None, None);
+        restate_string_conversions_in_expr(&mut expr, 64, None, None, &no_extern_objects());
         assert_eq!(expr, text, "got {expr:?}");
 
         // Converted to a number, the string is still an address, so the
@@ -6119,7 +6310,7 @@ mod tests {
             },
             text.clone(),
         );
-        restate_string_conversions_in_expr(&mut as_number, 64, None, None);
+        restate_string_conversions_in_expr(&mut as_number, 64, None, None, &no_extern_objects());
         assert!(
             matches!(
                 &as_number,
@@ -6674,8 +6865,15 @@ mod tests {
         let strings = BTreeMap::from([(0x1004, "text".to_string())]);
 
         let no_symbols = BTreeMap::new();
-        let unused_objects = std::cell::RefCell::new(std::collections::BTreeSet::new());
-        fold_constant_arithmetic_in_expr(&mut expr, &strings, &no_symbols, &unused_objects);
+        let no_object_types = r2types::ProgramDataObjectTypeFacts::default();
+        let unused_objects = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        fold_constant_arithmetic_in_expr(
+            &mut expr,
+            &strings,
+            &no_symbols,
+            &no_object_types,
+            &unused_objects,
+        );
         let mut function = CFunction::new(
             "folded",
             CType::Pointer(Box::new(CType::Int {
@@ -6700,6 +6898,93 @@ mod tests {
             function.body,
             vec![CStmt::Return(Some(CExpr::StringLit("text".to_string())))]
         );
+    }
+
+    #[test]
+    fn radare_typed_global_renders_as_its_type_and_direct_value() {
+        let mut function =
+            CFunction::new("read_counter", CType::i32()).with_body(vec![CStmt::Return(Some(
+                CExpr::deref(CExpr::cast(
+                    CType::ptr(CType::u32()),
+                    CExpr::UIntLit(0x7000),
+                )),
+            ))]);
+        let strings = BTreeMap::new();
+        let symbols = BTreeMap::from([(0x7000, "obj.global_counter".to_string())]);
+        let object_types = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, Some("int32_t"))],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let used = std::cell::RefCell::new(std::collections::BTreeMap::new());
+
+        fold_constant_arithmetic_in_function(
+            &mut function,
+            &strings,
+            &symbols,
+            &object_types,
+            &used,
+            64,
+        );
+        function.extern_objects = used.into_inner().into_values().collect();
+        note_unproven_constructs(&mut function, None);
+        let ready = crate::codegen::prepare_function_for_emission(&function);
+        let rendered =
+            crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
+
+        assert!(
+            rendered.contains("extern int32_t global_counter;"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("return global_counter;"), "{rendered}");
+        assert!(
+            rendered.contains("1 data object type supplied by radare2"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("extern char global_counter[]"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("*(uint32_t*)&global_counter"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn unplaceable_global_type_keeps_the_honest_byte_declaration() {
+        let mut function = CFunction::new("read_counter", CType::u32())
+            .with_body(vec![CStmt::Return(Some(CExpr::UIntLit(0x7000)))]);
+        let symbols = BTreeMap::from([(0x7000, "obj.global_counter".to_string())]);
+        let object_types = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, Some("looks_specific_t"))],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let used = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        fold_constant_arithmetic_in_function(
+            &mut function,
+            &BTreeMap::new(),
+            &symbols,
+            &object_types,
+            &used,
+            64,
+        );
+        function.extern_objects = used.into_inner().into_values().collect();
+        note_unproven_constructs(&mut function, None);
+        let ready = crate::codegen::prepare_function_for_emission(&function);
+        let rendered =
+            crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
+
+        assert!(
+            rendered.contains("extern char global_counter[];"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1 data object type refused"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("looks_specific_t"), "{rendered}");
     }
 
     #[test]
