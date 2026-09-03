@@ -37,7 +37,14 @@ done
 # library and each scores the other's work. This needs no cooperation from
 # whoever else is on the host.
 run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
-remote="/root/$run_id"
+# Runs live under one directory rather than directly in /root, and the
+# difference is not cosmetic. Older manual runs left `/root/decbench-*.log`
+# files behind, and a cleanup for those also matches `/root/decbench-<stamp>/`,
+# which is a live run's tree: two runs here were deleted mid-build by one, and
+# the script reported the failure as a missing install log, which reads like a
+# build error rather than the tree being pulled out from under it.
+run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
+remote="$run_root/$run_id"
 private_home="$remote/home"
 fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
 
@@ -102,6 +109,14 @@ mkdir -p '$private_home'
 export HOME='$private_home'
 cd '$remote/tree'
 LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
+    # A missing log here does not mean the build failed to write one: the
+    # host is shared, and this run's whole tree can be removed underneath it
+    # while it builds. Say which happened, because "install failed" sent one
+    # reader looking at a compiler for a directory that no longer existed.
+    if [ ! -d '$remote/tree' ]; then
+        echo "this run's remote tree was removed while it was building" >&2
+        exit 72
+    fi
     tail -20 '$remote/install.log'; exit 70; }
 lib=\$(find '$private_home/.local/share/radare2/plugins' -name 'libr2sleigh_plugin.*' | head -1)
 if [ -z "\$lib" ]; then echo "no plugin library was installed" >&2; exit 70; fi
