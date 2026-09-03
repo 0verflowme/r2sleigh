@@ -1,7 +1,7 @@
 name = "DecBench Scoreboard"
 description = ""
 version = "1.1"
-generated_at = "2026-09-03T06:57:43.404374"
+generated_at = "2026-09-03T09:03:58.883529"
 projects_evaluated = [ "bzip2",]
 optimization_levels = [ "O0",]
 decompilers = [ "angr", "r2sleigh",]
