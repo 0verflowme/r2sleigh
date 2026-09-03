@@ -2208,7 +2208,7 @@ impl LegacyObservationJournal {
         // The same boundary record the final placement audit will consult.
         // Two tables answering for one read is how a marker survives here and
         // is refused there, so they ask one question.
-        if !crate::placement::certified_boundary_read(&self.source, value, at) {
+        if !crate::binding_plan::certified_boundary_read(&self.source, value, at) {
             return Err(LegacyObservationJournalError::InvalidCertifiedValueRead { value, at });
         }
         let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {

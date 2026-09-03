@@ -628,19 +628,22 @@ fn inlinable_core(
 ) -> BTreeSet<ValueId> {
     let source = source_owned.source();
     let graph = source.graph();
-    // A call's arguments are readers the graph does not record. `SSAOp::Call`
-    // takes only the callee as an operand, so the value staged in `rdi` is
-    // consumed by the call boundary and has no `UseSite` at all: the callsite
-    // certificate is the source's record that the read happens, and it is the
-    // same record the renderer consults to spell the argument.
-    //
-    // Asked of the graph alone, such a value has no readers, and this function
-    // turned it away at the first gate -- so every argument a call stages
-    // stayed on the page as a local, whatever the single-use rule did. That is
-    // six statements of the fourteen `readError` renders for four lines of
-    // source, and it is the difference between naming a value and spelling it
-    // where it is used.
-    let mut call_arg_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    // Boundary certificates record reads that do not exist as SSA operands:
+    // return values, call arguments, switch selectors and identity call-result
+    // carriers read by derived-width results. A graph-only count made call
+    // arguments look dead here before that case was fixed; counting only that
+    // certificate kind would make the same mistake for the other three.
+    let mut certified_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    for inst in &graph.insts {
+        for value in super::certified_boundary_read_values(source, inst.id) {
+            certified_readers.entry(value).or_default().push(inst.id);
+        }
+    }
+    // Of those graphless reads, call arguments are the one kind the renderer
+    // can currently consume from an inline expression. Return, switch and
+    // derived-result markers require a binding symbol, so they count as reads
+    // for deadness but remain explicit inlining refusals below.
+    let mut call_arg_readers = BTreeMap::<ValueId, BTreeSet<InstId>>::new();
     if let Some(callsites) = source_owned.report().callsites() {
         for (site, facts) in &callsites.by_callsite {
             let Some(inst) = graph.inst_id_for_op_site(site.block_addr, site.op_index) else {
@@ -650,7 +653,7 @@ fn inlinable_core(
                 call_arg_readers
                     .entry(argument.value)
                     .or_default()
-                    .push(inst);
+                    .insert(inst);
             }
         }
     }
@@ -685,11 +688,11 @@ fn inlinable_core(
             }
         };
         let use_sites = graph.use_sites(value.id);
-        let arg_readers = call_arg_readers
+        let boundary_readers = certified_readers
             .get(&value.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let reader_count = use_sites.len() + arg_readers.len();
+        let reader_count = use_sites.len() + boundary_readers.len();
         if reader_count == 0 {
             rejected("no readers");
             continue;
@@ -743,9 +746,9 @@ fn inlinable_core(
         // corpus cells do this and five more refuse. See the handoff.
         if !literal_only && reader_count != 1 {
             rejected(&format!(
-                "{reader_count} readers ({} of them call arguments), of which {} sit in a \
+                "{reader_count} readers ({} of them certified boundary reads), of which {} sit in a \
                  certificate-elided instruction; root {root_kind}",
-                arg_readers.len(),
+                boundary_readers.len(),
                 use_sites
                     .iter()
                     .filter(|site| elided_reads.contains(&site.inst))
@@ -761,6 +764,14 @@ fn inlinable_core(
             rejected(&format!(
                 "expression kind does not render inline: {root_kind}"
             ));
+            continue;
+        }
+        if boundary_readers.iter().any(|reader| {
+            !call_arg_readers
+                .get(&value.id)
+                .is_some_and(|arguments| arguments.contains(reader))
+        }) {
+            rejected("a certified boundary reader requires a bound value");
             continue;
         }
         let Some(definition) = graph.def_inst(value.id) else {
@@ -808,7 +819,9 @@ fn inlinable_core(
         if use_sites
             .iter()
             .any(|site| elided_reads.contains(&site.inst))
-            || arg_readers.iter().any(|inst| elided_reads.contains(inst))
+            || boundary_readers
+                .iter()
+                .any(|inst| elided_reads.contains(inst))
         {
             rejected("a reader sits in a certificate-elided instruction");
             continue;
@@ -820,10 +833,10 @@ fn inlinable_core(
             inlinable.insert(value.id);
             continue;
         }
-        // The one reader, whether the graph recorded it or the callsite
+        // The one reader, whether the graph recorded it or a boundary
         // certificate did. Only its position is wanted from here on: which
         // block it sits in, and what runs between the definition and it.
-        let reader = match (use_sites, arg_readers) {
+        let reader = match (use_sites, boundary_readers) {
             ([site], []) => site.inst,
             ([], [inst]) => *inst,
             _ => unreachable!("a value that is not literal-only was required to have one reader"),

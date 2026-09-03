@@ -18,6 +18,7 @@ use crate::ast::{
 };
 use crate::binding_plan::{
     BindingId, BindingNameResolution, PlacementRead, PlacementRefusal, ValueDisposition,
+    certified_boundary_read,
 };
 use crate::structured_region::{RegionId, SealedStructuredRegionArtifact};
 use r2ssa::{InstId, SSAFunction, UseSite};
@@ -1854,106 +1855,6 @@ fn target_authorizes_binding(
         | (PlacementObservationTarget::CertifiedValueRead { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::Other, _) => false,
     }
-}
-
-/// Whether the source certifies that this instruction reads this value at a
-/// boundary for which the graph records no use.
-///
-/// A value crossing a boundary is read by an instruction that does not take it
-/// as an operand. `SSAOp::Return` carries only the control target and
-/// `SSAOp::Call` only the callee, so a returned value and a call argument
-/// alike have no `UseSite` anywhere in the graph. The boundary certificate is
-/// the only record that the read happens, and it is the same kind of record in
-/// both directions: the return certificate names the one value leaving the
-/// function, and the callsite certificate names each value entering the
-/// callee.
-pub(crate) fn certified_boundary_read(
-    source: &r2ssa::SsaArtifact,
-    value: r2ssa::ValueId,
-    at: InstId,
-) -> bool {
-    let graph = source.graph();
-    let Some(site) = graph.op_site_for_inst(at) else {
-        return false;
-    };
-    let Some(payload) = graph.inst(at).map(|inst| &inst.payload) else {
-        return false;
-    };
-    let certificates = source.certificates();
-    let returns = certificates
-        .returns_by_inst
-        .get(&at)
-        .and_then(|index| certificates.returns.get(*index))
-        .is_some_and(|certificate| {
-            certificate.at == at
-                // Any value the return carries, not only its base. A composed
-                // return reads its base and every overlay at this one site, so
-                // asking about the base alone refuses the overlays' reads.
-                && certificate.values().any(|carried| carried == value)
-                && (certificate.block_addr, certificate.op_index) == site
-                && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Return { .. }))
-        });
-    // A call result seen at another width reads the carrier it is a slice of.
-    // The `Derived` certificate is that proof: it names this value, the call
-    // site, and the identity result it derives from, so the read of the
-    // carrier's name is certified in the same sense the return and argument
-    // boundaries are.
-    // A call result seen at another width reads the carrier it is a slice of.
-    // The instruction here defines that slice, and its `Derived` certificate
-    // names the call site; the value being read is the identity result of the
-    // same site. That pair is the proof, in the same sense the return and
-    // argument boundaries are proofs.
-    let derived_result = graph
-        .inst(at)
-        .and_then(|inst| inst.output)
-        .and_then(|defined| source.call_result_certificate_for_value(defined))
-        .is_some_and(|slice| {
-            !slice.relation.is_identity()
-                && source
-                    .call_result_certificate_for_value(value)
-                    .is_some_and(|carrier| {
-                        carrier.relation.is_identity() && carrier.call_site == slice.call_site
-                    })
-        });
-    // The value a certified switch dispatches on, read at its dispatch. The
-    // switch certificate names the block and the selector, and the instruction
-    // is that block's indirect branch: the same pair of facts the return and
-    // argument boundaries are proved by. A dispatch has no operand for the
-    // selector -- its only input is the address it computed -- so without this
-    // the `switch (...)` heading reads a program variable no table authorizes,
-    // which is what refused every function with a jump table.
-    let switch_selector = graph
-        .inst(at)
-        .and_then(|inst| graph.block(inst.block))
-        .and_then(|block| certificates.switches.get(&block.addr))
-        .is_some_and(|certificate| {
-            certificate.selector == Some(value)
-                && matches!(
-                    payload,
-                    r2ssa::InstPayload::Op(r2ssa::SSAOp::BranchInd { .. })
-                )
-        });
-    returns
-        || derived_result
-        || switch_selector
-        || certificates
-            .callsites_by_inst
-            .get(&at)
-            .and_then(|call_site| certificates.callsites.get(call_site))
-            .is_some_and(|certificate| {
-                certificate.at == at
-                    && (certificate.block_addr, certificate.op_index) == site
-                    && certificate
-                        .argument_certificates
-                        .iter()
-                        .any(|argument| argument.value == value)
-                    && matches!(
-                        payload,
-                        r2ssa::InstPayload::Op(
-                            r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }
-                        )
-                    )
-            })
 }
 
 /// Revalidate the complete source-to-render identity chain carried by a
