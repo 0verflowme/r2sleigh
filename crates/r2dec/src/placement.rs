@@ -1339,6 +1339,7 @@ fn audit_statement(
                 &active,
                 source,
                 names,
+                targets,
                 by_symbol,
             )?;
             if let Some(init) = init {
@@ -1497,7 +1498,7 @@ fn audit_expr(
     }
     match expr {
         CExpr::Var(symbol) => {
-            audit_program_symbol(*symbol, access, active, source, names, by_symbol)?;
+            audit_program_symbol(*symbol, access, active, source, names, targets, by_symbol)?;
         }
         CExpr::Observed { .. } => unreachable!("leading observation was consumed"),
         CExpr::Unary { op, operand } => {
@@ -1704,6 +1705,7 @@ fn audit_program_symbol(
     active: &[PlacementObservationTarget],
     source: &r2ssa::SsaArtifact,
     names: &BindingNameResolution,
+    targets: &[Option<PlacementObservationTarget>],
     by_symbol: &BTreeMap<crate::symbol::SymbolId, BindingId>,
 ) -> Result<(), PlacementAnalysisError> {
     let binding = by_symbol
@@ -1717,9 +1719,24 @@ fn audit_program_symbol(
     {
         return Ok(());
     }
+    // A refusal here has two very different causes and the reader cannot tell
+    // them apart from the active set alone: either the journal never recorded
+    // a marker that would authorise this binding, or it recorded one and the
+    // marker did not survive onto the node being audited. Naming the markers
+    // that exist elsewhere in the journal separates the two.
+    let elsewhere = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| {
+            target.is_some_and(|target| {
+                target_authorizes_binding(target, access, binding, source, names)
+            })
+        })
+        .map(|(index, target)| format!("{index}:{:?}", target.expect("filtered to Some")))
+        .collect::<Vec<_>>();
     r2il::refusal_evidence!(
         "binding-symbol-observed",
-        "{access:?} binding={binding:?} name={:?} members={:?} active={:?}",
+        "{access:?} binding={binding:?} name={:?} members={:?} authorizing_elsewhere={elsewhere:?} active={:?}",
         names.spelling(symbol),
         (0..source.graph().values.len())
             .filter(|index| {
