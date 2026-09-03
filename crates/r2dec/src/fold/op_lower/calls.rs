@@ -31,6 +31,20 @@ fn exact_indexed_call_arguments(
     Some(indexed)
 }
 
+fn callee_declaration_return_type(
+    disposition: r2types::CallsiteRenderDisposition,
+    function_return_type: Option<&CType>,
+    call_result_bits: Option<u32>,
+) -> Option<CType> {
+    match disposition {
+        r2types::CallsiteRenderDisposition::TerminalReturn => function_return_type
+            .filter(|return_type| !matches!(return_type, CType::Void))
+            .cloned(),
+        r2types::CallsiteRenderDisposition::TerminalVoidReturn => Some(CType::Void),
+        _ => Some(call_result_bits.map_or(CType::Void, CType::uint)),
+    }
+}
+
 impl<'a> FoldingContext<'a> {
     pub(super) fn prepared_direct_call_target(
         &self,
@@ -105,6 +119,9 @@ impl<'a> FoldingContext<'a> {
         let cert = self
             .certified_callsite_for_op(block_addr, op_idx)
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let render_fact = self
+            .certified_call_render_fact_for_op(block_addr, op_idx)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         // Only the named parameters go in the list. The tail this call passes
         // is what differs between call sites, and the ellipsis stands for it.
         let named = if cert.variadic {
@@ -114,12 +131,18 @@ impl<'a> FoldingContext<'a> {
         } else {
             args.values.len()
         };
+        let call_result_bits = self
+            .certified_call_result_value((block_addr, op_idx))
+            .and_then(|value| self.machine_value_width_bits(value));
+        let ret_type = callee_declaration_return_type(
+            render_fact.disposition,
+            self.inputs.function_return_type,
+            call_result_bits,
+        )
+        .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         let declaration = crate::ast::CExternDecl {
             name: name.clone(),
-            ret_type: self
-                .certified_call_result_value((block_addr, op_idx))
-                .and_then(|value| self.machine_value_width_bits(value))
-                .map_or(CType::Void, CType::uint),
+            ret_type,
             params: args.values[..named]
                 .iter()
                 .map(|value| self.machine_value_width_bits(*value).map(CType::uint))
@@ -474,5 +497,42 @@ mod indexed_argument_tests {
     fn indexed_arguments_require_matching_render_proof_slot() {
         let (cert, render) = facts(&[(0, 10), (1, 11)], &[10, 12]);
         assert_eq!(exact_indexed_call_arguments(&cert, &render), None);
+    }
+}
+
+#[cfg(test)]
+mod callee_return_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_callee_declaration_uses_the_function_return_contract() {
+        let pointer = CType::Pointer(Box::new(CType::Int {
+            bits: 8,
+            signedness: r2types::Signedness::Unsigned,
+        }));
+        assert_eq!(
+            callee_declaration_return_type(
+                r2types::CallsiteRenderDisposition::TerminalReturn,
+                Some(&pointer),
+                None,
+            ),
+            Some(pointer)
+        );
+        assert_eq!(
+            callee_declaration_return_type(
+                r2types::CallsiteRenderDisposition::TerminalReturn,
+                Some(&CType::Void),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            callee_declaration_return_type(
+                r2types::CallsiteRenderDisposition::TerminalVoidReturn,
+                Some(&CType::Void),
+                None,
+            ),
+            Some(CType::Void)
+        );
     }
 }
