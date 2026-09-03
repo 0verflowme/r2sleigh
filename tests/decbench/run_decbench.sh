@@ -101,6 +101,12 @@ set -euo pipefail
 mkdir -p '$private_home'
 export HOME='$private_home'
 cd '$remote/tree'
+# One build directory for every run on this host. Each run copies its own tree,
+# so without this each of them compiles the whole dependency graph from nothing,
+# and eight of those on four cores is slower in aggregate than the same eight
+# taking turns. Cargo's own lock does the taking turns; the crates that differ
+# between two trees are the only ones recompiled.
+export CARGO_TARGET_DIR=\${R2SLEIGH_DECBENCH_TARGET:-/root/decbench-shared-target}
 LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
     tail -20 '$remote/install.log'; exit 70; }
 lib=\$(find '$private_home/.local/share/radare2/plugins' -name 'libr2sleigh_plugin.*' | head -1)
