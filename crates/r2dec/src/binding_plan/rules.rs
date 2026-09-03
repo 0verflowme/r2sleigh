@@ -180,9 +180,22 @@ pub(super) fn component_eligible_values(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
+    let inlinable = inlinable_values(source_owned, projection);
+    component_eligible_with(source_owned, &inlinable)
+}
+
+/// The same answer from a stated inlining decision.
+///
+/// The partition is a function of which values are inlined, and the inlining
+/// answer needs the partition to ask whether a literal is alone in its
+/// object. Taking the decision as an argument is what lets the two be
+/// computed in a stated order instead of one estimating the other.
+pub(super) fn component_eligible_with(
+    source_owned: &SourceOwnedFunctionFacts,
+    inlinable: &BTreeSet<ValueId>,
+) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
-    let inlinable = inlinable_values(source_owned, projection);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
@@ -506,6 +519,156 @@ pub(super) fn inlinable_values(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> BTreeSet<ValueId> {
+    // Two passes, in a stated order, and no iteration.
+    //
+    // The gate below turns away a literal that lives in a register because
+    // such a literal is frequently the only write of an object other values
+    // are coalesced into: `R8_1 = 0xcbf29ce484222325` initialises the
+    // accumulator `fnv1a64` then reads across its loop, and spelling the
+    // constant at each reader leaves that object read before it is assigned.
+    // The honest test is whether the value is alone in its binding, and that
+    // needs the partition, which is computed from this answer.
+    //
+    // So the partition is built once from the answer that admits no such
+    // literal -- the conservative one, which is what this function returned
+    // before -- and a literal that is a *one-member component* there is
+    // admitted on the second pass. Nothing coalesces with a one-member
+    // component by definition, so removing that value removes its own object
+    // and no other object loses a writer. A literal that shares an object,
+    // like the accumulator, is not a singleton and stays bound.
+    //
+    // Termination is by construction rather than by convergence: pass one
+    // does not depend on pass two, so there is no iteration to bound. The
+    // second pass is conservative rather than maximal -- a candidate that
+    // would become a singleton only after other candidates are inlined is
+    // declined -- which is the safe direction, and it is why estimating the
+    // partition from a relaxed eligibility set is not needed. That estimate
+    // is also unsound: excluding a value removes it from the member set
+    // `merge_would_interfere` reads, so it can remove the interference
+    // blocking a merge and make a component *grow*.
+    let conservative = inlinable_core(source_owned, projection, &BTreeSet::new());
+    let Ok(eligible) = component_eligible_with(source_owned, &conservative) else {
+        return conservative;
+    };
+    let Ok(components) = super::construction::binding_components_with(source_owned, &eligible)
+    else {
+        return conservative;
+    };
+    let alone = components
+        .iter()
+        .filter(|component| component.members.len() == 1)
+        .filter_map(|component| component.members.first().copied())
+        .collect::<BTreeSet<_>>();
+    let admitted = duplicable_bound_literals(projection, source_owned, &alone);
+    if admitted.is_empty() {
+        return conservative;
+    }
+    inlinable_core(source_owned, projection, &admitted)
+}
+
+/// Literals held in a machine location that are alone in their object.
+///
+/// A literal in a lowering temporary is admitted by the gate in
+/// `inlinable_core` without asking anything else, because the lifter's own
+/// scratch is never coalesced. This is the rest: a literal the machine keeps
+/// in a register or a memory cell, which may be an object's only write, and
+/// is safe to spell at its readers exactly when nothing shares that object.
+fn duplicable_bound_literals(
+    projection: &r2ssa::MachineProjection,
+    source_owned: &SourceOwnedFunctionFacts,
+    alone: &BTreeSet<ValueId>,
+) -> BTreeSet<ValueId> {
+    let graph = source_owned.source().graph();
+    let mut expr_by_value = std::collections::BTreeMap::new();
+    for entity in projection.entities() {
+        expr_by_value.insert(entity.output().value(), entity.root());
+    }
+    let boundary_rendered = boundary_rendered_values(source_owned.source());
+    let literal_candidates = graph
+        .values
+        .iter()
+        .filter(|value| alone.contains(&value.id))
+        .filter(|value| {
+            expr_by_value
+                .get(&value.id)
+                .copied()
+                .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
+        })
+        .map(|value| value.id)
+        .collect::<BTreeSet<_>>();
+    literal_candidates
+        .iter()
+        .copied()
+        // And something must still be rendered where the definition was. A
+        // block that renders nothing cannot answer for the instructions in
+        // it: the ledger reports `BlockNotRendered` and refuses the function,
+        // which is what `murmur3_32` did at x86-64 -O1 and -O2 once bound
+        // literals became inlinable.
+        //
+        // A reader in the same block is not enough, and assuming it was is
+        // what the first attempt got wrong: that reader can itself be a value
+        // the plan inlines, and the block empties anyway. What keeps a block
+        // on the page is an instruction whose output is bound, and the only
+        // extra inlining this pass performs is the candidates themselves --
+        // so an instruction bound under the conservative answer and not a
+        // candidate is bound under this one too, and its statement is the
+        // one that keeps the block.
+        // And the value must not be one a boundary depends on. A return
+        // value, a register composition, a return address or the exit stack
+        // pointer seeds a `LiveValueProducer` obligation on the instruction
+        // that defines it -- `seed_value_definition` -- and that obligation
+        // says the definition must render. The boundary spells such a value
+        // through its own path, which does not go through the inline
+        // machinery, so inlining it leaves the obligation with no occurrence
+        // and the function refuses. `murmur3_32` at x86-64 -O1 and -O2 is the
+        // case: one register literal, live at a boundary, one refused
+        // obligation.
+        //
+        // This is also why a literal in a lowering temporary never had the
+        // problem. A boundary is expressed in architectural storage, so the
+        // lifter's own scratch is never live at one.
+        .filter(|value| !boundary_rendered.contains(value))
+        .collect()
+}
+
+/// Values a return boundary spells through its own path.
+///
+/// These are exactly the values `seed_value_definition` seeds a
+/// `LiveValueProducer` obligation for at a return: the returned values, the
+/// pieces of a register composition, the return address, and the exit stack
+/// pointer. The obligation kind alone is far wider than this -- filtering on
+/// it turned away every candidate, including the page base that motivated
+/// the admission -- because the same kind is seeded elsewhere for values the
+/// inline machinery does render.
+fn boundary_rendered_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    let mut values = BTreeSet::new();
+    for boundary in source.facts().boundaries.returns.values() {
+        for value in &boundary.values {
+            values.insert(value.value);
+        }
+        for composition in &boundary.register_compositions {
+            values.insert(composition.base.value);
+            for overlay in &composition.overlays {
+                values.insert(overlay.definition.value);
+            }
+        }
+        if let Some(return_address) = boundary.return_address {
+            values.insert(return_address.value);
+        }
+        if let Some(r2ssa::SourceReturnStackPointerFact::ReachingValue { value, .. }) =
+            boundary.exit_stack_pointer
+        {
+            values.insert(value);
+        }
+    }
+    values
+}
+
+fn inlinable_core(
+    source_owned: &SourceOwnedFunctionFacts,
+    projection: &r2ssa::MachineProjection,
+    admitted: &BTreeSet<ValueId>,
+) -> BTreeSet<ValueId> {
     let source = source_owned.source();
     let graph = source.graph();
     // A call's arguments are readers the graph does not record. `SSAOp::Call`
@@ -602,9 +765,9 @@ pub(super) fn inlinable_values(
             .get(&value.id)
             .copied()
             .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
-            && value.canonical_storage.is_none_or(|storage| {
+            && (value.canonical_storage.is_none_or(|storage| {
                 matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
-            });
+            }) || admitted.contains(&value.id));
         let root_kind = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))

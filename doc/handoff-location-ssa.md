@@ -10424,3 +10424,209 @@ that reads a function will tell you what the function says, and what it says can
 be true while being about a different value than the one you are holding. And
 the probe that answers this took one command against a binary that was already
 built, against months of the same wrong framing.
+## The page-base literal: what the probe says, and why the fix is still a fork
+
+`R2SLEIGH_TRACE_INLINE=all` on `arm64_O0 pearson` names the gate exactly, and
+it is not the one the reading predicted:
+
+    INLINE X8_5 ValueId(128) stays bound: 3 readers (0 of them call
+    arguments), of which 0 sit in a certificate-elided instruction; root Copy
+
+Three readers, not one. So the single-reader path never applies, and the only
+way in is the duplicable-literal path -- which is gated on storage class:
+
+    let literal_only = ...machine_expr_is_literal(...)
+        && value.canonical_storage.is_none_or(|storage| {
+            matches!(storage.space, CanonicalStorageSpace::Unique)
+        });
+
+`X8_5` lives in a register, so it is turned away. The comment beside that gate
+already says the storage class is a proxy and names the honest test -- whether
+the value is coalesced with anything -- and says it cannot be asked there
+because the partition is computed from this answer.
+
+**The two rendered shapes confirm the proxy is discriminating the right
+thing.** In `pearson` the `x8` versions render as `X8_2, X8_4, X8_5, X8_6,
+X8_8, X8_9, X8_10` -- seven distinct names, so seven distinct bindings, so
+`X8_5` is alone in its object and inlining it orphans nothing. In `fnv1a64` at
+x86-64 -O2 the accumulator renders `R8_1 = 0xcbf29ce484222325U;` and is read
+later as `RAX_15 = R8_1;` -- one object, and the literal is its only write, so
+inlining it leaves the object read before it is assigned. That is the
+ten-cell breakage the proxy was installed to stop. "Alone in its binding" is
+exactly the discriminator, and it is exactly what the plan cannot ask yet.
+
+**The obvious way to break the circularity does not work, and this is new.**
+The natural two-pass is: compute a maximal partition with every value
+eligible, admit a literal that is alone in it, then compute the real
+partition. That relies on components only shrinking as values leave
+eligibility, and they do not. `merge_would_interfere` collects its members
+from the values that actually joined, so a value excluded from eligibility is
+not a member and cannot contribute an interference; removing it can therefore
+*remove* the interference that was blocking a merge, and the component grows.
+A value alone in the maximal partition can be coalesced in the real one, so
+the test is unsound in the direction that matters.
+
+Nor is there a partition-free sufficient condition available for this case.
+"Sole value in its storage span" would be sound -- nothing could merge with
+it -- but `X8_5` shares the `x8` span with six other versions and is separated
+from them only by the interference test, which is the partition again.
+
+So admitting the page-base literal requires the interference-resolved
+partition before the inlining answer that the partition is computed from, and
+the fix is the two-pass restructuring rather than a wider gate. That is the
+design question this file has recorded once before, now with the probe output
+that names the gate, the two renderings that show what the proxy is
+protecting, and one way of breaking the circularity ruled out.
+
+
+## The fixed point, built: what it buys and the one refusal it costs
+
+The two-pass construction is in. The partition is built once from the
+conservative answer that admits no bound literal -- exactly what
+`inlinable_values` returned before -- and a literal that is a **one-member
+component** there is admitted on a second pass. Nothing coalesces with a
+one-member component by definition, so removing that value removes its own
+object and no other object loses a writer; `fnv1a64`'s accumulator shares an
+object, is not a singleton, and stays bound, so the ten-cell breakage the
+storage-class proxy prevented is still prevented -- now by the property the
+proxy stood in for.
+
+Termination is by construction. Pass one does not depend on pass two, so
+there is no iteration, no bound to choose, and nothing to observe converging.
+The second pass is deliberately conservative rather than maximal: a candidate
+that would become a singleton only after other candidates are inlined is
+declined. That is the safe direction and it is why the relaxed-eligibility
+estimate is not needed -- which matters, because that estimate is unsound, as
+recorded above.
+
+It stays one answerer. `inlinable_values` keeps its signature and is still the
+only place inlining is decided; `component_eligible_with` and
+`binding_components_with` take that decision as an argument so the partition
+is *read against* it rather than guessing at it.
+
+**The payoff is confirmed on the cell that motivated it.**
+
+    #define _pearson_tab__r2sleigh_addr 0x100001e6cULL
+    extern char _pearson_tab[];
+    uint64_t tmp_11f80_2 = (uint64_t)&_pearson_tab;
+
+The page base inlines, the fold recombines it with its `0xe6c`, the object
+lookup runs, and `arm64_O0 pearson` names its table instead of dereferencing a
+bare page base. Across the corpus, `literal_only_declarations` falls 103 -> 70
+and `self_assignments` 225 -> 133.
+
+**And it costs two cells, which is where this stops.** `murmur3_32` at x86-64
+-O1 and -O2 refuse: one obligation of 145, `LiveValueProducer`, with
+`Refused { layer: Codegen, reason: BlockNotRendered }`. The inline trace says
+exactly one value is newly admitted in that function -- `R9_1`, a register
+literal, alone in its binding, four readers -- so the admission and the
+refusal are one-to-one.
+
+Three hypotheses were tried against it and all three were wrong, which is
+worth recording so the next attempt does not repeat them:
+
+  * *The block empties because its only statement was inlined.* Requiring a
+    reader in the defining block did not fix it.
+  * *That reader is itself inlined, so the block empties anyway.* Requiring an
+    instruction in the block whose output is bound under the conservative
+    answer and is not itself a candidate did not fix it either.
+  * *It is the storage class after all.* It is not; the same admission on
+    `pearson` renders and seals.
+
+So `BlockNotRendered` here is not obviously about the defining block being
+empty, and the next step is to establish which instruction the refused
+obligation names -- the id is `CanonicalInstructionId { block_addr:
+0x10000085c, site: Op(34) }`, in source coordinates, while the trace reports
+the definition in graph coordinates as `BlockId(3), ordinal 110`. Those were
+never reconciled, and every hypothesis above assumed they were the same
+instruction without checking. That is the first thing to check and it needs a
+probe, not a reading.
+
+Until then the branch is red on two of fifty-four on `--gate differential`,
+with no wrong answers -- both cells refuse rather than miscompute. Reverting
+`6f0cd8d..be06880` returns the corpus to 54 of 54 and gives up the naming and
+the thirty-three literal declarations.
+
+
+## The fixed point, green: the refusal was placement, not the admission
+
+The two cells the bound-literal admission cost are green, and the cause was
+none of the five things read into it. It was found by printing the mapping
+the coordinator asked for and then one more trace, and both should be kept.
+
+**The coordinate mapping.** The refusal is reported in source coordinates and
+every other view of the instruction in graph coordinates, and nothing
+reconciled them, so five hypotheses were argued about an instruction nobody
+had confirmed was the right one. The refusal evidence now prints both, and
+the answer was that the assumption had been correct all along:
+
+    kind=LiveValueProducer component=Op(34) block=0x10000085c
+    source_inst=Some(InstId(329)) graph_block=Some((BlockId(3), 110))
+    output=Some((ValueId(417), "R9_1"))
+
+`(BlockId(3), 110)` and `ValueId(417)` are exactly the admitted value's
+definition. The instruction was right; every proposed cause was wrong.
+
+**What it actually was.** Placement removes a binding nothing reads and
+reports the observations that went with it. The journal fills the value, use
+and write cells of those observations with `DeadUnreadBinding`; for an effect
+it did nothing, with a comment saying an effect answers to the effect ledger.
+That is right, and nothing was telling the ledger. The obligation was left
+with zero occurrences, no rule claimed it, and the default refusal fired.
+The two traces name the same obligation to the instruction, kind and
+component:
+
+    PLACEMENT_ELIDED_EFFECT  LiveValueProducer  0x10000085c Op(34)
+    zero-occurrence-outcome  LiveValueProducer  0x10000085c Op(34)
+
+So the obligation is dead with the statement, for the same fact the three
+cells beside it already record, and it is elided with the same reason. The
+rule can only fire on an obligation with no occurrences at all, so it cannot
+hide a live effect.
+
+The admission exposed this rather than caused it: inlining a literal moves its
+occurrence onto a reader's statement, and if placement later finds that
+statement's object unread, the occurrence goes with it. Any change that moves
+an occurrence onto another statement can reach the same hole.
+
+**Ruled out by experiment, not by reading.** The program-copy elision is not
+involved -- disabling it left the refusal unchanged. The defining block
+emptying is not the mechanism -- requiring a reader in that block, and then an
+instruction in it that provably still renders, both left the refusal in place,
+and both filters were removed again. Filtering on the `LiveValueProducer`
+obligation *kind* turned away every candidate including the page base, because
+that kind is seeded by a transitive closure over inputs and not only at
+boundaries; the filter that remains names the values a return boundary spells
+through its own path, which is the set `seed_value_definition` is called on
+there.
+
+**Where it lands.**
+
+    predicate                    start    now
+    same_type_casts               3395     185
+    cast_chains                      8       1
+    self_assignments               225     155
+    literal_only_declarations      103      75
+
+    column               result
+    binding_audit        54 / 54
+    effect_obligations   54 / 54
+    placement_audit      54 / 54
+    render_refusal       54 / 54
+    raw                  54 / 54
+    differential         54 / 54
+
+`--gate differential` exits zero. The workspace suite is 2,119 green. And
+`arm64_O0 pearson` names its table:
+
+    #define _pearson_tab__r2sleigh_addr 0x100001e6cULL
+    extern char _pearson_tab[];
+    uint64_t tmp_11f80_2 = (uint64_t)&_pearson_tab;
+
+The raw baseline is re-blessed, because the rendering changed on purpose.
+
+**One thing left on the table.** The return-boundary filter was added while
+chasing the wrong cause and kept because it is defensible on its own terms --
+a value the boundary spells through its own path should not be inlined -- but
+it was never shown to be *necessary* once the placement hole was closed.
+Removing it may admit more literals. That is one corpus run to find out.

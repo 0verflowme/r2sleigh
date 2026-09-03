@@ -661,6 +661,7 @@ struct CoalescedCarrierEffectElisions {
     coalesced_carrier_uses: BTreeSet<UseSite>,
     coalesced_carrier_phis: BTreeSet<InstId>,
     coalesced_copies: BTreeSet<InstId>,
+    placement_elided_effects: BTreeSet<SemanticObligationId>,
 }
 
 impl SurvivingEffectObservations {
@@ -709,6 +710,13 @@ impl SurvivingEffectObservations {
         self.coalesced_carriers.coalesced_copies.contains(&inst)
     }
 
+    /// Whether placement removed the statement carrying this obligation.
+    pub(crate) fn placement_removed_effect(&self, id: SemanticObligationId) -> bool {
+        self.coalesced_carriers
+            .placement_elided_effects
+            .contains(&id)
+    }
+
     #[cfg(test)]
     pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences.iter().filter_map(|(id, occurrences)| {
@@ -755,6 +763,9 @@ pub(crate) struct LegacyObservationJournal {
     /// a function whose cells are empty, and filling in whatever is empty would
     /// answer that check instead of answering to it.
     placement_elided_observations: BTreeSet<crate::ast::RenderObservationId>,
+    /// Obligations whose only occurrence placement removed with the statement
+    /// that carried it.
+    placement_elided_effects: BTreeSet<SemanticObligationId>,
     symbols: Rc<RefCell<SymbolTable>>,
     value_is_literal: Box<[bool]>,
     values: Box<[Option<LegacyValueObservation>]>,
@@ -1700,6 +1711,7 @@ impl LegacyObservationJournal {
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
             placement_elided_observations: BTreeSet::new(),
+            placement_elided_effects: BTreeSet::new(),
             symbols,
             value_is_literal,
             values,
@@ -2403,9 +2415,17 @@ impl LegacyObservationJournal {
                 // A stack access answers through the object it addresses, and a
                 // certified read through the value it reads; an effect answers
                 // to the effect ledger. None of the three owns a cell here.
+                // An effect answers to the effect ledger, and the ledger has
+                // to be told. Placement removed the statement that carried
+                // this obligation's only occurrence because nothing reads the
+                // object it wrote, which is the same fact the three cells
+                // above are filled with; the obligation is dead with the
+                // statement.
+                ObservationTarget::Effect(obligation) => {
+                    self.placement_elided_effects.insert(obligation);
+                }
                 ObservationTarget::StackAccess { .. }
-                | ObservationTarget::CertifiedValueRead { .. }
-                | ObservationTarget::Effect(_) => {}
+                | ObservationTarget::CertifiedValueRead { .. } => {}
             }
         }
 
@@ -2837,6 +2857,7 @@ impl LegacyObservationJournal {
                 coalesced_carrier_uses: self.coalesced_carrier_uses,
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
                 coalesced_copies: self.coalesced_copy_writes,
+                placement_elided_effects: self.placement_elided_effects,
             }),
         })
     }
@@ -3227,6 +3248,7 @@ impl LegacyObservationJournal {
                 coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
                 coalesced_copies: std::mem::take(&mut self.coalesced_copy_writes),
+                placement_elided_effects: std::mem::take(&mut self.placement_elided_effects),
             }),
         };
         let snapshot = self.into_snapshot(source);
