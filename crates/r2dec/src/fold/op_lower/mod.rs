@@ -113,6 +113,7 @@ pub(crate) mod convert;
 mod lowering;
 mod memory_renderer;
 mod projection;
+mod subscript_renderer;
 mod typing;
 
 #[derive(Debug, Clone, PartialEq)]

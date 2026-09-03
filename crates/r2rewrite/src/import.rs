@@ -13,16 +13,17 @@
 //! rendering the resulting term renders those instructions here, and the
 //! accounting has to know.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{
-    CanonicalInstructionId, InstId, MachineArithmeticMode, MachineBitVector, MachineCastKind,
-    MachineExprId, MachineExprKind, MachineOvershiftBehavior, MachineProjection,
-    MachineUseDisposition, MachineWriteDisposition, SsaArtifact, UseSite, ValueId,
+    CanonicalInstructionId, InductionStep, InstId, MachineArithmeticMode, MachineBitVector,
+    MachineCastKind, MachineExprId, MachineExprKind, MachineOvershiftBehavior, MachineProjection,
+    MachineSignedness, MachineType, MachineUseDisposition, MachineWriteDisposition, ObjectId,
+    ObjectKind, SsaArtifact, StackAddressRoot, StructuredAccessId, UseSite, ValueId,
 };
 
 use crate::driver::Rewrite;
-use crate::term::{MAX_TERM_WIDTH_BITS, TermArena, TermId, TermKind};
+use crate::term::{MAX_TERM_WIDTH_BITS, ObjectPlacement, PointerWalk, TermArena, TermId, TermKind};
 
 /// Rule id recorded for a `Copy` root elided at import.
 pub const COPY_ELIDE: &str = "copy.elide";
@@ -41,9 +42,24 @@ pub struct ImportedValue {
     pub substituted: BTreeSet<CanonicalInstructionId>,
 }
 
+/// The cell one structured memory access reads or writes, as a term.
+///
+/// A load's cell is its value's own term. A store has no value, so its cell
+/// is imported from the typed address leaf the projection interns for it:
+/// the `Load` that would read the cell back, which the subscript rules
+/// rewrite exactly as they rewrite a read.
+#[derive(Debug, Clone)]
+pub struct ImportedAccess {
+    pub access: StructuredAccessId,
+    pub term: TermId,
+    pub trace: Vec<Rewrite>,
+    pub substituted: BTreeSet<CanonicalInstructionId>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Import {
     values: Vec<Option<ImportedValue>>,
+    accesses: BTreeMap<StructuredAccessId, ImportedAccess>,
     /// Entry values whose storage no instruction of the function writes.
     entry_never_redefined: BTreeSet<ValueId>,
 }
@@ -55,6 +71,14 @@ impl Import {
 
     pub fn values(&self) -> impl Iterator<Item = &ImportedValue> {
         self.values.iter().flatten()
+    }
+
+    pub fn access(&self, access: StructuredAccessId) -> Option<&ImportedAccess> {
+        self.accesses.get(&access)
+    }
+
+    pub fn accesses(&self) -> impl Iterator<Item = &ImportedAccess> {
+        self.accesses.values()
     }
 
     pub fn entry_never_redefined(&self) -> &BTreeSet<ValueId> {
@@ -119,7 +143,9 @@ pub fn default_expansion_policy(query: &ExpansionQuery<'_>) -> bool {
 }
 
 /// Whether every read `term` makes is of a literal or of an entry value the
-/// function never redefines, and the term is not opaque.
+/// function never redefines, the term is not opaque, and it reads no memory
+/// -- a cell read twice is observed twice, and nothing here proves the two
+/// reads see the same store.
 pub fn term_is_duplicable(
     projection: &MachineProjection,
     arena: &TermArena,
@@ -127,6 +153,7 @@ pub fn term_is_duplicable(
     term: TermId,
 ) -> bool {
     !matches!(arena.term(term).kind, TermKind::Opaque(_))
+        && !arena.reads_memory(term)
         && arena
             .leaves(term)
             .into_iter()
@@ -226,6 +253,18 @@ struct Importer<'a> {
     roots: HashMap<MachineExprId, RootImport>,
     in_progress: HashSet<MachineExprId>,
     entry_never_redefined: BTreeSet<ValueId>,
+    /// Values the machine arena types as an address at some use.
+    address_typed: BTreeSet<ValueId>,
+    /// Parameters some address reaches memory through, so a pointer rather
+    /// than an integer that happens to be a parameter.
+    pointer_parameters: BTreeSet<usize>,
+    /// One integer-typed source node per value the arena reads, so a
+    /// certificate that names a value can be stated over a leaf.
+    source_nodes: BTreeMap<ValueId, MachineExprId>,
+    /// Walk certificates derived so far; `None` records a value asked about
+    /// and found not to walk, and a value being asked about, so that a
+    /// counter that is somehow its own pointer does not recurse.
+    walks: BTreeMap<ValueId, Option<PointerWalk>>,
 }
 
 /// Import under [`default_expansion_policy`].
@@ -246,6 +285,36 @@ pub fn import_with(
 ) -> Import {
     let graph = artifact.graph();
     let entry_never_redefined = entry_values_never_redefined(graph);
+    let mut address_typed = BTreeSet::new();
+    let mut source_nodes = BTreeMap::new();
+    for (id, expr) in projection.arena().iter() {
+        let MachineExprKind::Source { binding, .. } = expr.kind() else {
+            continue;
+        };
+        match expr.ty() {
+            MachineType::Address { .. } => {
+                address_typed.insert(binding.value());
+            }
+            MachineType::Integer { .. } => {
+                source_nodes.entry(binding.value()).or_insert(id);
+            }
+            MachineType::Bool { .. } => {}
+        }
+    }
+    // A parameter is a pointer because some certified access reads or writes
+    // through an address derived from it. Being a parameter proves nothing on
+    // its own: `arr_sum(const uint32_t *a, size_t n)` has parameter address
+    // provenance for `n` as well as for `a`, and calling both pointers leaves
+    // every one-byte access with two candidate bases and no way to choose.
+    // Neither does having an object: one is made for every parameter that
+    // appears in any address expression, `n` included.
+    let pointer_parameters = artifact
+        .structured()
+        .memory_accesses
+        .values()
+        .filter_map(|access| artifact.addresses().parameter_expression(access.address))
+        .map(|expression| expression.parameter)
+        .collect();
     let mut importer = Importer {
         artifact,
         projection,
@@ -254,14 +323,32 @@ pub fn import_with(
         roots: HashMap::new(),
         in_progress: HashSet::new(),
         entry_never_redefined,
+        address_typed,
+        pointer_parameters,
+        source_nodes,
+        walks: BTreeMap::new(),
     };
     let mut values: Vec<Option<ImportedValue>> = vec![None; graph.values.len()];
+    let mut accesses = BTreeMap::new();
     for entity in projection.entities() {
         let value = entity.output().value();
         let Some(inst) = graph.def_inst(value) else {
             continue;
         };
         let root = importer.import_root(entity.root(), inst);
+        if let Some(MachineExprKind::MemoryRead { access, .. }) =
+            projection.expr(entity.root()).map(|expr| expr.kind())
+        {
+            accesses.insert(
+                *access,
+                ImportedAccess {
+                    access: *access,
+                    term: root.term,
+                    trace: root.trace.clone(),
+                    substituted: root.substituted.clone(),
+                },
+            );
+        }
         if let Some(cell) = values.get_mut(value.0 as usize) {
             *cell = Some(ImportedValue {
                 value,
@@ -273,8 +360,17 @@ pub fn import_with(
             });
         }
     }
+    for (access, fact) in &artifact.structured().memory_accesses {
+        if !fact.is_write {
+            continue;
+        }
+        if let Some(imported) = importer.import_store_cell(*access, fact) {
+            accesses.insert(*access, imported);
+        }
+    }
     Import {
         values,
+        accesses,
         entry_never_redefined: importer.entry_never_redefined,
     }
 }
@@ -389,10 +485,11 @@ impl Importer<'_> {
                 Some(substituted) => Some(substituted),
                 None => {
                     let leaf = leaf(self.arena);
-                    if let Some((leaf_id, _, _)) = &leaf
-                        && let Some(definition) = self.definition_of(binding.value())
-                    {
-                        self.arena.define(*leaf_id, definition);
+                    if let Some((leaf_id, _, _)) = &leaf {
+                        if let Some(definition) = self.definition_of(binding.value()) {
+                            self.arena.define(*leaf_id, definition);
+                        }
+                        self.declare_leaf_facts(*leaf_id, binding.value());
                     }
                     leaf
                 }
@@ -408,8 +505,24 @@ impl Importer<'_> {
                 }
             }
             MachineExprKind::Copy { input } => self.import_expr(input),
-            MachineExprKind::MemoryRead { .. }
-            | MachineExprKind::Phi { .. }
+            MachineExprKind::MemoryRead {
+                object,
+                address,
+                width_bits,
+                ..
+            } => {
+                if width_bits != width {
+                    return None;
+                }
+                let (a, trace, substituted) = self.import_expr(address)?;
+                self.place_object(object);
+                Some((
+                    self.arena.intern(ty, TermKind::Load { object, address: a }),
+                    trace,
+                    substituted,
+                ))
+            }
+            MachineExprKind::Phi { .. }
             | MachineExprKind::PopulationCount { .. }
             | MachineExprKind::UnsignedDivide { .. }
             | MachineExprKind::UnsignedRemainder { .. } => None,
@@ -678,6 +791,203 @@ impl Importer<'_> {
         self.arena.term(id).width_bits()
     }
 
+    /// The cell a store writes, as the load that would read it back.
+    fn import_store_cell(
+        &mut self,
+        access: StructuredAccessId,
+        fact: &r2ssa::StructuredMemoryAccessFact,
+    ) -> Option<ImportedAccess> {
+        let node = self.projection.store_address(access)?;
+        let site = UseSite {
+            inst: access.inst,
+            input_idx: 0,
+        };
+        if !matches!(
+            self.projection.use_disposition(site),
+            Some(MachineUseDisposition::MemoryAddress(_))
+        ) {
+            return None;
+        }
+        let width_bits = fact.width.checked_mul(8)?;
+        if width_bits == 0 || width_bits > MAX_TERM_WIDTH_BITS {
+            return None;
+        }
+        let (address, trace, substituted) = self.import_expr(node)?;
+        self.place_object(fact.object);
+        let ty = MachineType::Integer {
+            width_bits,
+            signedness: MachineSignedness::Unsigned,
+        };
+        let term = self.arena.intern(
+            ty,
+            TermKind::Load {
+                object: fact.object,
+                address,
+            },
+        );
+        Some(ImportedAccess {
+            access,
+            term,
+            trace,
+            substituted,
+        })
+    }
+
+    /// Record where the object a load reaches is placed, when it is.
+    fn place_object(&mut self, object: ObjectId) {
+        let Some(fact) = self.artifact.objects().object(object) else {
+            return;
+        };
+        let placement = match fact.kind {
+            ObjectKind::StackSlot { base, offset, .. }
+            | ObjectKind::FrameObject { base, offset, .. } => {
+                ObjectPlacement::Stack(StackAddressRoot { base, offset })
+            }
+            ObjectKind::Global { address, .. } => ObjectPlacement::Global(address),
+            ObjectKind::Parameter { .. }
+            | ObjectKind::HeapAlloc { .. }
+            | ObjectKind::EscapedUnknown { .. } => return,
+        };
+        self.arena.place_object(object, placement);
+    }
+
+    /// Everything the certificates say about the value a leaf reads, put on
+    /// the leaf, because a rule sees the leaf and not the value.
+    fn declare_leaf_facts(&mut self, leaf: TermId, value: ValueId) {
+        if self.value_is_pointer(value) {
+            self.arena.declare_pointer(leaf);
+        }
+        if let Some(root) = self.stack_root_of(value) {
+            self.arena.declare_stack_root(leaf, root);
+        }
+        if let Some(walk) = self.walk_of(value) {
+            self.arena.declare_walk(leaf, walk);
+        }
+    }
+
+    /// Whether the certificates prove this value is a pointer.
+    ///
+    /// Two proofs, and each is a use rather than a declaration. The machine
+    /// arena types a value as an address exactly where a certified access
+    /// reads or writes through it. And the address provenance pass propagates
+    /// a parameter base through arithmetic and proven stack spills, so a
+    /// value that is a pointer parameter with no index added to it is that
+    /// pointer however many stack homes it passed through -- which is what a
+    /// `-O0` build does to every parameter before its first use.
+    ///
+    /// A value with terms added is a pointer too, and is not a *base*: it is
+    /// the whole address, and an address that is its own base leaves no index.
+    fn value_is_pointer(&self, value: ValueId) -> bool {
+        if self.address_typed.contains(&value) {
+            return true;
+        }
+        self.artifact
+            .addresses()
+            .parameter_expression(value)
+            .is_some_and(|expression| {
+                expression.terms.is_empty()
+                    && self.pointer_parameters.contains(&expression.parameter)
+            })
+    }
+
+    /// The frame position `value` holds, through the copies that carried it.
+    fn stack_root_of(&self, value: ValueId) -> Option<StackAddressRoot> {
+        let facts = self.artifact.function().decompile_prep_facts()?;
+        let var = &self.artifact.graph().value(value)?.var;
+        if let Some(root) = facts.stack_address_root_of(var) {
+            return Some(*root);
+        }
+        let mut current = var;
+        for _ in 0..32 {
+            let Some(next) = facts.canonical_root_of(current) else {
+                break;
+            };
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        facts.stack_address_root_of(current).copied()
+    }
+
+    /// The walk certificate of `value`, if it is a pointer carried round a
+    /// loop beside a unit counter that starts at zero.
+    ///
+    /// The pointer's induction fact says it advances by a constant on the
+    /// one latch; the counter's says it advances by one on the same latch
+    /// from the same header; and the counter starts at zero, so at the header
+    /// the pointer is its entry value plus the counter times the stride.
+    /// Where several counters qualify the lowest value is the one, so the
+    /// answer does not depend on iteration order. A pointer with no counter
+    /// beside it has no walk: an index is never invented.
+    fn walk_of(&mut self, value: ValueId) -> Option<PointerWalk> {
+        if let Some(known) = self.walks.get(&value) {
+            return *known;
+        }
+        self.walks.insert(value, None);
+        let derived = self.derive_walk(value);
+        self.walks.insert(value, derived);
+        derived
+    }
+
+    fn derive_walk(&mut self, value: ValueId) -> Option<PointerWalk> {
+        let inductions = &self.artifact.structured().inductions;
+        let fact = inductions.get(&value)?;
+        let InductionStep::AddConst(stride) = fact.step else {
+            return None;
+        };
+        if stride == 0 {
+            return None;
+        }
+        if !self.value_is_pointer(fact.init) {
+            return None;
+        }
+        let graph = self.artifact.graph();
+        let starts_at_zero = |init: ValueId| {
+            graph
+                .value(init)
+                .is_some_and(|value| value.var.constant_bits() == Some(0))
+        };
+        let counter = inductions
+            .values()
+            .filter(|counter| {
+                counter.phi != value
+                    && counter.loop_id == fact.loop_id
+                    && counter.header == fact.header
+                    && counter.latch == fact.latch
+                    && counter.width_bits == fact.width_bits
+                    && counter.step == InductionStep::AddConst(1)
+                    && starts_at_zero(counter.init)
+            })
+            .map(|counter| counter.phi)
+            .min()?;
+        let (init, counter_value) = (fact.init, counter);
+        let width_bits = fact.width_bits;
+        let init = self.leaf_for_value(init, width_bits)?;
+        let counter = self.leaf_for_value(counter_value, width_bits)?;
+        Some(PointerWalk {
+            init,
+            counter,
+            stride,
+        })
+    }
+
+    /// A leaf reading `value` by name, with its facts, for a certificate to
+    /// be stated over.
+    fn leaf_for_value(&mut self, value: ValueId, width_bits: u32) -> Option<TermId> {
+        let node = *self.source_nodes.get(&value)?;
+        let ty = *self.projection.expr(node)?.ty();
+        if ty.width_bits() != width_bits {
+            return None;
+        }
+        let leaf = self.arena.intern(ty, TermKind::Leaf(node));
+        if let Some(definition) = self.definition_of(value) {
+            self.arena.define(leaf, definition);
+        }
+        self.declare_leaf_facts(leaf, value);
+        Some(leaf)
+    }
+
     /// The producer's term, when it is modelled, for a leaf that keeps
     /// reading the value by name.
     fn definition_of(&mut self, value: ValueId) -> Option<TermId> {
@@ -709,6 +1019,12 @@ impl Importer<'_> {
         }
         let imported = self.import_root(root, inst);
         if imported.opaque {
+            return None;
+        }
+        // A load moved into its reader would be read past every store between
+        // the two, and nothing here proves none of them writes the cell. The
+        // load keeps its own statement and the reader keeps naming it.
+        if self.arena.reads_memory(imported.term) {
             return None;
         }
         let query = ExpansionQuery {

@@ -149,66 +149,6 @@ impl VmValueExpr {
             Self::Expr(_) => false,
         }
     }
-
-    fn lookup_binding(bindings: &BTreeMap<String, u64>, name: &str) -> Option<u64> {
-        bindings.get(name).copied().or_else(|| {
-            bindings
-                .iter()
-                .find_map(|(candidate, value)| same_logical_name(candidate, name).then_some(*value))
-        })
-    }
-
-    pub(crate) fn evaluate_u64(&self, bindings: &BTreeMap<String, u64>) -> Option<u64> {
-        match self {
-            Self::Const(value) => Some(*value),
-            Self::Var(name) => Self::lookup_binding(bindings, name),
-            Self::Unary { op, arg } => {
-                let value = arg.evaluate_u64(bindings)?;
-                Some(match op {
-                    VmUnaryOp::Neg => value.wrapping_neg(),
-                    VmUnaryOp::BitNot => !value,
-                    VmUnaryOp::BoolNot => u64::from(value == 0),
-                })
-            }
-            Self::Binary { op, lhs, rhs } => {
-                let lhs = lhs.evaluate_u64(bindings)?;
-                let rhs = rhs.evaluate_u64(bindings)?;
-                Some(match op {
-                    VmBinaryOp::Add => lhs.wrapping_add(rhs),
-                    VmBinaryOp::Sub => lhs.wrapping_sub(rhs),
-                    VmBinaryOp::Mul => lhs.wrapping_mul(rhs),
-                    VmBinaryOp::Div => lhs.checked_div(rhs)?,
-                    VmBinaryOp::Rem => lhs.checked_rem(rhs)?,
-                    VmBinaryOp::And => lhs & rhs,
-                    VmBinaryOp::Or => lhs | rhs,
-                    VmBinaryOp::Xor => lhs ^ rhs,
-                    VmBinaryOp::Shl => lhs.wrapping_shl((rhs & 63) as u32),
-                    VmBinaryOp::LShr => lhs.wrapping_shr((rhs & 63) as u32),
-                    VmBinaryOp::AShr => ((lhs as i64) >> ((rhs & 63) as u32)) as u64,
-                    VmBinaryOp::Eq => u64::from(lhs == rhs),
-                    VmBinaryOp::Ne => u64::from(lhs != rhs),
-                    VmBinaryOp::Lt => u64::from(lhs < rhs),
-                    VmBinaryOp::SLt => u64::from((lhs as i64) < (rhs as i64)),
-                    VmBinaryOp::Le => u64::from(lhs <= rhs),
-                    VmBinaryOp::SLe => u64::from((lhs as i64) <= (rhs as i64)),
-                    VmBinaryOp::BoolAnd => u64::from(lhs != 0 && rhs != 0),
-                    VmBinaryOp::BoolOr => u64::from(lhs != 0 || rhs != 0),
-                })
-            }
-            Self::Select {
-                cond,
-                if_true,
-                if_false,
-            } => {
-                if cond.evaluate_u64(bindings)? != 0 {
-                    if_true.evaluate_u64(bindings)
-                } else {
-                    if_false.evaluate_u64(bindings)
-                }
-            }
-            Self::Expr(_) => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,11 +160,6 @@ pub struct VmGuardCondition {
 }
 
 impl VmGuardCondition {
-    pub(crate) fn evaluate(&self, bindings: &BTreeMap<String, u64>) -> Option<bool> {
-        let value = self.value.evaluate_u64(bindings)?;
-        Some((value != 0) == self.expect_nonzero)
-    }
-
     pub fn evidence(&self) -> SemanticEvidence {
         if self.exact {
             SemanticEvidence::exact()

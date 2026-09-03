@@ -1846,15 +1846,16 @@ fn derive_symbolic_summary_for_function<'ctx>(
     );
     let _ =
         registry.install_known_symbols_for_function(&mut explorer, &function.prepared, symbol_map);
-    let summary = explorer.summarize_function(&function.prepared, state);
+    let paths = explorer.explore(&function.prepared, state);
+    let stats = explorer.stats();
 
     let completion = if opaque_return {
         DerivedSummaryCompletion::Unknown
-    } else if summary.stats.timed_out || summary.stats.max_states_exhausted {
+    } else if stats.timed_out || stats.max_states_exhausted {
         DerivedSummaryCompletion::BudgetExhausted
-    } else if summary.paths.is_empty() {
+    } else if paths.is_empty() {
         DerivedSummaryCompletion::Unknown
-    } else if summary.paths.iter().all(|path| path.feasible) {
+    } else if paths.iter().all(|path| path.feasible) {
         DerivedSummaryCompletion::Exact
     } else {
         DerivedSummaryCompletion::OverApprox
@@ -1864,7 +1865,7 @@ fn derive_symbolic_summary_for_function<'ctx>(
     let mut write_locations = collect_tracked_memory_writes(static_summary);
     write_locations.sort_unstable();
     write_locations.dedup();
-    for path in summary.paths.iter().filter(|path| path.feasible) {
+    for path in paths.iter().filter(|path| path.feasible) {
         let mut memory_writes = Vec::new();
         for (arg_index, offset, size) in &write_locations {
             let base_addr = helper_arg_region_base(function.id, *arg_index);

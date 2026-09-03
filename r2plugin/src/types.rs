@@ -276,7 +276,7 @@ pub(crate) fn add_stack_var(
         // comparison is on the types rather than on the spellings, so radare2
         // writing `void*` reaches the same conclusion as `void *`.
         if let Some(override_ty) = type_override
-            && r2types::parse_c_type_like(&override_ty, 64).is_void_pointer()
+            && r2types::parse_c_type_like(&override_ty, 64).is_some_and(|ty| ty.is_void_pointer())
             && let Some(existing) = vars.get_mut(existing_idx)
             && !existing.recovered_type_is_void_pointer()
         {

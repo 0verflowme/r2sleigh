@@ -4,7 +4,7 @@ use r2ssa::{
     DecompilePrepFacts, SSABlock, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, StackAddressBase,
 };
 
-use crate::facts::parse_type_like_spec;
+use crate::parse_c_type_like;
 use crate::signature_infer::RecoveredSignatureParam;
 use crate::writeback::RecoveredVariable;
 
@@ -485,7 +485,7 @@ pub fn recover_signature_params_from_ssa(
                                 None
                             };
                         let initial_ty = hinted_type
-                            .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+                            .and_then(|ty| parse_c_type_like(ty, ptr_bits))
                             .unwrap_or_else(|| size_to_neutral_int_type_like(dst.size));
                         params.push(RecoveredSignatureParam {
                             name: format!("arg{index}"),
@@ -1016,7 +1016,7 @@ fn recovered_arg_type_hint(
     if let Some(hint) = best_hint.as_ref()
         && hint.rank == TypeHintRank::Pointer
     {
-        let parsed = parse_type_like_spec(&hint.ty, ptr_bits)?;
+        let parsed = parse_c_type_like(&hint.ty, ptr_bits)?;
         if let Some(width) = signature_evidence.and_then(|evidence| {
             evidence
                 .pointer_pointee_width_bytes
@@ -1056,7 +1056,7 @@ fn recovered_arg_type_hint(
 }
 
 fn explicit_arg_type_hint(hint: &str, src: &SSAVar, ptr_bits: u32) -> Option<RecoveredArgTypeHint> {
-    match parse_type_like_spec(hint, ptr_bits) {
+    match parse_c_type_like(hint, ptr_bits) {
         Some(crate::CTypeLike::Int {
             bits, signedness, ..
         }) if bits > src.size.saturating_mul(8) => Some(RecoveredArgTypeHint {
@@ -1119,7 +1119,7 @@ fn add_stack_var(
         // comparison is on the types rather than on the spellings, so radare2
         // writing `void*` reaches the same conclusion as `void *`.
         if let Some(override_ty) = type_override
-            && crate::parse_c_type_like(&override_ty, 64).is_void_pointer()
+            && crate::parse_c_type_like(&override_ty, 64).is_some_and(|ty| ty.is_void_pointer())
             && let Some(existing) = vars.get_mut(existing_idx)
             && !existing.recovered_type_is_void_pointer()
         {

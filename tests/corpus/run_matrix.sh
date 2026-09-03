@@ -73,6 +73,15 @@ configs=(x64_O0 x64_O1 x64_O2 arm64_O0 arm64_O1 arm64_O2)
 arches=(x86_64 x86_64 x86_64 arm64 arm64 arm64)
 levels=(0 1 2 0 1 2)
 
+# Capture first, verify afterwards, because only the capture needs the plugin.
+#
+# The two used to be interleaved, so a run held the shared install lock through
+# six compiles, six oracle builds and six verifications as well as its six
+# sweeps. Only `sweep.sh` runs the decompiler. `verify_rendering.py` does invoke
+# radare2 three times -- `iSj`, `iSSj` and `p8j` -- but those read a section
+# list, a section-header list and raw bytes; none disassembles, none decompiles,
+# and none depends on which plugin is installed. With six worktrees queued, the
+# difference is hours.
 for index in "${!configs[@]}"; do
     config=${configs[$index]}
     arch=${arches[$index]}
@@ -86,6 +95,27 @@ for index in "${!configs[@]}"; do
         -o "$oracle" "$script_dir/oracle.c"
     "$script_dir/sweep.sh" "$binary" > "$dump"
 
+    if [[ $gate == cutover ]]; then
+        repeat_root="$artifact_root/repeat"
+        mkdir -p "$repeat_root/dumps"
+        "$script_dir/sweep.sh" "$binary" > "$repeat_root/dumps/out_${config}.txt"
+    fi
+done
+
+# Hand the lock back the moment the last sweep is captured. The wrapper that
+# took it tolerates finding it already gone, so a run that does not release
+# early behaves exactly as before.
+if [[ -n ${R2SLEIGH_PLUGIN_LOCK_HELD:-} && -d ${R2SLEIGH_PLUGIN_LOCK_HELD} ]]; then
+    rmdir "$R2SLEIGH_PLUGIN_LOCK_HELD" 2>/dev/null \
+        && echo "released the install lock; verification does not need it" >&2
+fi
+
+for index in "${!configs[@]}"; do
+    config=${configs[$index]}
+    binary="$artifact_root/bin/h_${config}"
+    oracle="$artifact_root/bin/oracle_${config}"
+    dump="$artifact_root/dumps/out_${config}.txt"
+
     verify_args=(
         "$config"
         --input "$dump"
@@ -98,8 +128,6 @@ for index in "${!configs[@]}"; do
     if [[ $gate == cutover ]]; then
         repeat_root="$artifact_root/repeat"
         repeat_dump="$repeat_root/dumps/out_${config}.txt"
-        mkdir -p "$repeat_root/dumps"
-        "$script_dir/sweep.sh" "$binary" > "$repeat_dump"
         python3 "$script_dir/verify_rendering.py" \
             "$config" \
             --input "$repeat_dump" \

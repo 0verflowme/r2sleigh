@@ -3,7 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::convert::CTypeLike;
+use crate::convert::{CTypeLike, parse_c_type_like};
 use crate::external::{
     ExternalEnum, ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion,
     normalize_external_type_name,
@@ -11,7 +11,6 @@ use crate::external::{
 use crate::facts::{
     CalleeFact, CalleeLinkage, CalleeReturnRelation, FunctionParamSpec, FunctionSignatureSpec,
     FunctionType, FunctionTypeFacts, SignatureCertificate, SignatureCertificateSource,
-    parse_type_like_spec,
 };
 use crate::signature_infer::render_signature_type;
 
@@ -995,7 +994,7 @@ fn parse_context_type_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
         "ptrdiff_t" => Some(CTypeLike::Typedef("ptrdiff_t".to_string())),
         "uintptr_t" => Some(CTypeLike::Typedef("uintptr_t".to_string())),
         "intptr_t" => Some(CTypeLike::Typedef("intptr_t".to_string())),
-        _ => parse_type_like_spec(&normalized, ptr_bits),
+        _ => parse_c_type_like(&normalized, ptr_bits),
     }?;
 
     if let Some(size) = array_size {
@@ -1407,7 +1406,7 @@ fn external_member_type(member: &ExternalBaseTypeMemberJson, ptr_bits: u32) -> S
     let Some(size_bits) = member.size_bits else {
         return normalized;
     };
-    let Some(parsed) = parse_type_like_spec(&normalized, ptr_bits) else {
+    let Some(parsed) = parse_c_type_like(&normalized, ptr_bits) else {
         return normalized;
     };
     if matches!(parsed, CTypeLike::Array(_, _)) {

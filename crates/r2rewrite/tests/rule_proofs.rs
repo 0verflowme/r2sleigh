@@ -69,8 +69,19 @@ fn every_rule_proves_at_sixty_four_bits_or_explains() {
     }
 }
 
+/// A fixed frame base for the evaluator's stack, and a fixed function of
+/// address and width for its memory: the evaluator only has to agree with
+/// itself on both sides, so any total answer will do.
+const FRAME_BASE: u128 = 0x40;
+
+fn cell(address: u128, width_bits: u32) -> u128 {
+    (address.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u128::from(width_bits)) & mask(width_bits)
+}
+
 /// Exhaustively evaluate both sides over every assignment when the term has
-/// at most two variables of at most eight bits each.
+/// at most two variables of at most eight bits each. A variable the arena
+/// says holds a frame position, or walks, is not free: it is evaluated from
+/// the certificate, as the Z3 encoding assumes it.
 fn exhaustive_agrees(
     arena: &TermArena,
     before: r2rewrite::TermId,
@@ -101,37 +112,62 @@ fn exhaustive_agrees(
             assignment.insert(*variable, domain[rest % domain.len()]);
             rest /= domain.len();
         }
-        let defined: HashMap<(u32, MachineType), r2rewrite::TermId> = variables
+        let variable_terms: HashMap<(u32, MachineType), r2rewrite::TermId> = variables
             .iter()
             .filter_map(|(index, ty)| {
-                let mut probe = TermArena::new();
-                let _ = &mut probe;
                 arena
                     .iter()
                     .find(|(_, term)| term.kind == TermKind::Variable(*index) && term.ty == *ty)
-                    .and_then(|(id, _)| arena.definition(id))
-                    .map(|definition| ((*index, *ty), definition))
+                    .map(|(id, _)| ((*index, *ty), id))
             })
             .collect();
         fn value_of(
             arena: &TermArena,
-            defined: &HashMap<(u32, MachineType), r2rewrite::TermId>,
+            variable_terms: &HashMap<(u32, MachineType), r2rewrite::TermId>,
             assignment: &HashMap<(u32, MachineType), u128>,
             leaf: LeafRef,
             ty: &MachineType,
         ) -> u128 {
+            let width = ty.width_bits();
             match leaf {
-                LeafRef::Variable(index) => match defined.get(&(index, *ty)) {
-                    Some(definition) => eval(arena, *definition, &mut |l, t| {
-                        value_of(arena, defined, assignment, l, t)
-                    }),
-                    None => assignment[&(index, *ty)],
+                LeafRef::Variable(index) => {
+                    let term = variable_terms.get(&(index, *ty)).copied();
+                    let mut recurse = |l: LeafRef, t: &MachineType| {
+                        value_of(arena, variable_terms, assignment, l, t)
+                    };
+                    if let Some(walk) = term.and_then(|term| arena.walk(term)) {
+                        let init = eval(arena, walk.init, &mut recurse);
+                        let counter = eval(arena, walk.counter, &mut recurse);
+                        return init.wrapping_add(counter.wrapping_mul(u128::from(walk.stride)))
+                            & mask(width);
+                    }
+                    if let Some(root) = term.and_then(|term| arena.stack_root(term)) {
+                        return FRAME_BASE.wrapping_add(root.offset as u128) & mask(width);
+                    }
+                    match term.and_then(|term| arena.definition(term)) {
+                        Some(definition) => eval(arena, definition, &mut recurse),
+                        None => assignment[&(index, *ty)],
+                    }
+                }
+                LeafRef::Memory {
+                    address,
+                    width_bits,
+                } => cell(address, width_bits),
+                LeafRef::ObjectAddress(object) => match arena.placement(object) {
+                    Some(r2rewrite::ObjectPlacement::Stack(root)) => {
+                        FRAME_BASE.wrapping_add(root.offset as u128) & mask(width)
+                    }
+                    Some(r2rewrite::ObjectPlacement::Global(address)) => {
+                        u128::from(address) & mask(width)
+                    }
+                    None => panic!("templates place every object they address"),
                 },
                 LeafRef::Expr(_) => panic!("templates have no base leaves"),
             }
         }
-        let mut leaf =
-            |leaf: LeafRef, ty: &MachineType| value_of(arena, &defined, &assignment, leaf, ty);
+        let mut leaf = |leaf: LeafRef, ty: &MachineType| {
+            value_of(arena, &variable_terms, &assignment, leaf, ty)
+        };
         let l = eval(arena, before, &mut leaf);
         let r = eval(arena, after, &mut leaf);
         if l != r {

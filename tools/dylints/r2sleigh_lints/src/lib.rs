@@ -8383,7 +8383,7 @@ fn r2engine_render_semantic_route_has_no_route_side_channel() {
         .unwrap_or_else(|| panic!("missing {marker} in {}", path.display()));
     let rest = &source[start..];
     let end = rest
-        .find("\npub fn target_query_route_decision")
+        .find("\nfn current_interproc_summary")
         .unwrap_or_else(|| panic!("missing semantic route end marker in {}", path.display()));
     let body = &rest[..end];
 

@@ -48,17 +48,45 @@ tree_fingerprint() {
 }
 before=$(tree_fingerprint)
 
+# One cleanup for everything this script owns, armed before anything is
+# started. Releasing the lock was already here; reaping the build is new, and it
+# is not a nicety. Killing this script does not kill the cargo it started, and
+# an orphaned cargo goes on holding the artifact directory and fights whichever
+# build comes next -- twice today an agent cancelled a queued run and then spent
+# time on a build that was losing to its own predecessor. Job control puts the
+# build in its own process group so the negative pid reaps rustc with it.
+build_pid=""
+cleanup() {
+    if [[ -n $build_pid ]]; then
+        kill -- -"$build_pid" 2>/dev/null || kill "$build_pid" 2>/dev/null || true
+        wait "$build_pid" 2>/dev/null || true
+    fi
+    rmdir "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 echo "building $root without the lock" >&2
+set -m
 cargo build --release --features all-archs -p r2sleigh-plugin \
-    --manifest-path "$root/Cargo.toml" >&2
+    --manifest-path "$root/Cargo.toml" >&2 &
+build_pid=$!
+wait "$build_pid"
+set +m
+build_pid=""
 
 echo "waiting for $lock" >&2
 until mkdir "$lock" 2>/dev/null; do
     sleep 10
 done
-# Released on any exit, so an interrupted run does not strand the queue.
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 echo "lock taken" >&2
+
+# Tell the command which directory the lock is, so it may hand it back as soon
+# as it is finished with the installed plugin rather than at exit. Only the
+# capture half of a corpus run needs exclusivity; compiles, oracle runs and
+# verification do not, and with six worktrees queued that is hours. A command
+# that ignores this behaves exactly as before, because cleanup below tolerates
+# finding the directory already gone.
+export R2SLEIGH_PLUGIN_LOCK_HELD="$lock"
 
 after=$(tree_fingerprint)
 if [[ -n $before && $before != $after ]]; then
