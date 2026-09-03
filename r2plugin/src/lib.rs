@@ -2154,11 +2154,14 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
     // parsed it again for the disassembler -- and the trusted lift path parsed
     // it a third time. At 58 to 91 milliseconds a parse that was most of what
     // creating an `R2ILContext` cost.
-    let spec = r2sleigh_lift::shared_arch_spec(lang.sla, lang.pspec, lang.name)
-        .map_err(|e| e.to_string())?;
-    let dis =
-        Disassembler::from_embedded(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
-    Ok((spec, dis))
+    // Both from one load. These were two separate parses of the same compiled
+    // `.sla` -- `build_arch_spec` for the architecture and `from_sla` for the
+    // disassembler -- at 84 to 295 milliseconds each, which was most of what
+    // creating an `R2ILContext` cost. One load handed to one caller is safe
+    // where sharing an instance between callers is not: nothing else can see a
+    // decode this one caches.
+    r2sleigh_lift::embedded_arch_and_disassembler(lang.sla, lang.pspec, lang.name)
+        .map_err(|e| e.to_string())
 }
 
 // Symbolic execution and CFG surfaces are implemented under r2plugin/src/analysis/.

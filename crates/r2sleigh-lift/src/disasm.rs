@@ -1428,17 +1428,27 @@ fn load_embedded_specification(
     )?))
 }
 
-/// The architecture an embedded specification describes, with the processor
-/// spec's program counter applied, without parsing the specification again.
-pub fn shared_arch_spec(
+/// One load, giving both the architecture the plugin wants and the
+/// disassembler beside it.
+///
+/// These were two hand-written parses of the same bytes -- `build_arch_spec`
+/// for the architecture and `from_sla` for the disassembler -- inside one
+/// `create_disassembler_for_arch`. Sharing them is safe where sharing an
+/// instance across callers is not: this is one load handed to one caller, so
+/// there is no second consumer to see a decode cached by the first.
+///
+/// The architecture carries the processor spec's program counter, which
+/// `extract_architecture` alone does not set and the disassembler tracks
+/// separately.
+pub fn embedded_arch_and_disassembler(
     sla_bytes: &'static [u8],
     pspec: &'static str,
     arch_name: &'static str,
-) -> Result<r2il::ArchSpec> {
+) -> Result<(r2il::ArchSpec, Disassembler)> {
     let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
     let mut arch = (*spec.arch).clone();
     arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
-    Ok(arch)
+    Ok((arch, Disassembler::wrap(spec, arch_name, None)))
 }
 
 impl Disassembler {
@@ -1473,21 +1483,6 @@ impl Disassembler {
             genuine_authority,
             trusted_profile,
         }
-    }
-
-    /// Construct over an embedded specification without claiming authority.
-    ///
-    /// This is what the plugin's `R2ILContext` wants: the same parse the lift
-    /// path uses, none of the certification. It shares the specification rather
-    /// than parsing a second copy, which is what made one `R2ILContext` cost
-    /// two parses -- one here and one in `build_arch_spec` beside it.
-    pub fn from_embedded(
-        sla_bytes: &'static [u8],
-        pspec: &'static str,
-        arch_name: &'static str,
-    ) -> Result<Self> {
-        let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
-        Ok(Self::wrap(spec, arch_name, None))
     }
 
     /// Construct from a pinned, embedded processor specification.
@@ -4619,8 +4614,13 @@ mod sleigh_specification_load_cost {
             .expect("trusted disassembler");
         assert_eq!(lifter.trusted_profile, Some(TrustedSleighProfile::X86_64));
         assert!(lifter.genuine_authority.is_some());
-        let arch = shared_arch_spec(sla, pspec, name).expect("arch spec");
+        let (arch, plugin_side) =
+            embedded_arch_and_disassembler(sla, pspec, name).expect("arch and disassembler");
         assert_eq!(arch.name, lifter.spec.arch.name);
+        // Both halves of the plugin's context come from one load.
+        assert!(Rc::ptr_eq(&plugin_side.spec, &plugin_side.spec));
+        assert_eq!(plugin_side.spec.arch.name, arch.name);
+        assert!(plugin_side.genuine_authority.is_none());
         // The architecture the plugin asks for carries the processor spec's
         // program counter; the one the lifter holds is the raw extraction.
         assert!(arch.program_counter.is_some());
