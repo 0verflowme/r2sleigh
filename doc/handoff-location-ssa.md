@@ -10313,3 +10313,58 @@ renders inline. It belongs to the inlining work.
 Note this is a different fact from the `adrp` page base found in the thunk work,
 where radare2's own reference points at the page rather than the slot. Here the
 page base is correct and simply un-recombined.
+
+
+## The page-base literal: what the probe says, and why the fix is still a fork
+
+`R2SLEIGH_TRACE_INLINE=all` on `arm64_O0 pearson` names the gate exactly, and
+it is not the one the reading predicted:
+
+    INLINE X8_5 ValueId(128) stays bound: 3 readers (0 of them call
+    arguments), of which 0 sit in a certificate-elided instruction; root Copy
+
+Three readers, not one. So the single-reader path never applies, and the only
+way in is the duplicable-literal path -- which is gated on storage class:
+
+    let literal_only = ...machine_expr_is_literal(...)
+        && value.canonical_storage.is_none_or(|storage| {
+            matches!(storage.space, CanonicalStorageSpace::Unique)
+        });
+
+`X8_5` lives in a register, so it is turned away. The comment beside that gate
+already says the storage class is a proxy and names the honest test -- whether
+the value is coalesced with anything -- and says it cannot be asked there
+because the partition is computed from this answer.
+
+**The two rendered shapes confirm the proxy is discriminating the right
+thing.** In `pearson` the `x8` versions render as `X8_2, X8_4, X8_5, X8_6,
+X8_8, X8_9, X8_10` -- seven distinct names, so seven distinct bindings, so
+`X8_5` is alone in its object and inlining it orphans nothing. In `fnv1a64` at
+x86-64 -O2 the accumulator renders `R8_1 = 0xcbf29ce484222325U;` and is read
+later as `RAX_15 = R8_1;` -- one object, and the literal is its only write, so
+inlining it leaves the object read before it is assigned. That is the
+ten-cell breakage the proxy was installed to stop. "Alone in its binding" is
+exactly the discriminator, and it is exactly what the plan cannot ask yet.
+
+**The obvious way to break the circularity does not work, and this is new.**
+The natural two-pass is: compute a maximal partition with every value
+eligible, admit a literal that is alone in it, then compute the real
+partition. That relies on components only shrinking as values leave
+eligibility, and they do not. `merge_would_interfere` collects its members
+from the values that actually joined, so a value excluded from eligibility is
+not a member and cannot contribute an interference; removing it can therefore
+*remove* the interference that was blocking a merge, and the component grows.
+A value alone in the maximal partition can be coalesced in the real one, so
+the test is unsound in the direction that matters.
+
+Nor is there a partition-free sufficient condition available for this case.
+"Sole value in its storage span" would be sound -- nothing could merge with
+it -- but `X8_5` shares the `x8` span with six other versions and is separated
+from them only by the interference test, which is the partition again.
+
+So admitting the page-base literal requires the interference-resolved
+partition before the inlining answer that the partition is computed from, and
+the fix is the two-pass restructuring rather than a wider gate. That is the
+design question this file has recorded once before, now with the probe output
+that names the gate, the two renderings that show what the proxy is
+protecting, and one way of breaking the circularity ruled out.
