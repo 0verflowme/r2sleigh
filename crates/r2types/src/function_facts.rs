@@ -1732,9 +1732,31 @@ fn exact_source_return_type(source: &r2ssa::SsaArtifact) -> Option<CTypeLike> {
             }
         }
     }
-    if return_count == 0
+    let mut tail_return_count = 0usize;
+    for call_site in source
+        .facts()
+        .call_sites
+        .by_id
+        .values()
+        .filter(|call_site| call_site.transfer == r2ssa::CallSiteTransfer::TailCall)
+    {
+        let certificate = source.certificates().callsites.get(&call_site.id)?;
+        let boundary = source.facts().boundaries.calls.get(&call_site.id)?;
+        if !exact_tail_return_certificate_matches(call_site, certificate, boundary, storage) {
+            return None;
+        }
+        tail_return_count = tail_return_count.checked_add(1)?;
+    }
+    let certified_tail_return_count = source
+        .certificates()
+        .callsites
+        .values()
+        .filter(|certificate| certificate.transfer == r2ssa::CallSiteTransfer::TailCall)
+        .count();
+    if return_count + tail_return_count == 0
         || source.certificates().returns.len() != return_count
         || source.certificates().returns_by_inst.len() != return_count
+        || certified_tail_return_count != tail_return_count
     {
         return None;
     }
@@ -1751,6 +1773,27 @@ fn exact_return_certificate_matches(
     certificate.source_logical_value == Some(logical)
         && certificate.width == logical_width
         && certificate.carrier.as_ref() == Some(expected_carrier)
+}
+
+fn exact_tail_return_certificate_matches(
+    call_site: &r2ssa::CallSiteFact,
+    certificate: &r2ssa::CallsiteCertificate,
+    boundary: &r2ssa::SourceCallBoundaryFact,
+    expected_storage: r2ssa::CanonicalStorageId,
+) -> bool {
+    call_site.transfer == r2ssa::CallSiteTransfer::TailCall
+        && call_site.raw_identity.is_some()
+        && certificate.transfer == r2ssa::CallSiteTransfer::TailCall
+        && certificate.call_site == call_site.id
+        && certificate.at == call_site.at
+        && certificate.target == call_site.target
+        && boundary.call_site == call_site.id
+        && boundary.at == call_site.at
+        && boundary.complete
+        && boundary.result_kind
+            == Some(r2ssa::SourceCallResult::Register {
+                storage: expected_storage,
+            })
 }
 
 fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<ParamSlotResolver> {
@@ -5058,6 +5101,87 @@ mod tests {
                     size: 8,
                 },
             },
+        ));
+    }
+
+    #[test]
+    fn exact_tail_return_requires_a_complete_matching_source_boundary() {
+        let storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let target_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Ram,
+            offset: 0x402000,
+            size: 8,
+        };
+        let call_site_id = r2ssa::CallSiteId(0);
+        let at = r2ssa::InstId(3);
+        let target = r2ssa::ValueId(7);
+        let call_site = r2ssa::CallSiteFact {
+            id: call_site_id,
+            at,
+            raw_identity: Some(r2ssa::SourceCallSiteIdentity::new(
+                0x401000,
+                2,
+                target_storage,
+            )),
+            target,
+            direct_target: Some(0x402000),
+            fallthrough: None,
+            transfer: r2ssa::CallSiteTransfer::TailCall,
+            memory_effect: r2ssa::CallMemoryEffect::Unknown,
+        };
+        let certificate = r2ssa::CallsiteCertificate {
+            call_site: call_site_id,
+            at,
+            block_addr: 0x401000,
+            op_index: 2,
+            target,
+            direct_target: Some(0x402000),
+            fallthrough: None,
+            transfer: r2ssa::CallSiteTransfer::TailCall,
+            argument_values: Vec::new(),
+            variadic: false,
+            fixed_argument_count: Some(0),
+            stack_argument_values: Vec::new(),
+            argument_certificates: Vec::new(),
+        };
+        let mut boundary = r2ssa::SourceCallBoundaryFact {
+            call_site: call_site_id,
+            at,
+            calling_convention: Some("sysv64".to_string()),
+            variadic: Some(false),
+            noreturn: Some(false),
+            result_kind: Some(r2ssa::SourceCallResult::Register { storage }),
+            arguments: Vec::new(),
+            fixed_argument_count: Some(0),
+            results: Vec::new(),
+            complete: true,
+        };
+
+        assert!(exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
+        ));
+
+        boundary.complete = false;
+        assert!(!exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
+        ));
+        boundary.complete = true;
+        boundary.result_kind = Some(r2ssa::SourceCallResult::Void);
+        assert!(!exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
         ));
     }
 
