@@ -11,6 +11,7 @@ pub(crate) mod lattice;
 pub(crate) mod model;
 pub(crate) mod oracle;
 pub(crate) mod prepare;
+mod register_identity;
 pub(crate) mod role_registry;
 pub(crate) mod signature;
 pub(crate) mod signature_infer;
@@ -96,6 +97,7 @@ pub use prepare::{
 };
 pub use r2source::DisplayNames;
 pub use r2ssa::AssumptionUsageReport;
+pub use register_identity::RegisterIdentity;
 pub use role_registry::{
     signature_hint_for_role_identity, signature_hint_for_summary_kinds,
     type_projection_for_role_identity,

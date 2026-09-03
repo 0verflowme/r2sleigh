@@ -16,7 +16,6 @@ use r2ssa::{
 use z3::Context;
 
 use crate::backward::DerivedCallSummaryView;
-use crate::constraints::FinalConstraintGraph;
 use crate::control::{SymExecutionControl, SymExecutionStopReason};
 use crate::executor::SymExecutor;
 use crate::loops::{self, ExactLoopFoldEvidence, ExactLoopRecurrenceEvidence, LoopSummaryKind};
@@ -24,12 +23,7 @@ use crate::sim::{
     CallConv, DerivedFunctionSummary, PreparedFunctionScope, evaluate_derived_summary_guidance,
 };
 use crate::solver::SymSolver;
-use crate::spec::ExplorationSpec;
 use crate::state::{ExecutionPc, ExitStatus, RuntimeBlockReason, SymState};
-use crate::tactics::{
-    SolveTacticConfig, constrain_exact_fold_inputs, constrain_exact_recurrence_candidate,
-    tactic_candidates_for_constraint_graph,
-};
 
 const TARGET_DISTANCE_CACHE_LIMIT: usize = 128;
 const EXACT_RUNTIME_LOOP_MAX_ITERS: u64 = 4096;
@@ -283,8 +277,6 @@ pub struct SolvedPath {
     pub final_pc: u64,
     /// Path constraints that were satisfied.
     pub num_constraints: usize,
-    /// Optional provenance when the candidate was produced by a solve tactic.
-    pub generation: Option<SolvedPathGeneration>,
 }
 
 /// Public model assignments that should be surfaced to users.
@@ -370,37 +362,6 @@ fn public_solution_register_is_visible(name: &str) -> bool {
     public_solution_symbol_is_visible(name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SolvedPathGenerationKind {
-    ExactRecurrenceConstraintTactic,
-    MitmConstraintTactic,
-    DomainConstraintTactic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SolvedPathGeneration {
-    pub kind: SolvedPathGenerationKind,
-    pub reason: String,
-    pub constrained_bytes: usize,
-}
-
-/// Result of a spec-driven exploration run.
-#[derive(Debug, Default)]
-pub struct SpecExploreResult<'ctx> {
-    /// Feasible paths that matched a find predicate.
-    pub found_paths: Vec<PathResult<'ctx>>,
-    /// Number of states pruned by avoid predicates.
-    pub avoided_states: usize,
-    /// Number of states pruned as infeasible.
-    pub unsat_states: usize,
-    /// Number of states that ended in an execution error.
-    pub errored_states: usize,
-    /// Number of completed states that did not hit a find predicate.
-    pub completed_states: usize,
-    /// Non-fatal diagnostics gathered during execution.
-    pub diagnostics: Vec<String>,
-}
-
 /// Path explorer for symbolic execution.
 pub struct PathExplorer<'ctx> {
     /// The Z3 context.
@@ -423,8 +384,6 @@ pub struct PathExplorer<'ctx> {
     derived_call_summaries: HashMap<u64, RegisteredDerivedCallSummary<'ctx>>,
     /// Cached reverse-distance maps keyed by (function entry, target address).
     target_distance_cache: TargetDistanceCache,
-    /// Candidate-generation tactics used during model extraction.
-    solve_tactic_config: SolveTacticConfig,
     /// Cooperative control shared with executor and solver worklists.
     execution: SymExecutionControl,
 }
@@ -735,12 +694,6 @@ enum DriverMode<'ctx> {
         avoid_set: HashSet<u64>,
         found: Option<PathResult<'ctx>>,
     },
-    Spec {
-        find_set: HashSet<u64>,
-        avoid_set: HashSet<u64>,
-        max_finds: usize,
-        result: SpecExploreResult<'ctx>,
-    },
 }
 
 impl<'ctx> DriverMode<'ctx> {
@@ -751,34 +704,6 @@ impl<'ctx> DriverMode<'ctx> {
         match self {
             DriverMode::Explore { results } => results.len() >= limit,
             _ => false,
-        }
-    }
-
-    fn on_timeout(&mut self) -> bool {
-        if let DriverMode::Spec { result, .. } = self {
-            result.diagnostics.push("exploration timed out".to_string());
-        }
-        true
-    }
-
-    fn on_max_states(&mut self) -> bool {
-        if let DriverMode::Spec { result, .. } = self {
-            result
-                .diagnostics
-                .push("exploration stopped at max_states budget".to_string());
-        }
-        true
-    }
-
-    fn on_execution_stop(&mut self, reason: SymExecutionStopReason) {
-        if let DriverMode::Spec { result, .. } = self {
-            result.diagnostics.push(reason.to_string());
-        }
-    }
-
-    fn on_unsat_pruned(&mut self) {
-        if let DriverMode::Spec { result, .. } = self {
-            result.unsat_states += 1;
         }
     }
 
@@ -833,33 +758,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Continue(Box::new(state))
                 }
             }
-            DriverMode::Spec {
-                find_set,
-                avoid_set,
-                max_finds,
-                result,
-            } => {
-                if explorer.state_hits_any_target(&state, avoid_set) {
-                    result.avoided_states += 1;
-                    return DriverAction::Skip;
-                }
-                if explorer.state_hits_any_target(&state, find_set) {
-                    if explorer.solver.is_sat(&state) {
-                        explorer.record_depth(state.depth);
-                        explorer.stats.paths_completed += 1;
-                        result.found_paths.push(PathResult::new(state, true));
-                        if result.found_paths.len() >= *max_finds {
-                            return DriverAction::Finish;
-                        }
-                    } else {
-                        explorer.stats.paths_pruned += 1;
-                        result.unsat_states += 1;
-                    }
-                    DriverAction::Skip
-                } else {
-                    DriverAction::Continue(Box::new(state))
-                }
-            }
         }
     }
 
@@ -894,11 +792,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Skip
                 }
             }
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_max_depth += 1;
-                result.completed_states += 1;
-                DriverAction::Skip
-            }
         }
     }
 
@@ -930,14 +823,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Skip
                 }
             }
-            DriverMode::Spec { result, .. } => {
-                result
-                    .diagnostics
-                    .push(format!("no SSA block at 0x{block_addr:x}"));
-                result.completed_states += 1;
-                explorer.stats.paths_completed += 1;
-                DriverAction::Skip
-            }
         }
     }
 
@@ -945,7 +830,6 @@ impl<'ctx> DriverMode<'ctx> {
         &mut self,
         explorer: &mut PathExplorer<'ctx>,
         state: SymState<'ctx>,
-        block_addr: u64,
         max_completed_paths: Option<usize>,
     ) -> DriverAction<'ctx> {
         explorer.record_runtime_exit_status(&state.exit_status);
@@ -962,19 +846,6 @@ impl<'ctx> DriverMode<'ctx> {
             DriverMode::FindFirst { .. }
             | DriverMode::FindAll { .. }
             | DriverMode::Avoid { .. } => {}
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_completed += 1;
-                result.diagnostics.push(format!(
-                    "state terminated at 0x{:x} with {:?}",
-                    block_addr, state.exit_status
-                ));
-                match &state.exit_status {
-                    Some(ExitStatus::Error(_)) | Some(ExitStatus::RuntimeBlocked(_)) => {
-                        result.errored_states += 1
-                    }
-                    _ => result.completed_states += 1,
-                }
-            }
         }
         DriverAction::Skip
     }
@@ -983,7 +854,6 @@ impl<'ctx> DriverMode<'ctx> {
         &mut self,
         explorer: &mut PathExplorer<'ctx>,
         mut state: SymState<'ctx>,
-        block_addr: u64,
         error: String,
         max_completed_paths: Option<usize>,
     ) -> DriverAction<'ctx> {
@@ -1000,36 +870,9 @@ impl<'ctx> DriverMode<'ctx> {
             DriverMode::FindAll { .. } => {
                 explorer.stats.paths_completed += 1;
             }
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_completed += 1;
-                result.errored_states += 1;
-                result
-                    .diagnostics
-                    .push(format!("execution error at 0x{block_addr:x}: {error}"));
-            }
             DriverMode::FindFirst { .. } | DriverMode::Avoid { .. } => {}
         }
         DriverAction::Skip
-    }
-
-    fn allow_enqueue(&mut self, state: &SymState<'ctx>) -> bool {
-        match self {
-            DriverMode::Avoid { .. } => true,
-            DriverMode::Spec {
-                avoid_set, result, ..
-            } => {
-                let static_pc = state.effective_static_pc();
-                if avoid_set.contains(&state.pc())
-                    || static_pc.is_some_and(|pc| avoid_set.contains(&pc))
-                {
-                    result.avoided_states += 1;
-                    false
-                } else {
-                    true
-                }
-            }
-            _ => true,
-        }
     }
 }
 
@@ -1295,15 +1138,7 @@ impl<'ctx> PathExplorer<'ctx> {
         raise_sites.into_iter().next()
     }
 
-    pub(crate) fn exception_bridge_target_in_scope(
-        &mut self,
-        root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        target_addr: u64,
-    ) -> Option<u64> {
-        self.exception_bridge_guidance_target(root, scope, target_addr)
-    }
-
+    #[cfg(test)]
     pub(crate) fn advance_current_block_in_scope(
         &mut self,
         func: &SsaArtifact,
@@ -1812,7 +1647,6 @@ impl<'ctx> PathExplorer<'ctx> {
             residual_runtime_loop_summaries_enabled: true,
             derived_call_summaries: HashMap::new(),
             target_distance_cache: TargetDistanceCache::new(),
-            solve_tactic_config: SolveTacticConfig::default(),
             execution,
         }
     }
@@ -1827,64 +1661,9 @@ impl<'ctx> PathExplorer<'ctx> {
         &self.stats
     }
 
-    pub fn set_solve_tactic_config(&mut self, config: SolveTacticConfig) {
-        self.solve_tactic_config = config;
-    }
-
-    pub fn solve_tactic_config(&self) -> &SolveTacticConfig {
-        &self.solve_tactic_config
-    }
-
-    pub(crate) fn with_isolated_stats<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> (T, ExploreStats) {
-        let previous = std::mem::take(&mut self.stats);
-        let result = f(self);
-        let isolated = std::mem::take(&mut self.stats);
-        self.stats = previous;
-        (result, isolated)
-    }
-
     /// Get the solver for additional queries.
     pub fn solver(&self) -> &SymSolver<'ctx> {
         &self.solver
-    }
-
-    pub(crate) fn with_prune_infeasible<T>(
-        &mut self,
-        prune_infeasible: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.config.prune_infeasible;
-        self.config.prune_infeasible = prune_infeasible;
-        let result = f(self);
-        self.config.prune_infeasible = previous;
-        result
-    }
-
-    pub(crate) fn with_exception_bridge_guidance<T>(
-        &mut self,
-        enabled: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.exception_bridge_guidance_enabled;
-        self.exception_bridge_guidance_enabled = enabled;
-        let result = f(self);
-        self.exception_bridge_guidance_enabled = previous;
-        result
-    }
-
-    pub(crate) fn with_residual_runtime_loop_summaries<T>(
-        &mut self,
-        enabled: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.residual_runtime_loop_summaries_enabled;
-        self.residual_runtime_loop_summaries_enabled = enabled;
-        let result = f(self);
-        self.residual_runtime_loop_summaries_enabled = previous;
-        result
     }
 
     /// Enable target-guided ordering for query-only helpers.
@@ -2014,83 +1793,6 @@ impl<'ctx> PathExplorer<'ctx> {
         Some(solved)
     }
 
-    /// Solve a path after applying constraint-graph tactics and exact input-domain tactics.
-    pub fn solve_path_with_constraint_graph_tactics(
-        &self,
-        path: &PathResult<'ctx>,
-        graph: &FinalConstraintGraph,
-        recurrences: &[ExactLoopRecurrenceEvidence],
-    ) -> Option<SolvedPath> {
-        if !path.feasible || !self.solve_tactic_config.enabled {
-            return None;
-        }
-        let folds = loops::exact_fold_evidence_from_recurrences(recurrences);
-
-        if !graph.is_empty() {
-            for candidate in tactic_candidates_for_constraint_graph(
-                graph,
-                Some(&path.state),
-                &self.solve_tactic_config,
-            ) {
-                let mut state = path.state.fork();
-                let report = constrain_exact_recurrence_candidate(
-                    &mut state,
-                    &candidate.recurrence,
-                    &candidate.bytes,
-                );
-                if report.constrained_bytes == 0 {
-                    continue;
-                }
-                let constrained_path = PathResult {
-                    state,
-                    exit_status: path.exit_status.clone(),
-                    depth: path.depth,
-                    feasible: path.feasible,
-                };
-                if let Some(mut solution) = self.solve_path(&constrained_path) {
-                    solution.generation = Some(SolvedPathGeneration {
-                        kind: if candidate.used_mitm {
-                            SolvedPathGenerationKind::MitmConstraintTactic
-                        } else {
-                            SolvedPathGenerationKind::ExactRecurrenceConstraintTactic
-                        },
-                        reason: candidate.reason,
-                        constrained_bytes: report.constrained_bytes,
-                    });
-                    return Some(solution);
-                }
-            }
-        }
-
-        for domain in &self.solve_tactic_config.preferred_domains {
-            let mut state = path.state.fork();
-            let report = constrain_exact_fold_inputs(
-                &mut state,
-                &folds,
-                domain,
-                self.solve_tactic_config.max_constrained_bytes,
-            );
-            if report.constrained_bytes == 0 {
-                continue;
-            }
-            let constrained_path = PathResult {
-                state,
-                exit_status: path.exit_status.clone(),
-                depth: path.depth,
-                feasible: path.feasible,
-            };
-            if let Some(mut solution) = self.solve_path(&constrained_path) {
-                solution.generation = Some(SolvedPathGeneration {
-                    kind: SolvedPathGenerationKind::DomainConstraintTactic,
-                    reason: "exact fold input-domain constraint".to_string(),
-                    constrained_bytes: report.constrained_bytes,
-                });
-                return Some(solution);
-            }
-        }
-        None
-    }
-
     /// Solve all feasible paths and return concrete solutions.
     pub fn solve_all_paths(&self, paths: &[PathResult<'ctx>]) -> Vec<Option<SolvedPath>> {
         paths.iter().map(|p| self.solve_path(p)).collect()
@@ -2114,7 +1816,7 @@ impl<'ctx> PathExplorer<'ctx> {
         self.budget_exhausted() || self.execution_stop_reason().is_some()
     }
 
-    fn poll_execution(&mut self, mode: &mut DriverMode<'ctx>) -> bool {
+    fn poll_execution(&mut self) -> bool {
         let Some(reason) = self
             .execution
             .stop_reason()
@@ -2123,7 +1825,6 @@ impl<'ctx> PathExplorer<'ctx> {
             return true;
         };
         self.stats.execution_stop = Some(reason);
-        mode.on_execution_stop(reason);
         false
     }
 
@@ -2213,7 +1914,7 @@ impl<'ctx> PathExplorer<'ctx> {
         worklist.push(initial_state);
 
         'worklist: while let Some(mut state) = worklist.pop_next() {
-            if !self.poll_execution(mode) {
+            if !self.poll_execution() {
                 break;
             }
             if self.config.merge_states
@@ -2227,7 +1928,6 @@ impl<'ctx> PathExplorer<'ctx> {
             steps_taken += 1;
             if let Some(max_steps) = self.config.max_steps
                 && steps_taken > max_steps
-                && mode.on_timeout()
             {
                 self.stats.timed_out = true;
                 break;
@@ -2242,7 +1942,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 DriverAction::Finish => break,
             }
 
-            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+            if self.stats.states_explored >= self.config.max_states {
                 self.stats.max_states_exhausted = true;
                 break;
             }
@@ -2259,19 +1959,17 @@ impl<'ctx> PathExplorer<'ctx> {
 
             if self.config.prune_infeasible && !self.solver.is_sat(&state) {
                 self.stats.paths_pruned += 1;
-                mode.on_unsat_pruned();
                 continue;
             }
 
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
-                if !self.poll_execution(mode) {
+                if !self.poll_execution() {
                     break 'worklist;
                 }
                 if let Some(max_steps) = self.config.max_steps
                     && steps_taken > max_steps
-                    && mode.on_timeout()
                 {
                     self.stats.timed_out = true;
                     break 'worklist;
@@ -2300,7 +1998,6 @@ impl<'ctx> PathExplorer<'ctx> {
                         DriverAction::Continue(_) | DriverAction::Skip => continue 'worklist,
                     }
                 };
-                let block_addr = block.runtime_addr;
                 let block_static_addr = block.static_addr;
                 let block_func = block.func;
                 let transfer_generation_before_block = state.control_transfer_generation();
@@ -2312,9 +2009,8 @@ impl<'ctx> PathExplorer<'ctx> {
                         for mut forked in forked_states {
                             self.remap_state_pc_after_block(&mut forked, block);
                             block.record_predecessor(&mut forked);
-                            if mode.allow_enqueue(&forked)
-                                && let Some(forked) =
-                                    self.prune_subsumed_same_pc_state(&mut worklist, forked)
+                            if let Some(forked) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, forked)
                             {
                                 worklist.push(forked);
                             }
@@ -2331,25 +2027,22 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block,
                                 transfer_generation_before_block,
                             );
-                            if mode.allow_enqueue(&state) {
-                                let can_inline_continue = !had_forks
-                                    && state.depth.saturating_sub(inline_start_depth)
-                                        < self.max_inline_runahead_depth_delta();
-                                if can_inline_continue {
-                                    revisit_current_state = true;
-                                    continue;
-                                }
-                                if let Some(state) =
-                                    self.prune_subsumed_same_pc_state(&mut worklist, state)
-                                {
-                                    worklist.push(state);
-                                }
+                            let can_inline_continue = !had_forks
+                                && state.depth.saturating_sub(inline_start_depth)
+                                    < self.max_inline_runahead_depth_delta();
+                            if can_inline_continue {
+                                revisit_current_state = true;
+                                continue;
+                            }
+                            if let Some(state) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, state)
+                            {
+                                worklist.push(state);
                             }
                         } else {
                             match mode.on_terminated_state(
                                 self,
                                 state,
-                                block_addr,
                                 self.config.max_completed_paths,
                             ) {
                                 DriverAction::Finish => break 'worklist,
@@ -2363,7 +2056,6 @@ impl<'ctx> PathExplorer<'ctx> {
                     Err(e) => match mode.on_execute_error(
                         self,
                         state,
-                        block_addr,
                         e.to_string(),
                         self.config.max_completed_paths,
                     ) {
@@ -2533,10 +2225,9 @@ impl<'ctx> PathExplorer<'ctx> {
         worklist: &mut StateWorklist<'ctx>,
         target_heap: &mut BinaryHeap<Reverse<TargetGuidedQueueEntry>>,
         guidance: &TargetGuidanceContext,
-        mode: &mut DriverMode<'ctx>,
         state: SymState<'ctx>,
     ) {
-        if !mode.allow_enqueue(&state) || !self.target_enqueue_allowed(guidance, &state) {
+        if !self.target_enqueue_allowed(guidance, &state) {
             return;
         }
         let Some(state) = self.prune_subsumed_same_pc_state(worklist, state) else {
@@ -2580,7 +2271,7 @@ impl<'ctx> PathExplorer<'ctx> {
         'worklist: while let Some((mut state, reordered)) =
             self.pop_target_guided_state(&mut worklist, &mut target_heap)
         {
-            if !self.poll_execution(mode) {
+            if !self.poll_execution() {
                 break;
             }
             if reordered {
@@ -2597,7 +2288,6 @@ impl<'ctx> PathExplorer<'ctx> {
             steps_taken += 1;
             if let Some(max_steps) = self.config.max_steps
                 && steps_taken > max_steps
-                && mode.on_timeout()
             {
                 self.stats.timed_out = true;
                 break;
@@ -2612,7 +2302,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 DriverAction::Finish => break,
             }
 
-            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+            if self.stats.states_explored >= self.config.max_states {
                 self.stats.max_states_exhausted = true;
                 break;
             }
@@ -2644,20 +2334,18 @@ impl<'ctx> PathExplorer<'ctx> {
                     state.depth,
                     state.num_constraints(),
                 ));
-                mode.on_unsat_pruned();
                 continue;
             }
 
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
-                if !self.poll_execution(mode) {
+                if !self.poll_execution() {
                     break 'worklist;
                 }
                 let mut had_runtime_dispatch = false;
                 if let Some(max_steps) = self.config.max_steps
                     && steps_taken > max_steps
-                    && mode.on_timeout()
                 {
                     self.stats.timed_out = true;
                     break 'worklist;
@@ -2680,7 +2368,6 @@ impl<'ctx> PathExplorer<'ctx> {
                         &mut worklist,
                         &mut target_heap,
                         &guidance,
-                        mode,
                         dispatched,
                     );
                 }
@@ -2725,7 +2412,6 @@ impl<'ctx> PathExplorer<'ctx> {
                         &mut worklist,
                         &mut target_heap,
                         &guidance,
-                        mode,
                         summarized,
                     );
                     continue 'worklist;
@@ -2769,7 +2455,6 @@ impl<'ctx> PathExplorer<'ctx> {
                                 &mut worklist,
                                 &mut target_heap,
                                 &guidance,
-                                mode,
                                 forked,
                             );
                         }
@@ -2785,9 +2470,7 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block,
                                 transfer_generation_before_block,
                             );
-                            if mode.allow_enqueue(&state)
-                                && self.target_enqueue_allowed(&guidance, &state)
-                            {
+                            if self.target_enqueue_allowed(&guidance, &state) {
                                 let can_inline_continue = !had_forks
                                     && !had_runtime_dispatch
                                     && state.depth.saturating_sub(inline_start_depth)
@@ -2817,7 +2500,6 @@ impl<'ctx> PathExplorer<'ctx> {
                                         &mut worklist,
                                         &mut target_heap,
                                         &guidance,
-                                        mode,
                                         resumed_state,
                                     );
                                 }
@@ -2826,7 +2508,6 @@ impl<'ctx> PathExplorer<'ctx> {
                             match mode.on_terminated_state(
                                 self,
                                 state,
-                                block_addr,
                                 self.config.max_completed_paths,
                             ) {
                                 DriverAction::Finish => break 'worklist,
@@ -2840,7 +2521,6 @@ impl<'ctx> PathExplorer<'ctx> {
                     Err(e) => match mode.on_execute_error(
                         self,
                         state,
-                        block_addr,
                         e.to_string(),
                         self.config.max_completed_paths,
                     ) {
@@ -3164,26 +2844,6 @@ impl<'ctx> PathExplorer<'ctx> {
             _ => unreachable!("find_path_avoiding should always use avoid mode"),
         }
     }
-
-    /// Run a typed exploration specification.
-    pub fn run_spec(
-        &mut self,
-        func: &SsaArtifact,
-        initial_state: SymState<'ctx>,
-        spec: &ExplorationSpec,
-    ) -> Result<SpecExploreResult<'ctx>, String> {
-        let mut mode = DriverMode::Spec {
-            find_set: spec.find_addresses()?.into_iter().collect(),
-            avoid_set: spec.avoid_addresses()?.into_iter().collect(),
-            max_finds: spec.max_finds(),
-            result: SpecExploreResult::default(),
-        };
-        self.drive_in_scope(func, None, initial_state, &mut mode);
-        match mode {
-            DriverMode::Spec { result, .. } => Ok(result),
-            _ => unreachable!("run_spec should always use spec mode"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3231,15 +2891,15 @@ mod tests {
             crate::SymExecutionControl::with_cancellation(cancellation),
         );
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::Cancelled);
+        let stats = explorer.stats();
         assert_eq!(
-            summary.stats.execution_stop,
+            stats.execution_stop,
             Some(crate::SymExecutionStopReason::Cancelled)
         );
-        assert!(!summary.stats.timed_out);
-        assert!(!summary.stats.max_states_exhausted);
+        assert!(!stats.timed_out);
+        assert!(!stats.max_states_exhausted);
     }
 
     #[test]
@@ -3253,15 +2913,15 @@ mod tests {
             crate::SymExecutionControl::with_deadline(deadline),
         );
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::DeadlineExceeded);
+        let stats = explorer.stats();
         assert_eq!(
-            summary.stats.execution_stop,
+            stats.execution_stop,
             Some(crate::SymExecutionStopReason::DeadlineExceeded)
         );
-        assert!(!summary.stats.timed_out);
-        assert!(!summary.stats.max_states_exhausted);
+        assert!(!stats.timed_out);
+        assert!(!stats.max_states_exhausted);
     }
 
     #[test]
@@ -3273,11 +2933,11 @@ mod tests {
         };
         let mut explorer = PathExplorer::with_config(&ctx, config);
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::BudgetExhausted);
-        assert!(summary.stats.max_states_exhausted);
-        assert_eq!(summary.stats.execution_stop, None);
+        let stats = explorer.stats();
+        assert!(stats.max_states_exhausted);
+        assert_eq!(stats.execution_stop, None);
     }
     const TMP0: u64 = 0x80;
     const TMP1: u64 = 0x88;
