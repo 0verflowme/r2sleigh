@@ -45,27 +45,6 @@ impl<'a> FoldingContext<'a> {
         (branches.next().is_none() && branch_idx == terminal_idx).then_some((branch_idx, cond))
     }
 
-    pub(super) fn certified_predicate_expr_for_id(
-        &self,
-        predicate_id: r2ssa::PredicateId,
-    ) -> Option<CExpr> {
-        let predicate = self
-            .control_facts()?
-            .branch_predicates
-            .values()
-            .find(|predicate| predicate.id == predicate_id)?;
-        let block = self
-            .inputs
-            .prepared_ssa?
-            .function()
-            .get_block(predicate.block_addr)?;
-        let (branch_idx, cond) = Self::unique_terminal_branch_condition(block)?;
-        if self.prepared_value_id_for_var(cond) != Some(predicate.condition) {
-            return None;
-        }
-        self.exact_branch_input_expr(predicate.block_addr, branch_idx)
-    }
-
     pub(super) fn resolve_predicate_rhs_for_var(&self, _src: &SSAVar, fallback: CExpr) -> CExpr {
         // `fallback` was assembled from the current normalized operation's
         // exact planned inputs. Preserve those source UseSites verbatim.

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use crate::analysis;
-use crate::ast::{CExpr, CType};
+use crate::ast::CExpr;
 use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts};
 #[cfg(test)]
@@ -42,7 +42,6 @@ pub(crate) struct FoldInputs<'a> {
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     #[cfg(test)]
     pub(crate) visible_bindings: &'a [VisibleBinding],
-    pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
     /// Sole `BindingId -> SymbolId` projection for this native rendering.
     pub(crate) binding_names: Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
@@ -460,6 +459,40 @@ impl<'a> FoldingContext<'a> {
         match journal
             .borrow_mut()
             .observe_certified_value_read_expr(value, at, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_certified_address_read_expr(
+        &self,
+        value: r2ssa::ValueId,
+        access: r2ssa::StructuredAccessId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::RenderedValueRequired(
+                    value,
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_address_read_expr(value, access, symbol, expr)
         {
             Ok(marked) => marked,
             Err(error) => {
@@ -955,6 +988,7 @@ impl<'a> FoldingContext<'a> {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(crate) fn exact_effect_obligations_for_source_memory(
         &self,
         kind: EffectOccurrenceKind,
@@ -1007,7 +1041,6 @@ impl<'a> FoldingContext<'a> {
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
             #[cfg(test)]
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
-            function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
         };

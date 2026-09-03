@@ -1,26 +1,4 @@
 impl<'a> FoldingContext<'a> {
-    fn certified_parameter_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
-        let slot = self
-            .certified_render_context()?
-            .render_facts
-            .exact_parameter_slot_for_value(value)?;
-        let names = self.inputs.binding_names?;
-        match names.require_parameter_slot(slot as u32) {
-            Ok(crate::binding_plan::PlannedParameterSymbol::Bound { symbol, .. }) => {
-                Some(CExpr::Var(symbol))
-            }
-            Err(_) => {
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                None
-            }
-        }
-    }
-
-    fn stable_semantic_ids_are_required(&self) -> bool {
-        self.certified_render_context()
-            .is_some_and(|proof| !proof.render_facts.certified_exprs.is_empty())
-    }
-
     pub(super) fn certified_const_bits(&self, var: &SSAVar) -> Option<u64> {
         let value = var.constant_bits()?;
         let storage = self
@@ -29,17 +7,6 @@ impl<'a> FoldingContext<'a> {
             .canonical_storage_for_var(var)?;
         (storage.space == r2ssa::CanonicalStorageSpace::Constant).then_some(value)
     }
-
-    fn certified_const_expr(&self, var: &SSAVar) -> Option<CExpr> {
-        let value = self.certified_const_bits(var)?;
-        Some(if value > 0x7fff_ffff {
-            CExpr::UIntLit(value)
-        } else {
-            CExpr::IntLit(value as i64)
-        })
-    }
-
-    const MAX_SEMANTIC_RENDER_DEPTH: u32 = 16;
 
     fn use_info(&self) -> &analysis::UseInfo {
         self.state.analysis_ctx.semantic()
@@ -58,48 +25,6 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn certified_residual_comment(&self, reason: impl Into<String>) -> CStmt {
         CStmt::Comment(format!("r2sleigh residual: {}", reason.into()))
-    }
-
-    pub(super) fn certified_loop_carrier_expr_for_value(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<CExpr> {
-        let r2types::CertifiedEntity::LoopCarrier { .. } = self
-            .certified_render_context()?
-            .render_facts
-            .loop_carrier_for_value(value)?
-        else {
-            return None;
-        };
-        match self.planned_value_expr(value) {
-            Ok(expr @ CExpr::Var(_)) => Some(expr),
-            Ok(_) => {
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                None
-            }
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                None
-            }
-        }
-    }
-
-    pub(super) fn certified_memory_result_expr_for_value(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<CExpr> {
-        self.certified_render_context()?
-            .exact_memory_read_for_value(value)?;
-        match self.planned_value_expr(value) {
-            Ok(expr @ CExpr::Var(_)) => Some(expr),
-            Ok(_) => None,
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                None
-            }
-        }
     }
 
     pub(crate) fn certified_callsite_for_op(
@@ -296,557 +221,6 @@ impl<'a> FoldingContext<'a> {
         Some((source_inst, boundary))
     }
 
-    fn certified_expr_for_prepared_var(
-        &self,
-        var: &SSAVar,
-        depth: u32,
-        visited: &mut BTreeSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if var.is_const() {
-            return self.certified_const_expr(var);
-        }
-        let value = self.prepared_value_id_for_var(var)?;
-        self.certified_structural_expr_for_value(value, depth + 1, visited)
-    }
-
-    fn certified_structural_expr_for_value(
-        &self,
-        value: r2ssa::ValueId,
-        depth: u32,
-        visited: &mut BTreeSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if let Some(expr) = self.certified_loop_carrier_expr_for_value(value) {
-            return Some(expr);
-        }
-        if let Some(expr) = self.certified_memory_result_expr_for_value(value) {
-            return Some(expr);
-        }
-        if !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let prepared = self.prepared_ssa()?;
-            let var = prepared.value_var(value)?;
-            if var.is_const() {
-                return self.certified_const_expr(var);
-            }
-            // A value the callee returned used to render as the call itself,
-            // because the result had no name to render as. Where the call site
-            // owns the result it has one now, and every use that re-rendered
-            // the call was a second evaluation of it -- which is what the
-            // single-evaluation check refuses.
-            if let Some(result) = prepared.call_result_certificate_for_value(value)
-                && result.relation.is_identity()
-            {
-                let site = (result.block_addr, result.op_index);
-                if !self.call_site_assigns_its_own_result(site) {
-                    return self.certified_call_result_expr_for_value(value);
-                }
-            }
-            let expression_renderable = self
-                .certified_render_context()
-                .is_some_and(|proof| proof.expression_is_renderable(value));
-            if var.version == 0 && var.is_register() {
-                if !expression_renderable {
-                    return None;
-                }
-                if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-                    return Some(expr);
-                }
-                if self.stable_semantic_ids_are_required() {
-                    return None;
-                }
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                return None;
-            }
-
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let transparent_value_forward = matches!(
-                &inst.payload,
-                r2ssa::InstPayload::Op(
-                    SSAOp::Copy { .. }
-                        | SSAOp::New { .. }
-                        | SSAOp::Cast { .. }
-                        | SSAOp::Subpiece { .. }
-                        | SSAOp::IntZExt { .. }
-                        | SSAOp::IntSExt { .. }
-                        | SSAOp::Trunc { .. }
-                )
-            );
-            let is_memory_load =
-                matches!(&inst.payload, r2ssa::InstPayload::Op(SSAOp::Load { .. }));
-            if !expression_renderable && !is_memory_load && !transparent_value_forward {
-                return None;
-            }
-            match &inst.payload {
-                r2ssa::InstPayload::Phi { predecessors } => {
-                    if let Some(guarded) = self
-                        .certified_render_context()
-                        .and_then(|render| render.render_facts.guarded_phi_for_value(value))
-                    {
-                        let expected_sources = inst
-                            .inputs
-                            .iter()
-                            .copied()
-                            .map(r2ssa::SemanticId::expression)
-                            .collect::<BTreeSet<_>>();
-                        let rendered_sources = guarded
-                            .when_true
-                            .sources
-                            .iter()
-                            .chain(&guarded.when_false.sources)
-                            .copied()
-                            .collect::<BTreeSet<_>>();
-                        let r2ssa::SemanticId::Predicate(predicate) = guarded.predicate else {
-                            return None;
-                        };
-                        let r2ssa::SemanticId::Expression(when_true) = guarded.when_true.rendered
-                        else {
-                            return None;
-                        };
-                        let r2ssa::SemanticId::Expression(when_false) = guarded.when_false.rendered
-                        else {
-                            return None;
-                        };
-                        if expected_sources != rendered_sources
-                            || guarded.when_true.sources.is_empty()
-                            || guarded.when_false.sources.is_empty()
-                        {
-                            return None;
-                        }
-                        return Some(CExpr::Ternary {
-                            cond: Box::new(self.certified_predicate_expr_for_id(predicate)?),
-                            then_expr: Box::new(self.certified_structural_expr_for_value(
-                                when_true,
-                                depth + 1,
-                                visited,
-                            )?),
-                            else_expr: Box::new(self.certified_structural_expr_for_value(
-                                when_false,
-                                depth + 1,
-                                visited,
-                            )?),
-                        });
-                    }
-                    let compute_latch = |pred_addr: u64| {
-                        self.control_facts().and_then(|facts| {
-                            facts
-                                .loops
-                                .values()
-                                .find_map(|fact| fact.latches.contains(&pred_addr).then_some(true))
-                        })
-                    };
-                    let mut rendered: Vec<(Option<bool>, CExpr)> = Vec::new();
-                    for (i, input) in inst.inputs.iter().enumerate() {
-                        let Some(expr) =
-                            self.certified_structural_expr_for_value(*input, depth + 1, visited)
-                        else {
-                            continue;
-                        };
-                        let is_latch = predecessors
-                            .get(i)
-                            .and_then(|pred_id| prepared.graph().block(*pred_id))
-                            .map(|block| block.addr)
-                            .and_then(compute_latch)
-                            .unwrap_or(false);
-                        rendered.push((Some(is_latch), expr));
-                    }
-                    let latch_exprs: Vec<_> = rendered
-                        .iter()
-                        .filter(|(is_latch, _)| is_latch.unwrap_or(false))
-                        .map(|(_, expr)| expr)
-                        .collect();
-                    let unique_exprs: Vec<_> = rendered.iter().map(|(_, expr)| expr).fold(
-                        Vec::<&CExpr>::new(),
-                        |mut acc, expr| {
-                            if !acc.contains(&expr) {
-                                acc.push(expr);
-                            }
-                            acc
-                        },
-                    );
-                    if latch_exprs.len() == 1 {
-                        Some(latch_exprs[0].clone())
-                    } else if unique_exprs.len() == 1 {
-                        Some(unique_exprs[0].clone())
-                    } else {
-                        None
-                    }
-                }
-                r2ssa::InstPayload::Op(op) => match op {
-                    SSAOp::Copy { src, .. } => {
-                        self.certified_expr_for_prepared_var(src, depth + 1, visited)
-                    }
-                    SSAOp::Load { addr: _, .. } => {
-                        let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                        let fact = self
-                            .certified_render_context()?
-                            .memory_access_for_op(block_addr, op_idx, false)?;
-                        if fact.value != Some(value) {
-                            return None;
-                        }
-                        let rendered = self.render_certified_memory_expr_for_fact(
-                            fact,
-                            type_from_size(fact.width),
-                        )?;
-                        let obligations = self.exact_effect_obligations_for_source_memory(
-                            EffectOccurrenceKind::MemoryRead,
-                            block_addr,
-                            op_idx,
-                            fact.space,
-                            Some(fact.address),
-                            fact.value,
-                        );
-                        Some(self.observe_effect_expr(&obligations, rendered))
-                    }
-                    SSAOp::IntAdd { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Add, a, b, depth, visited)
-                    }
-                    SSAOp::IntSub { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Sub, a, b, depth, visited)
-                    }
-                    SSAOp::IntMult { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Mul, a, b, depth, visited)
-                    }
-                    SSAOp::IntDiv { a, b, .. } | SSAOp::IntSDiv { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Div, a, b, depth, visited)
-                    }
-                    SSAOp::IntRem { a, b, .. } | SSAOp::IntSRem { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Mod, a, b, depth, visited)
-                    }
-                    SSAOp::IntAnd { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::BitAnd, a, b, depth, visited)
-                    }
-                    SSAOp::IntOr { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::BitOr, a, b, depth, visited)
-                    }
-                    SSAOp::IntXor { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::BitXor, a, b, depth, visited)
-                    }
-                    SSAOp::IntLeft { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Shl, a, b, depth, visited)
-                    }
-                    SSAOp::IntRight { a, b, .. } | SSAOp::IntSRight { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Shr, a, b, depth, visited)
-                    }
-                    SSAOp::IntEqual { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Eq, a, b, depth, visited)
-                    }
-                    SSAOp::IntNotEqual { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Ne, a, b, depth, visited)
-                    }
-                    SSAOp::IntLess { a, b, .. } | SSAOp::IntSLess { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Lt, a, b, depth, visited)
-                    }
-                    SSAOp::IntLessEqual { a, b, .. } | SSAOp::IntSLessEqual { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Le, a, b, depth, visited)
-                    }
-                    SSAOp::BoolAnd { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::And, a, b, depth, visited)
-                    }
-                    SSAOp::BoolOr { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::Or, a, b, depth, visited)
-                    }
-                    SSAOp::BoolXor { a, b, .. } => {
-                        self.certified_binary_return_expr(BinaryOp::BitXor, a, b, depth, visited)
-                    }
-                    SSAOp::IntNegate { src, .. } => self
-                        .certified_expr_for_prepared_var(src, depth + 1, visited)
-                        .map(|expr| CExpr::unary(UnaryOp::Neg, expr)),
-                    SSAOp::IntNot { src, .. } => self
-                        .certified_expr_for_prepared_var(src, depth + 1, visited)
-                        .map(|expr| CExpr::unary(UnaryOp::BitNot, expr)),
-                    SSAOp::BoolNot { src, .. } => self
-                        .certified_expr_for_prepared_var(src, depth + 1, visited)
-                        .map(|expr| CExpr::unary(UnaryOp::Not, expr)),
-                    SSAOp::Select {
-                        cond,
-                        if_true,
-                        if_false,
-                        ..
-                    } => {
-                        let cond_value = self.prepared_value_id_for_var(cond)?;
-                        if let Some(truth) =
-                            self.certified_value_truth_in_current_control_domain(cond_value)
-                        {
-                            return self.certified_expr_for_prepared_var(
-                                if truth { if_true } else { if_false },
-                                depth + 1,
-                                visited,
-                            );
-                        }
-                        Some(CExpr::Ternary {
-                            cond: Box::new(self.certified_expr_for_prepared_var(
-                                cond,
-                                depth + 1,
-                                visited,
-                            )?),
-                            then_expr: Box::new(self.certified_expr_for_prepared_var(
-                                if_true,
-                                depth + 1,
-                                visited,
-                            )?),
-                            else_expr: Box::new(self.certified_expr_for_prepared_var(
-                                if_false,
-                                depth + 1,
-                                visited,
-                            )?),
-                        })
-                    }
-                    SSAOp::IntZExt { dst, src }
-                    | SSAOp::IntSExt { dst, src }
-                    | SSAOp::Trunc { dst, src }
-                    | SSAOp::Cast { dst, src } => {
-                        let expr = self.certified_expr_for_prepared_var(src, depth + 1, visited)?;
-                        let source_already_matches_return = depth == 0
-                            && dst.size > src.size
-                            // 64 is what `CType::bits` assumed for a pointer
-                            // before the two type models were folded together.
-                            // The fold context carries no target width, so the
-                            // assumption is kept here rather than silently
-                            // changed; it only matters for a pointer return.
-                            && self
-                                .inputs
-                                .function_return_type
-                                .and_then(|ty| ty.bits(64))
-                                == Some(src.size.saturating_mul(8));
-                        Some(if source_already_matches_return {
-                            expr
-                        } else {
-                            CExpr::cast(type_from_size(dst.size), expr)
-                        })
-                    }
-                    SSAOp::Subpiece { dst, src, offset } => {
-                        let expr = self.certified_expr_for_prepared_var(src, depth + 1, visited)?;
-                        if *offset == 0 {
-                            Some(CExpr::cast(uint_type_from_size(dst.size), expr))
-                        } else {
-                            let shift_bits = offset.saturating_mul(8);
-                            let shifted = CExpr::binary(
-                                BinaryOp::Shr,
-                                CExpr::cast(uint_type_from_size(src.size), expr),
-                                CExpr::IntLit(shift_bits as i64),
-                            );
-                            Some(CExpr::cast(uint_type_from_size(dst.size), shifted))
-                        }
-                    }
-                    _ => None,
-                },
-            }
-        })();
-
-        visited.remove(&value);
-        result
-    }
-
-    fn certified_value_truth_in_current_control_domain(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<bool> {
-        let block_addr = self.current_block_addr.get()?;
-        let facts = self.control_facts()?;
-        if !facts
-            .control_domain_for_block(block_addr)
-            .is_some_and(|domain| domain.complete)
-        {
-            return None;
-        }
-        let target_compare = self.certified_compare_for_value(value);
-        let mut proven = None;
-        for assumption in facts.assumptions_for_block(block_addr) {
-            let Some(predicate) = facts
-                .branch_predicates
-                .values()
-                .find(|predicate| predicate.id == assumption.predicate)
-            else {
-                continue;
-            };
-            let implied = if predicate.condition == value {
-                Some(assumption.truth)
-            } else {
-                let Some(target_compare) = target_compare else {
-                    continue;
-                };
-                let Some(comparison) = predicate.comparison.as_ref() else {
-                    continue;
-                };
-                let Some(predicate_compare) = self.certified_canonical_compare(
-                    comparison.kind,
-                    comparison.lhs,
-                    comparison.rhs,
-                ) else {
-                    continue;
-                };
-                certified_compare_truth_relation(target_compare, predicate_compare)
-                    .map(|same_truth| assumption.truth == same_truth)
-            };
-            let Some(implied) = implied else {
-                continue;
-            };
-            if proven.is_some_and(|existing| existing != implied) {
-                return None;
-            }
-            proven = Some(implied);
-        }
-        proven
-    }
-
-    fn certified_compare_for_value(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<(r2ssa::CompareKind, r2ssa::SemanticId, r2ssa::SemanticId)> {
-        let prepared = self.prepared_ssa()?;
-        let inst = prepared.graph().inst(prepared.graph().def_inst(value)?)?;
-        let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return None;
-        };
-        let (kind, lhs, rhs) = match op {
-            SSAOp::IntEqual { a, b, .. } => (r2ssa::CompareKind::Equal, a, b),
-            SSAOp::IntNotEqual { a, b, .. } => (r2ssa::CompareKind::NotEqual, a, b),
-            SSAOp::IntLess { a, b, .. } => (r2ssa::CompareKind::Less, a, b),
-            SSAOp::IntSLess { a, b, .. } => (r2ssa::CompareKind::SignedLess, a, b),
-            SSAOp::IntLessEqual { a, b, .. } => (r2ssa::CompareKind::LessEqual, a, b),
-            SSAOp::IntSLessEqual { a, b, .. } => (r2ssa::CompareKind::SignedLessEqual, a, b),
-            _ => return None,
-        };
-        Some((
-            kind,
-            self.certified_canonical_value(lhs)?,
-            self.certified_canonical_value(rhs)?,
-        ))
-    }
-
-    fn certified_canonical_compare(
-        &self,
-        kind: r2ssa::CompareKind,
-        lhs: r2ssa::ValueId,
-        rhs: r2ssa::ValueId,
-    ) -> Option<(r2ssa::CompareKind, r2ssa::SemanticId, r2ssa::SemanticId)> {
-        let prepared = self.prepared_ssa()?;
-        Some((
-            kind,
-            self.certified_canonical_value(prepared.value_var(lhs)?)?,
-            self.certified_canonical_value(prepared.value_var(rhs)?)?,
-        ))
-    }
-
-    fn certified_canonical_value(&self, var: &SSAVar) -> Option<r2ssa::SemanticId> {
-        let prepared = self.prepared_ssa()?;
-        let mut value = self.prepared_value_id_for_var(var)?;
-        let mut visited = BTreeSet::new();
-        for _ in 0..32 {
-            if !visited.insert(value) {
-                return None;
-            }
-            if let Some(reload) = prepared.stack_reload_certificate_for_value(value)
-                && reload.canonical_source != value
-            {
-                value = reload.canonical_source;
-                continue;
-            }
-            let current = prepared.value_var(value)?;
-            if current.version == 0 && current.is_register() {
-                let certified = self
-                    .certified_render_context()?
-                    .render_facts
-                    .certified_expr_for_value(value)?;
-                let mut parameters = certified
-                    .bindings
-                    .iter()
-                    .filter(|binding| matches!(binding, r2ssa::SemanticId::Parameter(_)));
-                let parameter = *parameters.next()?;
-                if parameters.next().is_none() {
-                    return Some(parameter);
-                }
-                return None;
-            }
-            if let Some(object) = prepared.object_for_var(current, r2il::SpaceId::Ram) {
-                let identity = r2ssa::SemanticId::stack_slot(object);
-                if self
-                    .certified_render_context()?
-                    .render_facts
-                    .certified_entities
-                    .contains_key(&identity)
-                {
-                    return Some(identity);
-                }
-            }
-            let Some(root) = self.prepared_canonical_value_root(current) else {
-                return Some(r2ssa::SemanticId::expression(value));
-            };
-            let Some(root_value) = self.prepared_value_id_for_var(&root) else {
-                return Some(r2ssa::SemanticId::expression(value));
-            };
-            if root_value == value {
-                return Some(r2ssa::SemanticId::expression(value));
-            }
-            value = root_value;
-        }
-        None
-    }
-
-    fn certified_binary_return_expr(
-        &self,
-        op: BinaryOp,
-        a: &SSAVar,
-        b: &SSAVar,
-        depth: u32,
-        visited: &mut BTreeSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        Some(CExpr::binary(
-            op,
-            self.certified_expr_for_prepared_var(a, depth + 1, visited)?,
-            self.certified_expr_for_prepared_var(b, depth + 1, visited)?,
-        ))
-    }
-
-    fn certified_call_result_fact_for_value(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<&r2types::CallResultFact> {
-        let fact = self.inputs.call_result_facts()?.result_for_value(value)?;
-        (fact.value == value).then_some(fact)
-    }
-
-    pub(crate) fn certified_call_result_expr_for_value(
-        &self,
-        value: r2ssa::ValueId,
-    ) -> Option<CExpr> {
-        let prepared = self.prepared_ssa()?;
-        let prepared_result = prepared.call_result_certificate_for_value(value)?;
-        let fact = self.certified_call_result_fact_for_value(value)?;
-        if fact.call_site_id != prepared_result.call_site
-            || fact.relation != prepared_result.relation
-            || !fact.relation.is_identity()
-        {
-            return None;
-        }
-        let binding = r2ssa::SemanticId::call(fact.call_site_id);
-        let certified = self
-            .certified_render_context()?
-            .render_facts
-            .certified_expr_for_value(value)?;
-        if !certified.fact.renderable || !certified.bindings.contains(&binding) {
-            return None;
-        }
-        let source_call = (fact.callsite.block_addr, fact.callsite.op_index);
-        if let Some(owner) = self.certified_assigned_call_result_owner_expr_for_source(source_call)
-        {
-            return Some(owner);
-        }
-        if let r2ssa::ReturnCarrier::StackSlot { object, .. } = &fact.carrier {
-            let stack_binding = r2ssa::SemanticId::stack_slot(*object);
-            if !certified.bindings.contains(&stack_binding) {
-                return None;
-            }
-            return self.certified_stack_var_expr_for_object(*object);
-        }
-        self.synthesized_call_expr_for_source_call(source_call)
-    }
-
-    /// The canonical value behind a variable, for recording what a render owns.
     fn value_id_for_rendered_op(&self, var: &SSAVar) -> Option<ValueId> {
         self.inputs
             .prepared_ssa
@@ -884,11 +258,6 @@ impl<'a> FoldingContext<'a> {
         self.inputs.control_facts()
     }
 
-    pub(crate) fn prepared_decompile_prep_facts(&self) -> Option<&DecompilePrepFacts> {
-        self.prepared_ssa()
-            .and_then(|prepared| prepared.function().decompile_prep_facts())
-    }
-
     pub(crate) fn prepared_call_view_for_site(
         &self,
         block_addr: u64,
@@ -904,21 +273,6 @@ impl<'a> FoldingContext<'a> {
 
     pub(crate) fn prepared_value_id_for_var(&self, var: &SSAVar) -> Option<r2ssa::ValueId> {
         self.inputs.prepared_ssa?.graph().value_id_for_var(var)
-    }
-
-    pub(crate) fn prepared_canonical_value_root(&self, var: &SSAVar) -> Option<SSAVar> {
-        let facts = self.prepared_decompile_prep_facts()?;
-        let mut current = var.clone();
-        for _ in 0..32 {
-            let Some(next) = facts.canonical_root_of(&current) else {
-                break;
-            };
-            if next == &current {
-                break;
-            }
-            current = next.clone();
-        }
-        Some(current)
     }
 
     pub(crate) fn callee_identity_for_direct_target(&self, addr: u64) -> CalleeIdentity {
@@ -1719,33 +1073,33 @@ impl<'a> FoldingContext<'a> {
         None
     }
 
-    fn certified_call_result_owner_for_source(
+    fn certified_call_result_definition_for_source(
         &self,
         source_call: (u64, usize),
-    ) -> Option<&r2ssa::ValueOwner> {
+    ) -> Option<&r2types::CallResultFact> {
         let callsite = r2types::CallsiteKey {
             block_addr: source_call.0,
             op_index: source_call.1,
         };
-        self.inputs.call_result_facts()?.owner_for_site(callsite)
+        self.inputs
+            .call_result_facts()?
+            .definition_for_site(callsite)
     }
 
     fn certified_call_result_owner_expr_for_source(
         &self,
         source_call: (u64, usize),
     ) -> Option<CExpr> {
-        match self.certified_call_result_owner_for_source(source_call)? {
-            r2ssa::ValueOwner::StackSlot { object, .. } => {
-                self.certified_stack_var_expr_for_object(*object)
+        let value = self
+            .certified_call_result_definition_for_source(source_call)?
+            .value;
+        match self.planned_value_expr(value) {
+            Ok(expr) => Some(expr),
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
+                None
             }
-            r2ssa::ValueOwner::Value(value) => match self.planned_value_expr(*value) {
-                Ok(expr) => Some(expr),
-                Err(error) => {
-                    self.retain_first_observation_error(error);
-                    self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                    None
-                }
-            },
         }
     }
 
@@ -1804,13 +1158,7 @@ impl<'a> FoldingContext<'a> {
     /// nothing. What the statement assigns is this value, and naming it is what
     /// lets the obligation be discharged by the statement that renders it.
     pub(super) fn certified_call_result_value(&self, site: (u64, usize)) -> Option<ValueId> {
-        let view = self.prepared_semantic_view()?;
-        view.call_result_facts_by_value
-            .values()
-            .find(|cert| {
-                (cert.callsite.block_addr, cert.callsite.op_index) == site
-                    && cert.relation.is_identity()
-            })
+        self.certified_call_result_definition_for_source(site)
             .map(|cert| cert.value)
     }
 
@@ -1824,11 +1172,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         site: (u64, usize),
     ) -> Option<(u64, usize)> {
-        let view = self.prepared_semantic_view()?;
-        let cert = view.call_result_facts_by_value.values().find(|cert| {
-            (cert.callsite.block_addr, cert.callsite.op_index) == site
-                && cert.relation.is_identity()
-        })?;
+        let cert = self.certified_call_result_definition_for_source(site)?;
         let graph = self.inputs.prepared_ssa?.graph();
         graph.op_site_for_inst(graph.def_inst(cert.value)?)
     }

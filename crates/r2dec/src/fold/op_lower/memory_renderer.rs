@@ -1,5 +1,3 @@
-use std::collections::{BTreeSet, HashSet};
-
 use r2ssa::SSAVar;
 
 use super::*;
@@ -540,14 +538,28 @@ impl<'a> FoldingContext<'a> {
         {
             return None;
         }
-        let base = self.certified_parameter_expr_for_value(base_value)?;
-        let index_var = self.prepared_ssa()?.value_var(index)?;
-        let index = self.render_certified_value_expr_for_var(index_var)?;
+        let base = match self.planned_value_expr(base_value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return None;
+            }
+        };
+        let base = self.observe_certified_address_read_expr(base_value, array.access, base);
+        let index_value = index;
+        let index = match self.planned_value_expr(index_value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return None;
+            }
+        };
+        let index = self.observe_certified_address_read_expr(index_value, array.access, index);
         let indexed = CExpr::Subscript {
             base: Box::new(base),
             index: Box::new(index),
         };
-        match self.certified_member_fact_for_memory(memory) {
+        let rendered = match self.certified_member_fact_for_memory(memory) {
             Some(member)
                 if member.field_offset == array.field_offset && member.access == array.access =>
             {
@@ -555,7 +567,8 @@ impl<'a> FoldingContext<'a> {
             }
             None if array.field_offset == 0 => Some(indexed),
             _ => None,
-        }
+        }?;
+        self.observe_certified_address_replacement(memory, rendered)
     }
 
     /// Whether this expression can stand on the left of an assignment.
@@ -576,107 +589,6 @@ impl<'a> FoldingContext<'a> {
             CExpr::Paren(inner) => Self::expr_is_store_target_candidate(inner),
             _ => false,
         }
-    }
-
-    pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        if let Some(value) = self.certified_const_bits(var) {
-            return Some(if value > 0x7fff_ffff {
-                CExpr::UIntLit(value)
-            } else {
-                CExpr::IntLit(value as i64)
-            });
-        }
-
-        let value = self.prepared_value_id_for_var(var)?;
-        if let Some(expr) = self.certified_loop_carrier_expr_for_value(value) {
-            return Some(expr);
-        }
-        if let Some(expr) = self.certified_memory_result_expr_for_value(value) {
-            return Some(expr);
-        }
-        if self.prepared_ssa().is_some_and(|prepared| {
-            prepared
-                .call_result_certificate_for_value(value)
-                .is_some_and(|result| result.relation.is_identity())
-        }) {
-            return self.certified_call_result_expr_for_value(value);
-        }
-        if !self
-            .certified_render_context()
-            .is_some_and(|proof| proof.expression_is_renderable(value))
-        {
-            return None;
-        }
-        if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-            return Some(expr);
-        }
-        if let Some(expr) =
-            self.render_certified_stack_param_value_expr(value, 0, &mut HashSet::new())
-        {
-            return Some(expr);
-        }
-        if let Some(expr) = self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())
-        {
-            return Some(expr);
-        }
-        if var.version == 0 && var.is_register() && self.stable_semantic_ids_are_required() {
-            return None;
-        }
-        match self.planned_value_expr(value) {
-            Ok(expr) => Some(expr),
-            Err(error) => {
-                self.retain_first_observation_error(error);
-                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
-                None
-            }
-        }
-    }
-
-    fn render_certified_stack_param_value_expr(
-        &self,
-        value: r2ssa::ValueId,
-        depth: u32,
-        visited: &mut HashSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH || !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let prepared = self.prepared_ssa()?;
-            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-                return Some(expr);
-            }
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let r2ssa::InstPayload::Op(op) = &inst.payload else {
-                return None;
-            };
-            match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::New { src, .. }
-                | SSAOp::Cast { src, .. }
-                | SSAOp::Subpiece { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. } => {
-                    let src_value = self.prepared_value_id_for_var(src)?;
-                    self.render_certified_stack_param_value_expr(src_value, depth + 1, visited)
-                }
-                SSAOp::Load { .. } => {
-                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                    let proof = self.certified_render_context()?;
-                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
-                    if fact.value != Some(value) {
-                        return None;
-                    }
-                    self.certified_stack_owner_expr_for_memory_fact(fact)
-                }
-                _ => None,
-            }
-        })();
-
-        visited.remove(&value);
-        result
     }
 
     pub(super) fn certified_memory_address_expr(

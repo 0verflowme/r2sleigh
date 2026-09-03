@@ -629,7 +629,6 @@ mod tests {
             function_facts: empty_function_facts(),
             stack_slots: empty_stack_slots,
             visible_bindings: empty_visible,
-            function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
         })

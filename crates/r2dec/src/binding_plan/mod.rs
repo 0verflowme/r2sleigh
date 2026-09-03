@@ -174,6 +174,23 @@ pub(crate) enum ValueDisposition {
     },
 }
 
+/// Exact source fact that authorises a rendered value read without a matching
+/// graph operand at the rendered site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertifiedValueReadSource {
+    Boundary(InstId),
+    Address(r2ssa::StructuredAccessId),
+}
+
+impl CertifiedValueReadSource {
+    pub(crate) const fn inst(self) -> InstId {
+        match self {
+            Self::Boundary(inst) => inst,
+            Self::Address(access) => access.inst,
+        }
+    }
+}
+
 /// Values read at one exact certified boundary despite having no graph use.
 ///
 /// `SSAOp::Return` carries only its control target and `SSAOp::Call` only its
@@ -274,6 +291,56 @@ pub(crate) fn certified_boundary_read(
     at: InstId,
 ) -> bool {
     certified_boundary_read_values(source, at).contains(&value)
+}
+
+/// Whether affine address provenance certifies that one structured memory
+/// occurrence reads `value` as its parameter base or scalar index.
+///
+/// The typed array renderer replaces the machine's spill/reload and address
+/// arithmetic with `parameter[index]`. Those two names are real reads, but
+/// neither is necessarily an operand of the final load/store. Re-deriving the
+/// identity from the exact prepared access prevents the renderer's spelling
+/// from becoming a second authority.
+pub(crate) fn certified_address_read(
+    source: &r2ssa::SsaArtifact,
+    value: ValueId,
+    access: r2ssa::StructuredAccessId,
+) -> bool {
+    let Some(memory) = source.certificates().memory_accesses.get(&access) else {
+        return false;
+    };
+    if memory.access != access
+        || !source
+            .structured()
+            .memory_accesses
+            .get(&access)
+            .is_some_and(|fact| fact.provenance_complete)
+    {
+        return false;
+    }
+    let Some(address) = source.addresses().parameter_expression(memory.address) else {
+        return false;
+    };
+    let parameter_value = u32::try_from(address.parameter)
+        .ok()
+        .and_then(|slot| source.facts().boundaries.parameters.get(&slot))
+        .filter(|parameter| {
+            address.parameter_storage == Some(parameter.graph_storage)
+                && parameter.index as usize == address.parameter
+        })
+        .map(|parameter| parameter.value);
+    parameter_value == Some(value) || address.terms.iter().any(|term| term.value == value)
+}
+
+pub(crate) fn certified_value_read(
+    source: &r2ssa::SsaArtifact,
+    value: ValueId,
+    read: CertifiedValueReadSource,
+) -> bool {
+    match read {
+        CertifiedValueReadSource::Boundary(at) => certified_boundary_read(source, value, at),
+        CertifiedValueReadSource::Address(access) => certified_address_read(source, value, access),
+    }
 }
 
 /// Exact graph uses that consume a source-certified machine return target.

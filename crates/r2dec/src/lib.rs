@@ -4796,8 +4796,6 @@ impl Decompiler {
         };
         let inferred_ret_type =
             evidence_return_type(prepared, input.source_owned_facts().evidence_types());
-        let signature_ret_type = render_signature.and_then(|sig| sig.ret_type.clone());
-        let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
             arg_regs: self.config.arg_regs.clone(),
@@ -4855,7 +4853,6 @@ impl Decompiler {
             stack_slots: &self.context.type_facts().stack_slots,
             #[cfg(test)]
             visible_bindings: &self.context.type_facts().visible_bindings,
-            function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
             binding_names: Some(&binding_names),
             prepared_semantic_view: Some(&prepared_semantic_view),
@@ -6205,7 +6202,6 @@ mod tests {
             function_facts: crate::fold::context::empty_function_facts(),
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
-            function_return_type: None,
             prepared_ssa: None,
             binding_names: None,
             prepared_semantic_view: None,

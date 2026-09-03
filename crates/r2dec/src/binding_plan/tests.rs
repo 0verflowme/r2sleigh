@@ -220,6 +220,60 @@ fn test_projection(source_owned: &SourceOwnedFunctionFacts) -> r2ssa::MachinePro
 }
 
 #[test]
+fn certified_address_reads_are_owned_by_exact_affine_provenance() {
+    let source_owned = source_owned([
+        R2ILOp::IntMult {
+            dst: Varnode::unique(0x100, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::constant(16, 8),
+        },
+        R2ILOp::IntAdd {
+            dst: Varnode::unique(0x108, 8),
+            a: Varnode::register(0x38, 8),
+            b: Varnode::unique(0x100, 8),
+        },
+        R2ILOp::Load {
+            dst: Varnode::register(0x00, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x108, 8),
+        },
+    ]);
+    let source = source_owned.source();
+    let access = source
+        .certificates()
+        .memory_accesses_by_op
+        .get(&(0x1000, 2, false))
+        .and_then(|accesses| accesses.first())
+        .copied()
+        .expect("exact structured load access");
+    let memory = source
+        .certificates()
+        .memory_accesses
+        .get(&access)
+        .expect("exact memory certificate");
+    let address = source
+        .addresses()
+        .parameter_expression(memory.address)
+        .expect("parameter-relative affine address");
+    let base = source.facts().boundaries.parameters[&0].value;
+    let [index] = address.terms.as_slice() else {
+        panic!("one exact scalar index term: {address:?}");
+    };
+
+    assert!(certified_address_read(source, base, access));
+    assert!(certified_address_read(source, index.value, access));
+    assert!(!certified_address_read(source, memory.address, access));
+    assert!(!certified_address_read(
+        source,
+        base,
+        r2ssa::StructuredAccessId {
+            inst: access.inst,
+            ordinal: access.ordinal + 1,
+        }
+    ));
+}
+
+#[test]
 fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     let first = Varnode::unique(0x10, 8);
     let source_owned = source_owned([
