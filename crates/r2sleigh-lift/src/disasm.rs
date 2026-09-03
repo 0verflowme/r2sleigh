@@ -1677,12 +1677,7 @@ impl Disassembler {
         let pcode = self
             .sleigh
             .disassemble_pcode(&loader, address)
-            .map_err(|e| {
-                LiftError::Pcode(crate::pcode::PcodeError::InvalidOpcode(format!(
-                    "Disassembly failed: {}",
-                    e
-                )))
-            })?;
+            .map_err(|e| LiftError::Parse(format!("Disassembly failed: {e}")))?;
 
         // Translate P-code to r2il
         let mut block = self.translate_pcode(pcode, addr)?;

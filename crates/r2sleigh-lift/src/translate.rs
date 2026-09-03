@@ -1,15 +1,11 @@
-//! Shared P-code translation abstraction.
+//! Operand helpers for the canonical libsla P-code translator.
 //!
-//! This module provides a trait-based abstraction for translating P-code operations
-//! to r2il, reducing code duplication between the `disasm` and `pcode` modules.
+//! Opcode dispatch lives in `disasm`; these helpers validate the common operand
+//! shapes used by its translation arms.
 
 use r2il::{R2ILOp, SpaceId, Varnode};
 
-/// A source of P-code operands that can be translated to r2il.
-///
-/// This trait abstracts over different P-code representations:
-/// - `libsla::PcodeInstruction` (from runtime disassembly)
-/// - `RawPcodeOp` (from raw P-code bytes)
+/// A validated view of operands from a libsla P-code instruction.
 pub trait PcodeSource {
     /// Get the output varnode, if any.
     fn output(&self) -> Option<Varnode>;
