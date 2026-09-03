@@ -3073,8 +3073,57 @@ impl FunctionFacts {
         if recovered.is_empty() {
             return;
         }
+        self.apply_recovered_parameter_types(source, &recovered, ptr_bits);
         self.apply_recovered_return_type(source, &recovered, ptr_bits);
         self.apply_recovered_stack_slot_types(&recovered, ptr_bits);
+    }
+
+    /// The type of each exact source parameter value the solver reached.
+    ///
+    /// Boundary facts own the slot-to-`ValueId` mapping. A missing or
+    /// contradictory solution leaves just that parameter unchanged, while a
+    /// pointer or operation-proven scalar signedness may replace the weak
+    /// machine-width declaration inferred for the same slot.
+    fn apply_recovered_parameter_types(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let type_db = &self.types.external_type_db;
+        let Some(signature) = self.types.merged_signature.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        for (slot, parameter) in &source.facts().boundaries.parameters {
+            if parameter.index != *slot {
+                continue;
+            }
+            let Ok(index) = usize::try_from(*slot) else {
+                continue;
+            };
+            let Some(candidate) = recovered.value_type(parameter.value) else {
+                continue;
+            };
+            let Some(param) = signature.params.get_mut(index) else {
+                continue;
+            };
+            let replace = match param.ty.as_ref() {
+                None => true,
+                Some(existing) => {
+                    recovered_type_outranks(existing, candidate, ptr_bits, type_db)
+                        || recovered_scalar_signedness_outranks(existing, candidate)
+                }
+            };
+            if replace {
+                param.ty = Some(candidate.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.types
+                .certify_current_signature_with_source(SignatureCertificateSource::LocalInference);
+        }
     }
 
     /// The type of the value the function hands back.
@@ -3326,6 +3375,25 @@ fn recovered_type_is_evidence(ty: &CTypeLike, ptr_bits: u32) -> bool {
         CTypeLike::Typedef(name) => !crate::facts::is_weak_storage_scalar_typedef(name, ptr_bits),
         _ => false,
     }
+}
+
+/// Operation-proven signedness refines a weak scalar of the same width.
+fn recovered_scalar_signedness_outranks(existing: &CTypeLike, recovered: &CTypeLike) -> bool {
+    matches!(
+        (existing, recovered),
+        (
+            CTypeLike::Int {
+                bits: existing_bits,
+                signedness: existing_signedness,
+            },
+            CTypeLike::Int {
+                bits: recovered_bits,
+                signedness: recovered_signedness,
+            }
+        ) if existing_bits == recovered_bits
+            && existing_signedness != recovered_signedness
+            && *recovered_signedness != crate::Signedness::Unknown
+    )
 }
 
 fn struct_name_from_pointer_type(ty: Option<&CTypeLike>) -> Option<&str> {

@@ -20,6 +20,7 @@ use crate::convert::{CTypeLike, to_c_type_like};
 use crate::facts::FunctionType;
 use crate::model::{Signedness, Type, TypeArena, TypeId};
 use crate::oracle::TypeOracle;
+use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 use crate::solver::{SolvedTypes, SolverConfig, TypeSolver};
 
 /// A node of the recovered type graph.
@@ -223,6 +224,7 @@ pub fn solve_evidence_types(
 ) -> EvidenceTypes {
     let mut builder = EvidenceBuilder::new(source, ptr_bits);
     builder.gather_ssa_identities();
+    builder.gather_scalar_signedness();
     builder.gather_callee_prototypes(callsite_signatures);
     builder.gather_memory_widths();
     builder.gather_allocation_element_widths(callsite_signatures);
@@ -377,6 +379,53 @@ impl<'a> EvidenceBuilder<'a> {
         }
     }
 
+    /// Signed and unsigned machine operations type the values they consume.
+    ///
+    /// The signedness pass already follows transparent same-width operations.
+    /// SSA phi/cell identities are constraints in this builder, so a seed on
+    /// either side reaches the same solver class without a second alias model.
+    /// Conflicting signed and unsigned uses are both asserted: their meet is
+    /// `Bottom`, and readback refuses only that value.
+    fn gather_scalar_signedness(&mut self) {
+        let inferred = infer_scalar_signedness(
+            self.source
+                .function()
+                .blocks()
+                .flat_map(|block| block.ops.iter()),
+            std::iter::empty(),
+            crate::prepare::prepared_arch_display_name(self.source),
+        );
+        let mut inferred = inferred.into_iter().collect::<Vec<_>>();
+        inferred.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (var, evidence) in inferred {
+            let Some(value) = self.source.graph().value_id_for_var(&var) else {
+                continue;
+            };
+            let Some(bits) = var.size.checked_mul(8) else {
+                continue;
+            };
+            if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
+                continue;
+            }
+            for evidence in evidence {
+                let signedness = match evidence {
+                    ScalarSignednessEvidence::Signed => Signedness::Signed,
+                    ScalarSignednessEvidence::Unsigned => Signedness::Unsigned,
+                };
+                let ty = CTypeLike::Int { bits, signedness };
+                let Some(spelled) = self.intern_spelled(&ty) else {
+                    continue;
+                };
+                self.bound(
+                    EvidenceNode::Value(value),
+                    spelled,
+                    ConstraintSource::Inferred,
+                );
+            }
+        }
+    }
+
     /// What each callee declares about the values it is handed and returns.
     fn gather_callee_prototypes(
         &mut self,
@@ -437,7 +486,10 @@ impl<'a> EvidenceBuilder<'a> {
                 && let Some(elem) = pointee_type_for_width(access.width)
             {
                 let elem = self.pointee_with_loaded_signedness(access, elem);
-                address_bounds.push((EvidenceNode::Value(access.address), elem));
+                address_bounds.push((EvidenceNode::Value(access.address), elem.clone()));
+                if let Some(parameter) = self.provenance_parameter_value(access) {
+                    address_bounds.push((EvidenceNode::Value(parameter), elem));
+                }
             }
             let Some(value) = access.value else {
                 continue;
@@ -460,6 +512,37 @@ impl<'a> EvidenceBuilder<'a> {
         for (value, object) in cell_pairs {
             self.equate_nodes(value, object);
         }
+    }
+
+    /// The exact formal parameter at the base of one certified RAM address.
+    ///
+    /// Affine provenance is the owner of base identity across arithmetic and
+    /// proven stack spills. Matching its retained storage back to the source
+    /// boundary keeps this keyed by `ValueId`; a positional index alone is not
+    /// enough to assert a type on a graph value.
+    fn provenance_parameter_value(
+        &self,
+        access: &r2ssa::MemoryAccessCertificate,
+    ) -> Option<r2ssa::ValueId> {
+        if access.space != r2il::SpaceId::Ram
+            || self
+                .source
+                .machine_context()
+                .memory_space_at(access.block_addr, access.op_index)
+                != Some(access.space)
+        {
+            return None;
+        }
+        let address = self
+            .source
+            .addresses()
+            .parameter_expression(access.address)?;
+        let slot = u32::try_from(address.parameter).ok()?;
+        let parameter = self.source.facts().boundaries.parameters.get(&slot)?;
+        (parameter.index == slot
+            && parameter.index as usize == address.parameter
+            && address.parameter_storage == Some(parameter.graph_storage))
+        .then_some(parameter.value)
     }
 
     /// The element width of a block the function allocated.
@@ -1151,5 +1234,184 @@ mod tests {
             Some(&expected),
             "copy identity must carry memory evidence to the exact entry value"
         );
+    }
+
+    #[test]
+    fn affine_address_provenance_bootstraps_the_indexed_parameter_base() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rdi", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 24, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"indexed-parameter-evidence".to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register(0)),
+                r2ssa::SourceAbiParameterSpec::new(1, register(8)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register(16)))
+        .and_then(|interface| interface.with_return_address_storage(register(24)))
+        .expect("exact source interface");
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::IntMult {
+            dst: r2il::Varnode::unique(0x100, 8),
+            a: r2il::Varnode::register(8, 8),
+            b: r2il::Varnode::constant(4, 8),
+        });
+        block.push(r2il::R2ILOp::IntAdd {
+            dst: r2il::Varnode::unique(0x108, 8),
+            a: r2il::Varnode::register(0, 8),
+            b: r2il::Varnode::unique(0x100, 8),
+        });
+        block.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(0x200, 4),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x108, 8),
+        });
+        let source =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared source");
+        let parameter = source.facts().boundaries.parameters[&0].value;
+        let index = source.facts().boundaries.parameters[&1].value;
+        let access = source
+            .certificates()
+            .memory_accesses
+            .values()
+            .next()
+            .expect("certified indexed load");
+        assert_eq!(
+            source
+                .addresses()
+                .parameter_expression(access.address)
+                .map(|address| address.parameter),
+            Some(0)
+        );
+
+        let solved = solve_evidence_types(&source, &BTreeMap::new(), 64);
+        let expected = CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Unknown,
+        }));
+        assert_eq!(solved.value_type(parameter), Some(&expected));
+        assert_eq!(
+            solved.value_type(index),
+            None,
+            "the affine index is not a second pointer base"
+        );
+    }
+
+    #[test]
+    fn signed_comparison_types_only_its_exact_parameter_value() {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new("rdi", 0, 8));
+        arch.add_register(r2il::RegisterDef::new("rsi", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("rsp", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("rip", 24, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"signed-parameter-evidence".to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register(0)),
+                r2ssa::SourceAbiParameterSpec::new(1, register(8)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register(16)))
+        .and_then(|interface| interface.with_return_address_storage(register(24)))
+        .expect("exact source interface");
+        let mut entry = r2il::R2ILBlock::new(0x1000, 4);
+        entry.push(r2il::R2ILOp::IntSLess {
+            dst: r2il::Varnode::unique(0x100, 1),
+            a: r2il::Varnode::register(0, 8),
+            b: r2il::Varnode::constant(10, 8),
+        });
+        entry.push(r2il::R2ILOp::IntEqual {
+            dst: r2il::Varnode::unique(0x108, 1),
+            a: r2il::Varnode::register(8, 8),
+            b: r2il::Varnode::constant(0, 8),
+        });
+        entry.push(r2il::R2ILOp::BoolAnd {
+            dst: r2il::Varnode::unique(0x110, 1),
+            a: r2il::Varnode::unique(0x100, 1),
+            b: r2il::Varnode::unique(0x108, 1),
+        });
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x1008, 8),
+            cond: r2il::Varnode::unique(0x110, 1),
+        });
+        let fallthrough = r2il::R2ILBlock::new(0x1004, 4);
+        let taken = r2il::R2ILBlock::new(0x1008, 4);
+        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[entry, fallthrough, taken],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared source");
+        let signed = source.facts().boundaries.parameters[&0].value;
+        let untouched = source.facts().boundaries.parameters[&1].value;
+
+        let solved = solve_evidence_types(&source, &BTreeMap::new(), 64);
+        assert_eq!(
+            solved.value_type(signed),
+            Some(&CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            })
+        );
+        assert_eq!(solved.value_type(untouched), None);
+
+        let machine = CTypeLike::u64();
+        let signature = crate::FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: vec![
+                crate::FunctionParamSpec {
+                    name: "lhs".to_string(),
+                    ty: Some(machine.clone()),
+                },
+                crate::FunctionParamSpec {
+                    name: "rhs".to_string(),
+                    ty: Some(machine.clone()),
+                },
+            ],
+        };
+        let mut facts = crate::FunctionFacts::new(
+            crate::FunctionTypeFacts {
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::LocalInference],
+                ),
+                merged_signature: Some(signature),
+                ..crate::FunctionTypeFacts::default()
+            },
+            None,
+        );
+        facts.apply_recovered_evidence_types(&source, 64);
+        let written = facts
+            .type_facts()
+            .render_authorized_signature()
+            .expect("recovered parameter signature remains render-authorized");
+        assert_eq!(
+            written.params[0].ty,
+            Some(CTypeLike::Int {
+                bits: 64,
+                signedness: Signedness::Signed,
+            })
+        );
+        assert_eq!(written.params[1].ty, Some(machine));
     }
 }
