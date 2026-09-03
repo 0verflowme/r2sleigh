@@ -1210,6 +1210,20 @@ fn unique_call_site_identity(
                     {
                         target
                     }
+                    (r2source::AdvisoryCallTransfer::TailSlot, R2ILOp::BranchInd { target })
+                        if crate::machine_context::terminal_indirect_loaded_slot(
+                            block, op_index,
+                        )
+                        .is_some_and(|slot| slot.offset == call.target_address()) =>
+                    {
+                        let instruction = block
+                            .op_metadata(op_index)
+                            .and_then(|metadata| metadata.instruction_addr)?;
+                        let slot =
+                            crate::machine_context::terminal_indirect_loaded_slot(block, op_index)?;
+                        return (instruction == call.instruction_address())
+                            .then(|| SourceCallSiteIdentity::new(block.addr, op_index, slot));
+                    }
                     _ => return None,
                 };
                 let instruction = block
@@ -1229,7 +1243,7 @@ fn unique_call_site_identity(
 
 #[derive(Clone)]
 struct CorrelatedCallSites {
-    tail_jumps: Vec<SourceCallSiteIdentity>,
+    tail_calls: Vec<SourceCallSiteIdentity>,
     interfaces: Vec<SourceCallSiteInterface>,
 }
 
@@ -1238,14 +1252,17 @@ fn correlate_call_site_interfaces(
     blocks: &[R2ILBlock],
     callee_interfaces: &BTreeMap<u64, SourceFunctionInterface>,
 ) -> CorrelatedCallSites {
-    let mut tail_jumps = Vec::new();
+    let mut tail_calls = Vec::new();
     let mut interfaces = Vec::new();
     for call in source.advisory_calls() {
         let Some(identity) = unique_call_site_identity(blocks, call) else {
             continue;
         };
-        if call.transfer() == r2source::AdvisoryCallTransfer::TailJump {
-            tail_jumps.push(identity);
+        if matches!(
+            call.transfer(),
+            r2source::AdvisoryCallTransfer::TailJump | r2source::AdvisoryCallTransfer::TailSlot
+        ) {
+            tail_calls.push(identity);
         }
         // A prototype the source recovered, or -- where it recovered none and
         // this capture carries the callee's own body -- the interface we
@@ -1287,7 +1304,7 @@ fn correlate_call_site_interfaces(
         interfaces.push(interface);
     }
     CorrelatedCallSites {
-        tail_jumps,
+        tail_calls,
         interfaces,
     }
 }
@@ -1382,21 +1399,21 @@ impl TrustedSsaArtifact {
                 // exposing their call boundaries here would independently
                 // change call-argument identity, which is not a tail-transfer
                 // fact.
-                let recovered = if correlated_call_sites.tail_jumps.is_empty() {
+                let recovered = if correlated_call_sites.tail_calls.is_empty() {
                     crate::recover_interface::recover_interface(
                         &preliminary,
                         source.convention_slots(),
                     )
                 } else {
                     let provisional_machine_context =
-                        SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+                        SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
                             blocks.as_slice(),
                             Some(&arch),
                             None,
                             *source.machine_roles(),
                             Some(source.convention_slots().clone()),
                             correlated_call_sites.interfaces.clone(),
-                            correlated_call_sites.tail_jumps.clone(),
+                            correlated_call_sites.tail_calls.clone(),
                         );
                     crate::recover_interface::recover_interface_with_context(
                         &preliminary,
@@ -1426,14 +1443,14 @@ impl TrustedSsaArtifact {
                 minted
             }
         };
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
             blocks.as_slice(),
             Some(&arch),
             function_interface,
             *source.machine_roles(),
             Some(source.convention_slots().clone()),
             correlated_call_sites.interfaces,
-            correlated_call_sites.tail_jumps,
+            correlated_call_sites.tail_calls,
         );
         let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
             blocks.as_slice(),
@@ -5382,6 +5399,60 @@ mod tests {
     }
 
     #[test]
+    fn tail_slot_identity_unifies_direct_ram_and_loaded_register_targets() {
+        let slot = 0x1000_4010;
+        let tail = advisory_call_site(0x2010, slot, 2);
+
+        let mut direct_ram = R2ILBlock::new(0x2000, 0x14);
+        direct_ram.push_with_metadata(
+            R2ILOp::BranchInd {
+                target: Varnode::ram(slot, 8),
+            },
+            Some(r2il::OpMetadata {
+                instruction_addr: Some(0x2010),
+                ..r2il::OpMetadata::default()
+            }),
+        );
+        let direct_identity = unique_call_site_identity(&[direct_ram], &tail)
+            .expect("the terminal branch reads the relocated RAM slot directly");
+
+        let base = Varnode::constant(0x1000_4000, 8);
+        let displacement = Varnode::constant(0x10, 8);
+        let address = Varnode::unique(0x6500, 8);
+        let loaded = Varnode::register(0x4080, 8);
+        let pc = Varnode::register(0, 8);
+        let mut through_register = R2ILBlock::new(0x2000, 0x14);
+        through_register.push(R2ILOp::IntAdd {
+            dst: address.clone(),
+            a: base,
+            b: displacement,
+        });
+        through_register.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: r2il::SpaceId::Ram,
+            addr: address,
+        });
+        through_register.push(R2ILOp::Copy {
+            dst: pc.clone(),
+            src: loaded,
+        });
+        through_register.push_with_metadata(
+            R2ILOp::BranchInd { target: pc },
+            Some(r2il::OpMetadata {
+                instruction_addr: Some(0x2010),
+                ..r2il::OpMetadata::default()
+            }),
+        );
+        let loaded_identity = unique_call_site_identity(&[through_register], &tail)
+            .expect("the terminal branch reads a value loaded from the relocated slot");
+
+        assert_eq!(direct_identity.target(), loaded_identity.target());
+        assert_eq!(direct_identity.target().space, CanonicalStorageSpace::Ram);
+        assert_eq!(direct_identity.target().offset, slot);
+        assert!(unique_call_site_identity(&[R2ILBlock::new(0x2000, 0x14)], &tail,).is_none());
+    }
+
+    #[test]
     fn tail_jump_is_a_terminal_callsite_without_call_clobbers() {
         // Direct code targets lifted from a real branch retain RAM storage;
         // unlike an arithmetic literal, their SSA variable has no
@@ -5404,7 +5475,7 @@ mod tests {
             SourceCallResult::Void,
         )
         .expect("tail callsite interface");
-        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
             &[block.clone()],
             None,
             None,
@@ -5442,6 +5513,79 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(obligations.contains(&crate::SemanticObligationKind::Call));
         assert!(obligations.contains(&crate::SemanticObligationKind::ControlTransfer));
+    }
+
+    #[test]
+    fn tail_slot_is_a_terminal_callsite_through_either_ssa_shape() {
+        let slot = 0x401008;
+        let target_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Ram,
+            offset: slot,
+            size: 8,
+        };
+
+        let mut direct_ram = R2ILBlock::new(0x1600, 4);
+        direct_ram.push(R2ILOp::BranchInd {
+            target: Varnode::ram(slot, 8),
+        });
+
+        let address = Varnode::unique(0x6500, 8);
+        let loaded = Varnode::register(0x4080, 8);
+        let pc = Varnode::register(0, 8);
+        let mut through_register = R2ILBlock::new(0x2600, 16);
+        through_register.push(R2ILOp::IntAdd {
+            dst: address.clone(),
+            a: Varnode::constant(0x401000, 8),
+            b: Varnode::constant(8, 8),
+        });
+        through_register.push(R2ILOp::Load {
+            dst: loaded.clone(),
+            space: r2il::SpaceId::Ram,
+            addr: address,
+        });
+        through_register.push(R2ILOp::Copy {
+            dst: pc.clone(),
+            src: loaded,
+        });
+        through_register.push(R2ILOp::BranchInd { target: pc });
+
+        for (block, op_index) in [(direct_ram, 0), (through_register, 3)] {
+            let identity = SourceCallSiteIdentity::new(block.addr, op_index, target_storage);
+            let interface = SourceCallSiteInterface::new(
+                b"tail-slot".to_vec(),
+                identity,
+                true,
+                "sysv64",
+                [],
+                false,
+                false,
+                SourceCallResult::Void,
+            )
+            .expect("tail slot interface");
+            let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+                std::slice::from_ref(&block),
+                None,
+                None,
+                SourceMachineRoles::default(),
+                None,
+                vec![interface],
+                vec![identity],
+            );
+            let function =
+                SSAFunction::from_blocks_for_decompile(std::slice::from_ref(&block), None)
+                    .expect("tail slot SSA");
+            let artifact =
+                SsaArtifact::new_with_context(function, FunctionPrepareMode::Decompile, context);
+            let certificate = artifact
+                .callsite_certificate_for_op(block.addr, op_index)
+                .expect("tail slot callsite certificate");
+            assert_eq!(
+                certificate.transfer,
+                crate::semantic::CallSiteTransfer::TailCall
+            );
+            assert_eq!(certificate.direct_target, Some(slot));
+            assert_eq!(certificate.fallthrough, None);
+        }
     }
 
     #[test]
