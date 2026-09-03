@@ -7614,7 +7614,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_call_boundaries_do_not_create_call_result_certificates() {
+    fn call_result_certificates_require_a_complete_machine_boundary() {
         let arch = make_x86_64_prep_arch();
         let blocks = vec![R2ILBlock {
             addr: 0x1680,
@@ -7651,6 +7651,83 @@ mod tests {
 
         assert!(first.certificates().call_results.is_empty());
         assert!(first.certificates().call_results_by_callsite.is_empty());
+
+        // With a convention boundary, a read of a contained return-register
+        // lane is exact evidence for the result width even when the full
+        // convention carrier itself has no reader. This is how an unknown
+        // prototype returning in EAX is observed under an RAX result slot.
+        let mut arch = make_x86_64_prep_arch();
+        arch.add_register(RegisterDef::sub("eax", 0, 4, "rax"));
+        let widened = make_unique(0x40, 8);
+        let blocks = [R2ILBlock {
+            addr: 0x16c0,
+            size: 4,
+            ops: vec![
+                R2ILOp::Call {
+                    target: make_const(0x403000, 8),
+                },
+                R2ILOp::IntZExt {
+                    dst: widened.clone(),
+                    src: make_reg(0, 4),
+                },
+                R2ILOp::Copy {
+                    dst: make_unique(0x48, 8),
+                    src: widened,
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let full_result = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let lane_result = CanonicalStorageId {
+            size: 4,
+            ..full_result
+        };
+        let convention =
+            SourceConventionSlots::new("amd64", [], Some(full_result)).expect("result convention");
+        let prepared = SsaArtifact::for_decompile_with_interfaces_roles_and_convention(
+            &blocks,
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(convention),
+            Vec::new(),
+        )
+        .expect("prepared SSA with convention boundary");
+        let call = prepared
+            .callsite_certificate_for_op(0x16c0, 0)
+            .expect("convention-certified call");
+        let eax = prepared
+            .function()
+            .get_block(0x16c0)
+            .into_iter()
+            .flat_map(|block| &block.ops)
+            .find_map(|op| match op {
+                SSAOp::CallDefine { dst } if dst.name.eq_ignore_ascii_case("eax") => {
+                    prepared.graph().value_id_for_var(dst)
+                }
+                _ => None,
+            })
+            .expect("post-call EAX value");
+        let result = prepared
+            .call_result_certificate_for_value(eax)
+            .expect("observed return lane certificate");
+        assert_eq!(result.call_site, call.call_site);
+        assert_eq!(
+            result.relation,
+            crate::semantic::CallResultValueRelation::Identity
+        );
+        assert_eq!(
+            result.carrier,
+            crate::semantic::ReturnCarrier::Register {
+                storage: lane_result
+            }
+        );
+        assert_eq!(result.owner, Some(crate::semantic::ValueOwner::Value(eax)));
     }
 
     #[test]

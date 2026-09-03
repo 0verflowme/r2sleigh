@@ -11,7 +11,6 @@ mod tests {
     use crate::fold::context::{EffectOccurrenceKind, empty_function_facts};
     use crate::{
         FoldArchConfig, FoldInputs,
-        analysis::PreparedSemanticView,
         ast::{CFunction, CLocal},
     };
     use r2il::{
@@ -19,11 +18,6 @@ mod tests {
         RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
     };
     use r2ssa::SSAFunction;
-    /// The names a fixture in this module declares.
-    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
-        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
-    }
-
     use r2types::{CalleeFact, CalleeReturnRelation};
 
     #[derive(Debug, Clone)]
@@ -2522,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_prepared_call_args_require_argument_value_proof() {
+    fn certified_call_args_refuse_without_binding_plan_spelling() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::Copy {
@@ -2538,17 +2532,99 @@ mod tests {
         });
 
         let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
-            .with_name("certified_call_arg");
+            .with_name("call_arg_without_spelling_authority");
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         install_certified_function_facts(&mut ctx);
         ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
         install_callsite_resolution(&mut ctx, (0x1000, 2), 0x401050, "sym.helper", None);
 
         let block = prepared.function().get_block(0x1000).expect("entry");
-        let _observations = install_observed_lowering(&mut ctx, &prepared);
         enter_exact_test_site(&ctx, block.addr, 2);
+        assert_eq!(
+            ctx.op_to_stmt_with_args(&block.ops[2], block.addr, 2),
+            Err(OpLoweringRefusal::missing_machine_projection()),
+            "a certified position without binding-plan spelling authority must refuse the call"
+        );
+    }
+
+    #[test]
+    fn certified_call_args_take_spelling_only_from_binding_plan() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::constant(7, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x18, 8),
+            src: Varnode::unique(0x200, 4),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 2)
+            .with_name("certified_call_arg");
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(&mut ctx, (0x1000, 3), 0x401050, "sym.helper", None);
+
+        let argument_values = prepared
+            .callsite_certificate_for_op(0x1000, 3)
+            .expect("prepared callsite certificate")
+            .argument_values
+            .clone();
+        assert_eq!(argument_values.len(), 2);
+        assert!(
+            !ctx.inputs
+                .function_facts
+                .render_facts()
+                .expression_is_renderable(argument_values[1]),
+            "the fixture must expose the expression-certificate disagreement"
+        );
+
+        let block = prepared.function().get_block(0x1000).expect("entry");
+        let (_plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        for value in &argument_values {
+            assert!(
+                matches!(
+                    names.require_value(*value),
+                    Ok(crate::binding_plan::PlannedValueSymbol::Bound(_)
+                        | crate::binding_plan::PlannedValueSymbol::Inline(_))
+                ),
+                "the sealed binding plan must authorize argument {value:?}"
+            );
+        }
+
+        let mut prepared_view = crate::analysis::PreparedSemanticView::build_with_bindings(
+            &ctx.symbols,
+            crate::analysis::PreparedSemanticViewInputs {
+                prepared: &prepared,
+                stack_slots: ctx.inputs.stack_slots,
+                visible_bindings: ctx.inputs.visible_bindings,
+                function_facts: ctx.inputs.function_facts,
+                certified_rendering_required: false,
+            },
+            Rc::clone(names),
+        )
+        .expect("prepared semantic view");
+        let call_view = prepared_view
+            .call_view_by_site
+            .get_mut(&(0x1000, 3))
+            .expect("prepared call view");
+        assert_eq!(call_view.authoritative_arg_values, argument_values);
+        call_view.authoritative_args.truncate(1);
+        call_view.authoritative_arg_values.truncate(1);
+        ctx.inputs.prepared_semantic_view = Some(Box::leak(Box::new(prepared_view)));
+
+        enter_exact_test_site(&ctx, block.addr, 3);
         let stmt = ctx
-            .op_to_stmt_with_args(&block.ops[2], block.addr, 2)
+            .op_to_stmt_with_args(&block.ops[3], block.addr, 3)
             .expect("supported call lowering")
             .expect("call stmt");
 
@@ -2567,33 +2643,23 @@ mod tests {
         // the operation that defined the value instead would re-evaluate a
         // definition the plan has already bound, and would name a binding this
         // statement is not authorized to read.
-        let [argument] = args.as_slice() else {
-            panic!("expected exactly one certified argument, got {args:?}");
-        };
-        let arg_value = prepared
-            .callsite_certificate_for_op(0x1000, 2)
-            .expect("callsite certificate")
-            .argument_certificates
-            .first()
-            .expect("one certified argument")
-            .value;
-        let expected = ctx
-            .planned_value_expr(arg_value)
-            .expect("the plan spells every certified argument value");
-        // Through the markers, not around them. Asking the plan a second time
-        // allocates fresh observation ids, so two spellings of one value are
-        // equal as expressions and unequal as trees; `unobserved` strips only
-        // the outermost marker, which was enough while an argument was always
-        // a bound name and is not now that it can be a folded expression
-        // carrying the cells of the definition it replaced.
-        assert!(
-            argument.transparently_eq(&expected),
-            "argument {argument:?} is not the plan's spelling {expected:?}"
-        );
-        assert!(
-            matches!(argument, CExpr::Observed { .. }),
-            "a call argument is a read and must carry its read marker: {argument:?}"
-        );
+        assert_eq!(args.len(), 2, "the cached one-argument view cannot truncate the call");
+        for (argument, value) in args.iter().zip(argument_values) {
+            let expected = ctx
+                .planned_value_expr(value)
+                .expect("the plan spells every certified argument value");
+            // Through the markers, not around them. Asking the plan a second
+            // time allocates fresh observation ids, so two spellings of one
+            // value are equal as expressions and unequal as trees.
+            assert!(
+                argument.transparently_eq(&expected),
+                "argument {argument:?} is not the plan's spelling {expected:?}"
+            );
+            assert!(
+                matches!(argument, CExpr::Observed { .. }),
+                "a bound call argument is a read and must carry its read marker: {argument:?}"
+            );
+        }
     }
 
     #[test]
@@ -2985,107 +3051,6 @@ mod tests {
             )),
             "missing exact SSA authority must be a typed refusal, never an empty analysis"
         );
-    }
-
-    #[test]
-    fn certified_render_plan_requires_renderable_exact_nonraw_call_arg() {
-        let symbols = test_table();
-        let arch = make_test_arch_x86_64();
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::register(0x10, 8),
-            src: Varnode::constant(7, 8),
-        });
-        entry.push(R2ILOp::Copy {
-            dst: Varnode::unique(1, 8),
-            src: Varnode::constant(0x401050, 8),
-        });
-        entry.push(R2ILOp::Call {
-            target: Varnode::unique(1, 8),
-        });
-
-        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
-            .with_name("certified_prepared_view_arg");
-        let arg_value = prepared
-            .callsite_certificate_for_op(0x1000, 2)
-            .expect("prepared callsite certificate")
-            .argument_values[0];
-        let render_facts = |renderable| {
-            let id = r2ssa::SemanticId::expression(arg_value);
-            r2types::FunctionRenderFacts {
-                certified_exprs: BTreeMap::from([(
-                    id,
-                    r2types::CertifiedExpr {
-                        id,
-                        fact: r2types::ExpressionRenderFact {
-                            value: arg_value,
-                            defining_inst: None,
-                            width: 8,
-                            renderable,
-                        },
-                        inputs: Vec::new(),
-                        bindings: BTreeSet::new(),
-                        guarded_phi: None,
-                    },
-                )]),
-                ..r2types::FunctionRenderFacts::default()
-            }
-        };
-        let prepared_view = |value, expr| PreparedSemanticView {
-            call_view_by_site: BTreeMap::from([(
-                (0x1000, 2),
-                crate::analysis::PreparedCallView {
-                    authoritative_args: vec![expr],
-                    authoritative_arg_values: vec![value],
-                    render_fact: Some(r2types::CallsiteRenderFact {
-                        callsite: r2types::CallsiteKey {
-                            block_addr: 0x1000,
-                            op_index: 2,
-                        },
-                        target: None,
-                        disposition: r2types::CallsiteRenderDisposition::SideEffectStatement,
-                        proof_values: vec![value],
-                        residual_reason: None,
-                    }),
-                    ..crate::analysis::PreparedCallView::default()
-                },
-            )]),
-            ..PreparedSemanticView::default()
-        };
-
-        let render = render_facts(true);
-        let view = prepared_view(arg_value, crate::symbol::var_ref(&symbols, "n"));
-        let call_render = view
-            .call_view_for_site((0x1000, 2))
-            .and_then(|view| view.render_fact.clone())
-            .expect("exact prepared call render fact");
-        let mut function_facts = r2types::FunctionFacts::default();
-        function_facts.set_call_render(r2types::FunctionCallRenderFacts {
-            by_callsite: BTreeMap::from([(call_render.callsite, call_render)]),
-        });
-        let adapter = CertifiedRenderPlan::new(
-            &function_facts,
-            &view,
-            CertifiedRenderContext::new(&prepared, &render),
-        );
-        assert!(adapter.admits_call_arg((0x1000, 2), 0, arg_value));
-
-        let unrenderable = render_facts(false);
-        let adapter = CertifiedRenderPlan::new(
-            &function_facts,
-            &view,
-            CertifiedRenderContext::new(&prepared, &unrenderable),
-        );
-        assert!(!adapter.admits_call_arg((0x1000, 2), 0, arg_value));
-
-        let wrong_value_view =
-            prepared_view(r2ssa::ValueId(9999), crate::symbol::var_ref(&symbols, "n"));
-        let adapter = CertifiedRenderPlan::new(
-            &function_facts,
-            &wrong_value_view,
-            CertifiedRenderContext::new(&prepared, &render),
-        );
-        assert!(!adapter.admits_call_arg((0x1000, 2), 0, arg_value));
     }
 
     #[test]

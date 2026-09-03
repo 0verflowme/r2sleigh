@@ -3069,11 +3069,15 @@ struct ConventionCallBoundary {
 /// saying an argument exists, an untouched register carrying whatever the
 /// function was entered with is no evidence that the call reads it.
 ///
-/// The result is the convention's result register, and only when something
-/// reads it. A read after the call proves the callee returned a value there. No
-/// read proves nothing either way -- the callee may be `void`, or its result
-/// may simply be ignored -- and since nothing observes it, claiming one would
-/// add a local no reader ever names.
+/// The result is the widest observed view of the convention's result register,
+/// and only when something reads it. A call defines both a full carrier and
+/// its declared register lanes, while an unknown prototype tells us only the
+/// full convention carrier. Code that consumes a 32-bit return therefore reads
+/// the lane and may never read the 64-bit carrier. The contained lane is still
+/// structural register geometry, and its exact use proves the width the caller
+/// observes without guessing a prototype. No read proves nothing either way --
+/// the callee may be `void`, or its result may simply be ignored -- and since
+/// nothing observes it, claiming one would add a local no reader ever names.
 ///
 /// Where the convention itself is unknown there is no ground to stand on, and
 /// the boundary stays incomplete: the function refuses, which is the honest
@@ -3113,18 +3117,9 @@ fn convention_call_boundary(
     let results = convention
         .result_slot()
         .and_then(|storage| {
-            let value = call_result_value_after_call(
-                function,
-                graph,
-                machine_context,
-                block_addr,
-                op_index,
-                storage,
-            )?;
-            (!graph.use_sites(value).is_empty()).then_some(CallBoundaryValueFact {
-                slot: CallBoundarySlot::Register { index: 0, storage },
-                value,
-            })
+            observed_convention_call_result_after_call(
+                function, graph, block_addr, op_index, storage,
+            )
         })
         .into_iter()
         .collect();
@@ -4179,6 +4174,67 @@ fn call_result_value_after_call(
         [value] => Some(*value),
         _ => None,
     }
+}
+
+/// The one widest call-defined view of a convention result that the caller
+/// actually reads.
+///
+/// This is deliberately narrower than general alias recovery. Candidates are
+/// only the consecutive `CallDefine` operations emitted for this exact call,
+/// only exact or structurally contained register storage is admitted, and a
+/// tie at the widest observed width refuses. The scan is bounded by the
+/// architecture's call-clobber list rather than by the function size.
+fn observed_convention_call_result_after_call(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    block_addr: u64,
+    call_op_index: usize,
+    convention_storage: CanonicalStorageId,
+) -> Option<CallBoundaryValueFact> {
+    let block = function.get_block(block_addr)?;
+    let candidates = block
+        .ops
+        .get(call_op_index.checked_add(1)?..)?
+        .iter()
+        .enumerate()
+        .take_while(|(_, op)| matches!(op, SSAOp::CallDefine { .. }))
+        .filter_map(|(relative_index, op)| {
+            let SSAOp::CallDefine { dst } = op else {
+                return None;
+            };
+            let inst = graph.inst_id_for_op_site(
+                block_addr,
+                call_op_index.checked_add(1)?.checked_add(relative_index)?,
+            )?;
+            let graph_inst = graph.inst(inst)?;
+            let storage = graph_inst.canonical_storage?;
+            if storage != convention_storage
+                && contained_register_storage_offset(convention_storage, storage).is_none()
+            {
+                return None;
+            }
+            let value = graph_inst.output?;
+            if dst.size != storage.size || graph.use_sites(value).is_empty() {
+                return None;
+            }
+            Some(CallBoundaryValueFact {
+                slot: CallBoundarySlot::Register { index: 0, storage },
+                value,
+            })
+        })
+        .collect::<Vec<_>>();
+    let widest = candidates
+        .iter()
+        .map(|candidate| match candidate.slot {
+            CallBoundarySlot::Register { storage, .. } => storage.size,
+            CallBoundarySlot::Stack(_) => 0,
+        })
+        .max()?;
+    let mut widest_candidates = candidates.into_iter().filter(|candidate| {
+        matches!(candidate.slot, CallBoundarySlot::Register { storage, .. } if storage.size == widest)
+    });
+    let selected = widest_candidates.next()?;
+    widest_candidates.next().is_none().then_some(selected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
