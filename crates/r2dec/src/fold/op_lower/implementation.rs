@@ -1,89 +1,3 @@
-/// A C type the renderer is allowed to decide a conversion from.
-///
-/// Property 2 asks that inference be unrepresentable rather than merely
-/// avoided. A cast is a statement that one type becomes another, and the
-/// renderer may only make it from types something recorded. So the source of a
-/// conversion is this type, whose field is private to this module and whose
-/// constructors each name the evidence they come from: a binding's emitted
-/// declaration, a certified upstream fact, the operation's own requirement, or
-/// a callee's recorded signature.
-///
-/// A caller that has none of those cannot manufacture one. It has to pass
-/// `None`, and every `None` is therefore a site the compiler points at -- which
-/// is the enumeration Track B's first stage asks for, kept honest by the type
-/// rather than by a convention.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RecordedType(CType);
-
-impl RecordedType {
-    /// The type the emitted declaration gives this object.
-    fn from_declaration(ty: CType) -> Self {
-        Self(ty)
-    }
-
-    /// A type upstream certified for this value.
-    fn from_certified_fact(ty: CType) -> Self {
-        Self(ty)
-    }
-
-    /// The type the operation itself requires of its operands and result.
-    ///
-    /// `IntSLess` and `IntLess` differ only in the signedness of what they
-    /// compare, so this is the operation's meaning, not a reading of its
-    /// operands.
-    fn from_operation(ty: CType) -> Self {
-        Self(ty)
-    }
-
-    /// The return type recorded for the callee a call names.
-    fn from_callee_signature(ty: CType) -> Self {
-        Self(ty)
-    }
-
-    /// The type of the machine expression the plan inlines for a value.
-    ///
-    /// A value the plan inlines has no declaration, so it has no declared
-    /// type, and it was previously left with no source at all. It is not
-    /// typeless: the sealed machine projection holds the expression that will
-    /// be rendered in its place, and that expression has a width and a
-    /// signedness. That is a recorded fact about the value, not a reading of
-    /// the C the renderer is about to emit.
-    ///
-    /// An address is taken at its machine width. Without a recorded pointee
-    /// there is nothing to say about what it points at, and saying the width
-    /// is the honest half of the answer.
-    fn from_inline_expression(ty: &r2ssa::MachineType) -> Self {
-        Self(match ty {
-            r2ssa::MachineType::Bool { .. } => CType::Bool,
-            r2ssa::MachineType::Integer {
-                width_bits,
-                signedness,
-            } => match signedness {
-                r2ssa::MachineSignedness::Signed => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Signed },
-                r2ssa::MachineSignedness::Unsigned => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Unsigned },
-            },
-            r2ssa::MachineType::Address { width_bits, .. } => CType::Int { bits: *width_bits, signedness: r2types::Signedness::Unsigned },
-        })
-    }
-
-
-    /// A source for a fixture, which has no upstream to record one.
-    ///
-    /// Deliberately test-only: production must name the evidence.
-    #[cfg(test)]
-    pub(crate) fn for_test(ty: CType) -> Self {
-        Self(ty)
-    }
-
-    pub(crate) fn get(&self) -> &CType {
-        &self.0
-    }
-
-    fn into_inner(self) -> CType {
-        self.0
-    }
-}
-
 impl<'a> FoldingContext<'a> {
     fn certified_parameter_expr_for_value(&self, value: r2ssa::ValueId) -> Option<CExpr> {
         let slot = self
@@ -321,7 +235,11 @@ impl<'a> FoldingContext<'a> {
             Ok(self.observe_certified_value_read_expr(value, certificate.at, expr))
         };
 
-        let mut expr = self.cast_expr_to(read(certificate.value)?, composed_ty.clone());
+        let mut expr = self.convert_from(
+            read(certificate.value)?,
+            self.value_type(certificate.value).as_ref(),
+            &composed_ty,
+        );
         for overlay in &certificate.overlays {
             let overlay_bits = overlay
                 .width
@@ -348,7 +266,11 @@ impl<'a> FoldingContext<'a> {
                 left: Box::new(CExpr::Paren(Box::new(expr))),
                 right: Box::new(CExpr::UIntLit(!mask)),
             };
-            let mut laid = self.cast_expr_to(read(overlay.value)?, composed_ty.clone());
+            let mut laid = self.convert_from(
+                read(overlay.value)?,
+                self.value_type(overlay.value).as_ref(),
+                &composed_ty,
+            );
             laid = CExpr::Binary {
                 op: BinaryOp::BitAnd,
                 left: Box::new(CExpr::Paren(Box::new(laid))),
@@ -1640,16 +1562,51 @@ impl<'a> FoldingContext<'a> {
             })
     }
 
+    /// An assignment whose right-hand side has what the operation's root
+    /// produces, as the typed boundaries state it.
     fn assign_stmt(&self, lhs: CExpr, rhs: CExpr) -> Option<CStmt> {
+        self.assign_typed(lhs, rhs, None)
+    }
+
+    /// An assignment whose right-hand side has `rhs_type`.
+    ///
+    /// The conversion to the declared object is not made here. The write
+    /// projection is applied to the statement after it is built, and the
+    /// declared type is met once, outside it, from the type the projection
+    /// produced; this records what the projection starts from. An inlined
+    /// definition is the bare expression, and the reader converts it from
+    /// the same type.
+    fn assign_typed(&self, lhs: CExpr, rhs: CExpr, rhs_type: Option<CValue>) -> Option<CStmt> {
         if self.inlined_definition.get() {
             // The result is read where it is computed, so there is nothing to
             // assign it to; the expression is the whole of the answer.
             return Some(CStmt::Expr(rhs));
         }
+        self.pending_assignment_type.set(rhs_type);
         // Both sides are exact occurrence projections. Identity-looking text
         // is not an elision proof: distinct SSA values may intentionally share
         // one rendered binding, and a write may still be an observable effect.
         Some(CStmt::Expr(CExpr::assign(lhs, rhs)))
+    }
+
+    /// The operand at `input_idx`, read from `var`, converted to what the
+    /// operation being lowered requires of it. Where the operation states
+    /// no requirement -- it has no arena root, or the plan is absent -- the
+    /// operand is what it is, unless `stated` says what the operation
+    /// itself requires.
+    fn required_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        var: &SSAVar,
+        stated: Option<&CType>,
+    ) -> OpLoweringResult<CExpr> {
+        let (expr, ty) = self.typed_input(frame, input_idx, var)?;
+        let required = self.required_at(frame, input_idx);
+        Ok(match required.as_ref().or(stated) {
+            Some(required) => self.convert_from(expr, ty.as_ref(), required),
+            None => expr,
+        })
     }
 
     fn assignment_lhs_expr(&self, _dst: &SSAVar) -> OpLoweringResult<CExpr> {
@@ -1691,29 +1648,6 @@ impl<'a> FoldingContext<'a> {
         Ok(CExpr::binary(op, base_expr, scaled))
     }
 
-    fn looks_like_pointer(&self, expr: &CExpr) -> bool {
-        if self.expr_type_hint(expr).is_some_and(|ty| {
-            matches!(
-                ty,
-                CType::Pointer(_) | CType::Array(_, _) | CType::Struct(_) | CType::Union(_)
-            )
-        }) {
-            return true;
-        }
-
-        match expr.unobserved() {
-            CExpr::Cast { ty, .. } => matches!(ty, CType::Pointer(_)),
-            CExpr::Deref(_) => true,
-            CExpr::Subscript { .. } | CExpr::Member { .. } | CExpr::PtrMember { .. } => true,
-            CExpr::Var(_) => false,
-            CExpr::Binary {
-                op: BinaryOp::Add | BinaryOp::Sub,
-                left,
-                right,
-            } => self.looks_like_pointer(left) || self.looks_like_pointer(right),
-            _ => false,
-        }
-    }
 
     fn member_access_expr(&self, base_expr: CExpr, member: String) -> CExpr {
         let base_expr = self.canonical_member_base_expr(base_expr);
@@ -1733,75 +1667,9 @@ impl<'a> FoldingContext<'a> {
         base_expr
     }
 
-    /// The C type the emitted declaration gives the name this value renders as.
-    ///
-    /// This is not a hint and not a belief about what the value means. The
-    /// binding plan seals a `declaration_type` per binding and `placement.rs`
-    /// emits the declaration with exactly that type, so an operand spelled as
-    /// that name has exactly this type in the program the compiler reads.
-    ///
-    /// A value the plan inlines has no declaration and so has no type here.
-    /// That is an honest absence: the operand is an expression, not a name.
-    /// The declared type of the object a value is bound to.
-    ///
-    /// The same fact `declared_type_for_var` reports, asked of a value rather
-    /// than of a spelling, for the places that hold one -- a call result's
-    /// carrier is named by its certificate, not by a variable.
-    fn declared_type_for_value(&self, value: r2ssa::ValueId) -> Option<RecordedType> {
-        let names = self.inputs.binding_names?;
-        let crate::binding_plan::ValueDisposition::Bound { binding } =
-            names.disposition_for_value(value)?
-        else {
-            return None;
-        };
-        Some(RecordedType::from_declaration(
-            names.plan().binding(*binding)?.declaration_type().clone(),
-        ))
-    }
 
-    fn declared_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
-        let value = self.prepared_value_id_for_var(var)?;
-        let names = self.inputs.binding_names?;
-        let crate::binding_plan::ValueDisposition::Bound { binding } =
-            names.disposition_for_value(value)?
-        else {
-            return None;
-        };
-        Some(RecordedType::from_declaration(
-            names.plan().binding(*binding)?.declaration_type().clone(),
-        ))
-    }
 
-    /// The recorded type of an operand, for deciding whether a cast is needed.
-    ///
-    /// The declaration wins over the certified hint, because the two answer
-    /// different questions and only one of them is about the emitted C. Every
-    /// binding is declared at `CType::machine_bits`, i.e. unsigned, while
-    /// `type_hint_for_var` reports what upstream proved the value *means* --
-    /// signed, a pointer, a typedef. Deciding a cast from the meaning while
-    /// the compiler reads the declaration is how a value declared `uint32_t`
-    /// and believed `int32_t` reached a comparison with no cast and was
-    /// compared unsigned, which is the shape of the sign-flag defect that made
-    /// `crc32_bitwise` return a CRC of nothing while compiling cleanly.
-    fn source_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
-        self.declared_type_for_var(var)
-            .or_else(|| self.type_hint_for_var(var).map(RecordedType::from_certified_fact))
-            .or_else(|| self.inline_expression_type_for_var(var))
-    }
 
-    /// The recorded type of the expression the plan inlines for this value.
-    fn inline_expression_type_for_var(&self, var: &SSAVar) -> Option<RecordedType> {
-        let value = self.prepared_value_id_for_var(var)?;
-        let names = self.inputs.binding_names?;
-        let crate::binding_plan::ValueDisposition::Inline { expr, .. } =
-            names.disposition_for_value(value)?
-        else {
-            return None;
-        };
-        Some(RecordedType::from_inline_expression(
-            names.inline_expr(*expr)?.ty(),
-        ))
-    }
 
 
     fn type_hint_for_var(&self, var: &SSAVar) -> Option<CType> {
@@ -1981,317 +1849,14 @@ impl<'a> FoldingContext<'a> {
             .call_result_source_for_var(var)
     }
 
-    /// The type a name takes from the call whose result it owns.
-    ///
-    /// A local that owns a call result holds what the callee returned, so the
-    /// callee's prototype types it. Often that is the only thing that types it
-    /// at all: on a binary with no symbols nothing else in the function says
-    /// what `malloc` handed back, and the slot then reads as a plain integer,
-    /// which is enough to lose which side of `buf + len` is the pointer.
-    /// The aggregate a type names, through any pointer or array wrapping it.
-    /// The declared type of the object a rendered name stands for.
-    fn declaration_type_for_symbol(&self, symbol: crate::symbol::SymbolId) -> Option<CType> {
-        let names = self.inputs.binding_names?;
-        names.plan().bindings().find_map(|(binding, fact)| {
-            (names.symbol_for_binding(binding) == Some(symbol))
-                .then(|| fact.declaration_type().clone())
-        })
-    }
 
-    pub(super) fn expr_type_hint(&self, expr: &CExpr) -> Option<CType> {
-        match expr.unobserved() {
-            // A name's type is the declaration the plan gave the object it
-            // names. Answering `None` here was true while every object was an
-            // unsigned machine word and every rule that asks this question got
-            // the same answer anyway; it stopped being true when the evidence
-            // was allowed to declare a pointer, and left the pointer-aware
-            // conversions blind to the one expression that names an object.
-            CExpr::Var(symbol) => self.declaration_type_for_symbol(*symbol),
-            CExpr::Call {
-                site: Some((block_addr, op_idx)),
-                ..
-            } => self
-                .known_signature_for_site(*block_addr, *op_idx)
-                .map(|sig| sig.return_type.clone()),
-            CExpr::Call { site: None, .. } => None,
-            CExpr::Cast { ty, .. } => Some(ty.clone()),
-            CExpr::Paren(inner) => self.expr_type_hint(inner),
-            _ => None,
-        }
-    }
 
-    #[cfg(test)]
-    fn expr_type_hint_for_source_call(
-        &self,
-        source_call: (u64, usize),
-        expr: &CExpr,
-    ) -> Option<CType> {
-        match expr.unobserved() {
-            CExpr::Call { .. } => self
-                .known_signature_for_site(source_call.0, source_call.1)
-                .map(|sig| sig.return_type.clone()),
-            CExpr::Cast { ty, .. } => Some(ty.clone()),
-            CExpr::Paren(inner) => self.expr_type_hint_for_source_call(source_call, inner),
-            _ => self.expr_type_hint(expr),
-        }
-    }
 
-    fn cast_addr_expr_to_ptr_if_needed(
-        &self,
-        addr: &SSAVar,
-        addr_expr: CExpr,
-        target_ptr_ty: &CType,
-    ) -> CExpr {
-        if let CExpr::Cast { ty, .. } = &addr_expr
-            && ty == target_ptr_ty
-        {
-            return addr_expr;
-        }
 
-        // The declaration first, for the same reason as every other cast: it
-        // is what the compiler reads. Taking the certified hint alone said
-        // `RDI_0` was a pointer while its declaration said `uint64_t`, so no
-        // cast was emitted and the load rendered as `*RDI_0` -- a dereference
-        // of an integer, which does not compile.
-        let source_ty = self
-            .expr_type_hint(&addr_expr)
-            .map(RecordedType::from_certified_fact)
-            .or_else(|| self.source_type_for_var(addr));
-        if let Some(source_ty) = source_ty {
-            return self.cast_expr_if_needed(addr_expr, target_ptr_ty.clone(), Some(&source_ty));
-        }
 
-        if self.looks_like_pointer(&addr_expr) {
-            return addr_expr;
-        }
 
-        CExpr::cast(target_ptr_ty.clone(), addr_expr)
-    }
 
-    fn int_meta(&self, ty: &CType) -> Option<(bool, u32)> {
-        match ty {
-            CType::Int { bits, signedness: r2types::Signedness::Signed } => Some((true, *bits)),
-            CType::Int { bits, signedness: r2types::Signedness::Unsigned } => Some((false, *bits)),
-            CType::Bool => Some((false, 1)),
-            CType::Typedef(name) => self.typedef_int_meta(name),
-            _ => None,
-        }
-    }
 
-    fn typedef_int_meta(&self, name: &str) -> Option<(bool, u32)> {
-        let normalized = name
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        match normalized.as_str() {
-            "signed char" | "int8_t" => Some((true, 8)),
-            "unsigned char" | "uint8_t" => Some((false, 8)),
-            "short" | "short int" | "signed short" | "signed short int" | "int16_t" => {
-                Some((true, 16))
-            }
-            "unsigned short" | "unsigned short int" | "uint16_t" => Some((false, 16)),
-            "int" | "signed" | "signed int" | "int32_t" => Some((true, 32)),
-            "unsigned" | "unsigned int" | "uint32_t" => Some((false, 32)),
-            "long long"
-            | "long long int"
-            | "signed long long"
-            | "signed long long int"
-            | "int64_t"
-            | "intmax_t" => Some((true, 64)),
-            "unsigned long long" | "unsigned long long int" | "uint64_t" | "uintmax_t" => {
-                Some((false, 64))
-            }
-            "long" | "long int" | "signed long" | "signed long int" => {
-                Some((true, self.inputs.arch.ptr_size.saturating_mul(8)))
-            }
-            "unsigned long" | "unsigned long int" | "size_t" | "uintptr_t" => {
-                Some((false, self.inputs.arch.ptr_size.saturating_mul(8)))
-            }
-            "ssize_t" | "intptr_t" | "ptrdiff_t" => {
-                Some((true, self.inputs.arch.ptr_size.saturating_mul(8)))
-            }
-            _ => None,
-        }
-    }
-    fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
-        let Some(source) = source.map(RecordedType::get) else {
-            // Not knowing what the expression's type is says nothing about
-            // whether a conversion is needed, and for a pointer target it is
-            // exactly the case where one always is: C converts an integer to a
-            // pointer only when the program says so. Returning `false` here
-            // was safe while every declaration was an unsigned machine word
-            // and became `int8_t *p = some_uint64;` the moment the evidence
-            // was allowed to name a pointer.
-            return matches!(target, CType::Pointer(_));
-        };
-
-        if target == source {
-            return false;
-        }
-
-        if let (Some((dst_signed, dst_bits)), Some((src_signed, src_bits))) =
-            (self.int_meta(target), self.int_meta(source))
-        {
-            return dst_signed != src_signed || dst_bits != src_bits;
-        }
-
-        // Two pointers that are not the same pointer still need the
-        // conversion spelled: `target == source` was already excluded above,
-        // so reaching here with both pointers means they point at different
-        // things and the load or store would read the wrong width.
-        matches!(
-            (target, source),
-            (
-                CType::Pointer(_),
-                CType::Int { bits: _, signedness: r2types::Signedness::Signed } | CType::Int { bits: _, signedness: r2types::Signedness::Unsigned } | CType::Bool | CType::Pointer(_)
-            ) | (CType::Int { bits: _, signedness: r2types::Signedness::Signed } | CType::Int { bits: _, signedness: r2types::Signedness::Unsigned }, CType::Pointer(_))
-        )
-    }
-
-    /// Cast to exactly this type unless the expression already says so.
-    ///
-    /// Unlike `cast_expr_if_needed` this does not consult a source hint: it is
-    /// for a type the operation requires rather than one the renderer is free
-    /// to leave implicit.
-    fn cast_expr_to(&self, expr: CExpr, target: CType) -> CExpr {
-        if let CExpr::Cast { ty, .. } = expr.unobserved()
-            && *ty == target
-        {
-            return expr;
-        }
-        // Converting a pointer to an integer is the address-width step, or it
-        // goes through one. At the pointer's own width the conversion *is* the
-        // step and says so, which is what lets a round trip back to the
-        // pointer collapse. Narrower is `-Wpointer-to-int-cast`, because
-        // address bits are lost and the compiler will not let that be
-        // implicit, so the full-width step is spelled first and the narrowing
-        // becomes the program's own statement.
-        //
-        // The width comes from the memory model rather than from a literal 64,
-        // which is what this read before: a thirty-two bit target has no
-        // sixty-four bit address step and would have been given one.
-        if self.looks_like_pointer(&expr)
-            && let CType::Int { bits, .. } = &target
-            && let Some(pointer_bits) = self
-                .inputs
-                .prepared_ssa
-                .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
-        {
-            if *bits == pointer_bits {
-                return CExpr::pointer_width_cast(target, expr);
-            }
-            if *bits < pointer_bits {
-                return CExpr::cast(
-                    target,
-                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
-                );
-            }
-        }
-        CExpr::cast(target, expr)
-    }
-
-    fn cast_expr_if_needed(
-        &self,
-        expr: CExpr,
-        target: CType,
-        source: Option<&RecordedType>,
-    ) -> CExpr {
-        if let CExpr::Cast { ty, .. } = expr.unobserved()
-            && *ty == target
-        {
-            return expr;
-        }
-        // The expression itself is evidence when the source type is not
-        // recorded. A pointer-valued expression assigned to an integer needs
-        // the conversion spelled exactly as the other direction does, and
-        // asking only the recorded type meant `uint64_t n = p + i;` went out
-        // unconverted.
-        // What the expression is spelled as, not only what the source was
-        // recorded as. The two are the same object and can still disagree
-        // about the rendering: a pointer value already converted to an integer
-        // by an operand projection is an integer in the C, and assigning it
-        // back to the pointer the object is declared as needs the conversion
-        // said again. `cast_needed` compares recorded types, so it saw
-        // `int8_t *` on both sides and asked for nothing while the text read
-        // `stack_m16 = (uint64_t)(int8_t *)RDI_0;`.
-        let spelled_as_integer = matches!(
-            expr.unobserved(),
-            CExpr::Cast {
-                ty: CType::Int { .. },
-                ..
-            }
-        );
-        let pointer_valued = source.is_none()
-            && !matches!(target, CType::Pointer(_))
-            && self.int_meta(&target).is_some()
-            && self.looks_like_pointer(&expr);
-        let integer_valued = matches!(target, CType::Pointer(_)) && spelled_as_integer;
-        if pointer_valued || integer_valued || self.cast_needed(&target, source) {
-            // A pointer converts to an integer of its own width; converting it
-            // straight to a narrower one is a diagnostic in its own right
-            // (`-Wpointer-to-int-cast`) because the conversion loses address
-            // bits silently. Spelling the full-width step makes the narrowing
-            // the program's statement rather than the compiler's guess.
-            if let CType::Pointer(_) = &target
-                && let Some((_, bits)) = source
-                    .map(RecordedType::get)
-                    .and_then(|ty| self.int_meta(ty))
-                    .or_else(|| self.expr_type_hint(&expr).and_then(|ty| self.int_meta(&ty)))
-                && let Some(pointer_bits) = self
-                    .inputs
-                    .prepared_ssa
-                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
-                && bits < pointer_bits
-            {
-                return CExpr::cast(
-                    target,
-                    CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
-                );
-            }
-            if self.looks_like_pointer(&expr)
-                && let Some((_, bits)) = self.int_meta(&target)
-                && let Some(pointer_bits) = self
-                    .inputs
-                    .prepared_ssa
-                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
-            {
-                // At the pointer's own width the conversion is the step; below
-                // it, the step is spelled first and the narrowing follows.
-                if bits == pointer_bits {
-                    return CExpr::pointer_width_cast(target, expr);
-                }
-                if bits < pointer_bits {
-                    return CExpr::cast(
-                        target,
-                        CExpr::pointer_width_cast(uint_type_from_size(pointer_bits / 8), expr),
-                    );
-                }
-            }
-            CExpr::cast(target, expr)
-        } else {
-            expr
-        }
-    }
-
-    /// Convert a stored value to the declared type of the object written.
-    ///
-    /// A store's left-hand side is a certified access rather than a variable,
-    /// so the assignment policy above has no `dst` to ask. The object behind
-    /// the access has a declaration all the same, and it is what the compiler
-    /// reads.
-    fn assignment_rhs_from_stored_object_type(
-        &self,
-        access: r2ssa::StructuredAccessId,
-        val: &SSAVar,
-        rhs: CExpr,
-    ) -> CExpr {
-        let Some(target @ CType::Pointer(_)) = self.stored_object_declaration_type(access) else {
-            return rhs;
-        };
-        let source = self.source_type_for_var(val);
-        self.cast_expr_if_needed(rhs, target, source.as_ref())
-    }
 
     /// The declared type of the stack object a certified access writes.
     fn stored_object_declaration_type(
@@ -2310,78 +1875,8 @@ impl<'a> FoldingContext<'a> {
         Some(names.plan().binding(binding)?.declaration_type().clone())
     }
 
-    fn assignment_rhs_with_type_policy(
-        &self,
-        dst: &SSAVar,
-        src: Option<&SSAVar>,
-        rhs: CExpr,
-    ) -> CExpr {
-        self.assignment_rhs_from_source_type(dst, src.and_then(|var| self.source_type_for_var(var)), rhs)
-    }
 
-    /// The assignment cast policy, from a source type rather than a variable.
-    ///
-    /// Some operations know the type of the expression they produce without
-    /// there being a variable to ask: a binary operation whose operands were
-    /// both cast to a stated type produces that type. Passing `None` there
-    /// meant the policy decided from not knowing, which is what property 2
-    /// forbids.
-    fn assignment_rhs_from_source_type(
-        &self,
-        dst: &SSAVar,
-        src_ty: Option<RecordedType>,
-        rhs: CExpr,
-    ) -> CExpr {
-        // The target is the declared type for the same reason the source is:
-        // a cast is a statement about the emitted C, and the declaration is
-        // what the compiler reads. Casting to what upstream believes the value
-        // means, while the declaration says otherwise, produced
-        // `X1_0 = (int64_t)(...)` for an object declared `uint64_t` -- correct
-        // arithmetic that will not compile under `-Wsign-conversion`.
-        let Some(dst_ty) = self.source_type_for_var(dst).map(RecordedType::into_inner) else {
-            return rhs;
-        };
 
-        // A pointer destination is reached at the pointer's own width. Where
-        // the expression's own type is not recorded, the object being written
-        // still has a width, and converting through it makes the narrowing or
-        // widening the program's statement instead of leaving the compiler to
-        // reject `(int8_t *)(some 32-bit expression)`.
-        let rhs = if matches!(dst_ty, CType::Pointer(_))
-            && !self.looks_like_pointer(&rhs)
-            && src_ty.is_none()
-            && dst.size > 0
-        {
-            CExpr::cast(uint_type_from_size(dst.size), rhs)
-        } else {
-            rhs
-        };
-        let rhs = self.cast_expr_if_needed(rhs, dst_ty.clone(), src_ty.as_ref());
-        self.rewrite_typed_assignment_literal_expr(rhs, &dst_ty)
-    }
-
-    fn rewrite_typed_assignment_literal_expr(&self, expr: CExpr, dst_ty: &CType) -> CExpr {
-        let Some((is_signed, bits)) = self.int_meta(dst_ty) else {
-            return expr;
-        };
-        if bits == 0 || bits > 64 {
-            return expr;
-        }
-        match expr {
-            CExpr::Observed { id, expr } => CExpr::observed(
-                id,
-                self.rewrite_typed_assignment_literal_expr(*expr, dst_ty),
-            ),
-            CExpr::UIntLit(value) => crate::typed_integer_literal_expr(value, is_signed, bits),
-            CExpr::IntLit(value) if value >= 0 => {
-                crate::typed_integer_literal_expr(value as u64, is_signed, bits)
-            }
-            CExpr::Paren(inner) => CExpr::Paren(Box::new(
-                self.rewrite_typed_assignment_literal_expr(*inner, dst_ty),
-            )),
-            other => other,
-        }
-    }
 
     fn literal_to_i64(&self, expr: &CExpr) -> Option<i64> {
         match expr.unobserved() {
@@ -2649,18 +2144,12 @@ impl<'a> FoldingContext<'a> {
                     return Ok(None);
                 }
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs_base = self.get_expr(src)?;
-                let rhs = self.resolve_predicate_rhs_for_var(src, rhs_base);
-                // The operand is projected before it is converted, not after.
-                // The projection says which bits of the source object are
-                // read; the assignment cast says what the destination is. Run
-                // the other way round it re-wrapped a value already converted
-                // to the destination's type back into the source carrier's
-                // integer, which spells `int8_t *p = (uint64_t)(int8_t *)q;`
-                // once a destination may be a pointer.
-                let rhs = self.observed_input(frame, 0, rhs);
-                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
-                self.assign_stmt(lhs, rhs)
+                // A copy converts nothing: what it reads, projected, is what
+                // it has, and the assignment to the declared object is where
+                // the conversion is met, from that type.
+                let (rhs, ty) = self.typed_input(frame, 0, src)?;
+                let rhs = self.resolve_predicate_rhs_for_var(src, rhs);
+                self.assign_typed(lhs, rhs, ty)
             }
             SSAOp::Load { dst, addr, space } => {
                 if *space != r2il::SpaceId::Ram {
@@ -2682,9 +2171,9 @@ impl<'a> FoldingContext<'a> {
                 let elem_ty = self
                     .type_hint_for_var(dst)
                     .unwrap_or_else(|| uint_type_from_size(dst.size));
-                let rhs = self.render_certified_load_access_expr(dst, addr, elem_ty)?;
+                let rhs = self.render_certified_load_access_expr(dst, addr, elem_ty.clone())?;
                 let rhs = self.observed_memory_input(frame, 0, rhs);
-                self.assign_stmt(lhs, rhs)
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(elem_ty)))
             }
             SSAOp::Store { addr, val, space } => {
                 if *space != r2il::SpaceId::Ram {
@@ -2705,36 +2194,32 @@ impl<'a> FoldingContext<'a> {
                 // the result had no name of its own. It has one now: the site
                 // assigns it, and rendering the call here as well would call
                 // the function a second time.
-                let mut rhs = if let Some(source_call) = self
+                let (rhs, rhs_type) = if let Some(source_call) = self
                     .call_result_source_for_var(val)
                     .filter(|site| !self.call_site_assigns_its_own_result(*site))
-                {
-                    match self
+                    && let Some(call) = self
                         .call_result_exprs_map()
                         .get(&source_call)
                         .cloned()
                         .or_else(|| self.synthesized_call_expr_for_source_call(source_call))
-                    {
-                        Some(expr) => expr,
-                        None => self.get_expr(val)?,
-                    }
-                } else {
-                    self.get_expr(val)?
-                };
-                if let Some(val_ty) = self.type_hint_for_var(val)
-                    && matches!(val_ty, CType::Pointer(_))
-                    && !self.looks_like_pointer(&rhs)
                 {
-                    rhs = CExpr::cast(val_ty, rhs);
-                }
+                    // The callee's recorded return type is what the call
+                    // produces.
+                    let returned = self
+                        .known_signature_for_site(source_call.0, source_call.1)
+                        .map(|signature| CValue::Typed(signature.return_type.clone()));
+                    (self.observed_input(frame, 1, call), returned)
+                } else {
+                    self.typed_input(frame, 1, val)?
+                };
                 let lhs = self.observed_memory_input(frame, 0, certified_lhs);
-                let rhs = self.observed_input(frame, 1, rhs);
-                // A slot the evidence declared a pointer takes a pointer;
-                // storing the machine word into it does not compile. Only that
-                // direction is spelled here -- converting a stored value *to*
-                // an integer is what the access projection already did, and
-                // saying it again undid the pointer the read had just given.
-                let rhs = self.assignment_rhs_from_stored_object_type(stored_access, val, rhs);
+                // The object written decides the conversion: a slot the plan
+                // declared, at its declaration, or else the element the
+                // access was rendered at.
+                let written = self
+                    .stored_object_declaration_type(stored_access)
+                    .unwrap_or(elem_ty);
+                let rhs = self.convert_from(rhs, rhs_type.as_ref(), &written);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
@@ -2955,25 +2440,26 @@ impl<'a> FoldingContext<'a> {
             }
             SSAOp::IntNegate { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = CExpr::unary(UnaryOp::Neg, input(0, src)?);
+                let rhs = CExpr::unary(UnaryOp::Neg, self.required_input(frame, 0, src, None)?);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::IntNot { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = CExpr::unary(UnaryOp::BitNot, input(0, src)?);
+                let rhs = CExpr::unary(UnaryOp::BitNot, self.required_input(frame, 0, src, None)?);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::PopCount { dst, src } if (1..=8).contains(&src.size) => {
                 let lhs = self.assignment_lhs_expr(dst)?;
+                // The builtin takes an `unsigned long long` and returns an
+                // `int`; the assignment converts the `int` to the object.
                 let rhs = CExpr::call(
                     CExpr::External {
                         name: "__builtin_popcountll".to_string(),
                         kind: crate::symbol::ExternalKind::Intrinsic,
                     },
-                    vec![CExpr::cast(CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned }, input(0, src)?)],
+                    vec![self.required_input(frame, 0, src, Some(&CType::u64()))?],
                 );
-                let rhs = CExpr::cast(uint_type_from_size(dst.size), rhs);
-                self.assign_stmt(lhs, rhs)
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(CType::i32())))
             }
             SSAOp::BoolAnd { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::And, a, b),
             SSAOp::BoolOr { dst, a, b } => self.boolean_stmt(frame, dst, BinaryOp::Or, a, b),
@@ -2982,70 +2468,64 @@ impl<'a> FoldingContext<'a> {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let rhs = self
                     .resolve_predicate_rhs_for_var(dst, CExpr::unary(UnaryOp::Not, input(0, src)?));
-                self.assign_stmt(lhs, rhs)
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(CType::Bool)))
             }
-            // A destination is declared as the unsigned machine word of its own
-            // width, so that is what an assignment to it must produce. The
-            // signed intermediate a sign extension needs is already inside the
-            // operand expression; casting the whole result to the signed type
-            // again made the value's type disagree with the object holding it,
-            // which a strict compile rejects as a signedness-changing
-            // conversion. Zero extension and truncation were never signed.
-            SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src } => {
+            // A width change is the conversion. Its operand has the
+            // signedness the conversion extends by -- the typed boundaries
+            // require `int32_t` of a sign extension's operand and `uint32_t`
+            // of a zero extension's -- and what it produces is its own type,
+            // signed for a sign extension. The use projection usually spells
+            // the conversion already, in which case the operand arrives at
+            // the produced type and nothing more is said; the assignment then
+            // meets the declared object from that type.
+            SSAOp::IntZExt { dst, src }
+            | SSAOp::IntSExt { dst, src }
+            | SSAOp::Trunc { dst, src }
+            | SSAOp::Cast { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let ty = uint_type_from_size(dst.size);
-                let rhs = self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)?));
-                self.assign_stmt(lhs, rhs)
-            }
-            SSAOp::Trunc { dst, src } => {
-                let lhs = self.assignment_lhs_expr(dst)?;
-                let ty = uint_type_from_size(dst.size);
-                let rhs = self.resolve_predicate_rhs_for_var(dst, CExpr::cast(ty, input(0, src)?));
+                let rhs = self.width_change_expr(frame, dst, src)?;
+                let rhs = self.resolve_predicate_rhs_for_var(dst, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Piece { dst, hi, lo } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
                 let shift_bits = lo.size.saturating_mul(8);
                 let dst_ty = uint_type_from_size(dst.size);
-                let hi_cast = CExpr::cast(dst_ty.clone(), input(0, hi)?);
-                let lo_cast = CExpr::cast(dst_ty.clone(), input(1, lo)?);
+                // Each piece is brought to its own unsigned width and then
+                // widened to the whole, which is the composition's own
+                // conversion; C computes the shift and the or in the
+                // promoted type, and the assignment narrows a composition
+                // narrower than `int` back, from that type.
+                let hi = self.required_input(frame, 0, hi, Some(&uint_type_from_size(hi.size)))?;
+                let lo = self.required_input(frame, 1, lo, Some(&uint_type_from_size(lo.size)))?;
+                let hi_cast = CExpr::cast(dst_ty.clone(), hi);
+                let lo_cast = CExpr::cast(dst_ty, lo);
                 let shifted = if shift_bits == 0 {
                     hi_cast
                 } else {
                     CExpr::binary(BinaryOp::Shl, hi_cast, CExpr::IntLit(shift_bits as i64))
                 };
                 let rhs = CExpr::binary(BinaryOp::BitOr, shifted, lo_cast);
-                // A composition narrower than `int` is computed in `int`,
-                // because that is what C promotes the shift and the or to, and
-                // assigning the result back narrows it. The value always fits --
-                // the operands are exactly the destination's bytes -- but the
-                // strict dialect this renders for treats the implicit narrowing
-                // as an error, so the conversion is written down.
-                let rhs = if dst.size.saturating_mul(8) < 32 {
-                    CExpr::cast(dst_ty, rhs)
-                } else {
-                    rhs
-                };
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Subpiece { dst, src, offset } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let src_expr = input(0, src)?;
-                // Through `cast_expr_to`, which knows that a pointer narrowed
-                // straight to a smaller integer loses address bits and has to
-                // be converted at its own width first. A register alias is a
-                // `Subpiece` at offset zero, and taking the low half of a
-                // pointer-declared register is exactly that case.
+                // The source is brought to its own unsigned width -- a
+                // pointer takes its address-width step there, so the low
+                // half of a pointer-declared register is not a pointer
+                // narrowed straight to a smaller integer -- and the
+                // selection is spelled on that.
+                let src_expr =
+                    self.required_input(frame, 0, src, Some(&uint_type_from_size(src.size)))?;
                 let rhs = if *offset == 0 && dst.size == src.size {
                     src_expr
                 } else if *offset == 0 {
-                    self.cast_expr_to(src_expr, uint_type_from_size(dst.size))
+                    CExpr::cast(uint_type_from_size(dst.size), src_expr)
                 } else {
                     let shift_bits = offset.saturating_mul(8);
-                    let src_cast = self.cast_expr_to(src_expr, uint_type_from_size(src.size));
                     let shifted =
-                        CExpr::binary(BinaryOp::Shr, src_cast, CExpr::IntLit(shift_bits as i64));
-                    self.cast_expr_to(shifted, uint_type_from_size(dst.size))
+                        CExpr::binary(BinaryOp::Shr, src_expr, CExpr::IntLit(shift_bits as i64));
+                    CExpr::cast(uint_type_from_size(dst.size), shifted)
                 };
                 self.assign_stmt(lhs, rhs)
             }
@@ -3130,18 +2610,21 @@ impl<'a> FoldingContext<'a> {
             SSAOp::FloatNotEqual { dst, a, b } => self.binary_stmt(frame, dst, a, b, BinaryOp::Ne),
             SSAOp::Int2Float { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = CExpr::cast(CType::Float(dst.size), input(0, src)?);
-                self.assign_stmt(lhs, rhs)
+                let ty = CType::Float(dst.size.saturating_mul(8));
+                let rhs = CExpr::cast(ty.clone(), input(0, src)?);
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(ty)))
             }
             SSAOp::Float2Int { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = CExpr::cast(type_from_size(dst.size), input(0, src)?);
-                self.assign_stmt(lhs, rhs)
+                let ty = type_from_size(dst.size);
+                let rhs = CExpr::cast(ty.clone(), input(0, src)?);
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(ty)))
             }
             SSAOp::FloatFloat { dst, src } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = CExpr::cast(CType::Float(dst.size), input(0, src)?);
-                self.assign_stmt(lhs, rhs)
+                let ty = CType::Float(dst.size.saturating_mul(8));
+                let rhs = CExpr::cast(ty.clone(), input(0, src)?);
+                self.assign_typed(lhs, rhs, Some(CValue::Typed(ty)))
             }
             SSAOp::Call { target } => {
                 // Note: Call arguments are handled by op_to_stmt_with_args().
@@ -3197,14 +2680,6 @@ impl<'a> FoldingContext<'a> {
                 let rhs = self.ptr_arith_expr(frame, base, index, *element_size, true)?;
                 self.assign_stmt(lhs, rhs)
             }
-            SSAOp::Cast { dst, src } => {
-                let lhs = self.assignment_lhs_expr(dst)?;
-                let rhs = self.resolve_predicate_rhs_for_var(
-                    dst,
-                    CExpr::cast(type_from_size(dst.size), input(0, src)?),
-                );
-                self.assign_stmt(lhs, rhs)
-            }
             SSAOp::Select {
                 dst,
                 cond,
@@ -3212,19 +2687,13 @@ impl<'a> FoldingContext<'a> {
                 if_false,
             } => {
                 let lhs = self.assignment_lhs_expr(dst)?;
+                // Both arms are brought to the machine type of the selection,
+                // so the selection has it whichever arm is taken.
                 let rhs = CExpr::Ternary {
                     cond: Box::new(input(0, cond)?),
-                    then_expr: Box::new(input(1, if_true)?),
-                    else_expr: Box::new(input(2, if_false)?),
+                    then_expr: Box::new(self.required_input(frame, 1, if_true, None)?),
+                    else_expr: Box::new(self.required_input(frame, 2, if_false, None)?),
                 };
-                // A ternary's type is the type of its arms. Where they are
-                // recorded at the same one that is what this produces; where
-                // they disagree there is nothing to state, and saying nothing
-                // is the honest answer rather than a guess.
-                let arms = self
-                    .source_type_for_var(if_true)
-                    .filter(|arm| Some(arm) == self.source_type_for_var(if_false).as_ref());
-                let rhs = self.assignment_rhs_from_source_type(dst, arms, rhs);
                 self.assign_stmt(lhs, rhs)
             }
             SSAOp::Return { .. } => {
@@ -3289,9 +2758,8 @@ impl<'a> FoldingContext<'a> {
                     // has is the type that object is declared with. Passing
                     // nothing here let the cast policy decide from not knowing,
                     // which is the thing property 2 forbids.
-                    let carrier_ty = self.declared_type_for_value(carrier_value);
-                    let rhs = self.assignment_rhs_from_source_type(dst, carrier_ty, carrier);
-                    return Ok(self.assign_stmt(lhs, rhs));
+                    let carrier_ty = self.value_type(carrier_value);
+                    return Ok(self.assign_typed(lhs, carrier, carrier_ty));
                 }
                 // Where the call site owns its result the call statement
                 // assigns it, so rendering here would evaluate the call twice.
@@ -3309,11 +2777,8 @@ impl<'a> FoldingContext<'a> {
                 // expression.
                 let returned = self
                     .known_signature_for_site(source_call.0, source_call.1)
-                    .map(|signature| {
-                        RecordedType::from_callee_signature(signature.return_type.clone())
-                    });
-                let rhs = self.assignment_rhs_from_source_type(dst, returned, call);
-                self.assign_stmt(lhs, rhs)
+                    .map(|signature| CValue::Typed(signature.return_type.clone()));
+                self.assign_typed(lhs, call, returned)
             }
             // The carrier a call left where it found it. Nothing in C says
             // that, and nothing needs to: the value after the call is the
@@ -3380,15 +2845,10 @@ impl<'a> FoldingContext<'a> {
         }
         let lhs = self.assignment_lhs_expr(dst)?;
         let operand_ty = uint_type_from_size(a.size);
-        let left = CExpr::cast(
-            operand_ty.clone(),
-            self.observed_input(frame, 0, self.get_expr(a)?),
-        );
-        let right = CExpr::cast(
-            operand_ty,
-            self.observed_input(frame, 1, self.get_expr(b)?),
-        );
+        let left = self.required_input(frame, 0, a, Some(&operand_ty))?;
+        let right = self.required_input(frame, 1, b, Some(&operand_ty))?;
         let helper = format!("r2sleigh_int_{operation}_{}", a.size * 8);
+        // The helper returns a `uint8_t`, and the assignment converts that.
         let rhs = CExpr::call(
             CExpr::External {
                 name: helper,
@@ -3396,11 +2856,24 @@ impl<'a> FoldingContext<'a> {
             },
             vec![left, right],
         );
-        let rhs = CExpr::cast(uint_type_from_size(dst.size), rhs);
         let rhs = self.resolve_predicate_rhs_for_var(dst, rhs);
-        Ok(self.assign_stmt(lhs, rhs))
+        Ok(self.assign_typed(lhs, rhs, Some(CValue::Typed(CType::u8()))))
     }
 
+    /// Lower a binary operation.
+    ///
+    /// Each operand crosses the boundary the operation states for it, from
+    /// the type the operand has: the signedness a comparison, a shift or a
+    /// division fixes, the unsigned width every other integer operator works
+    /// in. A pointer-declared operand takes its address-width step there --
+    /// arithmetic on an address is arithmetic on a number, and C's one
+    /// operator that means something by a pointer operand counts elements
+    /// where the machine counted bytes -- and the destination's own
+    /// declaration puts the pointer back, at the assignment.
+    ///
+    /// `stated` is what the operation requires where the arena has no node
+    /// for it: a signed division or remainder, which the rewriter does not
+    /// model. Where a root exists its requirement is the one that holds.
     fn binary_stmt_typed(
         &self,
         frame: &LowerFrame,
@@ -3408,7 +2881,7 @@ impl<'a> FoldingContext<'a> {
         a: &SSAVar,
         b: &SSAVar,
         op: BinaryOp,
-        operand_ty: Option<CType>,
+        stated: Option<CType>,
     ) -> Option<CStmt> {
         let lhs = self.retain_lowering_result(self.assignment_lhs_expr(dst))?;
         if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr)
@@ -3426,127 +2899,41 @@ impl<'a> FoldingContext<'a> {
         {
             let call_expr = self.observed_input(frame, 0, call_expr);
             let call_expr = self.observed_input(frame, 1, call_expr);
-            let rhs = self.assignment_rhs_with_type_policy(dst, None, call_expr);
-            return self.assign_stmt(lhs, rhs);
+            let returned = self
+                .known_signature_for_site(left_source.0, left_source.1)
+                .map(|signature| CValue::Typed(signature.return_type.clone()));
+            return self.assign_typed(lhs, call_expr, returned);
         }
-        let mut lhs_expr =
-            self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
-        let mut rhs_expr =
-            self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
-        // C adds an integer to a pointer, never a pointer to a pointer. Both
-        // operands can be pointer-declared honestly -- a value used as an
-        // address somewhere else is a pointer wherever it is read -- and the
-        // sum is still one base and one offset. The left operand keeps the
-        // pointer and the right becomes the offset it is being used as, which
-        // is what the machine addition computes either way.
-        // Arithmetic on an address is arithmetic on a number. C has exactly
-        // one operator that accepts a pointer operand and means something by
-        // it -- addition and subtraction of an integer -- and it counts
-        // elements where the machine counted bytes: `(int32_t *)p + 4` moves
-        // sixteen bytes where the instruction moved four, and `xxhash32` at
-        // arm64 -O1 computed the wrong hash from exactly that. Every other
-        // operator rejects a pointer outright, a shift included. Comparisons
-        // are the exception in the other direction: comparing two pointers is
-        // both legal and what the program meant. `(int32_t *)p + 4` moves sixteen bytes where the
-        // instruction moved four, and `xxhash32` at arm64 -O1 computed the
-        // wrong hash from exactly that. Neither operand stays a pointer here:
-        // the addition is done on the addresses as numbers, which is what the
-        // machine did, and the destination's own declaration puts the pointer
-        // back. It also settles the cases C rejects outright -- a pointer
-        // added to a pointer, and a pointer subtracted from an integer.
-        if !matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge
-        ) && (self.looks_like_pointer(&lhs_expr) || self.looks_like_pointer(&rhs_expr))
-        {
-            lhs_expr = self.cast_expr_to(lhs_expr, uint_type_from_size(a.size));
-            rhs_expr = self.cast_expr_to(rhs_expr, uint_type_from_size(b.size));
-        }
-        let produced_ty = operand_ty.clone();
-        if let Some(ty) = operand_ty {
-            // Stated, not hinted. This type is the operation: `IntSLess` and
-            // `IntLess` differ only in the signedness of the operands they
-            // compare, so leaving it off changes what the comparison means.
-            //
-            // `cast_expr_if_needed` decides from the source type hint, and an
-            // absent hint made it conclude no cast was needed -- which is a
-            // conclusion drawn from not knowing. The x86 sign flag is
-            // `IntSLess(result, 0)`, and its operands carried no hint, so it
-            // rendered as `(uint32_t)result < (uint32_t)0`: false for every
-            // input. `cmp k, 8; jge` then exited on entry and the CRC inner
-            // loop never ran once.
-            lhs_expr = self.cast_expr_to(lhs_expr, ty.clone());
-            rhs_expr = self.cast_expr_to(rhs_expr, ty);
-        }
+        let lhs_expr =
+            self.retain_lowering_result(self.required_input(frame, 0, a, stated.as_ref()))?;
+        let rhs_expr =
+            self.retain_lowering_result(self.required_input(frame, 1, b, stated.as_ref()))?;
         let rhs_raw = self.identity_simplify_binary(
             op,
             lhs_expr,
             rhs_expr,
             (dst.size > 0).then_some(dst.size),
         );
-        let rhs = if matches!(
+        let comparison = matches!(
             op,
             BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-        ) {
+        );
+        let rhs = if comparison {
             self.resolve_predicate_rhs_for_var(dst, rhs_raw)
         } else {
             rhs_raw
         };
-        // Both operands were cast to the stated operand type, so that is the
-        // type of the expression this produces -- except for a comparison,
-        // whose value in C is an `int`. Either way it is stated rather than
-        // guessed, which is what the policy needs.
-        let produced = if matches!(
-            op,
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-        ) {
-            Some(RecordedType::from_operation(CType::Int { bits: 32, signedness: r2types::Signedness::Signed }))
+        // What the expression has follows from the operation: a comparison
+        // is a truth value, and every other operator produces the type its
+        // operands were brought to, promoted. Where the arena has no node
+        // the stated requirement is that type.
+        let produced = if comparison {
+            Some(CValue::Typed(CType::Bool))
         } else {
-            // No stated operand type means the operation did not require one,
-            // not that the expression has no type. Where both operands are
-            // recorded at the same type, the wrapping arithmetic C performs on
-            // them produces that type, and that is a derivation rather than a
-            // guess. Where they disagree there is nothing to state.
-            produced_ty
-                .map(RecordedType::from_operation)
-                .or_else(|| {
-                    let left = self.source_type_for_var(a)?;
-                    let right = self.source_type_for_var(b)?;
-                    if right == left {
-                        return Some(left);
-                    }
-                    // Both operands are recorded and they differ. C says what
-                    // the expression's type is then -- the usual arithmetic
-                    // conversions -- so it is still stated, from two recorded
-                    // facts and a rule in the standard, rather than guessed.
-                    // Leaving it unstated let the cast policy decide from not
-                    // knowing, which is the last place on the render path that
-                    // did.
-                    let (left_signed, left_bits) = self.int_meta(left.get())?;
-                    let (right_signed, right_bits) = self.int_meta(right.get())?;
-                    let bits = left_bits.max(right_bits);
-                    let signed = if left_bits == right_bits {
-                        left_signed && right_signed
-                    } else if left_bits > right_bits {
-                        left_signed
-                    } else {
-                        right_signed
-                    };
-                    let converted = if signed {
-                        CType::Int { bits, signedness: r2types::Signedness::Signed }
-                    } else {
-                        CType::Int { bits, signedness: r2types::Signedness::Unsigned }
-                    };
-                    Some(RecordedType::from_operation(converted))
-                })
+            self.produced_at(frame)
+                .or_else(|| stated.map(|ty| CValue::Typed(r2rewrite::promoted(&ty))))
         };
-        let rhs = self.assignment_rhs_from_source_type(dst, produced, rhs);
-        self.assign_stmt(lhs, rhs)
+        self.assign_typed(lhs, rhs, produced)
     }
 
     fn boolean_stmt(
@@ -3566,7 +2953,32 @@ impl<'a> FoldingContext<'a> {
                 self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?),
             ),
         );
-        self.assign_stmt(lhs, rhs)
+        self.assign_typed(lhs, rhs, Some(CValue::Typed(CType::Bool)))
+    }
+
+    /// The expression a width change produces: its operand, brought to the
+    /// signedness the conversion extends by, then to the conversion's own
+    /// type. Where the use projection already spelled the conversion the
+    /// operand arrives at that type and nothing more is said.
+    fn width_change_expr(
+        &self,
+        frame: &LowerFrame,
+        dst: &SSAVar,
+        src: &SSAVar,
+    ) -> OpLoweringResult<CExpr> {
+        let (expr, ty) = self.typed_input(frame, 0, src)?;
+        let produced = self
+            .produced_at(frame)
+            .and_then(|produced| produced.as_type().cloned())
+            .unwrap_or_else(|| uint_type_from_size(dst.size));
+        if ty.as_ref().and_then(CValue::as_type) == Some(&produced) {
+            return Ok(expr);
+        }
+        let operand = match self.required_at(frame, 0) {
+            Some(required) => self.convert_from(expr, ty.as_ref(), &required),
+            None => expr,
+        };
+        Ok(CExpr::cast(produced, operand))
     }
 }
 

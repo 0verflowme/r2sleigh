@@ -14,6 +14,7 @@ pub mod eval;
 pub mod import;
 pub mod rules;
 pub mod term;
+pub mod typed;
 
 pub use driver::{
     BudgetFailure, CanonicalAccess, CanonicalRoots, CanonicalValue, Multiplicity, Rewrite,
@@ -30,3 +31,4 @@ pub use rules::{
 pub use term::{
     MAX_TERM_WIDTH_BITS, ObjectPlacement, PointerWalk, Term, TermArena, TermId, TermKind,
 };
+pub use typed::{CValue, RenderTypes, TypedBoundaries, c_type_of, promoted, typed_boundaries};

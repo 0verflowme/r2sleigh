@@ -164,6 +164,19 @@ fn upstream_zero_occurrence_outcome(
     {
         return Outcome::Elided(ElisionReason::CoalescedIdentityPhi);
     }
+    // The same fact for a copy rather than a merge. A copy whose two sides
+    // are one object produces nothing the statement that made the value did
+    // not already produce, so the obligation to produce it is answered by
+    // that statement and not by a copy the rendering was right to drop.
+    if let Some(inst) = source_inst
+        && effects.is_coalesced_copy(inst)
+        && matches!(
+            id.kind,
+            SemanticObligationKind::LoopCarriedState | SemanticObligationKind::LiveValueProducer
+        )
+    {
+        return Outcome::Elided(ElisionReason::CoalescedCopy);
+    }
     if id.kind == SemanticObligationKind::LiveStateTransition
         && prepared
             .obligations()

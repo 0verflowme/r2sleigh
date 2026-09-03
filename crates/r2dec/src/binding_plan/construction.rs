@@ -953,6 +953,7 @@ impl BindingPlan {
             dispositions: dispositions.into_boxed_slice(),
             parameters: parameters.into_boxed_slice(),
             stack_objects,
+            typed: std::cell::OnceCell::new(),
         };
         plan.validate_seal(source_owned)?;
         Ok(plan)

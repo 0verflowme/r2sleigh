@@ -155,17 +155,16 @@ impl<'a> FoldingContext<'a> {
     /// accepts. The conversion is exact and says nothing new, because a
     /// machine word is what the call passes either way.
     ///
-    /// Only where the two differ. A cast from a type to itself is noise, and
-    /// every argument this rendering already types as its declared width would
-    /// grow one.
+    /// Only where the two differ, and that is the one emitter's answer. What
+    /// the argument has is what a read of the value renders as, which the
+    /// typed boundaries state; asking the rendered expression what type it
+    /// looks like would be deciding a conversion from the text it is about
+    /// to produce.
     fn call_argument_as_machine_word(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
         let Some(declared) = self.machine_value_width_bits(value).map(CType::uint) else {
             return expr;
         };
-        if self.expr_type_hint(&expr) == Some(declared.clone()) {
-            return expr;
-        }
-        CExpr::cast(declared, expr)
+        self.convert_from(expr, self.value_type(value).as_ref(), &declared)
     }
 
     /// The width a value occupies in machine storage, in bits.

@@ -2,6 +2,7 @@ use super::calls::CertifiedCallArgs;
 use super::memory_renderer::CertifiedMemoryAccessExpr;
 use super::projection::project_machine_write;
 use super::*;
+use r2rewrite::CValue;
 
 fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
     op.dst().is_some()
@@ -99,7 +100,7 @@ impl<'a> FoldingContext<'a> {
         obligations
     }
 
-    fn normalized_output_projection(
+    pub(super) fn normalized_output_projection(
         &self,
         site: crate::normalize::NormalizedOpSite,
     ) -> Result<
@@ -148,39 +149,39 @@ impl<'a> FoldingContext<'a> {
         };
         match names.require_write(output.inst) {
             Ok(r2ssa::MachineWriteDisposition::Exact(projection)) => {
-                // A value already spelled at the object's own type is not
-                // projected again. The projection exists to say how the
-                // machine writes a carrier -- a lane, or a zero-extension into
-                // the full register -- in that carrier's unsigned integer, and
-                // applying it to an expression that is already the pointer the
-                // object is declared as converts it straight back to an
-                // integer and the assignment stops compiling.
-                if matches!(
-                    rhs.unobserved(),
-                    CExpr::Cast {
-                        ty: CType::Pointer(_),
-                        ..
-                    }
-                ) {
-                    return Ok((lhs, rhs));
-                }
-                let (lhs, rhs) = project_machine_write(lhs, rhs, *projection).map_err(|_| {
+                // What the right-hand side has: stated by the lowering that
+                // built it, or, where it built the assignment directly, by
+                // the typed boundaries of the operation's root.
+                let rhs_type = self.pending_assignment_type.take().or_else(|| {
+                    let root = names
+                        .plan()
+                        .machine_projection()
+                        .entity_for_output(output.value)?
+                        .root();
+                    names.plan().typed_boundaries().produced(root).cloned()
+                });
+                // The projection says how the machine writes the carrier --
+                // a lane, or a zero-extension into the full register -- and
+                // spells that from what the right-hand side has. What the
+                // object is declared as is the last word, and the conversion
+                // to it is made once, outside the projection, from the type
+                // the projection produced.
+                let (lhs, rhs, projected_type) = project_machine_write(
+                    lhs,
+                    rhs,
+                    rhs_type.as_ref(),
+                    *projection,
+                    self.pointer_bits(),
+                )
+                .map_err(|_| {
                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
                         output.inst,
                     )
                 })?;
-                // The projection spells how the machine writes the carrier --
-                // a lane, or a zero-extension into the full register -- in the
-                // carrier's unsigned integer. That is the last word only while
-                // the object being written is that integer. Where the plan
-                // declared it a pointer, the conversion to the declaration is
-                // what the compiler reads, and it goes outside the projection
-                // rather than under it.
-                if let Some(declared @ CType::Pointer(_)) =
-                    self.value_declaration_type(output.value)
-                {
-                    return Ok((lhs, CExpr::cast(declared, rhs)));
-                }
+                let rhs = match self.value_declaration_type(output.value) {
+                    Some(declared) => self.convert_from(rhs, projected_type.as_ref(), &declared),
+                    None => rhs,
+                };
                 Ok((lhs, rhs))
             }
             Ok(r2ssa::MachineWriteDisposition::Refused(_)) => {
@@ -309,7 +310,7 @@ impl<'a> FoldingContext<'a> {
     }
 
     /// The type the plan declares for a value, if it declares one.
-    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+    pub(super) fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
         let names = self.inputs.binding_names?;
         let crate::binding_plan::ValueDisposition::Bound { binding } =
             names.disposition_for_value(value)?
@@ -338,8 +339,22 @@ impl<'a> FoldingContext<'a> {
         let Some(machine_expr) = names.inline_expr(expr) else {
             return Err(invalid());
         };
-        let child =
-            |id: r2ssa::MachineExprId| self.materialize_machine_expr(names, value, id, depth + 1);
+        // Every operand crosses the boundary its operator states for it,
+        // from the type the operand's own rendering has; both come from the
+        // typed boundaries, keyed by this node and the operand's position.
+        let typed = names.plan().typed_boundaries();
+        let child = |index: usize,
+                     id: r2ssa::MachineExprId|
+         -> Result<
+            CExpr,
+            crate::observation_journal::LegacyObservationJournalError,
+        > {
+            let rendered = self.materialize_machine_expr(names, value, id, depth + 1)?;
+            Ok(match typed.required(expr, index) {
+                Some(required) => self.convert_from(rendered, typed.produced(id), required),
+                None => rendered,
+            })
+        };
         Ok(match machine_expr.kind() {
             Kind::Constant {
                 binding,
@@ -390,7 +405,7 @@ impl<'a> FoldingContext<'a> {
                     rendered
                 }
             }
-            Kind::Copy { input } => child(*input)?,
+            Kind::Copy { input } => child(0, *input)?,
             Kind::Arithmetic {
                 op, left, right, ..
             } => CExpr::binary(
@@ -399,8 +414,8 @@ impl<'a> FoldingContext<'a> {
                     r2ssa::MachineArithmeticOp::Subtract => BinaryOp::Sub,
                     r2ssa::MachineArithmeticOp::Multiply => BinaryOp::Mul,
                 },
-                child(*left)?,
-                child(*right)?,
+                child(0, *left)?,
+                child(1, *right)?,
             ),
             Kind::Bitwise { op, left, right } => CExpr::binary(
                 match op {
@@ -408,8 +423,8 @@ impl<'a> FoldingContext<'a> {
                     r2ssa::MachineBitwiseOp::Or => BinaryOp::BitOr,
                     r2ssa::MachineBitwiseOp::Xor => BinaryOp::BitXor,
                 },
-                child(*left)?,
-                child(*right)?,
+                child(0, *left)?,
+                child(1, *right)?,
             ),
             Kind::Boolean { op, left, right } => CExpr::binary(
                 match op {
@@ -419,9 +434,11 @@ impl<'a> FoldingContext<'a> {
                     // already reduced to zero or one, inequality is it.
                     r2ssa::MachineBooleanOp::Xor => BinaryOp::Ne,
                 },
-                child(*left)?,
-                child(*right)?,
+                child(0, *left)?,
+                child(1, *right)?,
             ),
+            // The signedness of the comparison is the node's interpretation,
+            // and the typed boundaries state it as the operands' requirement.
             Kind::Compare {
                 op, left, right, ..
             } => CExpr::binary(
@@ -431,56 +448,36 @@ impl<'a> FoldingContext<'a> {
                     r2ssa::MachineComparisonOp::LessThan => BinaryOp::Lt,
                     r2ssa::MachineComparisonOp::LessThanOrEqual => BinaryOp::Le,
                 },
-                child(*left)?,
-                child(*right)?,
+                child(0, *left)?,
+                child(1, *right)?,
             ),
+            // An arithmetic right shift is `>>` on a signed operand and
+            // nothing else; the boundary requires the signed operand.
             Kind::Shift {
                 kind,
                 value: shifted,
                 count,
                 ..
-            } => {
-                // An arithmetic right shift is `>>` on a signed operand and
-                // nothing else, so the operand is cast rather than the operator
-                // changed -- the same mistake as the comparison above, and the
-                // same fix.
-                let value_expr = child(*shifted)?;
-                let value_expr = if matches!(kind, r2ssa::MachineShiftKind::ArithmeticRight) {
-                    let bits = names
-                        .inline_expr(*shifted)
-                        .map(|expr| expr.ty().width_bits())
-                        .unwrap_or(32);
-                    CExpr::cast(
-                        CType::Int {
-                            bits,
-                            signedness: r2types::Signedness::Signed,
-                        },
-                        value_expr,
-                    )
-                } else {
-                    value_expr
-                };
-                CExpr::binary(
-                    match kind {
-                        r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
-                        r2ssa::MachineShiftKind::LogicalRight
-                        | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
-                    },
-                    value_expr,
-                    child(*count)?,
-                )
-            }
-            Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(*input)?),
-            Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(*input)?),
-            Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(*input)?),
+            } => CExpr::binary(
+                match kind {
+                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                    r2ssa::MachineShiftKind::LogicalRight
+                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                },
+                child(0, *shifted)?,
+                child(1, *count)?,
+            ),
+            Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(0, *input)?),
+            Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(0, *input)?),
+            Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(0, *input)?),
             Kind::Select {
                 condition,
                 if_true,
                 if_false,
             } => CExpr::Ternary {
-                cond: Box::new(child(*condition)?),
-                then_expr: Box::new(child(*if_true)?),
-                else_expr: Box::new(child(*if_false)?),
+                cond: Box::new(child(0, *condition)?),
+                then_expr: Box::new(child(1, *if_true)?),
+                else_expr: Box::new(child(2, *if_false)?),
             },
             // Everything else -- a memory read, a merge, a division that traps,
             // a flag or a width change whose C form depends on a type this does
@@ -710,21 +707,32 @@ impl<'a> FoldingContext<'a> {
         Ok(Some((first_site, first_disposition)))
     }
 
+    /// The planned expression for one operand, with the type it has.
+    ///
+    /// The type is what the read renders as -- the declared type of the
+    /// object, or the type of the expression an inlined value stands for --
+    /// carried through the use projection, which converts it where a slice
+    /// or a conversion is selected and leaves it alone where the whole value
+    /// is read. The boundary reading the operand converts from this type.
     fn planned_input_expr(
         &self,
         frame: &LowerFrame,
         input_idx: usize,
-    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+    ) -> Result<(CExpr, Option<CValue>), crate::observation_journal::LegacyObservationJournalError>
+    {
         let (site, input) = self.normalized_input_projection(frame, input_idx)?;
         let Some((first_site, first_disposition)) =
             self.uniform_planned_input_disposition(site, input_idx, &input)?
         else {
             // Synthetic preservation inputs have no original graph use and
             // therefore no source-owned projection to apply.
-            return Ok(self.observe_optional_normalized_input_value_expr(
-                frame.normalized_site,
-                input_idx,
-                self.planned_value_expr(input.value)?,
+            return Ok((
+                self.observe_optional_normalized_input_value_expr(
+                    frame.normalized_site,
+                    input_idx,
+                    self.planned_value_expr(input.value)?,
+                ),
+                self.value_type(input.value),
             ));
         };
         match first_disposition {
@@ -734,35 +742,22 @@ impl<'a> FoldingContext<'a> {
                     input_idx,
                     self.planned_value_expr(input.value)?,
                 );
-                // A pointer read whole is spelled at its own type. The
-                // projection casts to the unsigned integer of the carrier's
-                // width, which is what every object used to be declared as;
-                // applied to an object the evidence declared a pointer it says
-                // `(uint64_t)p`, and the assignment that follows will not
-                // compile. The slice is the whole carrier at offset zero, so
-                // the projection selects nothing and the declared type is the
-                // exact statement to make about what is read.
-                let declared_pointer = matches!(
-                    self.value_declaration_type(input.value),
-                    Some(CType::Pointer(_))
-                );
-                if declared_pointer
-                    && slice.bit_offset() == 0
-                    && slice.width_bits() == slice.carrier_width_bits()
-                    && let Some(declared) = self.value_declaration_type(input.value)
-                {
-                    return Ok(CExpr::cast(declared, base));
-                }
-                super::projection::project_machine_use_of(base, slice, declared_pointer).map_err(
-                    |_| {
+                let base_type = self.value_type(input.value);
+                super::projection::project_machine_use_of(
+                    base,
+                    base_type.as_ref(),
+                    slice,
+                    self.pointer_bits(),
+                )
+                .map(|(projected, ty)| (projected, Some(ty)))
+                .map_err(|_| {
                     // The machine use is exact, but the strict C dialect cannot spell
                     // this projection without more type evidence. Refuse the emitted
                     // occurrence instead of inventing an integer or pointer type.
-                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
-                            first_site,
-                        )
-                    },
-                )
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                        first_site,
+                    )
+                })
             }
             // A contextual address cannot be projected from an arbitrary AST.
             // Only `planned_memory_input_expr` accepts the opaque expression
@@ -852,7 +847,7 @@ impl<'a> FoldingContext<'a> {
     ) -> OpLoweringResult<CExpr> {
         let frame = LowerFrame::for_observed_expr(self.normalized_site(block_addr, op_idx));
         match self.planned_input_expr(&frame, input_idx) {
-            Ok(expr) => Ok(self.observe_optional_normalized_input_uses_expr(
+            Ok((expr, _)) => Ok(self.observe_optional_normalized_input_uses_expr(
                 frame.normalized_site,
                 input_idx,
                 expr,
@@ -931,19 +926,54 @@ impl<'a> FoldingContext<'a> {
         input_idx: usize,
         expr: CExpr,
     ) -> CExpr {
+        self.observed_input_typed(frame, input_idx, expr, None).0
+    }
+
+    /// The operand at `input_idx`, read from `var`, with the type it has.
+    ///
+    /// Under observation the operand is the planned, projected expression
+    /// and its type comes with it; outside observation it is the value's
+    /// own rendering, at the type a read of that value has.
+    pub(super) fn typed_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        var: &SSAVar,
+    ) -> OpLoweringResult<(CExpr, Option<CValue>)> {
+        let expr = self.get_expr(var)?;
+        let fallback = self
+            .prepared_value_id_for_var(var)
+            .and_then(|value| self.value_type(value));
+        Ok(self.observed_input_typed(frame, input_idx, expr, fallback))
+    }
+
+    fn observed_input_typed(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        expr: CExpr,
+        fallback: Option<CValue>,
+    ) -> (CExpr, Option<CValue>) {
         if frame.observe_inputs {
-            let expr = match self.planned_input_expr(frame, input_idx) {
+            let (expr, ty) = match self.planned_input_expr(frame, input_idx) {
                 Ok(planned) => planned,
                 Err(error) => {
                     let refusal = Self::observation_lowering_refusal(&error);
                     self.retain_first_observation_error(error);
                     self.retain_first_lowering_refusal(refusal);
-                    return expr;
+                    return (expr, fallback);
                 }
             };
-            self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
+            (
+                self.observe_optional_normalized_input_uses_expr(
+                    frame.normalized_site,
+                    input_idx,
+                    expr,
+                ),
+                ty,
+            )
         } else {
-            expr
+            (expr, fallback)
         }
     }
 
@@ -996,16 +1026,20 @@ impl<'a> FoldingContext<'a> {
             self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
         {
             // The object the result is assigned to decides the conversion,
-            // exactly as it does everywhere else. A call site that owns its
-            // result assigns it directly, and where the plan declared that
-            // object a pointer the callee's integer return has to be
-            // converted or the assignment does not compile.
+            // exactly as it does everywhere else: from what the callee is
+            // recorded to return, to what the plan declared the object.
+            let returned = self
+                .known_signature_for_site(block_addr, op_idx)
+                .map(|signature| CValue::Typed(signature.return_type.clone()));
             let call = match self
                 .certified_call_result_value((block_addr, op_idx))
                 .and_then(|value| self.value_declaration_type(value))
-            {
-                Some(declared @ CType::Pointer(_)) => CExpr::cast(declared, call),
-                _ => call,
+                .or_else(|| {
+                    self.declared_type_of_name(&owner)
+                        .and_then(|owner| owner.as_type().cloned())
+                }) {
+                Some(declared) => self.convert_from(call, returned.as_ref(), &declared),
+                None => call,
             };
             return LoweredOp::Assign {
                 lhs: owner,
@@ -1038,7 +1072,7 @@ impl<'a> FoldingContext<'a> {
                 .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
             return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(address)));
         }
-        let planned = self.planned_input_expr(frame, 0).map_err(|error| {
+        let (planned, _) = self.planned_input_expr(frame, 0).map_err(|error| {
             let refusal = Self::observation_lowering_refusal(&error);
             self.retain_first_observation_error(error);
             refusal

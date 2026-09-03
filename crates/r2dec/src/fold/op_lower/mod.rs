@@ -20,6 +20,7 @@ use crate::analysis;
 pub(crate) use crate::analysis::lower::OpLoweringRefusal;
 use crate::ast::{BinaryOp, CExpr, CStmt, CType, UnaryOp};
 use crate::binding_plan::{BindingPlan, BindingPlanSourceMismatch};
+use r2rewrite::CValue;
 
 use super::SSABlock;
 use super::context::{EffectOccurrenceKind, FoldingContext};
@@ -108,10 +109,12 @@ fn certified_compare_truth_relation_handles_complement_and_swapped_equality() {
 
 mod aliases;
 mod calls;
+pub(crate) mod convert;
 mod lowering;
 mod memory_renderer;
 mod projection;
 mod subscript_renderer;
+mod typing;
 
 #[derive(Debug, Clone, PartialEq)]
 enum LoweredOp {

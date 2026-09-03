@@ -9885,3 +9885,431 @@ rules. The functions in that binary which do index arrays are among the ones
 r2sleigh still refuses, so the array work will remain unmeasurable there until
 the refusals fall. A second benchmark project with indexed access in its
 rendered subset would also serve, and is cheaper than waiting.
+## One conversion per type boundary: the types are stated once now
+
+**What was wrong.** Seven sites in the renderer each decided locally whether a
+cast was needed, and five of them decided it by looking at the text they had
+just produced -- whether a name `looks_like_pointer`, what type an
+`expr_type_hint` reads off an expression. Reading a type off the rendering is
+a defect rather than a style, because the rendering is the thing being
+decided: the answer changes with the spelling. It is also the mechanism behind
+the 3,395 same-type casts the new predicate found -- the read projection
+converted, then the assignment policy converted what the projection had
+spelled, then the next operand projection converted that.
+
+**What replaced it.** `r2rewrite::typed_boundaries` states, for every node of
+the machine arena, two things: what the expression that node renders *has*,
+and what the node *requires* of each operand. The operand rule is the
+operator's own -- the signedness a comparison, a shift or a division states,
+the unsigned width every other integer operator works in, the pointee for an
+address, the promoted `int` C computes narrow operands in. Signedness comes
+from the `interpretation` at a `Compare` and the `kind` at a `Shift`, never
+from the C operator about to be spelled. A leaf reads at the type the plan
+declared its object with, or at the type of the expression an inlined value
+stands for, so a value's declaration and its uses cannot disagree.
+
+`FoldingContext::convert` is the only emitter. It spells nothing where the two
+types are one, spells at most two casts -- the address-width step and the
+target -- and respells a constant in the type that reads it rather than
+casting it, because C types a constant by its value.
+`looks_like_pointer`, `expr_type_hint`, `cast_needed`, `cast_expr_to`,
+`cast_expr_if_needed`, both assignment policies and `RecordedType` are gone.
+
+**Measured, all fifty-four cells, against the new `same_type_casts`
+predicate.**
+
+    predicate                    before    after
+    same_type_casts               3395      185
+    cast_chains                      8        1
+    self_assignments               225      174
+    flag_carriers                  192      192
+    literal_only_declarations      103      103
+    comma_conditions                17       17
+    gotos                          125      125
+
+By configuration, the remaining 185 are `arm64_O0` 67, `x64_O0` 52,
+`arm64_O1` 38, `arm64_O2` 28, and **zero** at `x64_O1` and `x64_O2`. The one
+surviving cast chain is at `x64_O0`.
+
+Binding audit, effect obligations, placement audit and render refusal are
+54 of 54. The workspace suite is 2,203 tests green, up from 2,186, and every
+`r2rewrite` rule is still proven.
+
+**Two rules and a rule-side test.** `cast.extend_identity` -- an extension to
+the width its input already has -- is what lets `zext(zext(x))` collapse to
+one, proven at 8/16/32/64 like every other rule. The C sandwich
+`(uint64_t)(uint32_t)(uint64_t)x` needed no new rule: the driver
+canonicalises children first and the existing
+`cast.extract_of_extend_whole` removes the inner truncation, which
+`an_extension_sandwiched_in_its_own_truncation_is_one_extension` now records
+end to end.
+
+**A value's identity is the plan's answer, not the rendering's.** The journal
+classified a value by the shape of the C it was rendered as. A value the plan
+*inlines* was already exempt, with the reason written beside it -- the shape
+is not evidence. The same is true of a value the plan *binds*, and it was not
+exempt: one value is read at several places and the renderer spells each read
+as that place requires, so recovering the identity from each spelling makes it
+a function of the C. Two spellings then give one value two identities and the
+seal refuses with `ConflictingValue`. That refused **26 of 54 cells** the
+moment the redundant conversions went. `x` and `(uint64_t)x` were already
+handled by looking through casts, which is the same fix applied one shape at a
+time; `!x` inside a condition the structurer negated was the shape left over.
+A bound value is now classified by the symbol the plan gave it, provided the
+occurrence mentions that name -- which keeps a rendering that spells a bound
+value as a *constant* a conflict, because that one really does contradict the
+plan.
+
+**A late substitution changes a type, and the conversions above it have to be
+restated.** Two passes put an address where a number was: the string table and
+the object table. Everything above them was decided while the expression was a
+`uint64_t` constant, so `(char *)(uint64_t)"a string"` survived, and
+`uint64_t RDX_2 = &progName;` -- a pointer assigned to an integer with no
+conversion at all, because for a `uint64_t` constant into a `uint64_t` object
+the right answer had been *nothing*. The chain is now restated end to end
+through the one emitter, from what the address is to what the place required,
+and the place is asked even when it spells no cast. The corpus's own
+`-Wint-conversion` is what found the second shape.
+
+**Where the remaining twenty-three raw-compile failures are, and why one of
+them is a fork.**
+
+    error                                   count   status
+    -Wself-assign  (`x = x;`)                  18   design fork, below
+    -Wsign-conversion  int -> uint64_t          3   open, cause known
+    -Wint-conversion  uint64_t -> uint8_t *     2   open, cause known
+    -Wsign-compare  uint64_t vs int             1   open
+
+The three sign-conversion and one sign-compare failures are the same cause as
+the mask literal already fixed -- a constant that reaches the reader with no
+type of its own -- at sites the restatement walk does not reach yet. The two
+`-Wint-conversion` failures are a call result assigned to a pointer-declared
+object at a site where neither the callee's recorded signature nor the
+certificate names the value, so nothing states what the call produced.
+
+**The fork: what elision reason covers a copy whose two sides are one
+binding.** `x = x;` compiles only while a redundant cast hides it, which is
+why removing the casts turned 18 hidden self-assignments into hard errors. The
+statement performs nothing *because the plan bound both values to one object*,
+and the plan is the authority on that. `ElisionReason::CoalescedEdgeCopy`
+already says so in its own documentation -- "This was once restricted to a
+certified loop carrier, which is where the case was found rather than the
+reason it holds: what makes the copy say nothing is that both sides are one
+binding" -- and this stretch already widened it from certified carriers to any
+materialised merge edge, and from non-entry sources to entry ones, which took
+self-assignments from 225 to 174 and rendered `X1_0 = X1_0;` unnecessary in
+the merge cases. What is left is the copies that are not merge edges at all:
+real `Copy` instructions the plan coalesced.
+
+  * *Reuse `CoalescedEdgeCopy`.* Follows the reason the codebase already wrote
+    down, needs no schema change -- and misnames the case, because a plain
+    copy is not an edge, so the audits would report an edge elision where
+    there is no edge.
+  * *Add a reason, `CoalescedCopy`.* Names the case honestly and keeps the two
+    findings distinguishable in the ledger; costs an `ElisionReason` variant,
+    which appears in audit output and in blessed baselines.
+  * *Do not elide, and stop the plan coalescing across a real copy.* Keeps
+    every machine instruction answerable by a statement, at the cost of the
+    coalescing that removes the noise elsewhere -- and it is a bigger change
+    to the plan than to the ledger.
+  * *Do not elide, and keep a cast so `x = (uint64_t)x;` compiles.* Rejected
+    here rather than offered: it is a compensating workaround at the symptom,
+    and it is the thing this whole stretch removed.
+
+The first three are all defensible and the choice is long-lived, so it is put
+here rather than taken. This is the same fork this document has recorded once
+before, under the widening of merge-edge coalescing; it is now load-bearing,
+because it is the only thing between the corpus and a green raw column.
+
+**The benchmark says the casts were not what `byte_match` was measuring.**
+DecBench on `bzip2recover` at `-O0`, per function, r2sleigh before and after
+the typed-boundary work:
+
+    function        byte_match before -> after
+    endsInBz2            0.088 -> 0.085
+    mallocFail           0.161 -> 0.161
+    readError            0.214 -> 0.214
+    tooManyBlocks        0.156 -> 0.156
+    writeError           0.214 -> 0.214
+
+Unmoved. What the rendered C shows is why: the casts were never the bulk. For
+`readError`, four source statements become fourteen, and the fourteen are
+*bindings* -- a register-named local for every argument before the call --
+not conversions:
+
+    FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;
+    uint64_t RDX_2 = &progName;
+    char* RSI_1 = (char*)"%s: I/O error reading `%s' ...";
+    FILE* RDI_1 = RAX_1;
+    uint64_t RAX_3 = (uint64_t)sym_imp_fprintf(RDI_1, RSI_1, RDX_2);
+
+against `fprintf(stderr, "...", progName, inFileName)`. So the lever on
+`byte_match` is the inlining question -- why the plan binds a value with one
+reader instead of spelling it at that reader -- which is the `flag_carriers`
+and `literal_only_declarations` work, not this one. That is a correction to
+the premise this task was given, and it is worth carrying: removing 3,210
+redundant casts moved the semantic-correctness score by nothing.
+
+**The second fork: what type a global object is declared with.** `ast.rs`
+states the present decision beside the field and states it as a deliberate
+one -- "The type is deliberately not claimed: the body only ever takes the
+object's address, so an incomplete array of bytes declares exactly what is
+known". Every global therefore renders as `extern char name[]` and every read
+of one goes through the access width by hand, as `*(uint64_t *)&stderr` above.
+It is a fork rather than a bug because the standing decision that a type may
+be asserted from use evidence was made about *values*, whose scope is one
+function, while a global's scope is the program.
+
+  * *Keep the abstention.* Never asserts a type it cannot prove; costs a cast
+    and a dereference at every global read.
+  * *Declare the global at the width the evidence shows*, as
+    `declaration_type_for_stack_object` already does for stack slots, refusing
+    on disagreement. Reads become `stderr`. But r2sleigh renders one function
+    at a time, so two functions reading one global at two widths emit two
+    contradictory declarations of one name and nothing in a per-function
+    rendering can see the conflict; and the asserted type is knowingly not the
+    real one, since `stderr` is a `FILE *`.
+  * *Assert per rendering rather than per program* -- declare the width only
+    where this function reads the object as a scalar at one width. That is the
+    only scope a per-function decompiler has, and it makes two renderings of
+    one program disagree about a global, which is a new kind of statement for
+    this project.
+
+Worth knowing before choosing: the read compiles to the same load under all
+three, so `byte_match` should not move, and `type_match` is wrong under the
+first two alike because neither says `FILE *`.
+
+**An operational note that cost a measurement.** A corpus run was started
+while the tree was mid-edit; `locked_matrix.sh` built a half-edited tree, the
+build failed, and the matrix on disk was the *previous* run's, which read as
+"no change" rather than as an error. Delete `tests/corpus/artifacts/results/
+matrix.json` before a run, and do not edit the tree between starting
+`locked_matrix.sh` and its completion -- `run_matrix.sh` builds again under the
+lock, so an edit in that window is measured. That is the sixth reading this
+class of hazard has cost.
+
+
+## Both forks answered, and what the answers cost to carry out
+
+The two forks the typed-boundary work left are resolved, and the resolutions
+are implemented. What follows is what each turned out to require, because in
+both cases the answer was cheap to state and the accounting behind it was not.
+
+**Fork one, the elision reason for a copy whose two sides are one binding.**
+The rename had already landed on the integration branch -- `CoalescedEdgeCopy`
+became `CoalescedCopy`, one reason widened rather than a sibling added,
+following `CoalescedCarrierEdge` before it -- and its documentation already
+named the program's own copies as the case it covers. The journal did not:
+it declined every `Original` copy, because dropping them on the strength of
+the coalescing alone made three corpus cells compute the wrong answer.
+
+That decline was right and its reason is worth keeping. A copy normalization
+makes for a merge sits at an edge, where nothing can have touched the object
+between the edge's two ends. A copy the program made has a *position*, and a
+save and restore around a clobber is the same shape -- there the object is
+written in between and the restore is the only thing that puts the value
+back. So the question is now asked at the copy rather than of the coalescing:
+*nothing wrote this object between the value being produced and the copy of
+it*. That is local, exact, and independent of the interference test having
+been right. A source defined in another block declines, because reaching it
+crosses a control edge and what wrote the object on the way is a liveness
+question this does not ask.
+
+Eliding the statement then took three more answers, one per layer, and each
+was a separate refusal until it was given:
+
+  * the *value* the copy defined is rendered by its binding -- the same answer
+    the symmetric merge case gives, where a merge coalesced to one binding is
+    rendered by that binding rather than by a write of its own;
+  * the *write* is elided with the statement, because the object was already
+    written by whatever produced the value copied;
+  * the *`LiveValueProducer` obligation* is answered by that same statement,
+    which is the rule the coalesced merge already had, asked of a copy.
+
+Separately, a parameter's entry copy is now elided too. The version-0
+exclusion was wider than the reason recorded beside it: that reason is about a
+live-in register nothing declares, and a parameter is the case it excepts,
+since the signature declares it and the binding is written before the body
+starts. Excluding it left `X0_0 = X0_0;` on the first two lines of every arm64
+function that takes arguments.
+
+**Fork two, the type a global object is declared with: answered, not
+implemented, and the reason is a missing fact rather than a missing
+decision.** The answer -- radare2's type where it has one, marked as radare2's
+fact, and the evidenced access width where it does not, with the per-binary
+engine cache as the program scope that makes refuse-on-conflict possible --
+needs radare2's type for a data object to *reach* the renderer, and it does
+not. `DisplayNames` carries three maps and all three are spellings:
+`functions`, `symbols`, `strings`. The plugin's wire writes a data symbol as
+an address and a name and nothing else (`snapshot_walk.c`, the
+`num_data_symbols` loop). So the work is a vertical slice -- the C snapshot
+walk, the wire, `r2source`, `r2types`, then the renderer and the cache -- and
+none of it is the decision. It is left whole rather than started, because a
+half-plumbed type fact is worse than none.
+
+**The measurement, all fifty-four cells, after both.**
+
+    predicate                    start    now
+    same_type_casts               3395     185
+    cast_chains                      8       1
+    self_assignments               225     155
+    literal_only_declarations      103      80
+    flag_carriers                  192     192
+    comma_conditions                17      17
+    gotos                          125     125
+
+    column               result
+    binding_audit        54 / 54
+    effect_obligations   54 / 54
+    placement_audit      54 / 54
+    render_refusal       54 / 54
+    differential         52 pass, 1 fail, 1 blocked
+    raw                  52 pass, 2 fail
+
+The workspace suite is 2,216 green. The raw column went 23 failures to 2 over
+this stretch, and the two left are named rather than counted:
+
+  * `x64_O2 xxhash32:411`, `tmp_3ea80_2 < -0x4` -- a mask compared against a
+    `uint64_t`. The restatement gives a compared literal the type of what it
+    is compared with, and this site is not reached by it; every other mask
+    shape in the corpus is.
+  * `arm64_O0 xxhash32:332`, `uint8_t *X0_9 = sym__rotl32(...)` -- a call
+    result assigned to a pointer-declared object. Neither the callee's
+    recorded signature nor the call-result certificate names the value behind
+    the object at that site, so nothing states what the call produced.
+
+**The one that cost the most to find, and would again.** A render marker is
+metadata, and the restatement walk matched on the expression *directly*, so a
+marked right-hand side fell through with the requirement dropped. In
+production nearly every right-hand side carries an occurrence marker, so the
+pass silently did nothing on most statements while working perfectly in its
+own unit tests. What made it visible was two adjacent lines in one rendered
+function, the same shape, one converted and one not -- the converted one had
+been converted at lowering, not by this pass. A pass that walks the rendered
+tree has to look through `Observed` and `Paren` at every branch, not only in
+the descent.
+
+## The lock split works, measured in the field
+
+`released the install lock; verification does not need it` now appears in a
+real gate run. A corpus run holds the shared install lock for its install and
+its six sweeps and hands it back before the six compiles, six oracle builds and
+six verifications, which need no plugin. That was written when six worktrees
+were queued behind a whole-binary coverage sweep.
+
+Both files were replaced atomically rather than written in place, because bash
+reads a script by byte offset as it executes and five wrappers were running at
+the time. Running instances kept their descriptor on the old inode and the next
+invocation picked up the split, which is the technique to use for every edit to
+a script this project runs concurrently.
+
+## The gate this session has been using cannot fail on a wrong answer
+
+`run_matrix.sh --gate measurement` checks that every column was *measured*. Its
+only failures are `not_run`: a column that produced no record. It does not
+require the raw compile to pass, the differential to agree with the oracle, or
+the snapshot to match. It exits zero with a cell rendering the wrong value.
+
+That is what the name says, and it is a useful thing to have. The error was
+mine: I briefed every agent in this session to treat it as *the* merge gate, and
+reported branches as green on the strength of it. A run on the integration
+branch exited zero while one differential cell failed and eight diagnostic cells
+computed wrong values, and nothing in the exit status said so.
+
+**The correctness gate is `--gate differential`.** It subsumes the others: raw
+must compile and pass, the differential must agree with the source-built oracle
+*on the raw basis* rather than on the repaired one, and the snapshot must match
+or have been accepted. Use it before merging anything, and read `measurement`
+for what it is, a check that the harness still measures.
+
+One consequence for reading the diagnostic column. It exists to repair raw
+output that does not compile, and raw now passes on all fifty-four cells, so
+every diagnostic cell is a repair of something that needed none. The eight that
+compute wrong values are the repair heuristics mis-firing on output whose shape
+improved, not the decompiler getting an answer wrong: the same eight cells pass
+the differential on the raw basis. A column that only reports on a fallback
+nobody takes is measuring itself.
+## `arm64_O0 pearson`: the harness read a cast as a fact, and the naming gap behind it
+
+The differential scored this cell a wrong answer on every non-empty input,
+with `rendered_exit -11`. The decompiler was right and the harness was wrong,
+and the two are worth separating because the second half is still open.
+
+**The wrong answer was the harness.** `verify_rendering.py` maps an image
+address into a blob so the recompiled C reads the real table, and
+`certified_image_literals` recognised the binding of such an address to a
+name by matching `name = (uint64_t)0x100001000` -- with the conversion
+required, because every rendering used to spell one. This branch states a
+type only where the type changes, so the statement became
+`name = 0x100001000`, the test stopped recognising it, the address was left
+absolute and the program segfaulted. The conversion is now optional; the
+evidence it rests on is unchanged. All eighteen cases now return the right
+hash. This is the second time this one test has had to stop reading a
+spelling as the fact it carries, and the comment above it records the first.
+
+**The register-family hypothesis is disproven by the output.** The rendered C
+computes `0x100001000 + 0xe6c + index` and returns the correct Pearson hash on
+all eighteen inputs, so the `adrp` result and the `add` operand *are* agreed
+to be the same storage. If the pairing were broken the arithmetic would be
+wrong, not merely unnamed.
+
+**What is still open is naming, and it is not a lookup question.** Measured
+across the three architectures:
+
+    x64_O0     `0x1000019a0` arrives as one literal -> looked up ->
+               `&_pearson_tab`, with `extern char _pearson_tab[];` emitted
+    arm64_O1   neither the name nor the page base appears; the table is
+               reached by another path
+    arm64_O0   `X8_5 = 0x100001000;` then `X8_5 + 0xe6c` -- two statements
+
+The object table is not missing an entry and is not being asked about an
+interior address. `sym._pearson_tab` sits at `0x100001e6c`, which is exactly
+`0x100001000 + 0xe6c`, and radare2 has a flag there. The lookup would hit the
+way x64's does. It never runs, because the fold that performs it needs the
+address as one literal expression and the page base is *bound to a local*.
+
+So this is the `literal_only_declarations` column, not a new question: eighty
+literal-only bindings remain, and this is one of them. Inlining it would make
+the addition fold and the name appear. Doing that in the late fold would put
+a second answerer beside the binding plan for "does this value render
+inline", which is the duplication this project keeps removing, so it belongs
+to the inlining work and not here.
+
+## A test that reads a spelling as the fact, for the third time
+
+The one differential failure left on the integration branch, `arm64_O0 pearson`,
+was the harness. `verify_rendering.py` maps an image address into a blob so the
+recompiled C reads the real table, and `certified_image_literals` recognised the
+binding of such an address by matching `name = (uint64_t)0x100001000`, with the
+conversion required, because every rendering used to spell one. The cast work
+states a type only where the type changes, so the statement became
+`name = 0x100001000`, the pattern stopped matching, the address stayed absolute
+and the program segfaulted on eighteen of eighteen cases.
+
+The comment directly above that code records the previous time the same test had
+to stop reading a spelling as the fact, when recognising `*(uint8_t *)p` but not
+`*p` made a better rendering look unmapped. It is now three, counting the pass
+that matched an expression directly and so did nothing on any statement carrying
+a render marker.
+
+Two hypotheses were wrong and the output disproved both without a bisect. It was
+not the register families rekeyed on geometry: the rendered C computes
+`0x100001000 + 0xe6c + index` and returns the correct hash on all eighteen
+inputs, so the `adrp` result and the `add` operand are agreed to be the same
+storage. Had the pairing broken, the arithmetic would be wrong rather than
+merely unnamed. And it was not an object lookup missing an interior address:
+`sym._pearson_tab` is at `0x100001e6c`, exactly the base plus the offset, so the
+lookup would hit as it does on x64.
+
+**The lookup never runs.** It needs the address as one literal expression, and
+on this cell the page base is bound to a local rather than inlined, so the fold
+that would recombine them never sees a literal. x64 names the table because the
+address arrives as a single literal. That makes this one of the eighty remaining
+`literal_only_declarations`, and inlining it would make the fold happen and the
+name appear. It was deliberately not fixed in the fold: constant propagation
+there would stand a second answerer beside the binding plan for whether a value
+renders inline. It belongs to the inlining work.
+
+Note this is a different fact from the `adrp` page base found in the thunk work,
+where radare2's own reference points at the page rather than the slot. Here the
+page base is correct and simply un-recombined.

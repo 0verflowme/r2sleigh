@@ -12,7 +12,10 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Call { .. } = semantic_expr else {
             return false;
         };
-        self.expr_type_hint_for_source_call(source_call, semantic_expr)
-            .is_some_and(|ty| matches!(ty, CType::Void))
+        // What the callee is recorded to return, from the site's identity.
+        // The rendered callee's name is not evidence about the signature:
+        // a poisoned name resolved to a different function's prototype.
+        self.known_signature_for_site(source_call.0, source_call.1)
+            .is_some_and(|signature| matches!(signature.return_type, CType::Void))
     }
 }

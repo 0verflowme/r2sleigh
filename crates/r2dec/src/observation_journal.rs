@@ -660,6 +660,7 @@ pub(crate) struct EffectOccurrences {
 struct CoalescedCarrierEffectElisions {
     coalesced_carrier_uses: BTreeSet<UseSite>,
     coalesced_carrier_phis: BTreeSet<InstId>,
+    coalesced_copies: BTreeSet<InstId>,
 }
 
 impl SurvivingEffectObservations {
@@ -703,6 +704,11 @@ impl SurvivingEffectObservations {
             .contains(&inst)
     }
 
+    /// Whether this instruction is a copy elided for saying nothing.
+    pub(crate) fn is_coalesced_copy(&self, inst: InstId) -> bool {
+        self.coalesced_carriers.coalesced_copies.contains(&inst)
+    }
+
     #[cfg(test)]
     pub(crate) fn surviving(&self) -> impl Iterator<Item = (SemanticObligationId, usize)> + '_ {
         self.occurrences.iter().filter_map(|(id, occurrences)| {
@@ -726,6 +732,18 @@ pub(crate) struct LegacyObservationJournal {
     /// Removed carrier phis for which every incoming edge is already accounted
     /// by SSA identity or one of `coalesced_carrier_copy_sites`.
     coalesced_carrier_phi_writes: BTreeSet<InstId>,
+    /// Program copies this journal elides, by instruction.
+    ///
+    /// Their write is elided with them, for the same reason: the object was
+    /// already written by the statement that produced the value copied.
+    coalesced_copy_writes: BTreeSet<InstId>,
+    /// Values defined by a program copy this journal elides.
+    ///
+    /// The copy said nothing because its two sides are one object, so the
+    /// object's own rendering answers for the value the copy defined. Kept so
+    /// the seal can say that rather than look for an occurrence the elided
+    /// statement would have carried.
+    coalesced_copy_outputs: BTreeSet<ValueId>,
     /// Merges normalization removed by materializing every incoming edge, so
     /// the copies on those edges are what write them.
     materialized_removed_phis: BTreeSet<InstId>,
@@ -1493,6 +1511,8 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let mut coalesced_carrier_copy_sites = BTreeSet::new();
+        let mut coalesced_copy_writes = BTreeSet::new();
+        let mut coalesced_copy_outputs = BTreeSet::new();
         for block_id in graph.block_order.iter().copied() {
             let Some(block) = graph
                 .block(block_id)
@@ -1512,11 +1532,19 @@ impl LegacyObservationJournal {
                 // relocates ahead of its entry edges. What makes the copy say
                 // nothing is that both sides resolve to one binding, which is
                 // tested below; the loop carrier is where the case was found,
-                // not the reason it holds. A version-0 source stays excluded:
-                // it has no defining statement, and while `x = x` writes
-                // nothing, a live-in register that is not a parameter has no
-                // declaration to be rendered by either, so eliding its copy
-                // leaves the object read before it is assigned.
+                // not the reason it holds.
+                //
+                // A version-0 source has no defining statement, and the
+                // exclusion for it is exactly as wide as its reason: a
+                // live-in register that is not a parameter has no
+                // declaration to be rendered by either side, so eliding its
+                // copy leaves the object read before it is assigned. A
+                // parameter is the case the reason excepts -- the signature
+                // declares it, so the binding is written before the function
+                // body starts and the copy adds nothing. Excluding it too
+                // left `X0_0 = X0_0;` on the first two lines of every arm64
+                // function that takes arguments, which compiled only while a
+                // redundant cast hid it from `-Wself-assign`.
                 //
                 // And the program's own copies. `subs x1, x1, #1` lifts to a
                 // subtraction into a temporary and a copy of the temporary
@@ -1527,26 +1555,40 @@ impl LegacyObservationJournal {
                 // not: a write projection narrower than the object, or a read
                 // that converts, is a real operation whatever the two sides
                 // are called.
-                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
+                let r2ssa::SSAOp::Copy { src, .. } = op else {
+                    continue;
+                };
+                if src.version == 0 && !copy_source_is_a_parameter(&plan, graph, src) {
                     continue;
                 }
+                let mut program_copy = None;
                 let incoming = match origins.origin(site) {
                     Some(NormalizedOpOrigin::PhiEdgeCopy(origin)) => Some(origin.incoming),
                     Some(NormalizedOpOrigin::RelocatedInitializer(_)) => None,
-                    // One of the program's own copies is deliberately not
-                    // coalesced here. Both sides being one binding makes the
-                    // copy *look* redundant, and for a copy normalization
-                    // introduced it is: nothing else can have touched the
-                    // object between a merge edge's two ends. A program copy
-                    // has a position, and the object can be written between
-                    // the source's definition and the copy -- a save and
-                    // restore around a clobber is exactly that shape. The
-                    // interference tests decline to coalesce such values, so
-                    // the two sides should not be one binding at all; three
-                    // corpus cells say otherwise and compute the wrong answer
-                    // when the copy is dropped. Until that disagreement is
-                    // settled the copy keeps its statement.
-                    Some(NormalizedOpOrigin::Original(_)) => continue,
+                    // A copy the program itself made needs more than both
+                    // sides being one binding. A copy normalization
+                    // introduced sits at a merge edge, where nothing can have
+                    // touched the object between the edge's two ends; one the
+                    // program made has a position, and the object can be
+                    // written between the source's definition and the copy --
+                    // a save and restore around a clobber is exactly that
+                    // shape, and dropping the restore loses the value. Three
+                    // corpus cells computed the wrong answer when every such
+                    // copy was dropped on the strength of the coalescing
+                    // alone.
+                    //
+                    // So the question is asked at the copy rather than of the
+                    // coalescing: nothing wrote this object between the value
+                    // being produced and the copy of it. That is checkable
+                    // here and does not depend on the interference test having
+                    // been right. `subs x1, x1, #1` -- a subtraction into a
+                    // temporary and a copy of the temporary into `x1` -- is
+                    // the shape it admits, and it is the shape the ledger
+                    // already names.
+                    Some(NormalizedOpOrigin::Original(inst)) => {
+                        program_copy = Some(*inst);
+                        None
+                    }
                     None => continue,
                 };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
@@ -1563,6 +1605,11 @@ impl LegacyObservationJournal {
                 let Some(input) = input else {
                     continue;
                 };
+                if let Some(inst) = program_copy
+                    && !nothing_wrote_the_object_between(&plan, graph, inst, input.value)
+                {
+                    continue;
+                }
                 if matches!(
                     (plan.disposition(input.value), plan.disposition(output.value)),
                     (
@@ -1571,6 +1618,10 @@ impl LegacyObservationJournal {
                     ) if input == output
                 ) {
                     coalesced_carrier_copy_sites.insert(site);
+                    if let Some(inst) = program_copy {
+                        coalesced_copy_outputs.insert(output.value);
+                        coalesced_copy_writes.insert(inst);
+                    }
                 }
             }
         }
@@ -1644,6 +1695,8 @@ impl LegacyObservationJournal {
             coalesced_carrier_copy_sites,
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
+            coalesced_copy_writes,
+            coalesced_copy_outputs,
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
             placement_elided_observations: BTreeSet::new(),
@@ -1715,6 +1768,16 @@ impl LegacyObservationJournal {
         for inst in self.coalesced_carrier_phi_writes.iter().copied() {
             match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) {
                 Some(r2ssa::ledger::ElisionReason::CoalescedIdentityPhi) | None => {}
+                Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
+            }
+        }
+        // A program copy that says nothing owes no write either. The object
+        // it would have written was written by the statement that produced
+        // the value it copies, which is the same fact that let the statement
+        // go.
+        for inst in self.coalesced_copy_writes.iter().copied() {
+            match elided_writes.insert(inst, r2ssa::ledger::ElisionReason::CoalescedCopy) {
+                Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
                 Some(_) => return Err(LegacyObservationJournalError::ConflictingWrite(inst)),
             }
         }
@@ -2773,6 +2836,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: self.coalesced_carrier_uses,
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
+                coalesced_copies: self.coalesced_copy_writes,
             }),
         })
     }
@@ -2823,6 +2887,7 @@ impl LegacyObservationJournal {
         let targets = &self.targets;
         let value_is_literal = &self.value_is_literal;
         let plan = &self.plan;
+        let names = &self.names;
         let symbol_bindings = declared_legacy_bindings(function);
         let mut binding_failure = None;
         inspect_render_observations(
@@ -2876,6 +2941,7 @@ impl LegacyObservationJournal {
                             plan.disposition(value),
                             value_is_literal,
                             &symbol_bindings,
+                            names.symbol_for_value(value),
                         )
                         .and_then(|observation| {
                             record_same(&mut values[value.0 as usize], observation).map_err(|()| {
@@ -2923,6 +2989,27 @@ impl LegacyObservationJournal {
             }
             RenderObservationInspectError::Observer(error) => error,
         })?;
+
+        // A value defined by an elided program copy is rendered by its
+        // binding. The copy said nothing because both sides are one object,
+        // and the statement that produced the source is what writes that
+        // object, so the value's cell is the binding's -- exactly the answer
+        // the symmetric merge case gives, where a merge coalesced to one
+        // binding is rendered by that binding rather than by a write of its
+        // own. Looking for an occurrence on the statement that no longer
+        // exists would ask the rendering to carry a mark for a statement it
+        // was right not to emit.
+        for value in &self.coalesced_copy_outputs {
+            let slot = value.0 as usize;
+            if values.get(slot).is_some_and(Option::is_none)
+                && let Some(symbol) = names.symbol_for_value(*value)
+            {
+                match classify_symbol(*value, symbol, &symbol_bindings) {
+                    Ok(observation) => values[slot] = Some(observation),
+                    Err(error) => return Ok(LegacyObservationSeal::BindingFailure(error)),
+                }
+            }
+        }
 
         if let Some(error) = binding_failure {
             return Ok(LegacyObservationSeal::BindingFailure(error));
@@ -3139,6 +3226,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
+                coalesced_copies: std::mem::take(&mut self.coalesced_copy_writes),
             }),
         };
         let snapshot = self.into_snapshot(source);
@@ -3270,6 +3358,7 @@ fn classify_value_node(
     disposition: Option<&ValueDisposition>,
     value_is_literal: &[bool],
     symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    planned_symbol: Option<SymbolId>,
 ) -> Result<LegacyValueObservation, LegacyObservationJournalError> {
     // A value the plan renders where it is read is classified by that
     // decision, not by the shape of what it was rendered as. The shape is not
@@ -3303,32 +3392,61 @@ fn classify_value_node(
     // and the seal refused with `ConflictingValue` -- which is what a
     // redundant cast disappearing would otherwise cause.
     //
-    // The symbol still comes from the rendering rather than from the plan.
-    // This classification is also the check that a rendered name owns a
-    // declaration, and asking the plan for the name it intended would answer
-    // about a rendering that never happened.
-    if let Some(symbol) = named_object_of(expr) {
-        return classify_symbol(value, symbol, symbol_bindings);
-    }
-    if let CExpr::Binary { op, left, .. } = expr
-        && (*op == BinaryOp::Assign
-            || (statement_level
-                && matches!(
-                    op,
-                    BinaryOp::AddAssign
-                        | BinaryOp::SubAssign
-                        | BinaryOp::MulAssign
-                        | BinaryOp::DivAssign
-                        | BinaryOp::ModAssign
-                        | BinaryOp::BitAndAssign
-                        | BinaryOp::BitOrAssign
-                        | BinaryOp::BitXorAssign
-                        | BinaryOp::ShlAssign
-                        | BinaryOp::ShrAssign
-                )))
-        && let CExpr::Var(symbol) = left.unobserved()
+    // The name this occurrence renders the value as, where it renders one.
+    let rendered_symbol = named_object_of(expr).or_else(|| match expr {
+        CExpr::Binary { op, left, .. }
+            if *op == BinaryOp::Assign
+                || (statement_level
+                    && matches!(
+                        op,
+                        BinaryOp::AddAssign
+                            | BinaryOp::SubAssign
+                            | BinaryOp::MulAssign
+                            | BinaryOp::DivAssign
+                            | BinaryOp::ModAssign
+                            | BinaryOp::BitAndAssign
+                            | BinaryOp::BitOrAssign
+                            | BinaryOp::BitXorAssign
+                            | BinaryOp::ShlAssign
+                            | BinaryOp::ShrAssign
+                    )) =>
+        {
+            match left.unobserved() {
+                CExpr::Var(symbol) => Some(*symbol),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    // A rendered name must own a declaration wherever one is rendered. That
+    // is a statement about the C a reader gets, it is what
+    // `UnownedBindingSymbol` answers, and it is asked of every occurrence
+    // that names something.
+    let rendered = rendered_symbol
+        .map(|symbol| classify_symbol(value, symbol, symbol_bindings))
+        .transpose()?;
+    // Which value an occurrence *is* is the plan's answer and not the
+    // rendering's, for the same reason a value the plan inlines is already
+    // exempt above: the shape is not evidence. One value is read at several
+    // places and the renderer spells each read as that place requires -- `x`
+    // here, `!x` inside a condition the structurer negated -- so recovering
+    // the identity from each spelling makes it a function of the C, which is
+    // the thing being decided. Two spellings then give one value two
+    // identities and the seal refuses with `ConflictingValue`.
+    //
+    // The occurrence must still *mention* the name the plan gave the value.
+    // That is the difference between a marker sitting one node out from the
+    // name it marks, which says nothing about identity, and a rendering that
+    // contradicts the plan by spelling a bound value as a constant. The
+    // second is a defect and stays a conflict.
+    if let Some(ValueDisposition::Bound { .. }) = disposition
+        && let Some(planned) = planned_symbol
+        && expr_mentions_symbol(expr, planned)
     {
-        return classify_symbol(value, *symbol, symbol_bindings);
+        return classify_symbol(value, planned, symbol_bindings);
+    }
+    if let Some(rendered) = rendered {
+        return Ok(rendered);
     }
     let source_literal = value_is_literal
         .get(value.0 as usize)
@@ -3348,6 +3466,85 @@ fn classify_value_node(
     } else {
         Ok(LegacyValueObservation::InlineNonLiteral)
     }
+}
+
+/// Whether the object a copy writes went untouched between the value it
+/// copies being produced and the copy itself.
+///
+/// Both sides of the copy resolve to one binding, so the copy re-states a
+/// write the object has already had -- provided nothing else wrote that
+/// object in between. Asked here rather than of the coalescing, because the
+/// answer is local and exact: the source's definition and the copy are two
+/// positions in one block, and every write to the binding is an instruction
+/// whose output belongs to it.
+///
+/// A source defined in another block declines. Reaching it means crossing a
+/// control edge, and what may have written the object on the way is a
+/// liveness question this deliberately does not ask.
+fn nothing_wrote_the_object_between(
+    plan: &BindingPlan,
+    graph: &r2ssa::SsaGraph,
+    copy: InstId,
+    source: ValueId,
+) -> bool {
+    let Some(ValueDisposition::Bound { binding }) = plan.disposition(source) else {
+        return false;
+    };
+    let Some(copy_inst) = graph.inst(copy) else {
+        return false;
+    };
+    let Some(source_inst) = graph.def_inst(source).and_then(|inst| graph.inst(inst)) else {
+        return false;
+    };
+    if source_inst.block != copy_inst.block || source_inst.ordinal > copy_inst.ordinal {
+        return false;
+    }
+    !graph.insts.iter().any(|inst| {
+        inst.block == copy_inst.block
+            && inst.ordinal > source_inst.ordinal
+            && inst.ordinal < copy_inst.ordinal
+            && inst.output.is_some_and(|written| {
+                matches!(
+                    plan.disposition(written),
+                    Some(ValueDisposition::Bound { binding: other }) if other == binding
+                )
+            })
+    })
+}
+
+/// Whether a copy's undefined source is a value the signature declares.
+///
+/// A live-in register with no defining instruction is either a parameter,
+/// which the function's own signature declares and therefore writes before
+/// the body runs, or a register the program read before writing, which
+/// nothing declares. The first can have its copy elided; the second cannot,
+/// because then no statement writes the object at all.
+fn copy_source_is_a_parameter(
+    plan: &BindingPlan,
+    graph: &r2ssa::SsaGraph,
+    src: &r2ssa::SSAVar,
+) -> bool {
+    let Some(value) = graph.value_id_for_var(src) else {
+        return false;
+    };
+    let Some(ValueDisposition::Bound { binding }) = plan.disposition(value) else {
+        return false;
+    };
+    matches!(
+        plan.binding_role(*binding),
+        Some(crate::binding_plan::BindingRole::Parameter { .. })
+    )
+}
+
+/// Whether this expression reads `symbol` anywhere inside it.
+fn expr_mentions_symbol(expr: &CExpr, symbol: SymbolId) -> bool {
+    let mut found = false;
+    expr.visit(&mut |node| {
+        if !found && matches!(node, CExpr::Var(named) if *named == symbol) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// The object a rendered expression names, seen through conversions that do

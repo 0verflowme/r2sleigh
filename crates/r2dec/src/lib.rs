@@ -4988,7 +4988,13 @@ impl Decompiler {
         let used_objects: std::cell::RefCell<std::collections::BTreeSet<(String, u64)>> =
             std::cell::RefCell::new(std::collections::BTreeSet::new());
         crate::stage_timing::mark("structure");
-        fold_constant_arithmetic_in_function(&mut c_function, strings, data_symbols, &used_objects);
+        fold_constant_arithmetic_in_function(
+            &mut c_function,
+            strings,
+            data_symbols,
+            &used_objects,
+            self.config.ptr_size,
+        );
         c_function.extern_objects = used_objects.into_inner().into_iter().collect();
 
         if let Err(error) =
@@ -5310,10 +5316,246 @@ fn fold_constant_arithmetic_in_function(
     strings: &std::collections::BTreeMap<u64, String>,
     symbols: &std::collections::BTreeMap<u64, String>,
     used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
+    pointer_bits: u32,
 ) {
+    let symbol_table = std::rc::Rc::clone(&func.symbols);
     for stmt in &mut func.body {
-        fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
+        fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            Some(&symbol_table),
+        );
     }
+}
+
+/// Restate the conversions around a constant that turned out to be a string.
+///
+/// The conversions above a constant address are decided while it is an
+/// integer, because that is what it is until the string table is consulted.
+/// Substituting the string changes the expression's type -- a string literal
+/// is a `char *`, not a number -- so every conversion that was spelled for
+/// the integer is a statement about a type the expression no longer has, and
+/// `(char *)(uint64_t)"a string"` is what survives.
+///
+/// The chain is therefore not patched but restated: the net conversion, from
+/// what the string is to what the outermost conversion required, spelled by
+/// the one emitter. Where the two are the same the chain disappears, which is
+/// the common case -- a string reaches a `char *` parameter as itself.
+/// The type of a `char` in C, which is its own type.
+///
+/// Not `int8_t`. C has three character types and `char` is distinct from both
+/// `signed char` and `unsigned char`, so a `char *` and an `int8_t *` are
+/// different pointers and converting between them is a cast the compiler
+/// asks for. A string literal is an array of `char`, and saying so is what
+/// lets it reach a `char *` with nothing spelled.
+fn plain_char_type() -> CType {
+    CType::Typedef("char".to_string())
+}
+
+/// The address a chain of conversions is wrapped around, and what it is.
+///
+/// Two substitutions put an address where a number was. A string literal is
+/// an array of `char` that decays to a `char *` wherever a value is wanted.
+/// The address of a named object is a pointer to the object, and the object
+/// is declared `extern char name[]`, so `&name` is a pointer to an array of
+/// `char` -- not a `char *`, which is why converting it to one is a cast
+/// that C requires rather than noise.
+fn substituted_address_under_conversions(expr: &CExpr) -> Option<(&CExpr, CType)> {
+    match expr {
+        CExpr::StringLit(_) => Some((expr, CType::ptr(plain_char_type()))),
+        CExpr::AddrOf(inner)
+            if matches!(
+                inner.unobserved(),
+                CExpr::External {
+                    kind: crate::symbol::ExternalKind::Global,
+                    ..
+                }
+            ) =>
+        {
+            Some((
+                expr,
+                CType::ptr(CType::Array(Box::new(plain_char_type()), None)),
+            ))
+        }
+        CExpr::Observed { expr, .. } | CExpr::Paren(expr) | CExpr::Cast { expr, .. } => {
+            substituted_address_under_conversions(expr)
+        }
+        _ => None,
+    }
+}
+
+/// Restate the conversions around a substituted address.
+///
+/// `required` is what the place this expression sits in asks of it, for the
+/// places that ask without spelling a cast -- a declaration's initialiser
+/// asks for the declared type, an assignment's right-hand side for the type
+/// of what it is assigned to. Inside an expression the enclosing conversion
+/// is the ask, and the outermost one is what the whole chain amounted to.
+///
+/// The distinction matters because the conversion around a constant address
+/// is often *nothing*: a `uint64_t` constant initialising a `uint64_t` needs
+/// no cast, so after `&progName` is substituted there is no chain to notice
+/// and the rendering assigns a pointer to an integer. That is not noise but
+/// a type error, and `-Wint-conversion` in the corpus's own compile is what
+/// found it.
+fn restate_string_conversions_in_expr(
+    expr: &mut CExpr,
+    pointer_bits: u32,
+    required: Option<&CType>,
+    symbols: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
+) {
+    if let Some((address, from)) = substituted_address_under_conversions(expr) {
+        let required = match expr.unobserved() {
+            CExpr::Cast { ty, .. } => Some(ty.clone()),
+            _ => required.cloned(),
+        };
+        let Some(required) = required else {
+            return;
+        };
+        let restated = crate::fold::op_lower::convert::convert(
+            address.clone(),
+            &r2rewrite::CValue::Typed(from),
+            &required,
+            pointer_bits,
+        );
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_all_expr_observations(&source, restated);
+        return;
+    }
+    // A literal that the fold above rewrote, or that the renderer will spell
+    // as the negative it stands for, carries no type of its own. `-0x4` is an
+    // `int` whatever value it denotes, so reading it as a `uint64_t` is a
+    // signedness-changing conversion; the constant fold produces exactly that
+    // when it collapses a mask, after every conversion has been decided.
+    if let Some(required) = required
+        && crate::fold::op_lower::convert::literal_renders_as_signed(expr)
+        && crate::fold::op_lower::convert::is_unsigned_integer(required, pointer_bits)
+    {
+        // The cast is built around the literal as it stands, markers and
+        // all, so every occurrence it records is still in the tree exactly
+        // once. Carrying them again would put each one in twice.
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = CExpr::cast(required.clone(), source);
+        return;
+    }
+    // A render marker and a bracket are metadata: what the place asks of the
+    // expression it asks of the expression under them. Falling through to the
+    // generic descent instead dropped the requirement, and every statement
+    // whose right-hand side carries an occurrence marker -- which is most of
+    // them -- was walked as though nothing had been asked of it.
+    if let CExpr::Observed { expr, .. } | CExpr::Paren(expr) = expr {
+        restate_string_conversions_in_expr(expr, pointer_bits, required, symbols);
+        return;
+    }
+    // An assignment tells its right-hand side what is wanted: the type of
+    // the object being written. A compound assignment says the same thing:
+    // `x &= m` converts `m` to x's type exactly as `x = x & m` would.
+    if let CExpr::Binary {
+        op:
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+            | BinaryOp::ShlAssign
+            | BinaryOp::ShrAssign,
+        left,
+        right,
+    } = expr
+    {
+        let target = match left.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        restate_string_conversions_in_expr(left, pointer_bits, None, symbols);
+        restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols);
+        return;
+    }
+    // Arithmetic on an address is arithmetic on a number. C has one operator
+    // that means anything by a pointer operand, and it counts elements rather
+    // than bytes -- and `&name` is a pointer to an incomplete array, which C
+    // will not do arithmetic on at all. So an address that reaches an
+    // arithmetic operator crosses into the address integer first, and the
+    // conversion back to a pointer is whatever the surrounding place asks
+    // for.
+    if let CExpr::Binary { op, left, right } = expr
+        && matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+        )
+    {
+        // An address takes the address integer, because arithmetic on an
+        // address is arithmetic on a number. The operator's own operand rule
+        // is otherwise left alone: restating it from this pass, which knows
+        // the address width and nothing else, would widen a narrow
+        // computation and change what it computes.
+        //
+        // A literal is the exception, and only for the operators whose
+        // operands C converts to the result's type. There the type the whole
+        // expression is read at is the type the operand is read at, so a
+        // literal the renderer spells as a negative -- an `int` to the
+        // compiler whatever value it denotes -- can be given that type. A
+        // shift's count is not such an operand: it keeps its own type, and
+        // saying otherwise would be a claim about a different thing.
+        let address = CType::uint(pointer_bits);
+        let converted_together = !matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+        // A comparison's operands are converted to each other rather than to
+        // the type the comparison is read at, which is a truth value. So the
+        // type a literal takes there is the other operand's, and the only
+        // other operand this pass can ask about is a name.
+        let comparison = matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        );
+        let peer = |other: &CExpr| match other.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        let peers = comparison.then(|| (peer(right), peer(left)));
+        for (index, operand) in [&mut *left, &mut *right].into_iter().enumerate() {
+            let peer_type = peers.as_ref().and_then(|(for_left, for_right)| {
+                if index == 0 { for_left } else { for_right }.clone()
+            });
+            let wanted = if substituted_address_under_conversions(operand).is_some() {
+                Some(address.clone())
+            } else if !crate::fold::op_lower::convert::literal_renders_as_signed(operand) {
+                None
+            } else if comparison {
+                peer_type
+            } else if index == 0 || converted_together {
+                required.cloned()
+            } else {
+                None
+            };
+            restate_string_conversions_in_expr(operand, pointer_bits, wanted.as_ref(), symbols);
+        }
+        return;
+    }
+    let taken = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = taken.map_children(&mut |mut child| {
+        restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols);
+        child
+    });
 }
 
 fn fold_constant_arithmetic_in_stmt(
@@ -5321,16 +5563,33 @@ fn fold_constant_arithmetic_in_stmt(
     strings: &std::collections::BTreeMap<u64, String>,
     symbols: &std::collections::BTreeMap<u64, String>,
     used: &std::cell::RefCell<std::collections::BTreeSet<(String, u64)>>,
+    pointer_bits: u32,
+    symbol_table: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
 ) {
-    let fold_expr =
-        |expr: &mut CExpr| fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
+    // The substitution and the restatement of what it changed are one visit
+    // of one expression: a conversion can only be restated once the string
+    // it converts is there to be seen.
+    let fold_expr = |expr: &mut CExpr| {
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, used);
+        restate_string_conversions_in_expr(expr, pointer_bits, None, symbol_table);
+    };
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } => {
-            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used)
-        }
-        CStmt::Observed { stmt, .. } => {
-            fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used)
-        }
+        CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
+        CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
@@ -5338,9 +5597,10 @@ fn fold_constant_arithmetic_in_stmt(
         | CStmt::Label(_)
         | CStmt::Comment(_) => {}
         CStmt::Expr(expr) => fold_expr(expr),
-        CStmt::Decl { init, .. } => {
+        CStmt::Decl { ty, init, .. } => {
             if let Some(init) = init {
-                fold_expr(init);
+                fold_constant_arithmetic_in_expr(init, strings, symbols, used);
+                restate_string_conversions_in_expr(init, pointer_bits, Some(ty), symbol_table);
             }
         }
         CStmt::Return(expr) => {
@@ -5350,7 +5610,14 @@ fn fold_constant_arithmetic_in_stmt(
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
+                fold_constant_arithmetic_in_stmt(
+                    stmt,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
         CStmt::If {
@@ -5359,14 +5626,35 @@ fn fold_constant_arithmetic_in_stmt(
             else_body,
         } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(then_body, strings, symbols, used);
+            fold_constant_arithmetic_in_stmt(
+                then_body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
             if let Some(else_body) = else_body {
-                fold_constant_arithmetic_in_stmt(else_body, strings, symbols, used);
+                fold_constant_arithmetic_in_stmt(
+                    else_body,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
         CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
             fold_expr(cond);
-            fold_constant_arithmetic_in_stmt(body, strings, symbols, used);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::For {
             init,
@@ -5375,7 +5663,14 @@ fn fold_constant_arithmetic_in_stmt(
             body,
         } => {
             if let Some(init) = init {
-                fold_constant_arithmetic_in_stmt(init, strings, symbols, used);
+                fold_constant_arithmetic_in_stmt(
+                    init,
+                    strings,
+                    symbols,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
             if let Some(cond) = cond {
                 fold_expr(cond);
@@ -5383,7 +5678,14 @@ fn fold_constant_arithmetic_in_stmt(
             if let Some(update) = update {
                 fold_expr(update);
             }
-            fold_constant_arithmetic_in_stmt(body, strings, symbols, used);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::Switch {
             expr,
@@ -5393,12 +5695,26 @@ fn fold_constant_arithmetic_in_stmt(
             fold_expr(expr);
             for case in cases {
                 for stmt in &mut case.body {
-                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    fold_constant_arithmetic_in_stmt(stmt, strings, symbols, used);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
             }
         }
@@ -5709,6 +6025,119 @@ fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compared_mask_takes_the_type_of_what_it_is_compared_with() {
+        // `tmp < -0x4` where `tmp` is a `uint64_t`. The comparison is read as
+        // a truth value, so the type the mask needs is not the statement's --
+        // it is the other operand's, and `-0x4` is an `int` until something
+        // says otherwise.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "tmp_3ea80_2".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Lt,
+                CExpr::Var(name),
+                CExpr::UIntLit(0xffff_ffff_ffff_fffc),
+            ))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u8()), Some(&table));
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the comparison, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask takes the compared operand's type, not the flag's: {right:?}"
+        );
+    }
+
+    #[test]
+    fn a_mask_under_a_render_marker_still_takes_the_type_that_reads_it() {
+        // The shape every statement has in production: the right-hand side
+        // carries an occurrence marker. `X1_0 & -0x4` on a `uint64_t` is a
+        // signedness-changing conversion, because `-0x4` is an `int`
+        // whatever value it denotes, and the marker must not hide the ask.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "X1_0".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mask = CExpr::UIntLit(0xffff_ffff_ffff_fffc);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(BinaryOp::BitAnd, CExpr::Var(name), mask))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u64()), Some(&table));
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the masking, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask must say it is a uint64_t, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn a_string_address_drops_the_conversions_spelled_for_its_number() {
+        // A string reaches a `char *` as itself: the conversions above the
+        // constant were spelled while it was a number, and substituting the
+        // string makes every one of them a statement about a type the
+        // expression no longer has.
+        let text = CExpr::StringLit("usage: %s\n".to_string());
+        let char_ptr = CType::ptr(plain_char_type());
+        let mut expr = CExpr::cast(
+            char_ptr.clone(),
+            CExpr::cast(
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+                text.clone(),
+            ),
+        );
+        restate_string_conversions_in_expr(&mut expr, 64, None, None);
+        assert_eq!(expr, text, "got {expr:?}");
+
+        // Converted to a number, the string is still an address, so the
+        // conversion that is C's own is the one that survives -- and it is
+        // recorded as the address-width step, so a round trip collapses.
+        let mut as_number = CExpr::cast(
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            },
+            text.clone(),
+        );
+        restate_string_conversions_in_expr(&mut as_number, 64, None, None);
+        assert!(
+            matches!(
+                &as_number,
+                CExpr::Cast {
+                    ty: CType::Int { bits: 64, .. },
+                    role: crate::ast::CastRole::PointerWidthStep,
+                    ..
+                }
+            ),
+            "got {as_number:?}"
+        );
+        let _ = char_ptr;
+    }
 
     /// What the two type models lose when a type crosses between them.
     ///

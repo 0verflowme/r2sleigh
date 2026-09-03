@@ -996,14 +996,36 @@ mod tests {
         else {
             panic!("low-register write must remain an assignment expression");
         };
-        assert!(matches!(
-            copy_rhs.unobserved(),
-            CExpr::Cast {
-                ty: CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned },
-                expr,
-                ..
-            } if matches!(expr.unobserved(), CExpr::Cast { ty: CType::Int { bits: 32, signedness: r2types::Signedness::Unsigned }, .. })
-        ));
+        // One cast, not two. The write zero-extends a thirty-two bit value
+        // into the sixty-four bit carrier, and the addition already produces
+        // that thirty-two bit value: C computes `uint32_t + uint32_t` in
+        // `uint32_t`. The `(uint32_t)` this once spelled underneath said so a
+        // second time. What has to be spelled is the extension itself, and
+        // that it is an extension of an unsigned value rather than a signed
+        // one, which the operand's own type carries.
+        let CExpr::Cast {
+            ty:
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+            expr: extended,
+            ..
+        } = copy_rhs.unobserved()
+        else {
+            panic!("the write must zero-extend into the carrier: {copy_rhs:?}");
+        };
+        assert!(
+            matches!(
+                extended.unobserved(),
+                CExpr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            ),
+            "the extension applies to the thirty-two bit addition itself, \
+             with no conversion restating the width it already has: {extended:?}"
+        );
 
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
@@ -1901,60 +1923,6 @@ mod tests {
     }
 
     #[test]
-    fn source_call_expr_type_hint_prefers_typed_callsite_identity_over_rendered_callee() {
-        let mut ctx = make_x86_64_ctx();
-        let source_call = (0x3000, 2);
-        ctx.set_known_function_signatures(HashMap::from([(
-            "sym.local.poison".to_string(),
-            FunctionType {
-                return_type: CType::Int { bits: 32, signedness: r2types::Signedness::Signed },
-                params: Vec::new(),
-                variadic: false,
-            },
-        )]));
-        install_indirect_callsite_identity(
-            &mut ctx,
-            source_call,
-            "sym.imp.malloc",
-            Some(FunctionType {
-                return_type: CType::void_ptr(),
-                params: vec![CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned }],
-                variadic: false,
-            }),
-        );
-
-        let poisoned_rendered_call = CExpr::call(
-            CExpr::External {
-                name: "sym_local_poison".to_string(),
-                kind: crate::symbol::ExternalKind::Function,
-            },
-            vec![CExpr::UIntLit(16)],
-        );
-        assert_eq!(
-            ctx.expr_type_hint_for_source_call(source_call, &poisoned_rendered_call),
-            Some(CType::void_ptr()),
-            "explicit source-call return type must outrank a poisoned rendered callee"
-        );
-    }
-
-    #[test]
-    fn expr_type_hint_preserves_cast_through_paren() {
-        let ctx = make_x86_64_ctx();
-
-        assert_eq!(
-            ctx.expr_type_hint(&CExpr::cast(CType::Int { bits: 16, signedness: r2types::Signedness::Signed }, ctx.name_ref("value"))),
-            Some(CType::Int { bits: 16, signedness: r2types::Signedness::Signed })
-        );
-        assert_eq!(
-            ctx.expr_type_hint(&CExpr::Paren(Box::new(CExpr::cast(
-                CType::Int { bits: 16, signedness: r2types::Signedness::Signed },
-                ctx.name_ref("value"),
-            )))),
-            Some(CType::Int { bits: 16, signedness: r2types::Signedness::Signed })
-        );
-    }
-
-    #[test]
     fn should_inline_requires_the_exact_sealed_disposition() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1000, 4);
@@ -2107,20 +2075,23 @@ mod tests {
     }
 
     #[test]
-    fn assignment_cast_policy_is_observation_transparent() {
+    fn a_conversion_is_observation_transparent() {
         let ctx = FoldingContext::new(64);
         let target = CType::Int { bits: 32, signedness: r2types::Signedness::Signed };
-        let source =
-            RecordedType::for_test(CType::Int { bits: 64, signedness: r2types::Signedness::Unsigned });
-        let cast = CExpr::cast(target.clone(), ctx.name_ref("value"));
-        let plain = ctx.cast_expr_if_needed(cast.clone(), target.clone(), Some(&source));
+        let source = r2rewrite::CValue::Typed(CType::Int {
+            bits: 64,
+            signedness: r2types::Signedness::Unsigned,
+        });
+        let value = ctx.name_ref("value");
+        let plain = ctx.convert(value.clone(), &source, &target);
+        assert!(matches!(plain, CExpr::Cast { .. }), "a narrowing is spelled");
         let mut owner = crate::ast::RenderObservationOwner::new();
-        let (use_id, observed) = owner.observe_expr(cast).expect("cast observation");
-        let marked = ctx.cast_expr_if_needed(observed, target, Some(&source));
+        let (use_id, observed) = owner.observe_expr(value).expect("value observation");
+        let marked = ctx.convert(observed, &source, &target);
         let mut function = CFunction::new("cast", CType::Void).with_body(vec![CStmt::Expr(marked)]);
         let reachable =
             crate::ast::strip_render_observations(&mut function, owner.expected_count())
-                .expect("the cast observation must survive exactly once");
+                .expect("the value observation must survive exactly once");
 
         assert!(reachable.contains(use_id));
         assert_eq!(function.body, vec![CStmt::Expr(plain)]);
@@ -2131,10 +2102,12 @@ mod tests {
         let ctx = FoldingContext::new(64);
         let target = CType::Int { bits: 8, signedness: r2types::Signedness::Signed };
         let literal = CExpr::UIntLit(255);
-        let plain = ctx.rewrite_typed_assignment_literal_expr(literal.clone(), &target);
+        // A constant is spelled in the type that reads it rather than cast
+        // to it, so the conversion of a constant is a respelling.
+        let plain = ctx.convert(literal.clone(), &r2rewrite::CValue::Constant, &target);
         let mut owner = crate::ast::RenderObservationOwner::new();
         let (use_id, observed) = owner.observe_expr(literal).expect("literal observation");
-        let marked = ctx.rewrite_typed_assignment_literal_expr(observed, &target);
+        let marked = ctx.convert(observed, &r2rewrite::CValue::Constant, &target);
         let mut function =
             CFunction::new("literal", CType::Void).with_body(vec![CStmt::Expr(marked)]);
         let reachable =

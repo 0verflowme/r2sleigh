@@ -619,6 +619,26 @@ pub struct MachineUseSlice {
 }
 
 impl MachineUseSlice {
+    /// A slice for a test of something that consumes one.
+    ///
+    /// Production slices are built only here, from the source geometry, so
+    /// that a consumer cannot present an arbitrary selection as a certified
+    /// one; a test of the consumer still has to hand it a slice.
+    #[doc(hidden)]
+    pub const fn for_test(
+        bit_offset: u32,
+        width_bits: u32,
+        carrier_width_bits: u32,
+        conversion: Option<MachineUseConversion>,
+    ) -> Self {
+        Self {
+            bit_offset,
+            width_bits,
+            carrier_width_bits,
+            conversion,
+        }
+    }
+
     pub const fn bit_offset(self) -> u32 {
         self.bit_offset
     }
