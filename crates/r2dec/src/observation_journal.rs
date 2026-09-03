@@ -726,6 +726,13 @@ pub(crate) struct LegacyObservationJournal {
     /// Removed carrier phis for which every incoming edge is already accounted
     /// by SSA identity or one of `coalesced_carrier_copy_sites`.
     coalesced_carrier_phi_writes: BTreeSet<InstId>,
+    /// Values defined by a program copy this journal elides.
+    ///
+    /// The copy said nothing because its two sides are one object, so the
+    /// object's own rendering answers for the value the copy defined. Kept so
+    /// the seal can say that rather than look for an occurrence the elided
+    /// statement would have carried.
+    coalesced_copy_outputs: BTreeSet<ValueId>,
     /// Merges normalization removed by materializing every incoming edge, so
     /// the copies on those edges are what write them.
     materialized_removed_phis: BTreeSet<InstId>,
@@ -1493,6 +1500,7 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let mut coalesced_carrier_copy_sites = BTreeSet::new();
+        let mut coalesced_copy_outputs = BTreeSet::new();
         for block_id in graph.block_order.iter().copied() {
             let Some(block) = graph
                 .block(block_id)
@@ -1598,6 +1606,9 @@ impl LegacyObservationJournal {
                     ) if input == output
                 ) {
                     coalesced_carrier_copy_sites.insert(site);
+                    if program_copy.is_some() {
+                        coalesced_copy_outputs.insert(output.value);
+                    }
                 }
             }
         }
@@ -1671,6 +1682,7 @@ impl LegacyObservationJournal {
             coalesced_carrier_copy_sites,
             coalesced_carrier_uses,
             coalesced_carrier_phi_writes,
+            coalesced_copy_outputs,
             materialized_removed_phis,
             placement_elided_writes: BTreeSet::new(),
             placement_elided_observations: BTreeSet::new(),
@@ -2952,6 +2964,27 @@ impl LegacyObservationJournal {
             }
             RenderObservationInspectError::Observer(error) => error,
         })?;
+
+        // A value defined by an elided program copy is rendered by its
+        // binding. The copy said nothing because both sides are one object,
+        // and the statement that produced the source is what writes that
+        // object, so the value's cell is the binding's -- exactly the answer
+        // the symmetric merge case gives, where a merge coalesced to one
+        // binding is rendered by that binding rather than by a write of its
+        // own. Looking for an occurrence on the statement that no longer
+        // exists would ask the rendering to carry a mark for a statement it
+        // was right not to emit.
+        for value in &self.coalesced_copy_outputs {
+            let slot = value.0 as usize;
+            if values.get(slot).is_some_and(Option::is_none)
+                && let Some(symbol) = names.symbol_for_value(*value)
+            {
+                match classify_symbol(*value, symbol, &symbol_bindings) {
+                    Ok(observation) => values[slot] = Some(observation),
+                    Err(error) => return Ok(LegacyObservationSeal::BindingFailure(error)),
+                }
+            }
+        }
 
         if let Some(error) = binding_failure {
             return Ok(LegacyObservationSeal::BindingFailure(error));
