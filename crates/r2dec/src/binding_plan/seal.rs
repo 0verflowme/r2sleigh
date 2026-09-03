@@ -294,7 +294,7 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
         .ok_or(BindingPlanBuildError::Seal(
             BindingPlanSourceMismatch::Authority,
         ))?;
-    let unread = super::rules::unread_defined_values(source);
+    let unread = super::rules::unread_defined_values(source, machine_projection);
     let resolved = seal_binding_components(source_owned, machine_projection)?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
@@ -553,7 +553,7 @@ impl BindingPlan {
             .ok_or(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::Authority,
             ))?;
-        let unread = super::rules::unread_defined_values(source);
+        let unread = super::rules::unread_defined_values(source, &self.machine_projection);
         for (index, graph_value) in graph.values.iter().enumerate() {
             if graph_value.id.0 as usize != index {
                 return Err(BindingPlanBuildError::Seal(

@@ -204,7 +204,7 @@ pub(super) fn component_eligible_values(
     projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let inlinable = inlinable_values(source_owned, projection);
-    component_eligible_with(source_owned, &inlinable)
+    component_eligible_with(source_owned, projection, &inlinable)
 }
 
 /// The same answer from a stated inlining decision.
@@ -215,6 +215,7 @@ pub(super) fn component_eligible_values(
 /// computed in a stated order instead of one estimating the other.
 pub(super) fn component_eligible_with(
     source_owned: &SourceOwnedFunctionFacts,
+    projection: &r2ssa::MachineProjection,
     inlinable: &BTreeSet<ValueId>,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
@@ -226,7 +227,7 @@ pub(super) fn component_eligible_with(
     let direct_call_targets = certified_direct_call_target_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
-    let unread = unread_defined_values(source);
+    let unread = unread_defined_values(source, projection);
     let structural_unused = source
         .obligations()
         .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
@@ -260,13 +261,37 @@ pub(super) fn component_eligible_with(
 /// graph use table plus the complete graphless boundary-reader inventory is the
 /// closed read domain, so membership is a linear pass with `O(log n)` indexed
 /// certificate lookups.
-pub(super) fn unread_defined_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+pub(super) fn unread_defined_values(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+) -> BTreeSet<ValueId> {
     let certified = certified_value_readers(source);
     source
         .graph()
         .values
         .iter()
-        .filter(|value| source.graph().def_inst(value.id).is_some())
+        .filter(|value| {
+            let Some(definition) = source.graph().def_inst(value.id) else {
+                return false;
+            };
+            matches!(
+                projection.write_disposition(definition),
+                Some(r2ssa::MachineWriteDisposition::Exact(_))
+            ) && source.graph().inst(definition).is_some_and(|instruction| {
+                (0..instruction.inputs.len()).all(|input_idx| {
+                    matches!(
+                        projection.use_disposition(r2ssa::UseSite {
+                            inst: definition,
+                            input_idx,
+                        }),
+                        Some(
+                            r2ssa::MachineUseDisposition::Exact(_)
+                                | r2ssa::MachineUseDisposition::MemoryAddress(_)
+                        )
+                    )
+                })
+            })
+        })
         .filter(|value| source.graph().use_sites(value.id).is_empty())
         .filter(|value| !certified.contains_key(&value.id))
         .map(|value| value.id)
@@ -603,7 +628,7 @@ pub(super) fn inlinable_values(
     // `merge_would_interfere` reads, so it can remove the interference
     // blocking a merge and make a component *grow*.
     let conservative = inlinable_core(source_owned, projection, &BTreeSet::new());
-    let Ok(eligible) = component_eligible_with(source_owned, &conservative) else {
+    let Ok(eligible) = component_eligible_with(source_owned, projection, &conservative) else {
         return conservative;
     };
     let Ok(components) = super::construction::binding_components_with(source_owned, &eligible)

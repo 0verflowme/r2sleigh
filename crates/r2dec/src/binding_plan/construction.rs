@@ -385,7 +385,7 @@ impl BindingPlan {
             .ok_or(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::Authority,
             ))?;
-        let unread = super::rules::unread_defined_values(source);
+        let unread = super::rules::unread_defined_values(source, &machine_projection);
         let mut literal_by_value = BTreeMap::<ValueId, MachineExprId>::new();
         for (expr_id, expr) in machine_projection.arena().iter() {
             if let MachineExprKind::Constant { binding, .. } = expr.kind() {

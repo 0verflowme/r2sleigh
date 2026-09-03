@@ -326,7 +326,7 @@ fn unread_defined_value_is_elided_before_it_can_become_a_binding() {
         .expect("defined CF value")
         .id;
     assert!(graph.use_sites(dead).is_empty());
-    assert!(rules::unread_defined_values(source).contains(&dead));
+    assert!(rules::unread_defined_values(source, &test_projection(&source_owned)).contains(&dead));
 
     let plan = BindingPlan::build_shadow(&source_owned).expect("dead-value-aware plan");
     assert!(matches!(
@@ -427,7 +427,10 @@ fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
         semantic_return,
         semantic_return_certificate.at
     ));
-    assert!(!rules::unread_defined_values(source).contains(&semantic_return));
+    assert!(
+        !rules::unread_defined_values(source, &test_projection(&source_owned))
+            .contains(&semantic_return)
+    );
     let mut forged = plan;
     forged.dispositions[semantic_return.0 as usize] = ValueDisposition::Elided {
         reason: r2ssa::ledger::ElisionReason::ReturnControl,
