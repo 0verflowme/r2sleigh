@@ -255,9 +255,16 @@ for entry in entries:
         if entry[score]["status"] == "not_run":
             failures.append(f"{key}: {score} was not measured")
     gated = gate == "shapes-differential" or entry["function"] in REQUIRED_DIFFERENTIAL
-    if gate in {"shapes-snapshot", "shapes-raw"} or gated:
-        if entry["snapshot"]["status"] not in {"match", "accepted"}:
-            failures.append(f"{key}: snapshot={entry['snapshot']['status']}")
+    # Snapshot is its own opt-in gate and is deliberately not implied by the
+    # correctness ones. Sixty-four of these cells are refusal comments today;
+    # pinning their text as the expected rendering would make every improvement
+    # to the decompiler read as a regression, which is the corpus-as-specification
+    # mistake this project has already paid for once.
+    if gate == "shapes-snapshot" and entry["snapshot"]["status"] not in {
+        "match",
+        "accepted",
+    }:
+        failures.append(f"{key}: snapshot={entry['snapshot']['status']}")
     if gate == "shapes-raw" or gated:
         if entry["raw"]["status"] != "pass":
             failures.append(f"{key}: raw={entry['raw']['status']}")
