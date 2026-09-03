@@ -30,6 +30,24 @@ lock=${R2SLEIGH_PLUGIN_LOCK:-/tmp/r2sleigh-plugin-install.lock}
 : "${CARGO_TARGET_DIR:=$root/target}"
 export CARGO_TARGET_DIR
 
+# What the tree is, right now: the commit, every tracked modification, and the
+# names of untracked files. Recomputed after the lock is taken, because the
+# build below happens outside it and the command inside it builds again. A tree
+# edited during the wait would therefore be measured instead of the tree the
+# caller built, and the caller would have no way to tell.
+# Every git call is allowed to fail. A tree that is not a checkout still has a
+# run to do, and a fingerprint that cannot be taken must skip the comparison
+# rather than kill the run: an abort with no message is the failure mode this
+# guard exists to prevent, and it would be absurd to add one while adding it.
+tree_fingerprint() {
+    {
+        git -C "$root" rev-parse HEAD 2>/dev/null || true
+        git -C "$root" diff HEAD --binary 2>/dev/null || true
+        git -C "$root" ls-files --others --exclude-standard 2>/dev/null || true
+    } | shasum -a 256 | cut -d' ' -f1
+}
+before=$(tree_fingerprint)
+
 echo "building $root without the lock" >&2
 cargo build --release --features all-archs -p r2sleigh-plugin \
     --manifest-path "$root/Cargo.toml" >&2
@@ -41,5 +59,21 @@ done
 # Released on any exit, so an interrupted run does not strand the queue.
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 echo "lock taken" >&2
+
+after=$(tree_fingerprint)
+if [[ -n $before && $before != $after ]]; then
+    cat >&2 <<'CHANGED'
+the tree changed while this run waited for the lock
+
+The build happened before the lock and the command inside it builds again, so
+continuing would install and measure the edited tree while reporting it as the
+one that was built. That is the stale-plugin hazard turned inside out, and it is
+silent: nothing about the output would say which tree it describes.
+
+Nothing was installed. Re-run when the tree is settled, and do not edit while a
+locked run is queued.
+CHANGED
+    exit 75
+fi
 
 "$@"

@@ -84,3 +84,42 @@ read as zero rather than as a bug:
 
 `byte_match` is still unmeasured here: it recompiles with the original toolchain,
 which means a Linux toolchain this harness was not run under.
+
+Running it from this repository
+-------------------------------
+
+`run_decbench.sh` does the whole of the above against a Linux host and compares
+the result with `baseline.json`, per function and per metric:
+
+```
+tests/decbench/run_decbench.sh                    # compare with the record
+tests/decbench/run_decbench.sh --accept-baseline  # record this run instead
+```
+
+It needs an ssh alias for a Linux x86-64 host with the radare2 fork built and
+DecBench installed; `contabo` by default, `--host` or
+`R2SLEIGH_DECBENCH_HOST` to change it. The metric recompiles the decompiled
+output, so the host's toolchain has to be the one that built the benchmark's
+binaries, which is why this cannot run on a developer's Mac.
+
+Two hazards it handles, because both have already cost measurements here.
+
+It installs into a private `HOME` for the run. radare2 reads user plugins from
+`$HOME`, so two trees measuring at once otherwise overwrite each other's
+library and each scores the other's work.
+
+It appends a unique string to the tree it copies over and refuses to measure
+unless that string is in the installed library. `make install` once aborted on
+stale object files, left the previous library in place, and DecBench scored it
+happily. The numbers came back identical to the baseline, which is exactly what
+a change with no effect looks like.
+
+What the record is for
+----------------------
+
+`byte_match` and `type_match` are the only measurements here that score the
+*content* of a rendered function rather than its shape. Every defect they would
+have caught went unnoticed until they were first run: an argument dropped from
+a variadic call, the stack pointer drifting eight bytes at each call site, a
+register-named local staged before every argument. The corpus cannot see any of
+them, because it is nine hash functions of one shape with fixed inputs.
