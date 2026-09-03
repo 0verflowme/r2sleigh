@@ -9415,14 +9415,40 @@ the function that stopped rendering had scored zero, which is exactly why the
 record is per function and carries `decompiled` beside each score: a mean that
 improves because a bad case disappeared is not an improvement.
 
-**The merged tree is worse than one of its own branches.** Measured alone, the
-inlining branch put `readError` at 0.400 and `tooManyBlocks` at 0.316; merged,
-they are 0.255 and 0.148. Something integrated after it took back more than half
-of its gain. Only three commits between the two points touch rendering at all:
-the snapshot walked once rather than three times, the post-analysis budget
-derived from the program, and the callback separation. The budget is the least
-likely, because the binary measured here never bound against it either before or
-after.
+**The merged tree scored below one of its own branches, and the cause was not
+the merge.** Measured alone, the inlining branch put `readError` at 0.400 and
+`tooManyBlocks` at 0.316; through the integration harness they are 0.255 and
+0.148. Two trees, one before and one after the performance merge, were measured
+and render byte-identically, and the branch's own files are unchanged by the
+merge. The variable is the radare2 fork. The integration harness syncs it, so
+those runs carry the ellipsis predicate fix and the branch measurements did not.
+
+The fix is doing exactly what it should and the result is still worse, which is
+worth seeing rendered:
+
+```c
+uint64_t sym_imp_fprintf(uint64_t, uint64_t, ...);
+RAX_3 = sym_imp_fprintf(RDI_1, "%s: I/O error reading `%s'...\n", &progName, RCX_1);
+RAX_8 = sym_imp_fprintf(RDI_5, (char*)RCX_4, &progName, RCX_4);
+```
+
+The declaration is correctly variadic and the first call is right for the first
+time: four arguments, matching the source. The second call, whose source passes
+three, has a spurious fourth from gcc's use of `rcx` as scratch at `-O0`, and its
+format argument is a register rather than the literal, with that same register
+also handed over as the fourth argument. Correct on one call, worse on the
+other, worse in total.
+
+The discriminator for this was reported as not existing, on the grounds that
+counting format conversions would be a name test. It is not. Keying on a callee
+being *called* `printf` is forbidden because identity here is structural, but
+reading the bytes of a literal argument the program carries is data, in the same
+category as the string literals already recovered and rendered. Which parameter
+holds the format comes from radare2's prototype, which is load-bearing when
+marked. So: a variadic callee whose format argument resolves to a literal takes
+its count from that literal's conversion specifiers, and one whose format does
+not resolve refuses, which is what the second call above should be doing today
+instead of inventing a fourth argument.
 
 This is the case the per-function record was built for, and it is worth saying
 what would have happened without it. The aggregate went up. A run that reported
