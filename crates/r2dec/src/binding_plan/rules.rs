@@ -21,10 +21,151 @@ use r2ssa::{InstId, SsaGraph, UseSite, ValueId};
 use r2types::SourceOwnedFunctionFacts;
 
 use super::{
-    BindingPlanBuildError, BindingPlanSourceMismatch, certified_direct_call_target_values,
-    certified_direct_control_target_values, certified_elided_read_instructions,
-    certified_return_control_values, certified_stack_frame_values, certified_stack_geometry_values,
+    BindingPlanBuildError, BindingPlanSourceMismatch, ParameterRefusal, SemanticId,
+    certified_direct_call_target_values, certified_direct_control_target_values,
+    certified_elided_read_instructions, certified_return_control_values,
+    certified_stack_frame_values, certified_stack_geometry_values, declaration_width_is_supported,
 };
+
+/// One ABI slot's evidence, before either derivation turns it into a
+/// disposition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ParameterCandidate {
+    Exact {
+        entity: SemanticId,
+        width_bytes: u32,
+        entry_values: BTreeSet<ValueId>,
+    },
+    Refused(ParameterRefusal),
+}
+
+/// Collect the dense exact ABI-parameter domain without consulting names.
+///
+/// The source interface supplies unused formals; a matching render entity
+/// supplies its exact entry-value membership and source-var carrier width.
+/// Two claims on one slot refuse it, and the first refusal stands: a later
+/// claim on a slot already refused does not change why it was refused, and
+/// construction and the seal once disagreed about exactly that -- one
+/// overwrote the reason, the other kept it -- so the seal refused every
+/// function in which a slot was claimed three times, for a plan that was
+/// right. One statement here is what keeps them from disagreeing again.
+pub(super) fn parameter_candidates(
+    source_owned: &SourceOwnedFunctionFacts,
+) -> Vec<Option<ParameterCandidate>> {
+    let mut candidates = Vec::new();
+    if let Some(interface) = source_owned.source().machine_context().function_interface() {
+        for parameter in interface.parameters() {
+            insert_formal_parameter_candidate(
+                &mut candidates,
+                parameter.index(),
+                parameter.storage().size,
+            );
+        }
+    }
+    let Some(render) = source_owned.report().render() else {
+        return candidates;
+    };
+    for (key, certified) in &render.certified_entities {
+        let r2types::CertifiedEntity::Parameter {
+            id,
+            slot,
+            entry_values,
+            carrier_width,
+            ..
+        } = certified
+        else {
+            continue;
+        };
+        let Ok(index) = usize::try_from(*slot) else {
+            continue;
+        };
+        if index >= candidates.len() {
+            candidates.resize_with(index.saturating_add(1), || None);
+        }
+        let canonical = SemanticId::Parameter(*slot);
+        if *key != *id || *id != canonical {
+            candidates[index] = Some(ParameterCandidate::Refused(
+                ParameterRefusal::ConflictingEntityOwnership {
+                    entity: *id,
+                    expected_slot: *slot,
+                    claimed_slot: match *id {
+                        SemanticId::Parameter(claimed) => claimed,
+                        _ => u32::MAX,
+                    },
+                },
+            ));
+            continue;
+        }
+        candidates[index] = Some(match &candidates[index] {
+            Some(ParameterCandidate::Exact { entity, .. }) if *entity != *id => {
+                ParameterCandidate::Refused(ParameterRefusal::ConflictingSlotOwnership {
+                    slot: *slot,
+                    first: *entity,
+                    second: *id,
+                })
+            }
+            Some(ParameterCandidate::Refused(reason)) => ParameterCandidate::Refused(*reason),
+            Some(ParameterCandidate::Exact { .. }) | None => ParameterCandidate::Exact {
+                entity: *id,
+                width_bytes: *carrier_width,
+                entry_values: entry_values.clone(),
+            },
+        });
+    }
+    candidates
+}
+
+pub(super) fn insert_formal_parameter_candidate(
+    candidates: &mut Vec<Option<ParameterCandidate>>,
+    slot: u32,
+    width_bytes: u32,
+) {
+    let index = slot as usize;
+    if index >= candidates.len() {
+        candidates.resize_with(index.saturating_add(1), || None);
+    }
+    let entity = SemanticId::Parameter(slot);
+    candidates[index] = Some(match &candidates[index] {
+        None => ParameterCandidate::Exact {
+            entity,
+            width_bytes,
+            entry_values: BTreeSet::new(),
+        },
+        Some(ParameterCandidate::Exact { entity: first, .. }) => {
+            ParameterCandidate::Refused(ParameterRefusal::ConflictingSlotOwnership {
+                slot,
+                first: *first,
+                second: entity,
+            })
+        }
+        Some(ParameterCandidate::Refused(reason)) => ParameterCandidate::Refused(*reason),
+    });
+}
+
+/// The declaration width of one parameter slot, from its carrier width.
+pub(super) fn parameter_width(
+    entity: SemanticId,
+    slot: u32,
+    width_bytes: u32,
+) -> Result<u32, ParameterRefusal> {
+    if width_bytes == 0 {
+        return Err(ParameterRefusal::MissingWidth { entity, slot });
+    }
+    let width_bits = width_bytes
+        .checked_mul(8)
+        .ok_or(ParameterRefusal::InvalidWidth {
+            entity,
+            slot,
+            size_bytes: width_bytes,
+        })?;
+    declaration_width_is_supported(width_bits)
+        .then_some(width_bits)
+        .ok_or(ParameterRefusal::UnsupportedWidth {
+            entity,
+            slot,
+            width_bits,
+        })
+}
 
 /// Which values can be members of a binding at all.
 ///
@@ -41,7 +182,7 @@ pub(super) fn component_eligible_values(
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
-    let inlinable = inlinable_values(source, projection);
+    let inlinable = inlinable_values(source_owned, projection);
     let unobserved_merges = source.unobserved_merges();
     let unobserved_values = source.unobserved_values();
     let return_controls = certified_return_control_values(source);
@@ -362,10 +503,37 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
 /// derived from the artifact and is the same object either way; deriving it
 /// again is not a second opinion, only the same answer at a cost.
 pub(super) fn inlinable_values(
-    source: &r2ssa::SsaArtifact,
+    source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> BTreeSet<ValueId> {
+    let source = source_owned.source();
     let graph = source.graph();
+    // A call's arguments are readers the graph does not record. `SSAOp::Call`
+    // takes only the callee as an operand, so the value staged in `rdi` is
+    // consumed by the call boundary and has no `UseSite` at all: the callsite
+    // certificate is the source's record that the read happens, and it is the
+    // same record the renderer consults to spell the argument.
+    //
+    // Asked of the graph alone, such a value has no readers, and this function
+    // turned it away at the first gate -- so every argument a call stages
+    // stayed on the page as a local, whatever the single-use rule did. That is
+    // six statements of the fourteen `readError` renders for four lines of
+    // source, and it is the difference between naming a value and spelling it
+    // where it is used.
+    let mut call_arg_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    if let Some(callsites) = source_owned.report().callsites() {
+        for (site, facts) in &callsites.by_callsite {
+            let Some(inst) = graph.inst_id_for_op_site(site.block_addr, site.op_index) else {
+                continue;
+            };
+            for argument in &facts.argument_values {
+                call_arg_readers
+                    .entry(argument.value)
+                    .or_default()
+                    .push(inst);
+            }
+        }
+    }
     let mut expr_by_value = std::collections::BTreeMap::new();
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
@@ -377,10 +545,33 @@ pub(super) fn inlinable_values(
         return BTreeSet::new();
     };
     let elided_reads = cells.read_elided_instructions;
+    // Which gate turned a value away, by name. Reading this function said a
+    // flag copy passes every test in it, and the corpus said it stays bound;
+    // the two could only be reconciled by asking the function itself, one
+    // value at a time. `R2SLEIGH_TRACE_INLINE=<display name>` or `=all`.
+    let trace = std::env::var("R2SLEIGH_TRACE_INLINE").ok();
     let mut inlinable = BTreeSet::new();
     for value in &graph.values {
+        let traced = trace.as_deref().is_some_and(|want| {
+            want == "all" || value.var.display_name().eq_ignore_ascii_case(want)
+        });
+        let rejected = |gate: &str| {
+            if traced {
+                eprintln!(
+                    "INLINE {} {:?} stays bound: {gate}",
+                    value.var.display_name(),
+                    value.id
+                );
+            }
+        };
         let use_sites = graph.use_sites(value.id);
-        if use_sites.is_empty() {
+        let arg_readers = call_arg_readers
+            .get(&value.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let reader_count = use_sites.len() + arg_readers.len();
+        if reader_count == 0 {
+            rejected("no readers");
             continue;
         }
         // A value that reads nothing but literals is the same at every reader
@@ -392,12 +583,21 @@ pub(super) fn inlinable_values(
         // real computation, not a local removed, so the plan asks the stricter
         // question.
         // ...and whose own storage is a lowering temporary. A register or a
-        // memory cell holding a literal is a machine object the program
-        // writes, and that write is an effect the ledger accounts for once; a
-        // reader spelling the literal instead does not perform it. Rendering
-        // such a value at several readers is the multiplicity question, which
-        // is a separate piece of work. A `Unique` slot is the lifter's own
-        // scratch and its write is not an effect of the program.
+        // memory cell holding a literal is a machine object other values are
+        // coalesced with, and its write is frequently the only definition the
+        // resulting C object has: `RAX_1 = 0xcbf29ce484222325` initialises
+        // the accumulator that the loop then updates, and the two are one
+        // binding. Spelling the constant at each reader deletes that
+        // definition, and placement then finds the object read before it is
+        // assigned -- ten of the fifty-four corpus cells, all on x86-64,
+        // where the initialiser is a bare register literal.
+        //
+        // The honest test is not the storage class but whether the value is
+        // coalesced with anything, and that cannot be asked here: the
+        // partition is computed *from* this answer. A `Unique` slot is the
+        // lifter's own scratch, which is the case this can decide without the
+        // partition. Widening it needs the two-pass structure described in
+        // the handoff, and is a design question rather than a bug.
         let literal_only = expr_by_value
             .get(&value.id)
             .copied()
@@ -405,7 +605,32 @@ pub(super) fn inlinable_values(
             && value.canonical_storage.is_none_or(|storage| {
                 matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
             });
-        if !literal_only && use_sites.len() != 1 {
+        let root_kind = expr_by_value
+            .get(&value.id)
+            .and_then(|root| projection.expr(*root))
+            .map_or("<no entity>", |expr| machine_expr_kind_name(expr.kind()));
+        // Every reader, not only the ones that render. Discounting a reader
+        // whose instruction a certificate elides looks right -- such a read
+        // spells nothing -- and it is what the DecBench staging locals need.
+        // It is also unsound as the rest of this function stands: with the
+        // elided readers discounted, a value that is read again after its
+        // object is rewritten becomes single-use, and the interference test
+        // below spans only the window between the definition and the one
+        // reader it then believes in. `fnv1a64` at x86-64 -O2 renders
+        // `R8_1 = byte3; R8_1 = (R8_1 ^ (... ^ R8_1) * k) * k`, reading the
+        // accumulator after the byte load has overwritten it, and computes a
+        // wrong hash under a proof line claiming nothing was refused. Three
+        // corpus cells do this and five more refuse. See the handoff.
+        if !literal_only && reader_count != 1 {
+            rejected(&format!(
+                "{reader_count} readers ({} of them call arguments), of which {} sit in a \
+                 certificate-elided instruction; root {root_kind}",
+                arg_readers.len(),
+                use_sites
+                    .iter()
+                    .filter(|site| elided_reads.contains(&site.inst))
+                    .count(),
+            ));
             continue;
         }
         let renderable = expr_by_value
@@ -413,9 +638,13 @@ pub(super) fn inlinable_values(
             .and_then(|root| projection.expr(*root))
             .is_some_and(|expr| expression_renders_inline(expr.kind()));
         if !renderable {
+            rejected(&format!(
+                "expression kind does not render inline: {root_kind}"
+            ));
             continue;
         }
         let Some(definition) = graph.def_inst(value.id) else {
+            rejected("no defining instruction");
             continue;
         };
         // The renderer will ask the plan for a write observation on the
@@ -427,9 +656,11 @@ pub(super) fn inlinable_values(
             projection.write_disposition(definition),
             Some(r2ssa::MachineWriteDisposition::Exact(_))
         ) {
+            rejected("definition has no exact write disposition");
             continue;
         }
         let Some(def_inst) = graph.inst(definition) else {
+            rejected("defining instruction missing from the graph");
             continue;
         };
         if !(0..def_inst.inputs.len()).all(|input_idx| {
@@ -444,6 +675,7 @@ pub(super) fn inlinable_values(
                 )
             )
         }) {
+            rejected("an operand of the definition has no exact use disposition");
             continue;
         }
         // The read this expression would move into has to be a read that
@@ -453,14 +685,12 @@ pub(super) fn inlinable_values(
         // effect its definition answered for is then owed by nobody. The
         // ledger scores that as a refusal and the function falls back to no
         // decompilation at all, which is what `murmur3_32` and `xxhash32` did.
-        // Every reader, not one: an occurrence inside an instruction a
-        // certificate elides disappears with it, and a duplicable value whose
-        // readers are partly elided is a case whose accounting nobody has
-        // established, so it stays bound.
         if use_sites
             .iter()
             .any(|site| elided_reads.contains(&site.inst))
+            || arg_readers.iter().any(|inst| elided_reads.contains(inst))
         {
+            rejected("a reader sits in a certificate-elided instruction");
             continue;
         }
         if literal_only {
@@ -470,10 +700,16 @@ pub(super) fn inlinable_values(
             inlinable.insert(value.id);
             continue;
         }
-        let [use_site] = use_sites else {
-            unreachable!("a value that is not literal-only was required to have one reader");
+        // The one reader, whether the graph recorded it or the callsite
+        // certificate did. Only its position is wanted from here on: which
+        // block it sits in, and what runs between the definition and it.
+        let reader = match (use_sites, arg_readers) {
+            ([site], []) => site.inst,
+            ([], [inst]) => *inst,
+            _ => unreachable!("a value that is not literal-only was required to have one reader"),
         };
-        let Some(use_inst) = graph.inst(use_site.inst) else {
+        let Some(use_inst) = graph.inst(reader) else {
+            rejected("reading instruction missing from the graph");
             continue;
         };
         // A merge reads its operands on edges, not at a position in a block, so
@@ -483,9 +719,11 @@ pub(super) fn inlinable_values(
         // are merges, and folding into them computed the wrong answer while
         // every other check passed.
         if matches!(use_inst.payload, r2ssa::InstPayload::Phi { .. }) {
+            rejected("the one reader is a merge");
             continue;
         }
         if def_inst.block != use_inst.block || def_inst.ordinal >= use_inst.ordinal {
+            rejected("the one reader is in another block or does not follow the definition");
             continue;
         }
         // Every location the *rendered* expression reads, not only the ones the
@@ -533,18 +771,61 @@ pub(super) fn inlinable_values(
                     .and_then(|v| v.canonical_storage)
                     .is_some_and(|s| read_locations.contains(&s.location()))
         });
-        if !rewritten {
+        if rewritten {
+            rejected("a location the expression reads is written between definition and reader");
+        } else {
             inlinable.insert(value.id);
         }
     }
     inlinable
 }
 
+/// The name of a machine expression's kind, for the inlining probe.
+fn machine_expr_kind_name(kind: &r2ssa::MachineExprKind) -> &'static str {
+    use r2ssa::MachineExprKind as Kind;
+    match kind {
+        Kind::Source { .. } => "Source",
+        Kind::Constant { .. } => "Constant",
+        Kind::MemoryRead { .. } => "MemoryRead",
+        Kind::Arithmetic { .. } => "Arithmetic",
+        Kind::Bitwise { .. } => "Bitwise",
+        Kind::BitwiseNot { .. } => "BitwiseNot",
+        Kind::Boolean { .. } => "Boolean",
+        Kind::BooleanNot { .. } => "BooleanNot",
+        Kind::Compare { .. } => "Compare",
+        Kind::Copy { .. } => "Copy",
+        Kind::Negate { .. } => "Negate",
+        Kind::Select { .. } => "Select",
+        Kind::Shift { .. } => "Shift",
+        Kind::Cast { .. } => "Cast",
+        _ => "other",
+    }
+}
+
+/// Whether the renderer has a form for this expression at a reader.
+///
+/// The list is exactly what `materialize_machine_expr` can build, and it is
+/// asked of every folding candidate: a plan that promises an inline the
+/// renderer cannot produce refuses the function rather than declining to
+/// fold.
+///
+/// `Constant` belongs here and was missing, which is why a literal-only value
+/// was admitted by the duplicable rule above and then turned away by this
+/// one. That is the whole of the literal-only declaration column: the plan
+/// agreed the value was cheap to spell at each reader and then asked whether
+/// a constant renders inline, and this said no. It is the first arm of the
+/// materialiser.
+///
+/// A computation *over* constants is not a constant. `machine_expr_is_literal`
+/// is true of `popcount(0xf0f0)`, because it asks only whether every leaf is
+/// a constant; the materialiser has no form for a population count, so the
+/// shape is still asked here and that expression still keeps its statement.
 fn expression_renders_inline(kind: &r2ssa::MachineExprKind) -> bool {
     use r2ssa::MachineExprKind as Kind;
     matches!(
         kind,
-        Kind::Arithmetic { .. }
+        Kind::Constant { .. }
+            | Kind::Arithmetic { .. }
             | Kind::Bitwise { .. }
             | Kind::BitwiseNot { .. }
             | Kind::Boolean { .. }
@@ -857,7 +1138,12 @@ pub(crate) fn certificate_elided_cells(
 ///
 /// A version-0 input is excluded, mirroring the journal's own exclusion: such
 /// an input has no defining statement, so its edge copy is the only place the
-/// value is written and is therefore rendered.
+/// value is written and is therefore rendered. Removing the exclusion is
+/// tempting -- the copy spells `x = x` and the binding has a name already --
+/// but a live-in register that is not a parameter has no declaration to be
+/// rendered by, and placement then reports the object read before it is
+/// assigned. Whether such a value should get an entry declaration is the
+/// open question; until it is answered the edge copy is what defines it.
 pub(super) fn identity_merge_values(
     graph: &SsaGraph,
     group_of: impl Fn(ValueId) -> Option<u32>,

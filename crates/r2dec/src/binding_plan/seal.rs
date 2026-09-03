@@ -1,132 +1,6 @@
 use super::*;
 
-#[derive(Debug)]
-enum SealParameterCandidate {
-    Exact {
-        entity: SemanticId,
-        width_bytes: u32,
-        entry_values: BTreeSet<ValueId>,
-    },
-    Refused(ParameterRefusal),
-}
-
-/// Rebuild the formal-parameter evidence independently of construction.
-fn seal_parameter_candidates(
-    source_owned: &SourceOwnedFunctionFacts,
-) -> Vec<Option<SealParameterCandidate>> {
-    let mut result = Vec::new();
-    if let Some(interface) = source_owned.source().machine_context().function_interface() {
-        for parameter in interface.parameters() {
-            let slot = parameter.index();
-            let index = slot as usize;
-            if index >= result.len() {
-                result.resize_with(index.saturating_add(1), || None);
-            }
-            let entity = SemanticId::Parameter(slot);
-            result[index] = Some(match &result[index] {
-                None => SealParameterCandidate::Exact {
-                    entity,
-                    width_bytes: parameter.storage().size,
-                    entry_values: BTreeSet::new(),
-                },
-                Some(SealParameterCandidate::Exact { entity: first, .. }) => {
-                    SealParameterCandidate::Refused(ParameterRefusal::ConflictingSlotOwnership {
-                        slot,
-                        first: *first,
-                        second: entity,
-                    })
-                }
-                Some(SealParameterCandidate::Refused(reason)) => {
-                    SealParameterCandidate::Refused(*reason)
-                }
-            });
-        }
-    }
-    let Some(render) = source_owned.report().render() else {
-        return result;
-    };
-    for (map_id, entity) in &render.certified_entities {
-        let r2types::CertifiedEntity::Parameter {
-            id,
-            slot,
-            entry_values,
-            carrier_width,
-            ..
-        } = entity
-        else {
-            continue;
-        };
-        let index = *slot as usize;
-        if index >= result.len() {
-            result.resize_with(index.saturating_add(1), || None);
-        }
-        let expected = SemanticId::Parameter(*slot);
-        if map_id != id || *id != expected {
-            result[index] = Some(SealParameterCandidate::Refused(
-                ParameterRefusal::ConflictingEntityOwnership {
-                    entity: *id,
-                    expected_slot: *slot,
-                    claimed_slot: match *id {
-                        SemanticId::Parameter(claimed) => claimed,
-                        _ => u32::MAX,
-                    },
-                },
-            ));
-            continue;
-        }
-        match &result[index] {
-            Some(SealParameterCandidate::Exact { entity: owner, .. }) if owner == id => {
-                result[index] = Some(SealParameterCandidate::Exact {
-                    entity: *id,
-                    width_bytes: *carrier_width,
-                    entry_values: entry_values.clone(),
-                });
-            }
-            Some(SealParameterCandidate::Exact { entity: owner, .. }) => {
-                result[index] = Some(SealParameterCandidate::Refused(
-                    ParameterRefusal::ConflictingSlotOwnership {
-                        slot: *slot,
-                        first: *owner,
-                        second: *id,
-                    },
-                ));
-            }
-            Some(SealParameterCandidate::Refused(_)) => {}
-            None => {
-                result[index] = Some(SealParameterCandidate::Exact {
-                    entity: *id,
-                    width_bytes: *carrier_width,
-                    entry_values: entry_values.clone(),
-                });
-            }
-        }
-    }
-    result
-}
-
-fn seal_parameter_width(
-    entity: SemanticId,
-    slot: u32,
-    size_bytes: u32,
-) -> Result<u32, ParameterRefusal> {
-    if size_bytes == 0 {
-        return Err(ParameterRefusal::MissingWidth { entity, slot });
-    }
-    let width_bits = size_bytes
-        .checked_mul(8)
-        .ok_or(ParameterRefusal::InvalidWidth {
-            entity,
-            slot,
-            size_bytes,
-        })?;
-    declaration_width_is_supported(width_bits)
-        .then_some(width_bits)
-        .ok_or(ParameterRefusal::UnsupportedWidth {
-            entity,
-            slot,
-            width_bits,
-        })
-}
+use super::rules::{ParameterCandidate, parameter_candidates, parameter_width};
 
 fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
     super::rules::declaration_type_width(ty, ptr_bits)
@@ -439,7 +313,7 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let inlinable = super::rules::inlinable_values(source, machine_projection);
+    let inlinable = super::rules::inlinable_values(source_owned, machine_projection);
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
         if return_controls.contains(&graph_value.id) {
@@ -607,7 +481,8 @@ impl BindingPlan {
         // derives the canonical terms again and requires the same answer.
         // Sharing the plan's would prove nothing: a rewriter that varied with
         // hash order or with a stale budget would agree with itself.
-        let sealed_inlinable = super::rules::inlinable_values(source, &self.machine_projection);
+        let sealed_inlinable =
+            super::rules::inlinable_values(source_owned, &self.machine_projection);
         let sealed_canonical = r2rewrite::canonicalize_with(
             source,
             &self.machine_projection,
@@ -642,7 +517,7 @@ impl BindingPlan {
         }
         // Once per seal, not once per inlined value: this walks the whole
         // machine arena.
-        let inlinable = super::rules::inlinable_values(source, &self.machine_projection);
+        let inlinable = super::rules::inlinable_values(source_owned, &self.machine_projection);
         let ptr_bits = source
             .machine_context()
             .memory_model()
@@ -863,7 +738,7 @@ impl BindingPlan {
             }
         }
 
-        let parameter_candidates = seal_parameter_candidates(source_owned);
+        let parameter_candidates = parameter_candidates(source_owned);
         if self.parameters.len() != parameter_candidates.len() {
             return Err(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::ParameterCount {
@@ -874,7 +749,7 @@ impl BindingPlan {
         }
         let mut slots_by_reused_binding = BTreeMap::<BindingId, Vec<u32>>::new();
         for (index, candidate) in parameter_candidates.iter().enumerate() {
-            let Some(SealParameterCandidate::Exact {
+            let Some(ParameterCandidate::Exact {
                 entity,
                 width_bytes,
                 entry_values,
@@ -883,8 +758,7 @@ impl BindingPlan {
                 continue;
             };
             let slot = index as u32;
-            if seal_parameter_width(*entity, slot, *width_bytes).is_err() || entry_values.is_empty()
-            {
+            if parameter_width(*entity, slot, *width_bytes).is_err() || entry_values.is_empty() {
                 continue;
             }
             let mut binding = None;
@@ -919,14 +793,14 @@ impl BindingPlan {
                     }
                     continue;
                 }
-                Some(SealParameterCandidate::Refused(reason)) => {
+                Some(ParameterCandidate::Refused(reason)) => {
                     ParameterDisposition::Refused { reason }
                 }
-                Some(SealParameterCandidate::Exact {
+                Some(ParameterCandidate::Exact {
                     entity,
                     width_bytes,
                     entry_values,
-                }) => match seal_parameter_width(entity, slot, width_bytes) {
+                }) => match parameter_width(entity, slot, width_bytes) {
                     Err(reason) => ParameterDisposition::Refused { reason },
                     Ok(width_bits) if entry_values.is_empty() => {
                         let binding = BindingId(binding_index as u32);

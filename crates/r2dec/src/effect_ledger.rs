@@ -172,7 +172,7 @@ fn upstream_zero_occurrence_outcome(
             .and_then(|obligation| obligation.edge_use)
             .is_some_and(|site| effects.is_coalesced_carrier_use(site))
     {
-        return Outcome::Elided(ElisionReason::CoalescedEdgeCopy);
+        return Outcome::Elided(ElisionReason::CoalescedCopy);
     }
 
     if let Some(inst) = source_inst

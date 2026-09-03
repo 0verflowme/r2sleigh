@@ -20,20 +20,21 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Whether a certified synthetic copy restates a carrier update the block
-    /// has already rendered.
+    /// Whether a copy restates a write the block has already rendered.
     ///
     /// Materialising a merge replaces it with a copy on every predecessor edge,
     /// so a loop carries its update back to the header as `X8_2 = X8_3`. Once the
     /// alias map covers what materialisation introduced, both sides are spelled
     /// by the carrier's one name and the copy says `x8 = x8`, which the statement
-    /// that computed the update has already said.
+    /// that computed the update has already said. One of the program's own
+    /// copies acquires the same spelling once carrier coalescing puts its two
+    /// sides in one object, and says as little.
     ///
-    /// An original program `Copy` can acquire the same spelling on both sides
-    /// after carrier coalescing.  It remains a real definition and use, so the
-    /// sealed normalization origin is required before any suppression.  The
-    /// edge into the loop is also kept because a version-0 source has no
-    /// defining statement of its own.
+    /// The answer is the journal's sealed one, never a comparison of the two
+    /// spellings here: a copy whose sides share a name but not a whole write
+    /// -- a narrowing into a lane -- is a real operation and keeps its
+    /// statement, and only the journal has the projection to tell the two
+    /// apart.
     pub(super) fn current_copy_has_coalesced_carrier_elision(&self) -> bool {
         let (Some(block), Some(op_idx), Some(journal)) = (
             self.current_block_id.get(),

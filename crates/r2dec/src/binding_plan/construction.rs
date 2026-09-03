@@ -1,160 +1,6 @@
 use super::*;
 
-#[derive(Debug)]
-enum ParameterCandidate {
-    Exact {
-        entity: SemanticId,
-        width_bytes: u32,
-        entry_values: BTreeSet<ValueId>,
-    },
-    Refused {
-        entity: SemanticId,
-        reason: ParameterRefusal,
-    },
-}
-
-/// Collect the dense exact ABI-parameter domain without consulting names.
-/// The source interface supplies unused formals; a matching render entity
-/// supplies its exact entry-value membership and source-var carrier width.
-fn parameter_candidates(
-    source_owned: &SourceOwnedFunctionFacts,
-) -> Vec<Option<ParameterCandidate>> {
-    let interface = source_owned.source().machine_context().function_interface();
-    let mut candidates = Vec::new();
-    if let Some(interface) = interface {
-        for parameter in interface.parameters() {
-            insert_formal_parameter_candidate(
-                &mut candidates,
-                parameter.index(),
-                parameter.storage().size,
-            );
-        }
-    }
-    let Some(render) = source_owned.report().render() else {
-        return candidates;
-    };
-
-    for (key, certified) in &render.certified_entities {
-        let r2types::CertifiedEntity::Parameter {
-            id,
-            slot,
-            entry_values,
-            carrier_width,
-            ..
-        } = certified
-        else {
-            continue;
-        };
-        let Ok(index) = usize::try_from(*slot) else {
-            continue;
-        };
-        if index >= candidates.len() {
-            candidates.resize_with(index.saturating_add(1), || None);
-        }
-        let canonical = SemanticId::Parameter(*slot);
-        if *key != *id || *id != canonical {
-            candidates[index] = Some(ParameterCandidate::Refused {
-                entity: canonical,
-                reason: ParameterRefusal::ConflictingEntityOwnership {
-                    entity: *id,
-                    expected_slot: *slot,
-                    claimed_slot: match *id {
-                        SemanticId::Parameter(claimed) => claimed,
-                        _ => u32::MAX,
-                    },
-                },
-            });
-            continue;
-        }
-        match &candidates[index] {
-            Some(ParameterCandidate::Exact {
-                entity: existing, ..
-            }) if *existing == *id => {
-                candidates[index] = Some(ParameterCandidate::Exact {
-                    entity: *id,
-                    width_bytes: *carrier_width,
-                    entry_values: entry_values.clone(),
-                });
-            }
-            Some(ParameterCandidate::Exact {
-                entity: existing, ..
-            })
-            | Some(ParameterCandidate::Refused {
-                entity: existing, ..
-            }) => {
-                candidates[index] = Some(ParameterCandidate::Refused {
-                    entity: canonical,
-                    reason: ParameterRefusal::ConflictingSlotOwnership {
-                        slot: *slot,
-                        first: *existing,
-                        second: *id,
-                    },
-                });
-            }
-            None => {
-                candidates[index] = Some(ParameterCandidate::Exact {
-                    entity: *id,
-                    width_bytes: *carrier_width,
-                    entry_values: entry_values.clone(),
-                });
-            }
-        }
-    }
-    candidates
-}
-
-fn insert_formal_parameter_candidate(
-    candidates: &mut Vec<Option<ParameterCandidate>>,
-    slot: u32,
-    width_bytes: u32,
-) {
-    let index = slot as usize;
-    if index >= candidates.len() {
-        candidates.resize_with(index.saturating_add(1), || None);
-    }
-    let entity = SemanticId::Parameter(slot);
-    candidates[index] = Some(match &candidates[index] {
-        None => ParameterCandidate::Exact {
-            entity,
-            width_bytes,
-            entry_values: BTreeSet::new(),
-        },
-        Some(ParameterCandidate::Exact { entity: first, .. })
-        | Some(ParameterCandidate::Refused { entity: first, .. }) => ParameterCandidate::Refused {
-            entity,
-            reason: ParameterRefusal::ConflictingSlotOwnership {
-                slot,
-                first: *first,
-                second: entity,
-            },
-        },
-    });
-}
-
-fn parameter_width(
-    entity: SemanticId,
-    slot: u32,
-    width_bytes: u32,
-) -> Result<u32, ParameterRefusal> {
-    if width_bytes == 0 {
-        return Err(ParameterRefusal::MissingWidth { entity, slot });
-    }
-    let Some(width_bits) = width_bytes.checked_mul(8) else {
-        return Err(ParameterRefusal::InvalidWidth {
-            entity,
-            slot,
-            size_bytes: width_bytes,
-        });
-    };
-    if !declaration_width_is_supported(width_bits) {
-        return Err(ParameterRefusal::UnsupportedWidth {
-            entity,
-            slot,
-            width_bits,
-        });
-    }
-    Ok(width_bits)
-}
+use super::rules::{ParameterCandidate, parameter_candidates, parameter_width};
 
 fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDisposition>]) {
     let mut parameter_slots_by_binding = BTreeMap::<BindingId, Vec<u32>>::new();
@@ -538,7 +384,7 @@ impl BindingPlan {
         for entity in machine_projection.entities() {
             expr_by_value.insert(entity.output().value(), entity.root());
         }
-        let inlinable = super::rules::inlinable_values(source, &machine_projection);
+        let inlinable = super::rules::inlinable_values(source_owned, &machine_projection);
         let mut dispositions = graph
             .values
             .iter()
@@ -777,7 +623,7 @@ impl BindingPlan {
                     width_bytes,
                     entry_values,
                 } => (entity, width_bytes, entry_values),
-                ParameterCandidate::Refused { reason, .. } => {
+                ParameterCandidate::Refused(reason) => {
                     parameters[index] = Some(ParameterDisposition::Refused { reason });
                     continue;
                 }
@@ -1083,7 +929,8 @@ impl BindingPlan {
         // rendered without a local" are one answer rather than two that agree
         // today. `inlinable_values` is computed once from the same projection
         // and the closure only tests membership.
-        let inlinable_for_expansion = super::rules::inlinable_values(source, &machine_projection);
+        let inlinable_for_expansion =
+            super::rules::inlinable_values(source_owned, &machine_projection);
         let canonical = r2rewrite::canonicalize_with(
             source,
             &machine_projection,
@@ -1119,8 +966,8 @@ mod parameter_tests {
     #[test]
     fn sparse_out_of_order_slots_keep_their_exact_indices() {
         let mut candidates = Vec::new();
-        insert_formal_parameter_candidate(&mut candidates, 3, 8);
-        insert_formal_parameter_candidate(&mut candidates, 1, 4);
+        super::super::rules::insert_formal_parameter_candidate(&mut candidates, 3, 8);
+        super::super::rules::insert_formal_parameter_candidate(&mut candidates, 1, 4);
 
         assert_eq!(candidates.len(), 4);
         assert!(candidates[0].is_none());
