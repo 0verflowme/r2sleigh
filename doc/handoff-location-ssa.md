@@ -8868,3 +8868,41 @@ same one this document already gives for the corpus: verify the artifact you
 measured is the artifact you built. `run-placement.sh` on the host now copies
 the freshly built library itself and prints whether a string only this tree
 contains is present in the installed one.
+
+## The effect-ledger refusals, split by layer
+
+The effect ledger is the largest single cause of refusal among real functions,
+26 of them across the coverage baseline, and until now the cause line said only
+"N refused, N unaccounted, N conflicts". `R2SLEIGH_DEBUG_UNOWNED=1` writes a
+per-function ledger line to `/tmp/r2sleigh_unowned.log` naming the layer, the
+reason and the obligation ids, and it splits them cleanly. Swept over 78
+functions in three binaries, four had a refused obligation:
+
+| count | layer and reason | obligation kind |
+| --- | --- | --- |
+| 22 | `ssa/unsupported-effect` | `volatile-or-unknown` |
+| 5 | `codegen/block-not-rendered` | `live-value-producer` |
+
+The two are different problems and only one of them is about the decompiler's
+ability to read a program.
+
+**`ssa/unsupported-effect`** appears entirely in `_init` and `entry.init0` of
+the pinned GCC binaries, at a single address. Those are compiler-generated
+stubs whose effects the SSA layer declines to model. Whether they are worth
+modelling at all is a scope question rather than a defect, and their share of
+the count makes the ledger cause look larger than the part that matters.
+
+**`codegen/block-not-rendered`** is the real one. A block exists in the SSA,
+produces live values, and never reached the output, so the obligations of the
+values it produces have nowhere to be discharged. `siphash24` at x64-O1 is the
+clearest case: 435 obligations, 393 rendered, 40 elided, and exactly two
+refused, both `live-value-producer` on the same block. Anything that drops a
+block after the plan is fixed produces this, so the trace runs from the
+structurer's region handling and the linearizer through placement's statement
+removal.
+
+Note that the elision profile of that same function is healthy and worth
+keeping as a reference for what a well-accounted function looks like:
+21 coalesced identity phis, 6 coalesced copies, 3 dead stack bases,
+3 materialized phi edges, 3 stack frame, 2 return control, 1 direct control
+target and 1 with no native semantics.
