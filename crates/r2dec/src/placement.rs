@@ -225,6 +225,24 @@ pub(crate) fn collect_final_placement_occurrences(
                     });
                 }
                 Some(FinalObservationScope::Ambiguous) => {
+                    // The refusal names an observation id, and an id alone
+                    // says nothing about which occurrence could not be
+                    // ordered. What the observation stands for, and -- for a
+                    // write -- the instruction and value behind it, is what
+                    // an investigation starts from; finding it back from the
+                    // id cost a whole session once. The group that declared
+                    // the ambiguity names itself in `record_observation_group`
+                    // under the same switch.
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!("ambiguous observation {index} target {target:?}");
+                        if let Some(PlacementObservationTarget::Write { inst, .. }) = target {
+                            let output = source.graph().inst(inst).and_then(|inst| inst.output);
+                            eprintln!(
+                                "  write of {inst:?} output {output:?} disposition {:?}",
+                                output.and_then(|value| names.plan().disposition(value))
+                            );
+                        }
+                    }
                     return Err(PlacementAnalysisError::AmbiguousExecutionOrder {
                         observation: RenderObservationId::from_dense_index(index),
                     });
@@ -760,6 +778,7 @@ fn visit_nested_statement_lists(statement: &CStmt, after: &mut BTreeSet<RenderOb
     }
 }
 
+#[track_caller]
 fn record_observation_group(
     ids: &[RenderObservationId],
     region: Option<RegionId>,
@@ -769,6 +788,16 @@ fn record_observation_group(
 ) {
     if ids.is_empty() {
         return;
+    }
+    // Which construct declared the group unorderable. Several do, and the
+    // refusal reports only the observation, so the caller's line is the one
+    // fact that says whether the answer is a call, an assignment, an operand
+    // of a binary, or a control statement's own marker.
+    if ambiguous && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+        eprintln!(
+            "ambiguous group {ids:?} recorded at {}",
+            std::panic::Location::caller()
+        );
     }
     let current = FinalOccurrenceOrder(*order);
     *order = order.saturating_add(1);
@@ -910,6 +939,7 @@ fn record_completion_observations(
     record_observation_group(&writes, current, false, order, scoped);
 }
 
+#[track_caller]
 fn record_control_observations(
     ids: &[RenderObservationId],
     current: Option<RegionId>,
@@ -924,6 +954,7 @@ fn record_control_observations(
     record_observation_group(ids, current, ambiguous, order, scoped);
 }
 
+#[track_caller]
 fn record_ambiguous_expr_group<'a>(
     exprs: impl IntoIterator<Item = &'a CExpr>,
     current: Option<RegionId>,
