@@ -14,7 +14,7 @@ use crate::context::{
     canonical_main_signature_spec, is_generic_arg_name,
     stack_slots_from_legacy_external_stack_vars,
 };
-use crate::convert::{CTypeLike, render_c_type_like};
+use crate::convert::{CTypeLike, parse_c_type_like, render_c_type_like};
 use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion, normalize_external_type_name,
 };
@@ -28,7 +28,7 @@ use crate::facts::{
     InterprocFactDiagnostics, LocalFieldAccessFact, OutParamCertificate,
     OutParamCertificateEvidence, OutParamCertificateSource, ScalarArrayRenderCandidate,
     SignatureCertificate, SignatureCertificateSource, SignatureProjectionResult,
-    SignatureProjectionSource, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    SignatureProjectionSource, VisibleBinding, VisibleBindingKind,
 };
 use crate::function_facts::{FunctionFacts, InterprocSummaryView, SourceOwnedFunctionFacts};
 use crate::inferred_signature_from_signature_spec;
@@ -145,8 +145,8 @@ impl RecoveredVariable {
     /// what radare2 told us, not something we decided. What should not happen
     /// is each consumer taking the spelling apart its own way, which is how one
     /// of them came to test for a pointer with `contains('*')`.
-    pub fn recovered_type(&self, ptr_bits: u32) -> CTypeLike {
-        crate::convert::parse_c_type_like(&self.var_type, ptr_bits)
+    pub fn recovered_type(&self, ptr_bits: u32) -> Option<CTypeLike> {
+        parse_c_type_like(&self.var_type, ptr_bits)
     }
 
     /// Whether the recovered spelling is `void *`, however it was spaced.
@@ -155,7 +155,8 @@ impl RecoveredVariable {
     /// for the integer names whose width is a property of the target, and the
     /// shape of a pointer is not one of them.
     pub fn recovered_type_is_void_pointer(&self) -> bool {
-        self.recovered_type(64).is_void_pointer()
+        self.recovered_type(64)
+            .is_some_and(|ty| ty.is_void_pointer())
     }
 }
 
@@ -3143,7 +3144,7 @@ fn infer_interproc_return_type(
                 inferred_signature
                     .params
                     .get(idx)
-                    .and_then(|param| parse_type_like_spec(&param.param_type, ptr_bits))
+                    .and_then(|param| parse_c_type_like(&param.param_type, ptr_bits))
                     .filter(|ty| !is_generic_signature_type(Some(ty)))
             }),
         _ => None,
@@ -3220,7 +3221,7 @@ fn maybe_upgrade_param_to_pointer(
         let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
             is_generic_type_string(&param.param_type)
                 || matches!(
-                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    parse_c_type_like(&param.param_type, ptr_bits),
                     Some(CTypeLike::Int {
                         bits,
                         signedness: Signedness::Signed
@@ -3286,7 +3287,7 @@ fn upgrade_param_indices_to_pointer(
         let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
             is_generic_type_string(&param.param_type)
                 || matches!(
-                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    parse_c_type_like(&param.param_type, ptr_bits),
                     Some(CTypeLike::Int {
                         bits,
                         signedness: Signedness::Signed
@@ -3380,7 +3381,7 @@ fn upgrade_param_type_hints(
 
     for (idx, hint) in hints {
         if let Some(param) = inferred_signature.params.get_mut(*idx) {
-            let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+            let existing_ty = parse_c_type_like(&param.param_type, ptr_bits);
             let should_replace = is_generic_type_string(&param.param_type)
                 || existing_ty.as_ref().is_some_and(|existing| {
                     summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
@@ -3424,7 +3425,7 @@ fn upgrade_return_type_hint(
         }
     }
 
-    let existing_ty = parse_type_like_spec(&inferred_signature.ret_type, ptr_bits);
+    let existing_ty = parse_c_type_like(&inferred_signature.ret_type, ptr_bits);
     let should_replace = is_generic_type_string(&inferred_signature.ret_type)
         || existing_ty.as_ref().is_some_and(|existing| {
             summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
@@ -3640,15 +3641,15 @@ fn apply_interproc_summary_to_signature(
     }
 
     if is_generic_type_string(&inferred_signature.ret_type)
-        || parse_type_like_spec(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+        || parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
             summary_hint_can_replace_weak_existing(&ty, &ret_ty, ptr_bits, type_db)
         })
         || matches!(summary.return_relation, SummaryReturnRelation::HeapAlloc)
-            && parse_type_like_spec(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+            && parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
                 crate::signature_hint_can_replace_existing(&ty, Some(&ret_ty), ptr_bits, type_db)
             })
         || matches!(ret_ty, CTypeLike::Void)
-            && parse_type_like_spec(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+            && parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
                 crate::signature_return_hint_can_replace_existing(
                     &ty,
                     Some(&ret_ty),
@@ -3657,7 +3658,7 @@ fn apply_interproc_summary_to_signature(
                 )
             })
         || matches!(
-            parse_type_like_spec(&inferred_signature.ret_type, ptr_bits),
+            parse_c_type_like(&inferred_signature.ret_type, ptr_bits),
             Some(CTypeLike::Int {
                 bits,
                 signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
@@ -3765,7 +3766,7 @@ fn apply_type_hint_to_signature_param(
     }
 
     if let Some(param) = inferred_signature.params.get_mut(index) {
-        let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+        let existing_ty = parse_c_type_like(&param.param_type, ptr_bits);
         let can_replace = is_generic_type_string(&param.param_type)
             || existing_ty.as_ref().is_some_and(|existing| {
                 type_hint_can_replace_weak_existing(
@@ -6383,18 +6384,20 @@ fn infer_local_struct_artifacts_from_blocks(
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape.hash(&mut hasher);
         let struct_name = format!("sla_struct_{:016x}", hasher.finish());
-        let fields = selected_fields
+        let Some(fields) = selected_fields
             .into_iter()
-            .map(|(offset, field_type, confidence)| StructFieldCandidate {
-                name: format!("f_{offset:x}"),
-                offset,
-                field_type: crate::convert::parse_c_type_like(
-                    &field_type.render(&struct_name),
-                    ptr_bits,
-                ),
-                confidence,
+            .map(|(offset, field_type, confidence)| {
+                Some(StructFieldCandidate {
+                    name: format!("f_{offset:x}"),
+                    offset,
+                    field_type: parse_c_type_like(&field_type.render(&struct_name), ptr_bits)?,
+                    confidence,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let normalized_fields = fields
             .iter()
             // The profile is still keyed by spelling; render at that boundary
@@ -7362,7 +7365,7 @@ fn external_field_access_for_offset(
     let rel = offset - field.offset;
     let field_ty = field.ty.as_deref();
     if let Some(CTypeLike::Array(inner, len)) =
-        field_ty.and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+        field_ty.and_then(|ty| parse_c_type_like(ty, ptr_bits))
     {
         let elem_size = estimate_type_like_size_bytes(&inner, ptr_bits)?;
         if elem_size == 0 || !rel.is_multiple_of(elem_size) || access_width > elem_size {
@@ -7490,7 +7493,7 @@ fn scalar_element_stride(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         }
         CTypeLike::Typedef(name) => {
             let normalized = normalize_external_type_name(name);
-            parse_type_like_spec(&normalized, ptr_bits).and_then(|parsed| match parsed {
+            parse_c_type_like(&normalized, ptr_bits).and_then(|parsed| match parsed {
                 CTypeLike::Bool | CTypeLike::Int { .. } | CTypeLike::Float(_) => {
                     estimate_type_like_size_bytes(&parsed, ptr_bits).filter(|size| *size > 0)
                 }
@@ -8184,7 +8187,7 @@ fn aggregate_stride_for_slot(
 }
 
 fn aggregate_pointee_type_names_from_str(raw_ty: &str, ptr_bits: u32) -> Vec<String> {
-    parse_type_like_spec(raw_ty, ptr_bits)
+    parse_c_type_like(raw_ty, ptr_bits)
         .map(|ty| aggregate_pointee_type_names_from_type(&ty))
         .unwrap_or_default()
 }
@@ -8314,15 +8317,20 @@ fn augment_local_struct_artifacts_with_projection(
             continue;
         }
         let struct_name = format!("sla_struct_symbolic_arg{}", slot + 1);
-        let fields = profile
+        let Some(fields) = profile
             .iter()
-            .map(|(offset, field_type)| StructFieldCandidate {
-                name: format!("f_{offset:x}"),
-                offset: *offset,
-                field_type: crate::convert::parse_c_type_like(field_type, ptr_bits),
-                confidence: 84,
+            .map(|(offset, field_type)| {
+                Some(StructFieldCandidate {
+                    name: format!("f_{offset:x}"),
+                    offset: *offset,
+                    field_type: parse_c_type_like(field_type, ptr_bits)?,
+                    confidence: 84,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
             continue;
         };
@@ -8377,18 +8385,21 @@ fn augment_local_struct_artifacts_with_local_field_accesses(
             continue;
         }
         let mut shape = String::new();
-        let fields = profile
+        let Some(fields) = profile
             .iter()
             .map(|(offset, field_type)| {
                 shape.push_str(&format!("{offset:x}:{field_type};"));
-                StructFieldCandidate {
+                Some(StructFieldCandidate {
                     name: format!("f_{offset:x}"),
                     offset: *offset,
-                    field_type: crate::convert::parse_c_type_like(field_type, ptr_bits),
+                    field_type: parse_c_type_like(field_type, ptr_bits)?,
                     confidence: 90,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape.hash(&mut hasher);
         let struct_name = format!("sla_struct_{:016x}", hasher.finish());
@@ -8470,7 +8481,7 @@ fn inferred_signature_abi_register_params(
         .enumerate()
         .map(|(idx, param)| ExternalRegisterParamSpec {
             name: param.name.clone(),
-            ty: parse_type_like_spec(&param.param_type, ptr_bits),
+            ty: parse_c_type_like(&param.param_type, ptr_bits),
             reg: arg_regs[idx].to_string(),
         })
         .collect()
@@ -8887,7 +8898,7 @@ fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option
         "ptrdiff_t" => Some(typedef_type("ptrdiff_t")),
         "uintptr_t" => Some(typedef_type("uintptr_t")),
         "intptr_t" => Some(typedef_type("intptr_t")),
-        _ => parse_type_like_spec(ty, ptr_bits),
+        _ => parse_c_type_like(ty, ptr_bits),
     }
 }
 
@@ -9335,7 +9346,7 @@ fn build_visible_bindings(
             ty: type_map
                 .get(&RecoveredVarKey::for_recovered_var(var))
                 .cloned()
-                .or_else(|| parse_type_like_spec(&var.var_type, ptr_bits)),
+                .or_else(|| parse_c_type_like(&var.var_type, ptr_bits)),
             kind: if var.isarg {
                 VisibleBindingKind::Param
             } else if matches!(key, VisibleBindingKey::Stack(_)) {
@@ -9363,7 +9374,7 @@ fn build_visible_bindings(
 }
 
 fn integer_type_bits(ty: &str, ptr_bits: u32) -> Option<u32> {
-    match parse_type_like_spec(ty, ptr_bits)? {
+    match parse_c_type_like(ty, ptr_bits)? {
         CTypeLike::Int { bits, .. } => Some(bits),
         _ => None,
     }
@@ -9456,7 +9467,10 @@ fn build_var_type_candidates(
         }
 
         let mut source = WritebackSource::LocalInferred;
-        let mut confidence = if var.recovered_type(ctx.ptr_bits).is_pointer() {
+        let mut confidence = if var
+            .recovered_type(ctx.ptr_bits)
+            .is_some_and(|ty| ty.is_pointer())
+        {
             92
         } else if var.isarg {
             88
@@ -9573,15 +9587,23 @@ fn build_var_type_candidates(
             }
         }
 
-        let chosen_type = normalize_external_type_name(&chosen_type);
+        let Some(var_type) = parse_c_type_like(&chosen_type, ctx.ptr_bits) else {
+            diagnostics.warnings.push(format!(
+                "var `{}` type `{chosen_type}` was not a placeable C type",
+                var.name
+            ));
+            continue;
+        };
+        let size =
+            estimate_type_like_size_bytes(&var_type, ctx.ptr_bits).unwrap_or_default() as u32;
         out.push(VarTypeCandidate {
             name: var.name.clone(),
             kind: var.kind.clone(),
             delta: var.delta,
-            var_type: crate::convert::parse_c_type_like(&chosen_type, ctx.ptr_bits),
+            var_type,
             isarg: var.isarg,
             reg: var.reg.clone(),
-            size: estimate_c_type_size_bytes(&chosen_type, ctx.ptr_bits) as u32,
+            size,
             confidence,
             source,
             evidence,
@@ -9848,7 +9870,7 @@ fn merge_slot_type_overrides_into_signature(
         if *slot >= sig.params.len() {
             continue;
         }
-        let Some(parsed) = parse_type_like_spec(raw_ty, ptr_bits) else {
+        let Some(parsed) = parse_c_type_like(raw_ty, ptr_bits) else {
             continue;
         };
         let param = &mut sig.params[*slot];
@@ -9877,7 +9899,7 @@ fn generated_local_struct_name_from_override(raw_ty: &str, ptr_bits: u32) -> Opt
     {
         return Some(name);
     }
-    let Some(CTypeLike::Pointer(inner)) = parse_type_like_spec(raw_ty, ptr_bits) else {
+    let Some(CTypeLike::Pointer(inner)) = parse_c_type_like(raw_ty, ptr_bits) else {
         return None;
     };
     match inner.as_ref() {
@@ -9911,10 +9933,7 @@ pub fn type_db_resolves_type_name(type_db: &ExternalTypeDb, name: &str, ptr_bits
     if matches!(name.trim(), "allocation_ptr" | "memory_ptr") {
         return true;
     }
-    if !matches!(
-        crate::convert::parse_c_type_like(name, ptr_bits),
-        CTypeLike::Typedef(_)
-    ) {
+    if parse_c_type_like(name, ptr_bits).is_some_and(|ty| !matches!(ty, CTypeLike::Typedef(_))) {
         return true;
     }
     if external_named_aggregate_has_real_layout(type_db, name) {
@@ -10192,7 +10211,7 @@ fn collect_external_struct_candidates_from_db(
     keys.sort();
 
     let mut out = Vec::new();
-    for key in keys {
+    'structs: for key in keys {
         let Some(st) = db.structs.get(&key) else {
             continue;
         };
@@ -10205,10 +10224,13 @@ fn collect_external_struct_candidates_from_db(
         let mut fields = Vec::new();
         for (offset, field) in &st.fields {
             let raw_ty = field.ty.clone().unwrap_or_else(|| "uint8_t".to_string());
+            let Some(field_type) = parse_c_type_like(&raw_ty, ptr_bits) else {
+                continue 'structs;
+            };
             fields.push(StructFieldCandidate {
                 name: field.name.clone(),
                 offset: *offset,
-                field_type: crate::convert::parse_c_type_like(&raw_ty, ptr_bits),
+                field_type,
                 confidence: 95,
             });
         }
@@ -10296,7 +10318,7 @@ fn should_replace_struct_decl(
 
 fn canonical_field_type_key(ty: &str, ptr_bits: u32) -> String {
     let normalized = normalize_external_type_name(ty);
-    parse_type_like_spec(&normalized, ptr_bits)
+    parse_c_type_like(&normalized, ptr_bits)
         .map(|parsed| render_signature_type(&parsed, ptr_bits).to_ascii_lowercase())
         .unwrap_or_else(|| normalized.to_ascii_lowercase())
 }
@@ -10875,7 +10897,7 @@ fn parse_existing_var_types_from_specs(
 }
 
 fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
-    if let Some(parsed) = parse_type_like_spec(ty, ptr_bits)
+    if let Some(parsed) = parse_c_type_like(ty, ptr_bits)
         && let Some(size) = estimate_type_like_size_bytes(&parsed, ptr_bits)
         && size > 0
     {
@@ -11456,7 +11478,7 @@ fn is_generic_type_string(ty: &str) -> bool {
 }
 
 fn is_low_signal_storage_scalar_type(ty: &str, ptr_bits: u32) -> bool {
-    parse_type_like_spec(ty, ptr_bits).is_some_and(|parsed| matches!(parsed, CTypeLike::Int { .. }))
+    parse_c_type_like(ty, ptr_bits).is_some_and(|parsed| matches!(parsed, CTypeLike::Int { .. }))
 }
 
 fn sanitize_c_identifier(raw: &str) -> Option<String> {
@@ -11658,6 +11680,48 @@ mod tests {
     }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn parse_test_type(spelling: &str, ptr_bits: u32) -> CTypeLike {
+        parse_c_type_like(spelling, ptr_bits).expect("test type spelling should parse")
+    }
+
+    #[test]
+    fn unplaceable_recovered_type_produces_no_writeback_candidate() {
+        let vars = [RecoveredVariable {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "not a type".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let context_maps = SignatureContextMaps::default();
+        let slot_type_overrides = HashMap::new();
+        let stack_slots = BTreeMap::new();
+        let existing_types = HashMap::new();
+        let stack_access_widths = BTreeMap::new();
+        let stack_access_signedness = BTreeMap::new();
+        let context = VarTypeCandidateContext {
+            current_context_maps: &context_maps,
+            merged_signature: None,
+            slot_type_overrides: &slot_type_overrides,
+            stack_slots: &stack_slots,
+            existing_types: &existing_types,
+            stack_access_widths: &stack_access_widths,
+            stack_access_signedness: &stack_access_signedness,
+            ptr_bits: 64,
+            is_main_signature: false,
+        };
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let candidates = build_var_type_candidates(&vars, &context, &mut diagnostics);
+
+        assert!(candidates.is_empty());
+        assert_eq!(
+            diagnostics.warnings,
+            ["var `var_8h` type `not a type` was not a placeable C type"]
+        );
+    }
 
     #[test]
     fn constant_offsets_require_exact_ssa_evidence() {
@@ -11876,7 +11940,7 @@ mod tests {
             name: name.to_string(),
             kind: "r".to_string(),
             delta: 0,
-            var_type: crate::convert::parse_c_type_like("int64_t", 64),
+            var_type: parse_test_type("int64_t", 64),
             isarg: true,
             reg: register.map(str::to_string),
             size: 8,
@@ -11901,10 +11965,7 @@ mod tests {
 
         assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
         let candidate = &analysis.plan().var_type_candidates[0];
-        assert_eq!(
-            candidate.var_type,
-            crate::convert::parse_c_type_like("int8_t", 64)
-        );
+        assert_eq!(candidate.var_type, parse_test_type("int8_t", 64));
         assert_eq!(candidate.size, 1);
         assert_eq!(candidate.source, WritebackSource::CalleeSignature);
         assert!(
@@ -12495,10 +12556,7 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(
-            candidate.var_type,
-            crate::convert::parse_c_type_like("int32_t", 64)
-        );
+        assert_eq!(candidate.var_type, parse_test_type("int32_t", 64));
         assert_eq!(candidate.source, WritebackSource::DataflowRanked);
         assert!(
             candidate
@@ -12616,10 +12674,7 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(
-            candidate.var_type,
-            crate::convert::parse_c_type_like("uint8_t", 64)
-        );
+        assert_eq!(candidate.var_type, parse_test_type("uint8_t", 64));
         assert!(
             candidate
                 .evidence
@@ -13374,7 +13429,7 @@ mod tests {
                 name: "var_8h".to_string(),
                 kind: "b".to_string(),
                 delta: -8,
-                var_type: crate::convert::parse_c_type_like("int32_t", 64),
+                var_type: parse_test_type("int32_t", 64),
                 isarg: false,
                 reg: None,
                 size: 4,
@@ -13538,7 +13593,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: crate::convert::parse_c_type_like("int32_t", 64),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13597,7 +13652,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: crate::convert::parse_c_type_like("struct type.Foo*", 64),
+            var_type: parse_test_type("struct type.Foo*", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -13615,7 +13670,7 @@ mod tests {
             name: "var_ch".to_string(),
             kind: "b".to_string(),
             delta: -12,
-            var_type: crate::convert::parse_c_type_like("int32_t", 64),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13627,7 +13682,7 @@ mod tests {
             name: "var_10h".to_string(),
             kind: "b".to_string(),
             delta: -16,
-            var_type: crate::convert::parse_c_type_like("struct type_0x123 *", 64),
+            var_type: parse_test_type("struct type_0x123 *", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -14157,7 +14212,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: crate::convert::parse_c_type_like("int32_t", 64),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -14243,7 +14298,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: crate::convert::parse_c_type_like("int32_t", 64),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -14308,13 +14363,13 @@ mod tests {
                 StructFieldCandidate {
                     name: "f_8".to_string(),
                     offset: 8,
-                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 },
                 StructFieldCandidate {
                     name: "f_34".to_string(),
                     offset: 0x34,
-                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 },
             ],
@@ -15701,7 +15756,7 @@ mod tests {
         assert_eq!(analysis.signature.params[0].param_type, "int32_t");
         assert_eq!(
             analysis.plan.var_type_candidates[0].var_type,
-            crate::convert::parse_c_type_like("int32_t", 64)
+            parse_test_type("int32_t", 64)
         );
         let merged = analysis
             .type_facts
@@ -16163,7 +16218,7 @@ mod tests {
         });
         assert_eq!(
             analysis.plan.var_type_candidates[0].var_type,
-            crate::convert::parse_c_type_like("int32_t", 64)
+            parse_test_type("int32_t", 64)
         );
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
         assert!(
@@ -17038,7 +17093,7 @@ mod tests {
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
         assert_eq!(
             analysis.plan.var_type_candidates[0].var_type,
-            crate::convert::parse_c_type_like("void *", 64)
+            parse_test_type("void *", 64)
         );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
@@ -17107,7 +17162,7 @@ mod tests {
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
         assert_eq!(
             analysis.plan.var_type_candidates[0].var_type,
-            crate::convert::parse_c_type_like("void *", 64)
+            parse_test_type("void *", 64)
         );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
@@ -17168,7 +17223,7 @@ mod tests {
 
         assert_eq!(
             analysis.plan.var_type_candidates[0].var_type,
-            crate::convert::parse_c_type_like("int32_t", 64)
+            parse_test_type("int32_t", 64)
         );
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
         assert!(
@@ -17218,13 +17273,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 90,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("struct node *", 64),
+                        field_type: parse_test_type("struct node *", 64),
                         confidence: 90,
                     },
                 ],
@@ -17338,13 +17393,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17494,13 +17549,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17638,13 +17693,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_c".to_string(),
                         offset: 12,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17807,13 +17862,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19535,13 +19590,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19620,13 +19675,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19709,7 +19764,7 @@ mod tests {
                 fields: vec![StructFieldCandidate {
                     name: "f_0".to_string(),
                     offset: 0,
-                    field_type: crate::convert::parse_c_type_like("int32_t", 64),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 }],
             }],
@@ -20438,8 +20493,7 @@ mod tests {
         assert!(
             artifacts.struct_decls.iter().any(|decl| {
                 decl.fields.iter().any(|field| {
-                    field.offset == 0x20
-                        && field.field_type == crate::convert::parse_c_type_like(struct_pointer, 64)
+                    field.offset == 0x20 && field.field_type == parse_test_type(struct_pointer, 64)
                 })
             }),
             "diagnostics={diagnostics:?}; artifacts={artifacts:?}"

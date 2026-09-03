@@ -114,10 +114,50 @@ fn normalize_primitive_alias(base: &str) -> Option<&'static str> {
 
 pub fn normalize_external_type_name(ty: &str) -> String {
     let spelled = normalize_type_spelling(ty);
-    if spelled.trim().is_empty() || is_opaque_placeholder_type_name(&spelled) {
+    if spelled.trim().is_empty()
+        || spelled.contains('.')
+        || is_opaque_placeholder_type_name(&spelled)
+    {
         return "void *".to_string();
     }
     spelled
+}
+
+fn is_type_qualifier(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "const"
+            | "volatile"
+            | "restrict"
+            | "register"
+            | "__const"
+            | "__const__"
+            | "__volatile"
+            | "__volatile__"
+            | "__restrict"
+            | "__restrict__"
+    )
+}
+
+fn strip_type_qualifiers(spelling: &str) -> String {
+    let mut normalized = String::with_capacity(spelling.len());
+    let mut start = 0usize;
+    for (idx, ch) in spelling.char_indices() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        let token = &spelling[start..idx];
+        if !is_type_qualifier(token) {
+            normalized.push_str(token);
+        }
+        normalized.push(ch);
+        start = idx + ch.len_utf8();
+    }
+    let token = &spelling[start..];
+    if !is_type_qualifier(token) {
+        normalized.push_str(token);
+    }
+    normalized
 }
 
 /// Strip the spellings radare2 decorates a type name with.
@@ -129,14 +169,7 @@ pub fn normalize_external_type_name(ty: &str) -> String {
 /// must not make that judgement: a `struct type_0x123 *` has to survive as
 /// itself so the writeback can require its materialization and fail closed.
 pub fn normalize_type_spelling(ty: &str) -> String {
-    let mut normalized = ty.trim().to_string();
-    for qualifier in ["const", "volatile", "restrict", "register"] {
-        normalized = normalized
-            .split_whitespace()
-            .filter(|part| !part.eq_ignore_ascii_case(qualifier))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
+    let mut normalized = strip_type_qualifiers(ty.trim()).trim().to_string();
 
     loop {
         let lower = normalized.to_ascii_lowercase();
@@ -186,19 +219,11 @@ pub fn normalize_type_spelling(ty: &str) -> String {
             let ident = parts.next().unwrap_or("").replace('.', "_");
             normalized = format!("{prefix} {}", ident.trim());
         }
-    } else {
-        if let Some(alias) = normalize_primitive_alias(&normalized) {
-            normalized = alias.to_string();
-        }
-        if normalized.contains('.') {
-            return "void *".to_string();
-        }
+    } else if let Some(alias) = normalize_primitive_alias(&normalized) {
+        normalized = alias.to_string();
     }
 
     normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return "void *".to_string();
-    }
     format!("{normalized}{ptr_suffix}")
 }
 
