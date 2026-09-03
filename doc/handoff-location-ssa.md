@@ -11020,3 +11020,44 @@ The call-restore work was reverted because the benchmark fell from seven
 functions to one. A real defect in it was then found and fixed, the macOS corpus
 went green, and it was reapplied on that evidence alone. The benchmark was never
 re-run, and the regression it had been reverted for was still there.
+
+## The rendered-value refusal census names one cause
+
+The refusal-evidence sweep on 2026-09-03 did not support treating
+`RenderedValueRequired` as one presumed binding-plan defect. It named the exact
+precondition, value, actual disposition, and demanding site for every current
+occurrence. The cause table for the current locked sweep is:
+
+| count | `RenderedValueRequirementCause` |
+| ---: | --- |
+| 121 | `UnobservedValueCellAtSeal` |
+| 0 | `CertifiedValueReadMissingSymbol` |
+| 0 | `CertifiedAddressReadMissingSymbol` |
+| 0 | `CertifiedReadDispositionNotBound` |
+| 0 | `CertifiedReadExpressionMissingSymbol` |
+| 0 | `NonrenderedValueDisposition` |
+| 0 | `PlannedValueNamesUnavailable` |
+| 0 | `PlannedInputNamesUnavailable` |
+
+`UnobservedValueCellAtSeal` dominates completely. The seal found 101 of those
+values planned `Inline` and 20 planned `Bound`; none was absent, elided, or
+refused. Of the 121 functions, 111 are import thunks and ten are non-import
+functions. The thunk split also explains the disposition split: x86-64 reads a
+live-in RAM slot and binds it, while AArch64 computes the terminal target and
+plans its last carrier inline, but neither terminal indirect branch currently
+produces an observed target occurrence.
+
+The checked-in baseline names 119 historical members of the old aggregate
+label, while the diagnostic commit's behavior-preserving sweep names 121
+current members because other work since the baseline changed which refusal is
+reached. Of the original 119, 115 reproduce and all 115 are
+`UnobservedValueCellAtSeal` (101 `Inline`, 14 `Bound`); three `hashes_arm64`
+`main` cells now render and `system_ls_a97c50d3::sym.func.100002524` now reaches
+the independently owned effect-obligation refusal. Six current members were not
+in the historical set: two `branchy_x64` `main` cells, three new pinned
+`shapes` import cells, and `system_ls_a97c50d3::sym.func.100003278`.
+
+The locked result was 387 of 556 rendered: pinned 76 of 107, compiled 281 of
+313, and system 30 of 136. The relevant evidence line is uniformly of the form
+`cause=UnobservedValueCellAtSeal`, with the exact `ValueId`, `Bound` or `Inline`
+disposition, and the call site of invariant I1 beside it.
