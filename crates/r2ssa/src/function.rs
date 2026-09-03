@@ -529,6 +529,7 @@ impl SsaArtifact {
                 arch,
                 coherent_function_interface(&machine_context),
                 machine_context.machine_roles().call_preserved_carriers(),
+                machine_context.stack_pointer_carrier(),
                 &UncheckedSsaWorkControl,
             )
             .ok()?,
@@ -578,6 +579,7 @@ impl SsaArtifact {
             arch,
             coherent_function_interface(&machine_context),
             machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
             control,
         )?;
         control.poll()?;
@@ -629,6 +631,7 @@ impl SsaArtifact {
             Some(arch),
             coherent_function_interface(&machine_context),
             machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
             control,
         )?;
         if function.entry != lifted.authority().layout().entry_addr() {
@@ -1394,6 +1397,7 @@ impl TrustedSsaArtifact {
             Some(&arch),
             coherent_function_interface(&machine_context),
             machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
             control,
         )?;
         // What the source calls this function. A name radare2 derived from the
@@ -1666,7 +1670,16 @@ pub struct DefRef<'a> {
     pub site: DefSite,
 }
 
-fn decompile_call_boundary_config(arch: Option<&ArchSpec>) -> Option<CallBoundaryConfig> {
+/// What a call boundary does to this architecture's registers.
+///
+/// `stack_pointer_restored_by_callee` carries the storage only when the source
+/// stated that the convention restores it; see the field's own documentation
+/// for why the caller's stack pointer is otherwise wrong from its first call
+/// onward.
+fn decompile_call_boundary_config(
+    arch: Option<&ArchSpec>,
+    stack_pointer_restored_by_callee: Option<CanonicalStorageId>,
+) -> Option<CallBoundaryConfig> {
     let arch = arch?;
     let lower = arch.name.to_ascii_lowercase();
     let defined_regs: Vec<CallBoundaryDef> = match lower.as_str() {
@@ -2045,7 +2058,49 @@ fn decompile_call_boundary_config(arch: Option<&ArchSpec>) -> Option<CallBoundar
         _ => Vec::new(),
     };
 
-    (!defined_regs.is_empty()).then_some(CallBoundaryConfig { defined_regs })
+    if defined_regs.is_empty() && stack_pointer_restored_by_callee.is_none() {
+        return None;
+    }
+    Some(CallBoundaryConfig {
+        defined_regs,
+        stack_pointer_restored_by_callee,
+    })
+}
+
+/// Whether the convention puts the stack pointer back after a call.
+///
+/// The source publishes this beside the machine roles for every function,
+/// including the ones whose signature it never linked; the interface's copy is
+/// the fallback, and it is defaulted to false for exactly those functions, so
+/// asking it first asks the answerer that does not know.
+fn stack_pointer_restored_across_calls(
+    carriers: Option<SourceCallPreservedCarriers>,
+    function_interface: Option<&SourceFunctionInterface>,
+) -> bool {
+    carriers.map_or_else(
+        || {
+            function_interface
+                .is_some_and(SourceFunctionInterface::stack_pointer_preserved_across_calls)
+        },
+        SourceCallPreservedCarriers::stack_pointer,
+    )
+}
+
+/// The same question for the frame pointer, which has no carrier to restore
+/// when the function keeps none.
+fn frame_pointer_restored_across_calls(
+    carriers: Option<SourceCallPreservedCarriers>,
+    function_interface: Option<&SourceFunctionInterface>,
+) -> bool {
+    carriers.map_or_else(
+        || {
+            function_interface.is_some_and(|interface| {
+                interface.frame_pointer_storage().is_none()
+                    || interface.frame_pointer_preserved_across_calls()
+            })
+        },
+        SourceCallPreservedCarriers::frame_pointer,
+    )
 }
 
 impl SSAFunction {
@@ -2117,7 +2172,7 @@ impl SSAFunction {
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
         Self::from_blocks_for_decompile_with_interface_and_control(
-            blocks, arch, None, None, control,
+            blocks, arch, None, None, None, control,
         )
     }
 
@@ -2126,10 +2181,24 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         function_interface: Option<&SourceFunctionInterface>,
         call_preserved_carriers: Option<SourceCallPreservedCarriers>,
+        stack_pointer_carrier: Option<CanonicalStorageId>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
-        let mut func = Self::from_blocks_raw_for_decompile_with_control(blocks, arch, control)?;
+        // The convention says the callee leaves this carrier where it found
+        // it, and the machine's own p-code moved it to transfer control. Both
+        // halves have to be in hand before SSA construction, because it is
+        // construction that decides which value each later read of the carrier
+        // sees.
+        let stack_pointer_restored_by_callee = stack_pointer_carrier.filter(|_| {
+            stack_pointer_restored_across_calls(call_preserved_carriers, function_interface)
+        });
+        let mut func = Self::from_blocks_raw_for_decompile_with_carriers_and_control(
+            blocks,
+            arch,
+            stack_pointer_restored_by_callee,
+            control,
+        )?;
         func.call_preserved_carriers = call_preserved_carriers;
         func.prepare_for_decompile_with_interface_and_control(
             &crate::optimize::DecompilePrepConfig::default(),
@@ -2225,7 +2294,17 @@ impl SSAFunction {
         arch: Option<&ArchSpec>,
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
-        let policy = decompile_call_boundary_config(arch);
+        Self::from_blocks_raw_for_decompile_with_carriers_and_control(blocks, arch, None, control)
+    }
+
+    /// The same, told which carrier the convention says a callee restores.
+    fn from_blocks_raw_for_decompile_with_carriers_and_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        stack_pointer_restored_by_callee: Option<CanonicalStorageId>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        let policy = decompile_call_boundary_config(arch, stack_pointer_restored_by_callee);
         Self::from_blocks_raw_with_policy_and_control(blocks, arch, policy.as_ref(), control)
     }
 
@@ -3062,21 +3141,21 @@ impl SSAFunction {
         // lost every fact about its own frame: no stack roots, so no
         // certificate that a slot is its own, so its dead spills could not be
         // dropped and rendered as variables set and never used.
-        let call_carriers_are_restored = self.call_preserved_carriers.map_or_else(
-            || {
-                function_interface.is_some_and(|interface| {
-                    interface.stack_pointer_preserved_across_calls()
-                        && (interface.frame_pointer_storage().is_none()
-                            || interface.frame_pointer_preserved_across_calls())
-                })
-            },
-            SourceCallPreservedCarriers::frame_survives_a_call,
-        );
+        // Each half asked of the answerer that knows it, so the two questions
+        // cannot drift apart from the one SSA construction already asked about
+        // the stack pointer.
+        let call_carriers_are_restored =
+            stack_pointer_restored_across_calls(self.call_preserved_carriers, function_interface)
+                && frame_pointer_restored_across_calls(
+                    self.call_preserved_carriers,
+                    function_interface,
+                );
         let entry_stack_roots_are_stable = self.blocks().all(|block| {
             block.ops.iter().all(|op| match op {
-                SSAOp::Call { .. } | SSAOp::CallInd { .. } | SSAOp::CallDefine { .. } => {
-                    call_carriers_are_restored
-                }
+                SSAOp::Call { .. }
+                | SSAOp::CallInd { .. }
+                | SSAOp::CallDefine { .. }
+                | SSAOp::CallRestore { .. } => call_carriers_are_restored,
                 SSAOp::CallOther { .. }
                 | SSAOp::Unimplemented
                 | SSAOp::CpuId { .. }
@@ -3197,7 +3276,9 @@ impl SSAFunction {
                 for op in &block.ops {
                     control.poll()?;
                     match op {
-                        SSAOp::Copy { dst, src } | SSAOp::Cast { dst, src } => {
+                        SSAOp::Copy { dst, src }
+                        | SSAOp::Cast { dst, src }
+                        | SSAOp::CallRestore { dst, src } => {
                             let src_root = resolve_value_root(
                                 src,
                                 &facts.canonical_value_roots,
@@ -4238,7 +4319,7 @@ fn apply_op_family_effect(
     kill_overlapping_family_roots(state, written);
 
     match op {
-        SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } => {
+        SSAOp::Copy { src, .. } | SSAOp::Cast { src, .. } | SSAOp::CallRestore { src, .. } => {
             let root = adapt_family_root(src, written.width).unwrap_or_else(|| dst.clone());
             let exact_root = if family_slot_is_maximal(family_info, written) {
                 dst
@@ -4339,6 +4420,18 @@ fn materialize_register_alias_sources(
 ) -> (Vec<SSAOp>, SSAOp) {
     let mut materialized = Vec::new();
     let mut replacements = HashMap::<SSAVar, SSAVar>::new();
+    // A call boundary's restore is the exception, and it is the only one.
+    //
+    // Everything else here is a name the lift wrote down, and this pass exists
+    // because such a name means "whatever is in that register now" -- an `EAX`
+    // operand is a slice of the current `RAX`, whatever version that is. A
+    // restore does not name a register; it names the exact value the callee
+    // gave back, which is the one the carrier held before the call instruction
+    // spent it. Resolving it forward to the reaching definition would resolve
+    // it to the spend itself, which is precisely the value it exists to undo.
+    if matches!(op, SSAOp::CallRestore { .. }) {
+        return (materialized, op.clone());
+    }
     let op = rewrite_decompile_family_subpiece(op, state, family_info, canonical_storage_by_var)
         .unwrap_or_else(|| op.clone());
 
@@ -6678,6 +6771,148 @@ mod tests {
             Some(&crate::semantic::ObjectKind::EscapedUnknown {
                 space: r2il::SpaceId::Ram,
             })
+        );
+    }
+
+    /// One call, two calls, three: the stack pointer is where it started.
+    ///
+    /// Sleigh lifts an x86-64 `call` as `RSP = RSP - 8` and the store of the
+    /// return address. The callee's `ret` puts the eight back, and the callee
+    /// is not in this function, so before the convention said so nothing did:
+    /// a function with one call grew a phantom slot at entry - 16, with two at
+    /// entry - 24, with three at entry - 32. Offsets taken after a call then
+    /// named a slot that does not exist, or worse, one that does and holds
+    /// something else.
+    #[test]
+    fn a_call_leaves_the_stack_pointer_where_the_convention_says_it_found_it() {
+        let arch = make_x86_64_prep_arch();
+        let sp_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 16,
+            size: 8,
+        };
+        let ra_storage = CanonicalStorageId {
+            space: crate::CanonicalStorageSpace::Register,
+            offset: 24,
+            size: 8,
+        };
+        let rsp = make_reg(16, 8);
+
+        // Three calls, each lifted the way Sleigh lifts one: the return
+        // address pushed, then the transfer. Every operation carries the
+        // instruction it came from, because that is what says where one call
+        // instruction's stack traffic ends.
+        let mut ops = Vec::new();
+        let mut op_metadata = std::collections::BTreeMap::new();
+        for index in 0..3u64 {
+            let instr_addr = 0x4000 + index * 5;
+            let first = ops.len();
+            ops.push(R2ILOp::IntSub {
+                dst: rsp.clone(),
+                a: rsp.clone(),
+                b: make_const(8, 8),
+            });
+            ops.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: rsp.clone(),
+                val: make_const(instr_addr + 5, 8),
+            });
+            ops.push(R2ILOp::Call {
+                target: make_ram(0x401000, 8),
+            });
+            for op_index in first..ops.len() {
+                op_metadata.insert(
+                    op_index,
+                    r2il::OpMetadata {
+                        instruction_addr: Some(instr_addr),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let last = ops.len();
+        ops.push(R2ILOp::Return {
+            target: make_const(0, 8),
+        });
+        op_metadata.insert(
+            last,
+            r2il::OpMetadata {
+                instruction_addr: Some(0x400f),
+                ..Default::default()
+            },
+        );
+
+        let blocks = vec![R2ILBlock {
+            addr: 0x4000,
+            size: 16,
+            ops,
+            switch_info: None,
+            op_metadata,
+        }];
+
+        let interface = SourceFunctionInterface::new_exact(
+            b"call-chain-stack-pointer".to_vec(),
+            "sysv",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact interface")
+        .with_return_address_storage(ra_storage)
+        .expect("return-address carrier")
+        .with_stack_pointer_storage(sp_storage)
+        .expect("stack-pointer carrier")
+        .with_preserved_call_carriers(true, true);
+
+        let prepared = SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+            .expect("prepared SSA should build");
+        let function = prepared.function();
+        let facts = function.decompile_prep_facts().expect("prep facts");
+        let block = function.get_block(0x4000).expect("entry block");
+
+        // Every restore the boundary states, in order. Three calls, three of
+        // them, and the last one is what the return sees.
+        let restored = block
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                SSAOp::CallRestore { dst, .. } => Some(dst.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored.len(),
+            3,
+            "each call restores the carrier once: {:?}",
+            block.ops
+        );
+
+        for (index, dst) in restored.iter().enumerate() {
+            assert_eq!(
+                facts.entry_stack_address_root_of(dst).copied(),
+                Some(StackAddressRoot {
+                    base: StackAddressBase::StackPointer,
+                    offset: 0,
+                }),
+                "after call {index} the stack pointer is the entry stack pointer"
+            );
+        }
+
+        // And nothing in the function ever offers a slot at the drifted
+        // addresses the un-refunded pushes used to leave behind.
+        let drifted = block
+            .ops
+            .iter()
+            .filter_map(|op| op.dst())
+            .filter_map(|dst| facts.entry_stack_address_root_of(dst).copied())
+            .filter(|root| {
+                root.base == StackAddressBase::StackPointer
+                    && matches!(root.offset, -16 | -24 | -32)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            drifted.is_empty(),
+            "no value addresses a slot the drift invented: {drifted:?}"
         );
     }
 
