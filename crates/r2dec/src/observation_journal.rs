@@ -1376,6 +1376,17 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
+    fn expr_has_value_observation(&self, expr: &CExpr, value: ValueId) -> bool {
+        let mut found = false;
+        expr.visit_render_observations(&mut |id| {
+            found |= matches!(
+                self.targets.get(id.index() as usize),
+                Some(ObservationTarget::Value(observed)) if *observed == value
+            );
+        });
+        found
+    }
+
     /// Consume placement's complete removal report as one cell contract.
     ///
     /// The removed binding identifies every defining instruction whose
@@ -2281,10 +2292,18 @@ impl LegacyObservationJournal {
                 });
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) {
-                    match self.plan.disposition(input) {
-                        Some(ValueDisposition::Bound { .. }) => {}
+                    let needs_value_target = match self.plan.disposition(input) {
+                        Some(ValueDisposition::Bound { .. }) => true,
                         Some(ValueDisposition::Inline { .. })
-                            if self.source.graph().def_inst(input).is_none() => {}
+                            if self.source.graph().def_inst(input).is_none() =>
+                        {
+                            true
+                        }
+                        Some(ValueDisposition::Inline { .. })
+                            if self.expr_has_value_observation(&expr, input) =>
+                        {
+                            false
+                        }
                         Some(ValueDisposition::Inline { .. })
                         | Some(ValueDisposition::Elided { .. })
                         | Some(ValueDisposition::Refused { .. })
@@ -2293,8 +2312,8 @@ impl LegacyObservationJournal {
                                 input,
                             ));
                         }
-                    }
-                    if represented_values.insert(input) {
+                    };
+                    if needs_value_target && represented_values.insert(input) {
                         self.value_slot(input)?;
                         targets.push(ObservationTarget::Value(input));
                     }
@@ -5718,6 +5737,82 @@ mod tests {
                 "obligation {obligation:?} is rendered once by the discharge"
             );
         }
+    }
+
+    #[test]
+    fn nested_replacement_requires_and_reuses_the_inner_value_occurrence() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let (folded, folded_definition) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                ) {
+                    return None;
+                }
+                Some((value.id, graph.def_inst(value.id)?))
+            })
+            .expect("fixture folds one computed value into its reader");
+        let [use_site] = graph.use_sites(folded) else {
+            panic!("a folded value has exactly one reader");
+        };
+        let reader = use_site.inst;
+        let rendered = graph
+            .inst(reader)
+            .and_then(|inst| inst.output)
+            .expect("the reader defines a value");
+
+        assert_eq!(
+            journal.observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::IntLit(3),
+                    rendered,
+                    vec![reader],
+                    BTreeSet::new(),
+                ),
+            ),
+            Err(LegacyObservationJournalError::RenderedValueRequired(folded)),
+            "an outer replacement cannot silently claim a defined inline operand"
+        );
+
+        let inner = journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+                    folded,
+                    vec![folded_definition],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the inner replacement owns the folded value occurrence");
+        let before_outer = journal.targets.len();
+        journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, inner, CExpr::IntLit(4)),
+                    rendered,
+                    vec![reader],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the outer replacement composes the finalized inner expression");
+
+        assert!(
+            !journal.targets[before_outer..].contains(&ObservationTarget::Value(folded)),
+            "the outer replacement must not become a second answerer for the inner value"
+        );
+        assert_eq!(
+            journal
+                .targets
+                .iter()
+                .filter(|target| **target == ObservationTarget::Value(folded))
+                .count(),
+            1,
+            "the nested expression carries exactly one folded-value occurrence"
+        );
     }
 
     #[test]

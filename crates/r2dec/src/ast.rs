@@ -202,6 +202,20 @@ impl CExpr {
         }
     }
 
+    /// Visit the opaque proof markers nested in this expression.
+    ///
+    /// Semantic visitors deliberately skip wrappers. The observation journal
+    /// needs the complementary view when it composes an outer replacement
+    /// with an already-finalized inner one, so it can require that the inner
+    /// value has its own occurrence instead of marking it twice.
+    pub(crate) fn visit_render_observations(&self, visit: &mut impl FnMut(RenderObservationId)) {
+        visit_expr_observations(self, &mut |id| {
+            visit(id);
+            Ok::<(), ()>(())
+        })
+        .expect("an infallible render-observation visitor cannot refuse");
+    }
+
     /// Borrow the semantic expression beneath any internal observation markers.
     pub(crate) fn unobserved(&self) -> &Self {
         let mut expr = self;
