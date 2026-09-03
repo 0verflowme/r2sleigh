@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{
-    ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStackVarSpec,
-    StackSlotKey, legacy_external_stack_vars_from_slots,
-    stack_slots_from_legacy_external_stack_vars,
+    ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey,
 };
 use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
@@ -668,8 +666,6 @@ pub struct FunctionTypeFacts {
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
-    // Legacy compatibility view derived from canonical stack_slots when available.
-    pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
@@ -692,7 +688,6 @@ pub struct FunctionTypeFactInputs {
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
-    pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
@@ -721,7 +716,6 @@ impl FunctionTypeFacts {
             && self.stack_slots.is_empty()
             && self.visible_bindings.is_empty()
             && self.callee_facts.is_empty()
-            && self.external_stack_vars.is_empty()
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
             && self.external_type_db.enums.is_empty()
@@ -748,7 +742,6 @@ impl FunctionTypeFacts {
             stack_slots: self.stack_slots,
             visible_bindings: self.visible_bindings,
             callee_facts: self.callee_facts,
-            external_stack_vars: self.external_stack_vars,
             external_type_db: self.external_type_db,
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
@@ -1375,7 +1368,6 @@ impl FunctionTypeFactsBuilder {
             mut stack_slots,
             mut visible_bindings,
             callee_facts,
-            external_stack_vars,
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
@@ -1385,10 +1377,6 @@ impl FunctionTypeFactsBuilder {
             ..
         } = self.inputs;
 
-        if stack_slots.is_empty() && !external_stack_vars.is_empty() {
-            stack_slots = stack_slots_from_legacy_external_stack_vars(&external_stack_vars);
-        }
-
         canonicalize_generic_param_names(
             &mut merged_signature,
             &mut signature_certificate,
@@ -1396,12 +1384,6 @@ impl FunctionTypeFactsBuilder {
             &mut stack_slots,
             &mut visible_bindings,
         );
-
-        let external_stack_vars = if stack_slots.is_empty() {
-            external_stack_vars
-        } else {
-            legacy_external_stack_vars_from_slots(&stack_slots)
-        };
 
         let mut diagnostics = diagnostics;
         diagnostics.extend(external_type_db.diagnostics.iter().cloned());
@@ -1416,7 +1398,6 @@ impl FunctionTypeFactsBuilder {
             stack_slots,
             visible_bindings,
             callee_facts,
-            external_stack_vars,
             external_type_db,
             slot_type_overrides,
             slot_field_profiles,
@@ -2028,14 +2009,13 @@ mod tests {
     }
 
     #[test]
-    fn builder_derives_legacy_stack_var_view_from_canonical_slots() {
+    fn builder_preserves_structural_stack_slot_root() {
         let spec = ExternalStackSlotSpec {
             name: "count".to_string(),
             ty: Some(CTypeLike::Int {
                 bits: 32,
                 signedness: Signedness::Signed,
             }),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
@@ -2049,53 +2029,24 @@ mod tests {
                 },
                 spec.clone(),
             )]),
-            external_stack_vars: HashMap::from([(
-                -0x10,
-                ExternalStackSlotSpec {
-                    name: "stale".to_string(),
-                    ..spec.clone()
-                },
-            )]),
             ..FunctionTypeFactInputs::default()
         })
         .build();
 
         assert_eq!(
             facts
-                .external_stack_vars
-                .get(&-0x10)
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -0x10,
+                })
                 .map(|slot| slot.name.as_str()),
             Some("count")
         );
-    }
-
-    #[test]
-    fn builder_canonicalizes_stack_slots_from_legacy_input() {
-        let spec = ExternalStackSlotSpec {
-            name: "count".to_string(),
-            ty: Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            }),
-            base: ExternalStackBase::FramePointer,
-            role: ExternalStackSlotRole::Local,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
-            external_stack_vars: HashMap::from([(-0x10, spec)]),
-            ..FunctionTypeFactInputs::default()
-        })
-        .build();
-
-        assert_eq!(
-            facts.stack_slots.get(&StackSlotKey {
-                base: ExternalStackBase::FramePointer,
-                offset: -0x10,
-            }),
-            facts.external_stack_vars.get(&-0x10)
-        );
+        assert!(!facts.stack_slots.contains_key(&StackSlotKey {
+            base: ExternalStackBase::StackPointer,
+            offset: -0x10,
+        }));
     }
 
     #[test]

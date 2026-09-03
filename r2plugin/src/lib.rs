@@ -2185,7 +2185,6 @@ struct AfcfjFunction {
 #[serde(untagged)]
 #[allow(dead_code)]
 enum AfvjRef {
-    Stack { base: String, offset: i64 },
     Register(String),
     Other(serde_json::Value),
 }
@@ -2206,10 +2205,6 @@ struct AfvjVar {
 struct AfvjPayload {
     #[serde(default)]
     reg: Vec<AfvjVar>,
-    #[serde(default)]
-    bp: Vec<AfvjVar>,
-    #[serde(default)]
-    sp: Vec<AfvjVar>,
 }
 
 #[cfg(test)]
@@ -2341,16 +2336,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-fn is_low_quality_stack_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("var_")
-        || lower.starts_with("local_")
-        || lower.starts_with("stack_")
-        || lower == "saved_fp"
-        || is_generic_arg_name(&lower)
 }
 
 #[cfg(test)]
@@ -2554,65 +2539,6 @@ fn parse_signature_context(json_str: &str, ptr_bits: u32) -> ParsedSignatureCont
     }
 
     parsed
-}
-
-#[cfg(test)]
-fn parse_external_stack_vars(
-    json_str: &str,
-    ptr_bits: u32,
-) -> std::collections::HashMap<i64, r2types::ExternalStackVarSpec> {
-    let payload = match serde_json::from_str::<AfvjPayload>(json_str) {
-        Ok(v) => v,
-        Err(_) => return std::collections::HashMap::new(),
-    };
-
-    let mut vars = std::collections::HashMap::new();
-    let mut used_names = std::collections::HashSet::new();
-
-    for entry in payload.bp.into_iter().chain(payload.sp.into_iter()) {
-        let Some(AfvjRef::Stack { base, offset }) = entry.reference else {
-            continue;
-        };
-
-        let raw_name = entry
-            .name
-            .unwrap_or_else(|| format!("stack_{:x}", offset.unsigned_abs()));
-        let Some(clean_name) = sanitize_c_identifier(&raw_name) else {
-            continue;
-        };
-        let var_name = uniquify_name(clean_name, &mut used_names);
-        let candidate = r2types::ExternalStackVarSpec {
-            name: var_name,
-            ty: entry
-                .ty
-                .as_deref()
-                .and_then(|raw| parse_external_type(raw, ptr_bits)),
-            base: match base.trim().to_ascii_lowercase().as_str() {
-                "bp" | "ebp" | "rbp" | "fp" => r2types::ExternalStackBase::FramePointer,
-                "sp" | "esp" | "rsp" => r2types::ExternalStackBase::StackPointer,
-                _ => r2types::ExternalStackBase::Named(base),
-            },
-            role: r2types::ExternalStackSlotRole::Unknown,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-
-        match vars.get(&offset) {
-            None => {
-                vars.insert(offset, candidate);
-            }
-            Some(existing) => {
-                if is_low_quality_stack_name(&existing.name)
-                    && !is_low_quality_stack_name(&candidate.name)
-                {
-                    vars.insert(offset, candidate);
-                }
-            }
-        }
-    }
-
-    vars
 }
 
 #[derive(Debug)]
@@ -6057,18 +5983,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_external_stack_vars_bp_sp() {
-        let json = r#"{"sp":[{"name":"var_8h","kind":"var","type":"int64_t","ref":{"base":"RSP","offset":80}}],"bp":[{"name":"buf","kind":"var","type":"char[64]","ref":{"base":"RBP","offset":-64}},{"name":"user_input","kind":"var","type":"char *","ref":{"base":"RBP","offset":-72}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        assert_eq!(vars.get(&-64).map(|v| v.name.as_str()), Some("buf"));
-        assert_eq!(vars.get(&-72).map(|v| v.name.as_str()), Some("user_input"));
-        assert_eq!(
-            vars.get(&80).and_then(|v| v.base.legacy_name()),
-            Some("rsp".to_string())
-        );
-    }
-
-    #[test]
     fn x86_32_pointer_slots_do_not_inherit_sysv64_argument_registers() {
         let mut arch = ArchSpec::new("x86");
         arch.addr_size = 4;
@@ -6109,16 +6023,6 @@ mod tests {
         assert_eq!(merged.params.len(), 2);
         assert_eq!(merged.params[0].ty, Some(signed_type(32)));
         assert_eq!(merged.params[1].ty, Some(signed_type(32)));
-    }
-
-    #[test]
-    fn test_name_sanitization_and_collisions() {
-        let json = r#"{"bp":[{"name":"bad-name","type":"int","ref":{"base":"RBP","offset":-8}},{"name":"bad name","type":"int","ref":{"base":"RBP","offset":-16}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        let first = vars.get(&-8).expect("first var");
-        let second = vars.get(&-16).expect("second var");
-        assert_eq!(first.name, "bad_name");
-        assert_ne!(first.name, second.name);
     }
 
     #[test]
