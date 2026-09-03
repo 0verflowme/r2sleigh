@@ -449,11 +449,12 @@ impl<'a> FoldingContext<'a> {
     /// [`Self::absorbed_extensions_discharged_by`], asked from the other side,
     /// so the two cannot disagree.
     pub(crate) fn write_is_discharged_by_absorbing_write(&self, inst: r2ssa::InstId) -> bool {
-        let Some(head) = self
-            .inputs
-            .binding_names
-            .and_then(|names| names.plan().machine_projection().absorbing_write(inst))
-        else {
+        let Some(head) = self.inputs.binding_names.and_then(|names| {
+            names
+                .plan()
+                .machine_projection()
+                .immediate_absorbing_write(inst)
+        }) else {
             return false;
         };
         self.absorbed_extensions_discharged_by(head).contains(&inst)
