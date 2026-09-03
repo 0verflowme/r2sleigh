@@ -1809,7 +1809,14 @@ impl LegacyObservationJournal {
         for site in origins.noop_sites() {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge) {
                 Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                Some(existing) => {
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!(
+                            "conflicting use {site:?}: certificate reason {existing:?}, normalization reason RedundantPhiEdge"
+                        );
+                    }
+                    return Err(LegacyObservationJournalError::ConflictingUse(site));
+                }
             }
         }
         let coalesced_carrier_uses = self
@@ -1820,7 +1827,14 @@ impl LegacyObservationJournal {
         for site in coalesced_carrier_uses {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCopy) {
                 Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                Some(existing) => {
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!(
+                            "conflicting use {site:?}: certificate reason {existing:?}, normalization reason CoalescedCopy"
+                        );
+                    }
+                    return Err(LegacyObservationJournalError::ConflictingUse(site));
+                }
             }
         }
         for inst in self.coalesced_carrier_phi_writes.iter().copied() {
@@ -1870,7 +1884,14 @@ impl LegacyObservationJournal {
                 match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
                 {
                     Some(r2ssa::ledger::ElisionReason::CoalescedImmutablePhi) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                    Some(existing) => {
+                        if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!(
+                                "conflicting use {site:?}: certificate reason {existing:?}, normalization reason CoalescedImmutablePhi"
+                            );
+                        }
+                        return Err(LegacyObservationJournalError::ConflictingUse(site));
+                    }
                 }
             }
             match elided_writes.insert(inst.id, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
