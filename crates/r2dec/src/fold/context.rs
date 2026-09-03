@@ -415,9 +415,18 @@ impl<'a> FoldingContext<'a> {
     /// Statement twin of [`Self::observe_discharged_expr`]: the cells and the
     /// effects of the instructions a rendered definition's projection stands
     /// for, on that definition's statement.
+    /// `already` is the obligation set the caller will mark on this same
+    /// statement for its own operation. A machine instruction lifts to several
+    /// p-code operations, so a narrow write and the carrier clear that
+    /// certifies it are frequently *one* `CanonicalInstructionId` carrying one
+    /// obligation. Marking it here as well as there renders it twice, and the
+    /// ledger scores an obligation with two occurrences as
+    /// `DuplicateRenderedOccurrence` -- which is a refusal, and the right one:
+    /// two occurrences of one effect is exactly what it is there to catch.
     pub(crate) fn observe_discharged_stmt(
         &self,
         discharged: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
         stmt: crate::ast::CStmt,
     ) -> crate::ast::CStmt {
         let Some(journal) = self.inputs.observation_journal else {
@@ -447,6 +456,7 @@ impl<'a> FoldingContext<'a> {
                 output,
             ));
         }
+        let obligations = obligations.difference(already).copied().collect();
         self.observe_effect_stmt(&obligations, marked)
     }
 

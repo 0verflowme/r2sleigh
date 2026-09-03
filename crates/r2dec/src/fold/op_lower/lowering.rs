@@ -1190,7 +1190,7 @@ impl<'a> FoldingContext<'a> {
             if discharged.is_empty() {
                 stmt
             } else {
-                self.observe_discharged_stmt(&discharged, stmt)
+                self.observe_discharged_stmt(&discharged, &obligations, stmt)
             }
         } else if rendered
             && matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
