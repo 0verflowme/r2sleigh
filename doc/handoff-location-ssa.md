@@ -9502,3 +9502,32 @@ the ledger names the layer and the obligation ids -- and this one has not, which
 is why it has stayed unowned while smaller causes were traced. Name the argument
 index and the value first, then the cause will be a short read rather than a
 hunt.
+
+## Candidate: the install lock is held about four times longer than it needs to be
+
+`locked_run.sh` wraps a whole command, so `run_matrix.sh` holds the lock across
+install, six sweeps, six compiles, six oracle builds and six verifications.
+Only the install and the six sweeps touch the installed plugin.
+
+The verification half was checked rather than assumed. `verify_rendering.py`
+invokes radare2 three times, for `iSj`, `iSSj` and `p8j`: a section list, a
+section-header list and raw bytes. None disassembles, none decompiles, and none
+depends on which plugin is installed. The compiles and the oracle runs touch
+nothing of ours at all.
+
+So the held window could shrink to install plus sweeps, which at six agents and
+a queue five deep is the difference between a wait measured in hours and one
+measured in minutes.
+
+It is not a small edit. The lock is owned by the wrapper, and moving it to the
+script that installs changes the contract of five callers -- the matrix, probe,
+coverage, shapes and values wrappers -- every one of which is being executed by
+a running agent. Bash reads a script by byte offset as it runs, so an in-place
+edit of a file mid-execution corrupts the instance reading it; an atomic replace
+avoids that, since the running shell keeps its descriptor on the old inode.
+
+Do it when the queue drains, not before, and use atomic replacement for every
+script edit from then on. Note also that whoever does it should keep the one-
+owner property that made the wrapper worth building: the lock belongs with the
+thing that needs exclusivity, so the honest end state is the installing script
+taking it directly rather than a wrapper guessing when to let go.
