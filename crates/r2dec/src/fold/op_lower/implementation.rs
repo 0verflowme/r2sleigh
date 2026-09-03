@@ -56,17 +56,6 @@ impl<'a> FoldingContext<'a> {
         ))
     }
 
-    pub(crate) fn certified_render_plan<'b>(
-        &'b self,
-        proof: CertifiedRenderContext<'b>,
-    ) -> Option<CertifiedRenderPlan<'b>> {
-        Some(CertifiedRenderPlan::new(
-            self.inputs.function_facts,
-            self.prepared_semantic_view()?,
-            proof,
-        ))
-    }
-
     pub(crate) fn certified_residual_comment(&self, reason: impl Into<String>) -> CStmt {
         CStmt::Comment(format!("r2sleigh residual: {}", reason.into()))
     }
