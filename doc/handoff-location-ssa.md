@@ -10670,3 +10670,105 @@ The rule this cost us: **a branch merges when its own gate is green, not when
 its work is good.** A red cell carried into integration is not one team's
 problem, it is everybody's, and it invalidates every measurement taken until it
 is fixed.
+
+## The array functions stopped rendering because one producer was rendered twice
+
+Eight whole-binary cells regressed when array indexing landed --
+`elem_at`, `elem_before`, `bounded_fetch` and `half_stride`, at x86-64 -O1 and
+-O2, exactly the corpus's indexed shapes -- all refusing at declaration
+placement with `ambiguous_observation_execution_order`. The fifty-four-cell
+matrix stayed green throughout, which is why it was the coverage sweep that
+found them: these four functions are in `branchy.c` and no cell scores them.
+
+### What the trace said
+
+`ambiguous_observation_execution_order` reports an observation id and nothing
+else, so the first thing added was a trace. For `elem_at` it says:
+
+    ambiguous group [22, 21, ... 7, 5, 6] recorded at placement.rs:970
+    ambiguous observation 9 target Some(Write { inst: InstId(4), ... })
+      write of InstId(4) output ValueId(7) disposition Bound { binding: 1 }
+
+`placement.rs:970` is `record_ambiguous_expr_group` reached from the
+assignment arm, and the statement is
+`tmp_11f00_1 = ((uint32_t*)RDI_0)[(int64_t)(int32_t)ESI_0]`. Two lines above
+it, the same function renders `RAX_1 = (uint64_t)(int32_t)ESI_0`. `InstId(4)`
+is that sign extension, and its write is marked twice: once as observation 3,
+on the statement that assigns `RAX_1`, and once as observation 9, inside the
+subscript. Placement is right to refuse -- C states no order between a write
+in an operand and the reads beside it -- and the refusal is the symptom of the
+duplication rather than the defect.
+
+### The cause, which predates the subscript rule by a day
+
+`BindingPlan` supplies the rewriter's expansion policy, and it read
+
+    inlinable_for_expansion.contains(&query.value)
+        || r2rewrite::term_is_duplicable(..)
+
+The comment above it already said the intent: "may this producer be expanded
+into its reader" and "may this value be rendered without a local" are one
+question with one answer. The second disjunct answers a different one.
+Duplicability says re-evaluating a term observes nothing twice; it does not say
+the producer stops being rendered, and only the plan's disposition does that.
+`ExpansionPolicy`'s own documentation says as much -- a duplicable term
+expanded at every reader "would need `Multiplicity::Any` there" -- and the plan
+has no multiplicity rule.
+
+So a duplicable term whose value the plan bound is rendered twice: once as
+`name = ...`, and again inside every term that absorbed it. `discharged_from`
+then reports that producer as discharged, correctly by its own definition --
+the canonical term no longer reads the value as a leaf -- and
+`observe_discharged_expr` marks the vanished instruction's write on the
+expression standing in for it. Two answerers for one write.
+
+`sext(esi)` hits it exactly. The plan binds the value because
+`expression_renders_inline` excludes `Cast`, and the term is duplicable because
+`esi` is an entry value the function never writes. The divergence was inert
+while nothing rendered from the canonical terms; the subscript renderer is the
+first thing that does.
+
+The policy is one function in `binding_plan::rules` now, `term_absorbs_producer`,
+called by construction and by the seal so they cannot drift.
+
+### Measured
+
+Whole-binary sweep, 517 functions over twelve compiled configurations, two
+pinned GCC binaries and `/bin/ls`, run from the worktree with the plugin loaded
+by `L` rather than installed, so the shared install lock was not involved:
+
+    rendered            316 -> 324      (the blessed baseline is 321; the
+                                         difference either way is the eight)
+    regressions vs baseline   8 -> 0
+
+Exactly eight functions render different text. The other 509 are
+byte-identical, so no subscript was lost anywhere and the corpus's twenty-one
+are untouched. Six of the eight index:
+`((uint32_t*)RDI_0)[RAX_1]`, with the index spelled as the name the plan gave
+it rather than re-derived.
+
+### Two things this leaves on the table
+
+**`bounded_fetch` renders address arithmetic instead of a subscript.** Its
+lifter temporaries `tmp:4900_1` and `tmp:4a00_1` have two readers each -- the
+second is a merge of the Sleigh temporary across the branch, which the source
+program does not have -- so the plan binds them, so the term cannot absorb them
+and the address is spelled out. The subscript is recoverable by making those
+temporaries single-reader, which is a question about lifting Sleigh scratch
+across blocks rather than about the rewriter. Nothing here decided against it.
+
+**A width change has no inline form, and the subscript renderer has one.**
+`expression_renders_inline` is the list of shapes `materialize_machine_expr`
+can build and it excludes `Cast`, which is why `sext(esi)` is bound at all,
+which is why the index is `RAX_1` and not `ESI_0`. `render_subscript_term`
+does have a `TermKind::Cast` arm. Two renderers with different capabilities is
+tolerable; the plan's gate being written against the weaker one is what costs
+the source-shaped `v[i]`. Widening it is one measurement, and it is the change
+that would make these renderings read like the source.
+
+**Not the fix, and worth saying so.** A guard refusing a second exact write
+occurrence for one instruction looks like the way to catch this class at its
+source. It is wrong: normalization materializes one phi definition as a copy on
+each incoming edge, so several write occurrences for one instruction are
+legitimate and `PlacementObservationTarget::Write` carries a per-occurrence
+block precisely to distinguish them.
