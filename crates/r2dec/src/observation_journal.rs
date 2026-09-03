@@ -4261,7 +4261,7 @@ mod tests {
             ledger.outcome(&obligation),
             r2ssa::ledger::Outcome::Refused {
                 layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::BlockNotRendered,
+                reason: r2ssa::ledger::RefusalReason::NoRenderedOccurrence,
             }
         );
     }

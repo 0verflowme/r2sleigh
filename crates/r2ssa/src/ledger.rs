@@ -205,8 +205,12 @@ impl std::fmt::Display for ElisionReason {
 pub enum RefusalReason {
     /// The admission rule asks this effect to residualize rather than be owned.
     UnsupportedEffect,
-    /// Structuring emitted no body for the block this obligation sits in.
-    BlockNotRendered,
+    /// Final emission retained no occurrence that owns this obligation.
+    ///
+    /// This deliberately does not guess which earlier phase removed it. The
+    /// absence of an occurrence proves the coverage failure, but it does not
+    /// prove that the containing block was omitted.
+    NoRenderedOccurrence,
     /// The value this obligation needs was never bound to anything the output names.
     ValueUnbound,
     /// A phase ran out of its budget before reaching this obligation.
@@ -225,7 +229,7 @@ impl std::fmt::Display for RefusalReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::UnsupportedEffect => "unsupported-effect",
-            Self::BlockNotRendered => "block-not-rendered",
+            Self::NoRenderedOccurrence => "no-rendered-occurrence",
             Self::ValueUnbound => "value-unbound",
             Self::BudgetExhausted => "budget-exhausted",
             Self::DuplicateRenderedOccurrence => "duplicate-rendered-occurrence",
@@ -540,7 +544,7 @@ mod tests {
 
         let refused = Outcome::Refused {
             layer: LedgerLayer::Structure,
-            reason: RefusalReason::BlockNotRendered,
+            reason: RefusalReason::NoRenderedOccurrence,
         };
         assert_eq!(ledger.overwrite(id, refused), Record::Accepted);
 
