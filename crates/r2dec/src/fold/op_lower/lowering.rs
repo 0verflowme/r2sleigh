@@ -32,10 +32,10 @@ impl<'a> FoldingContext<'a> {
             self.retain_first_observation_error(invalid());
             return expr;
         };
-        let replaced = match source {
-            ReplacementSource::RenderedValue => Vec::new(),
+        let (replaced, frame_address) = match source {
+            ReplacementSource::RenderedValue => (Vec::new(), None),
             ReplacementSource::PlannedInline => {
-                prepared.graph().def_inst(value).into_iter().collect()
+                (prepared.graph().def_inst(value).into_iter().collect(), None)
             }
             ReplacementSource::CanonicalAccess(access) => {
                 let Some(names) = self.inputs.binding_names else {
@@ -63,8 +63,12 @@ impl<'a> FoldingContext<'a> {
                     self.retain_first_observation_error(invalid());
                     return expr;
                 }
-                replaced
+                (replaced, None)
             }
+            ReplacementSource::EscapedStackAddress(frame_address) => (
+                prepared.graph().def_inst(value).into_iter().collect(),
+                Some(frame_address),
+            ),
         };
         let obligations = replaced
             .iter()
@@ -81,7 +85,8 @@ impl<'a> FoldingContext<'a> {
             })
             .collect::<BTreeSet<_>>();
         let fallback = expr.clone();
-        let contract = RenderedReplacementContract::new(expr, value, replaced, obligations);
+        let contract =
+            RenderedReplacementContract::new(expr, value, replaced, obligations, frame_address);
         match journal
             .borrow_mut()
             .observe_rendered_replacement_expr(contract)

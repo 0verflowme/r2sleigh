@@ -144,6 +144,15 @@ enum ReplacementSource {
     RenderedValue,
     PlannedInline,
     CanonicalAccess(r2ssa::StructuredAccessId),
+    EscapedStackAddress(RenderedFrameObjectAddress),
+}
+
+/// Source-owned identity behind one frame-object address spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderedFrameObjectAddress {
+    pub(crate) call: r2ssa::InstId,
+    pub(crate) argument_index: usize,
+    pub(crate) object: r2ssa::ObjectId,
 }
 
 impl PendingReplacementExpr {
@@ -170,6 +179,24 @@ impl PendingReplacementExpr {
             source: ReplacementSource::CanonicalAccess(fact.access),
         }
     }
+
+    fn escaped_stack_address(
+        value: ValueId,
+        call: r2ssa::InstId,
+        argument_index: usize,
+        object: r2ssa::ObjectId,
+        expr: CExpr,
+    ) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::EscapedStackAddress(RenderedFrameObjectAddress {
+                call,
+                argument_index,
+                object,
+            }),
+        }
+    }
 }
 
 /// Complete, one-shot input to the observation journal's cell derivation.
@@ -183,6 +210,7 @@ pub(crate) struct RenderedReplacementContract {
     value: ValueId,
     replaced: Vec<r2ssa::InstId>,
     obligations: BTreeSet<r2ssa::SemanticObligationId>,
+    frame_address: Option<RenderedFrameObjectAddress>,
 }
 
 impl RenderedReplacementContract {
@@ -191,12 +219,14 @@ impl RenderedReplacementContract {
         value: ValueId,
         replaced: Vec<r2ssa::InstId>,
         obligations: BTreeSet<r2ssa::SemanticObligationId>,
+        frame_address: Option<RenderedFrameObjectAddress>,
     ) -> Self {
         Self {
             expr,
             value,
             replaced,
             obligations,
+            frame_address,
         }
     }
 
@@ -207,8 +237,15 @@ impl RenderedReplacementContract {
         ValueId,
         Vec<r2ssa::InstId>,
         BTreeSet<r2ssa::SemanticObligationId>,
+        Option<RenderedFrameObjectAddress>,
     ) {
-        (self.expr, self.value, self.replaced, self.obligations)
+        (
+            self.expr,
+            self.value,
+            self.replaced,
+            self.obligations,
+            self.frame_address,
+        )
     }
 
     #[cfg(test)]
@@ -218,7 +255,7 @@ impl RenderedReplacementContract {
         replaced: Vec<r2ssa::InstId>,
         obligations: BTreeSet<r2ssa::SemanticObligationId>,
     ) -> Self {
-        Self::new(expr, value, replaced, obligations)
+        Self::new(expr, value, replaced, obligations, None)
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::ast::CExpr;
+use crate::ast::{CExpr, CType};
 use r2ssa::ObjectId;
 
 use super::context::FoldingContext;
@@ -18,6 +18,33 @@ impl<'a> FoldingContext<'a> {
                 None
             }
         }
+    }
+
+    /// Spell the base address of one certified frame object and the C type
+    /// that spelling actually has.
+    ///
+    /// Arrays decay from their bare object name. Every other object needs an
+    /// explicit address-of, so the call and the later stack access visibly
+    /// name the same program object rather than unrelated stack arithmetic.
+    pub(super) fn certified_stack_address_expr_for_object(
+        &self,
+        object: ObjectId,
+    ) -> Option<(CExpr, CType)> {
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::StackObjectDisposition::Bound { binding } =
+            names.plan().stack_object_disposition(object)?
+        else {
+            self.retain_first_lowering_refusal(
+                super::op_lower::OpLoweringRefusal::missing_program_variable(),
+            );
+            return None;
+        };
+        let ty = names.plan().binding(binding)?.declaration_type().clone();
+        let object_expr = self.certified_stack_var_expr_for_object(object)?;
+        Some(match ty {
+            CType::Array(_, _) => (object_expr, ty),
+            _ => (CExpr::addr_of(object_expr), CType::Pointer(Box::new(ty))),
+        })
     }
 
     /// Whether a copy restates a write the block has already rendered.

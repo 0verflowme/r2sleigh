@@ -298,6 +298,47 @@ pub(crate) fn certified_boundary_read(
     certified_boundary_read_values(source, at).contains(&value)
 }
 
+/// The exact frame object whose base address one certified call argument passes.
+///
+/// Call arguments are boundary reads rather than graph uses, while object
+/// identity belongs to the source-owned object model. Joining those two facts
+/// here keeps the renderer and final placement audit on one predicate. An
+/// indexed address names storage inside the object, not the object's base, and
+/// therefore cannot license the `&object`/array-decay spelling.
+pub(crate) fn certified_frame_object_call_argument(
+    source: &r2ssa::SsaArtifact,
+    at: InstId,
+    argument_index: usize,
+    value: ValueId,
+) -> Option<r2ssa::ObjectId> {
+    let graph = source.graph();
+    let inst = graph.inst(at)?;
+    let call_site = source.certificates().callsites_by_inst.get(&at)?;
+    let certificate = source.certificates().callsites.get(call_site)?;
+    if certificate.at != at
+        || !matches!(
+            inst.payload,
+            r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. })
+        )
+        || certificate.argument_values.get(argument_index).copied() != Some(value)
+        || !certificate
+            .argument_certificates
+            .iter()
+            .any(|argument| argument.index == argument_index && argument.value == value)
+        || source.objects().address_is_indexed(value)
+    {
+        return None;
+    }
+    let object = source
+        .objects()
+        .object_for_value(value, r2il::SpaceId::Ram)?;
+    matches!(
+        source.objects().object(object)?.kind,
+        r2ssa::ObjectKind::StackSlot { .. } | r2ssa::ObjectKind::FrameObject { .. }
+    )
+    .then_some(object)
+}
+
 /// Whether affine address provenance certifies that one structured memory
 /// occurrence reads `value` as its parameter base or scalar index.
 ///
@@ -881,6 +922,13 @@ pub(crate) enum PlacementRead {
     /// declaration defines and which no per-element proof can be built for --
     /// the write that would answer for it is at an offset nobody knows.
     IndexedStackAccess(r2ssa::StructuredAccessId),
+    /// The base address of this frame object is passed through a certified
+    /// call boundary. It is a placement occurrence, because the declaration
+    /// must dominate the call, but it does not read the object's contents.
+    EscapedStackAddress {
+        call: InstId,
+        value: ValueId,
+    },
     PreservedCarrierWrite(InstId),
 }
 
