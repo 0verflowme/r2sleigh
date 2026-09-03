@@ -75,9 +75,22 @@ set +m
 build_pid=""
 
 echo "waiting for $lock" >&2
+# The holder records its process id, and a waiter reclaims the lock when that
+# process is gone. Without this a holder killed with a signal its trap cannot
+# catch leaves the directory behind and every later run waits on it forever,
+# which is a guard that can never clear -- the same defect class as one that can
+# never fire. Reclaiming is safe because the directory is the lock: whoever
+# recreates it is the new holder, and a live holder is never displaced.
 until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/owner" 2>/dev/null || echo "")
+    if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then
+        echo "lock holder $holder is gone; reclaiming" >&2
+        rm -rf "$lock"
+        continue
+    fi
     sleep 10
 done
+printf '%s\n' "$$" > "$lock/owner" 2>/dev/null || true
 echo "lock taken" >&2
 
 # Tell the command which directory the lock is, so it may hand it back as soon

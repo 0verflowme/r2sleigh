@@ -10314,6 +10314,64 @@ Note this is a different fact from the `adrp` page base found in the thunk work,
 where radare2's own reference points at the page rather than the slot. Here the
 page base is correct and simply un-recombined.
 
+## A lock nobody could clear, and a corpus cell nobody can render
+
+Two things came out of the first attempt to measure the value-hazard corpus, and
+neither was the measurement.
+
+**The install lock had no recovery from a dead holder.** A run killed with a
+signal its trap cannot catch left the directory behind, and every later run
+waited on it forever. That is a guard that can never clear, the same defect
+class as one that can never fire, and this session has now found one of each
+kind three times over. The holder now records its process id in the lock and a
+waiter reclaims the lock when that process is gone. Reclaiming is safe because
+the directory *is* the lock: whoever recreates it is the new holder, and a live
+holder is never displaced. Both paths were exercised, a dead holder reclaimed
+and a live one waited on.
+
+**A value-hazard function does not finish.** The run held the lock for forty
+minutes and never got past the first of six configurations, sweeping thirteen
+leaf functions with no calls, no loops over memory and no aggregates. Whatever is
+slow is slow on straight-line integer arithmetic, which makes it a much smaller
+reproduction than `main` in `bzip2recover`, the function that spends 2.27
+seconds in the structurer against 2.77 for every other stage combined.
+
+That is worth more than the measurement it prevented. A pathological case in
+thirteen short functions can be bisected to one function and one hazard in
+minutes, and it should be handed to whoever holds the structurer's safety
+budget, since a budget of block count times 128 consumed in proof order is the
+standing suspect. Run one config with a timeout and per-function timing to find
+which of the thirteen it is before running the whole matrix again.
+
+## The structurer pathology, reduced to one function
+
+The value-hazard corpus held the install lock for forty minutes without
+finishing one of six configurations. Timing its thirteen leaf functions
+individually, with the plugin already installed and no lock involved, says why.
+Eleven finish in under eight seconds. Three do not:
+
+| function | time |
+| --- | --- |
+| `value_overflow_flags` | exceeds 60 s, did not finish |
+| `value_signed_compare` | exceeds 60 s, did not finish |
+| `value_width_conflict` | 21 s, finishes |
+
+These are leaf functions with no calls, no loops over memory and no aggregates,
+so whatever is superlinear is superlinear on straight-line flag arithmetic and
+signed comparison, which is where the reaching-path predicates multiply. They
+also have very few blocks, and still exhaust whatever budget they are given,
+which is direct evidence that a budget of block count times 128 is the wrong
+shape rather than merely an unprincipled constant.
+
+`value_overflow_flags` is therefore a one-function reproduction that iterates in
+a minute, against the 2.27 seconds inside `main` in `bzip2recover` that the
+work was originally scoped against. Time those three before and after any change
+to the safety budget; it costs seconds and needs no plugin install and no lock.
+
+Method worth reusing: install once, then run the decompiler per function with a
+timeout, outside the lock. Identifying which function is pathological does not
+need an exclusive plugin, and taking the lock for a hang is how a forty-minute
+hold happened in the first place.
 
 ## The page-base literal: what the probe says, and why the fix is still a fork
 
