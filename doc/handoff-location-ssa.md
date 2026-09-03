@@ -10313,3 +10313,32 @@ renders inline. It belongs to the inlining work.
 Note this is a different fact from the `adrp` page base found in the thunk work,
 where radare2's own reference points at the page rather than the slot. Here the
 page base is correct and simply un-recombined.
+
+## A lock nobody could clear, and a corpus cell nobody can render
+
+Two things came out of the first attempt to measure the value-hazard corpus, and
+neither was the measurement.
+
+**The install lock had no recovery from a dead holder.** A run killed with a
+signal its trap cannot catch left the directory behind, and every later run
+waited on it forever. That is a guard that can never clear, the same defect
+class as one that can never fire, and this session has now found one of each
+kind three times over. The holder now records its process id in the lock and a
+waiter reclaims the lock when that process is gone. Reclaiming is safe because
+the directory *is* the lock: whoever recreates it is the new holder, and a live
+holder is never displaced. Both paths were exercised, a dead holder reclaimed
+and a live one waited on.
+
+**A value-hazard function does not finish.** The run held the lock for forty
+minutes and never got past the first of six configurations, sweeping thirteen
+leaf functions with no calls, no loops over memory and no aggregates. Whatever is
+slow is slow on straight-line integer arithmetic, which makes it a much smaller
+reproduction than `main` in `bzip2recover`, the function that spends 2.27
+seconds in the structurer against 2.77 for every other stage combined.
+
+That is worth more than the measurement it prevented. A pathological case in
+thirteen short functions can be bisected to one function and one hazard in
+minutes, and it should be handed to whoever holds the structurer's safety
+budget, since a budget of block count times 128 consumed in proof order is the
+standing suspect. Run one config with a timeout and per-function timing to find
+which of the thirteen it is before running the whole matrix again.
