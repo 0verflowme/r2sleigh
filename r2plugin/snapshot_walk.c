@@ -470,6 +470,9 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 
 /* Wire discriminants shared with r2source::snapshot_wire. */
 #define WALK_SPACE_REGISTER 1
+#define WALK_CALL_TRANSFER_CALL 0
+#define WALK_CALL_TRANSFER_TAIL_JUMP 1
+#define WALK_CALL_TRANSFER_TAIL_SLOT 2
 #define WALK_RESULT_VOID 0
 #define WALK_RESULT_REGISTER 1
 #define WALK_CARRIER_FULL 0
@@ -593,6 +596,29 @@ static bool walk_call_site(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 		return false;
 	}
 	r2sleigh_wire_string (writer, target_name);
+	/* How control gets there. A jump that leaves the function for another
+	 * one is a call whose return is this function's, and a jump through a
+	 * relocated slot is the same with the slot standing for the callee; the
+	 * consumer has to see the difference to match the site to the machine. */
+	RAnalCallTransfer transfer = R_ANAL_CALL_TRANSFER_CALL;
+	if (!r_anal_function_snapshot_call_site_transfer (snapshot, index, &transfer)) {
+		return false;
+	}
+	switch (transfer) {
+	case R_ANAL_CALL_TRANSFER_CALL:
+		r2sleigh_wire_u8 (writer, WALK_CALL_TRANSFER_CALL);
+		break;
+	case R_ANAL_CALL_TRANSFER_TAIL_JUMP:
+		r2sleigh_wire_u8 (writer, WALK_CALL_TRANSFER_TAIL_JUMP);
+		break;
+	case R_ANAL_CALL_TRANSFER_TAIL_SLOT:
+		r2sleigh_wire_u8 (writer, WALK_CALL_TRANSFER_TAIL_SLOT);
+		break;
+	default:
+		/* A transfer this side cannot name is one the consumer would
+		 * misread as a call. */
+		return false;
+	}
 	/* An incomplete site described the call but not what it takes or returns,
 	 * which is a different fact from a call that takes nothing. */
 	if (!view.complete) {

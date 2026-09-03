@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 6;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 7;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -354,11 +354,11 @@ use crate::contracts::{
     SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
 };
 use crate::{
-    AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
-    CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
-    MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
-    SnapshotValidationError, SourceCodePointerTable, SourceEndianness, SourceSignatureParameter,
-    SourceSignaturePresentation, SourceStackSlotName,
+    AdvisoryCallPrototype, AdvisoryCallSite, AdvisoryCallTransfer, AdvisorySuccessor,
+    AdvisorySuccessorKind, CapturedSourceFields, DiagnosticIdentity, FunctionIdentity,
+    FunctionPresentation, MachineProfile, OwnedFunctionBlock, OwnedFunctionImage,
+    OwnedFunctionSnapshot, SnapshotValidationError, SourceCodePointerTable, SourceEndianness,
+    SourceSignatureParameter, SourceSignaturePresentation, SourceStackSlotName,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -1243,6 +1243,10 @@ pub fn read_call_prototype(
     })
 }
 
+const CALL_TRANSFER_CALL: u8 = 0;
+const CALL_TRANSFER_TAIL_JUMP: u8 = 1;
+const CALL_TRANSFER_TAIL_SLOT: u8 = 2;
+
 pub fn write_call_site(
     writer: &mut SnapshotWireWriter,
     site: &AdvisoryCallSite,
@@ -1250,6 +1254,11 @@ pub fn write_call_site(
     writer.u64(site.instruction_address());
     writer.u64(site.target_address());
     writer.string(site.target_name().unwrap_or(""))?;
+    writer.u8(match site.transfer() {
+        AdvisoryCallTransfer::Call => CALL_TRANSFER_CALL,
+        AdvisoryCallTransfer::TailJump => CALL_TRANSFER_TAIL_JUMP,
+        AdvisoryCallTransfer::TailSlot => CALL_TRANSFER_TAIL_SLOT,
+    });
     // Absence is meaningful here: radare2 described the call but not what it
     // takes or returns, which is not the same as an empty prototype.
     match site.prototype() {
@@ -1268,6 +1277,23 @@ pub fn read_call_site(
     let instruction_address = reader.u64()?;
     let target_address = reader.u64()?;
     let target_name = reader.string()?;
+    // Before version 7 every site radare2 reported was a call instruction, so
+    // an older buffer says so without carrying the byte.
+    let transfer = if reader.format_version() >= 7 {
+        match reader.u8()? {
+            CALL_TRANSFER_CALL => AdvisoryCallTransfer::Call,
+            CALL_TRANSFER_TAIL_JUMP => AdvisoryCallTransfer::TailJump,
+            CALL_TRANSFER_TAIL_SLOT => AdvisoryCallTransfer::TailSlot,
+            tag => {
+                return Err(SnapshotWireError::UnknownDiscriminant {
+                    record: "call transfer",
+                    tag: u64::from(tag),
+                });
+            }
+        }
+    } else {
+        AdvisoryCallTransfer::Call
+    };
     let prototype = if reader.bool()? {
         Some(read_call_prototype(reader)?)
     } else {
@@ -1276,6 +1302,7 @@ pub fn read_call_site(
     Ok(AdvisoryCallSite {
         instruction_address,
         target_address,
+        transfer,
         target_name: (!target_name.is_empty()).then(|| target_name.to_string()),
         prototype,
     })
@@ -2735,6 +2762,7 @@ mod tests {
         let with_prototype = AdvisoryCallSite {
             instruction_address: 0x1000_0741,
             target_address: 0x1000_1980,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: Some("sym.imp.strcmp".to_string()),
             prototype: Some(AdvisoryCallPrototype {
                 calling_convention: "amd64".to_string(),
@@ -2753,16 +2781,35 @@ mod tests {
         let without = AdvisoryCallSite {
             instruction_address: 0x1000_0757,
             target_address: 0x1000_1986,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: Some("sym.imp.malloc".to_string()),
             prototype: None,
         };
         let unnamed = AdvisoryCallSite {
             instruction_address: 0x1000_0763,
             target_address: 0x1000_1992,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: None,
             prototype: None,
         };
-        for site in [with_prototype, without, unnamed] {
+        // A tail transfer is the same record with a different way in: a jump
+        // to the callee's entry, or a jump through a relocated slot, in which
+        // case the target address is the slot.
+        let tail_jump = AdvisoryCallSite {
+            instruction_address: 0x1000_0770,
+            target_address: 0x1000_1a00,
+            transfer: AdvisoryCallTransfer::TailJump,
+            target_name: Some("sym.func.10001a00".to_string()),
+            prototype: None,
+        };
+        let tail_slot = AdvisoryCallSite {
+            instruction_address: 0x1000_42b0,
+            target_address: 0x1000_8010,
+            transfer: AdvisoryCallTransfer::TailSlot,
+            target_name: Some("strcoll".to_string()),
+            prototype: None,
+        };
+        for site in [with_prototype, without, unnamed, tail_jump, tail_slot] {
             let mut writer = SnapshotWireWriter::new();
             write_call_site(&mut writer, &site).expect("write");
             let buffer = writer.finish().expect("finish");
