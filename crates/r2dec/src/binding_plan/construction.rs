@@ -38,10 +38,24 @@ pub(super) fn binding_components(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &MachineProjection,
 ) -> Result<Vec<BindingComponent>, BindingPlanBuildError> {
+    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
+    binding_components_with(source_owned, &eligible)
+}
+
+/// The same partition from a stated eligibility.
+///
+/// `inlinable_values` builds one of these from its conservative first pass,
+/// to ask whether a literal is alone in its object before deciding whether to
+/// spell it at its readers. Taking eligibility as an argument is what keeps
+/// that from being a second answerer: the inlining decision is still made in
+/// one place, and this is the partition that decision is read against.
+pub(super) fn binding_components_with(
+    source_owned: &SourceOwnedFunctionFacts,
+    eligible: &[bool],
+) -> Result<Vec<BindingComponent>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
     let mut parent = (0..value_count).collect::<Vec<_>>();
     let mut rank = vec![0_u8; value_count];
 
