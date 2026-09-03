@@ -207,12 +207,25 @@ d = json.loads(p.read_text()) if p.exists() else {}
 print((d.get("reference") or {}).get("version") or "")
 PY
 )
-baseline_cells=$(python3 - "$baseline" <<'PY'
+baseline_cells=$(python3 - "$baseline" "${required_metrics[@]}" <<'PY'
 import json, sys
 from pathlib import Path
 p = Path(sys.argv[1])
 d = json.loads(p.read_text()) if p.exists() else {}
-print("\n".join((d.get("selection") or {}).get("cells") or []))
+required = set(sys.argv[2:])
+selection = set((d.get("selection") or {}).get("cells") or [])
+reference = d.get("reference") or {}
+metric_cells = reference.get("metric_cells")
+if metric_cells is None:
+    metrics = set(reference.get("metrics") or [])
+    if not metrics:
+        metrics = set(((d.get("summary") or {}).get("metrics") or {}))
+    complete = selection if required <= metrics else set()
+else:
+    complete = set(selection)
+    for metric in required:
+        complete &= set(metric_cells.get(metric) or [])
+print("\n".join(sorted(complete)))
 PY
 )
 

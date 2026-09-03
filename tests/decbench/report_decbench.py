@@ -60,6 +60,7 @@ class Collected:
     opt_levels: set[str]
     reference_version: str | None
     reference_cells: set[str]
+    metrics: set[str]
 
 
 def collect(results: dict) -> Collected:
@@ -111,7 +112,14 @@ def collect(results: dict) -> Collected:
         )
     )
     return Collected(
-        rows, groups, cells, projects, opt_levels, version, reference_cells
+        rows,
+        groups,
+        cells,
+        projects,
+        opt_levels,
+        version,
+        reference_cells,
+        set(results.get("metrics") or []),
     )
 
 
@@ -238,6 +246,11 @@ def measured_record(current: Collected, rows: dict[str, dict]) -> dict:
         "reference": {
             "decompiler": REFERENCE,
             "version": current.reference_version,
+            "fresh_cells": sorted(current.reference_cells),
+            "metric_cells": {
+                metric: sorted(current.reference_cells)
+                for metric in sorted(current.metrics)
+            },
         },
         "selection": {
             "projects": sorted(current.projects),
@@ -268,13 +281,52 @@ def merge_baseline(old: dict | None, measured: dict) -> dict:
     functions.update(measured["functions"])
     groups = {key for key in (old.get("groups") or []) if group_cell(key) not in cells}
     groups.update(measured["groups"])
-    all_cells = {key_cell(key) for key in functions}
+    all_cells = {
+        cell
+        for cell in (old.get("selection") or {}).get("cells") or []
+        if cell not in cells
+    }
+    all_cells.update(cells)
     projects = {cell.rsplit("/", 1)[0] for cell in all_cells}
     opt_levels = {cell.rsplit("/", 1)[1] for cell in all_cells}
     reference_version = new_version or old_version
+    old_reference = old.get("reference") or {}
+    old_metric_cells = old_reference.get("metric_cells")
+    if old_metric_cells is None:
+        old_metrics = set(old_reference.get("metrics") or [])
+        if not old_metrics:
+            old_metrics = set(((old.get("summary") or {}).get("metrics") or {}))
+        old_metric_cells = {
+            metric: list((old.get("selection") or {}).get("cells") or [])
+            for metric in old_metrics
+        }
+    metric_cells = {
+        metric: set(metric_selection)
+        for metric, metric_selection in old_metric_cells.items()
+    }
+    fresh_cells = set(measured["reference"].get("fresh_cells") or [])
+    for metric_selection in metric_cells.values():
+        metric_selection.difference_update(fresh_cells)
+    for metric, metric_selection in (
+        measured["reference"].get("metric_cells") or {}
+    ).items():
+        metric_cells.setdefault(metric, set()).update(metric_selection)
+    metric_cells = {
+        metric: cells_for_metric & all_cells
+        for metric, cells_for_metric in metric_cells.items()
+        if cells_for_metric & all_cells
+    }
     return {
         "schema_version": 2,
-        "reference": {"decompiler": REFERENCE, "version": reference_version},
+        "reference": {
+            "decompiler": REFERENCE,
+            "version": reference_version,
+            "metrics": sorted(metric_cells),
+            "metric_cells": {
+                metric: sorted(metric_selection)
+                for metric, metric_selection in sorted(metric_cells.items())
+            },
+        },
         "selection": {
             "projects": sorted(projects),
             "opt_levels": sorted(opt_levels),

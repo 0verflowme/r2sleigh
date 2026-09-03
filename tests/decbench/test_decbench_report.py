@@ -168,6 +168,33 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate binary group"):
             merger.merge([payload("one", 0.5), payload("one", 0.6)])
 
+    def test_baseline_records_metric_completeness_per_reference_cell(self) -> None:
+        old = {
+            "reference": {"decompiler": "angr", "version": "9.3.3"},
+            "selection": {"cells": ["cached/O0"]},
+            "groups": [],
+            "functions": {},
+            "summary": {"metrics": {"byte_match": {}}},
+        }
+        fresh_payload = payload("fresh", 0.5)
+        fresh_payload["decompilers"].append("angr")
+        fresh_payload["decompiler_versions"] = {"angr": "9.3.3"}
+        fresh_payload["metrics"] = ["byte_match", "vj_ged"]
+        current = report.collect(merger.merge([fresh_payload]))
+        measured = report.measured_record(current, current.rows)
+        baseline = report.merge_baseline(old, measured)
+        self.assertEqual(
+            baseline["reference"]["metric_cells"],
+            {
+                "byte_match": ["cached/O0", "fresh/O0"],
+                "vj_ged": ["fresh/O0"],
+            },
+        )
+        self.assertEqual(
+            baseline["selection"]["cells"],
+            ["cached/O0", "fresh/O0"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

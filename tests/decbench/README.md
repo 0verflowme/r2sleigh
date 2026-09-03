@@ -161,7 +161,10 @@ keeps angr's per-function values and rendered flags, so ordinary tree sweeps
 pay only for r2sleigh. Missing reference cells refresh angr at project
 granularity: one incomplete project does not cause completed projects in the
 same sweep to rerun angr, while all requested optimization levels still share
-that project's single DecBench invocation.
+that project's single DecBench invocation. Completeness is recorded per metric
+and per cell, so adding a metric such as `vj_ged` invalidates only cells that
+have never measured it rather than treating an older three-metric row as a
+complete reference.
 
 The final cost line measures end-to-end wall time, the peak size of the
 garbage-collected run directory, the peak host disk consumption observed while
