@@ -527,6 +527,7 @@ mod tests {
                 variadic: None,
                 noreturn: None,
                 result_kind: None,
+                fixed_argument_count: Some(arguments.len()),
                 arguments,
                 results: Vec::new(),
                 complete: true,

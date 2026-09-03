@@ -4209,6 +4209,14 @@ impl Decompiler {
         // and where it did it would claim a transfer inside this function that
         // the machine makes into another one. A direct tail call is the common
         // shape here and it needs a callsite, not a jump.
+        //
+        // This is a guard over a missing capability, not the capability. It
+        // stops being right the moment a transfer that leaves the function has
+        // a real form: a callsite interface offered by the source layer for a
+        // branch whose target lies outside this function's bounds, rendered as
+        // a terminal call with no fallthrough. Delete this block in the commit
+        // that lands that form. A guard left standing over a case the renderer
+        // can express is a workaround wearing a refusal's clothes.
         let own_blocks: std::collections::BTreeSet<u64> =
             blocks.iter().map(|block| block.addr).collect();
         if blocks.iter().any(|block| {
@@ -4543,6 +4551,43 @@ impl Decompiler {
                         DecompileRenderRefusal::NormalizationOriginUnavailable,
                     ));
                 }
+            }
+        }
+        // The graph and the normalized function, verbatim, so a rendered
+        // statement can be read back to the instruction that produced it.
+        // Every other probe answers one question; this one is for the
+        // question nobody has asked yet.
+        if std::env::var_os("R2SLEIGH_DUMP_SSA").is_some() {
+            let graph = prepared.graph();
+            eprintln!("SSADUMP prepared\n{}", func.dump());
+            eprintln!("SSADUMP normalized\n{}", normalized_func.dump());
+            for value in &graph.values {
+                eprintln!(
+                    "SSAVALUE {:?} {} storage={:?} def={:?} uses={:?}",
+                    value.id,
+                    value.var,
+                    value.canonical_storage.map(|storage| (
+                        storage.space,
+                        storage.offset,
+                        storage.size
+                    )),
+                    graph.def_inst(value.id),
+                    graph.use_sites(value.id)
+                );
+            }
+            for inst in &graph.insts {
+                eprintln!(
+                    "SSAINST {:?} block={:?} ordinal={} out={:?} in={:?} {}",
+                    inst.id,
+                    inst.block,
+                    inst.ordinal,
+                    inst.output,
+                    inst.inputs,
+                    format!("{:?}", inst.payload)
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                );
             }
         }
         if let Err(error) = normalization_origins.validate(

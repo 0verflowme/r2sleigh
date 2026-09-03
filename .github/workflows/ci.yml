@@ -162,6 +162,40 @@ jobs:
           path: target/fixed-performance.json
           if-no-files-found: error
 
+  # ── Whole-binary render coverage ────────────────────────────────────
+  #
+  # The other gates score nine hand-picked functions and check that what they
+  # render is correct. This one asks how much of a binary renders at all, which
+  # is the question that went unmeasured while `/bin/ls` halved. It gates on the
+  # two programs the repository ships as bytes, reports the compiled cells, and
+  # reports whatever the runner has at `/bin/ls` without gating on it, because
+  # the runner image decides which program that name points at.
+  coverage:
+    name: Whole-Binary Render Coverage
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Rust PATH
+        run: |
+          for p in "$HOME/.cargo/bin" "/root/.cargo/bin" "/usr/local/cargo/bin"; do
+            if [ -d "$p" ]; then
+              echo "$p" >> "$GITHUB_PATH"
+              export PATH="$p:$PATH"
+            fi
+          done
+          command -v cargo >/dev/null
+      - name: Ensure radare2 + headers
+        run: bash .github/scripts/ensure-radare2-ci.sh
+      - name: Run coverage sweep
+        run: ./tests/coverage/run_coverage.sh
+      - name: Archive coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tests/coverage/artifacts/coverage.json
+          if-no-files-found: error
+
   # ── Rust E2E / integration tests ────────────────────────────────────
   e2e:
     name: Rust E2E Tests

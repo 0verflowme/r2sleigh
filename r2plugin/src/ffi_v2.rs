@@ -1189,10 +1189,40 @@ unsafe fn capture_trusted_ssa_from_buffer(
     let mut callee_interfaces = std::collections::BTreeMap::new();
     let callee_started = Instant::now();
     let callee_count = callees.len();
+    let mut callee_hits = 0usize;
     for callee in callees {
         let entry = callee.function().address();
-        let Ok(artifact) = trusted_from_source(callee, execution) else {
-            continue;
+        // A callee body is prepared from its own snapshot and nothing else --
+        // the set is one level deep, so it has no callee interfaces of its own
+        // to be prepared against. Re-serializing it therefore reproduces the
+        // whole of what its lift reads, which is what the cache compares. The
+        // encoder is deterministic, so the same body yields the same bytes;
+        // re-encoding costs microseconds against a lift's hundreds of
+        // milliseconds, and a body that will not serialize is simply not
+        // cached rather than being cached under a partial key.
+        //
+        // `encode_snapshot_cache_key` rather than `encode_snapshot`, because a
+        // callee inherits its caller's capture tag and a plain encoding would
+        // therefore differ for every caller of the same body. That function
+        // states exactly what it substitutes and why.
+        let key = r2source::snapshot_wire::encode_snapshot_cache_key(&callee).ok();
+        let cached = key
+            .as_deref()
+            .and_then(|key| r2engine::cached_function_artifact(CALLEE, entry, key));
+        let artifact = match cached {
+            Some(artifact) => {
+                callee_hits += 1;
+                artifact
+            }
+            None => {
+                let Ok(artifact) = trusted_from_source(callee, execution) else {
+                    continue;
+                };
+                if let Some(key) = key.as_deref() {
+                    r2engine::cache_function_artifact(CALLEE, entry, key, &artifact);
+                }
+                artifact
+            }
         };
         if let Some(interface) = artifact.artifact().machine_context().function_interface() {
             callee_interfaces.insert(entry, interface.clone());
@@ -1201,7 +1231,20 @@ unsafe fn capture_trusted_ssa_from_buffer(
     }
     let callee_elapsed = callee_started.elapsed();
     let root_started = Instant::now();
-    let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
+    // The root is prepared against the interfaces of the callees above, so its
+    // input is the whole request buffer rather than its own record within it.
+    // That is exactly the buffer in hand, and it is the buffer radare2 built
+    // from the function and everything it calls: two requests that agree on it
+    // agree on every input the root's preparation reads.
+    let root_address = source.function().address();
+    let (root, root_hit) = match r2engine::cached_function_artifact(ROOT, root_address, bytes) {
+        Some(root) => (root, true),
+        None => {
+            let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
+            r2engine::cache_function_artifact(ROOT, root_address, bytes, &root);
+            (root, false)
+        }
+    };
     Ok(TrustedIngress {
         root,
         callees: lifted_callees,
@@ -1209,10 +1252,15 @@ unsafe fn capture_trusted_ssa_from_buffer(
             decode: decode_elapsed,
             callee_lift: callee_elapsed,
             callee_count,
+            callee_hits,
             root_lift: root_started.elapsed(),
+            root_hit,
         },
     })
 }
+
+const ROOT: r2engine::PreparedRole = r2engine::PreparedRole::Root;
+const CALLEE: r2engine::PreparedRole = r2engine::PreparedRole::Callee;
 
 /// What one snapshot capture cost, split where the cost actually divides.
 ///
@@ -1225,20 +1273,32 @@ pub(crate) struct CaptureTiming {
     pub(crate) decode: Duration,
     pub(crate) callee_lift: Duration,
     pub(crate) callee_count: usize,
+    /// How many of those callees came back from the program cache instead of
+    /// being lifted. Reported beside the count, because `callee_lift` falling
+    /// says nothing on its own about whether the cache or the program changed.
+    pub(crate) callee_hits: usize,
     pub(crate) root_lift: Duration,
+    pub(crate) root_hit: bool,
 }
 
 impl CaptureTiming {
     /// One comment naming the capture's cost, when `R2SLEIGH_TIMING` asks.
     pub(crate) fn comment(&self) -> Option<String> {
         std::env::var_os("R2SLEIGH_TIMING")?;
+        let cache = r2engine::program_cache_stats();
         Some(format!(
-            "/* r2dec timing: capture={}us decode={}us callee_lift={}us callees={} root_lift={}us */",
+            "/* r2dec timing: capture={}us decode={}us callee_lift={}us callees={} cached_callees={} root_lift={}us cached_root={} cache_entries={} cache_hits={} cache_misses={} cache_replacements={} */",
             (self.decode + self.callee_lift + self.root_lift).as_micros(),
             self.decode.as_micros(),
             self.callee_lift.as_micros(),
             self.callee_count,
+            self.callee_hits,
             self.root_lift.as_micros(),
+            u8::from(self.root_hit),
+            cache.entries,
+            cache.hits,
+            cache.misses,
+            cache.replacements,
         ))
     }
 }

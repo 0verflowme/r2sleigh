@@ -1,0 +1,181 @@
+{
+  "functions": {
+    "bzip2recover/O0::bsClose": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.8472222222222222,
+        "ged": 8.0,
+        "type_match": 0.5
+      },
+      "scores": {
+        "byte_match": 0.0,
+        "ged": 8.0,
+        "type_match": 0.0
+      }
+    },
+    "bzip2recover/O0::bsGetBit": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.375,
+        "ged": 2.0,
+        "type_match": 0.5
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::bsOpenReadStream": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.75,
+        "ged": 6.0,
+        "type_match": 0.0
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::bsOpenWriteStream": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.75,
+        "ged": 6.0,
+        "type_match": 0.0
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::bsPutBit": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.45588235294117646,
+        "ged": 2.0,
+        "type_match": 0.6666666666666666
+      },
+      "scores": {
+        "byte_match": 0.052884615384615384,
+        "ged": 5.0,
+        "type_match": 0.0
+      }
+    },
+    "bzip2recover/O0::bsPutUChar": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.35135135135135137,
+        "ged": 3.0,
+        "type_match": 0.3333333333333333
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::bsPutUInt32": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.5161290322580645,
+        "ged": 3.0,
+        "type_match": 0.6666666666666666
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::endsInBz2": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.7777777777777778,
+        "ged": 7.0,
+        "type_match": 1.0
+      },
+      "scores": {
+        "byte_match": 0.08780487804878048,
+        "ged": 25.0,
+        "type_match": 0.5
+      }
+    },
+    "bzip2recover/O0::entry.fini0": {
+      "decompiled": true,
+      "reference": {},
+      "scores": {
+        "byte_match": 0.0
+      }
+    },
+    "bzip2recover/O0::main": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.533515731874145,
+        "ged": 35.0,
+        "type_match": 0.8333333333333334
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::mallocFail": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.9090909090909091,
+        "ged": 0.0,
+        "type_match": 1.0
+      },
+      "scores": {
+        "byte_match": 0.16071428571428573,
+        "ged": 0.0,
+        "type_match": 0.0
+      }
+    },
+    "bzip2recover/O0::readError": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.9130434782608695,
+        "ged": 0.0
+      },
+      "scores": {
+        "byte_match": 0.21428571428571427,
+        "ged": 0.0
+      }
+    },
+    "bzip2recover/O0::sub_401285": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.0
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::sub_4017ef": {
+      "decompiled": false,
+      "reference": {
+        "byte_match": 0.0
+      },
+      "scores": {}
+    },
+    "bzip2recover/O0::tooManyBlocks": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.9333333333333333,
+        "ged": 0.0,
+        "type_match": 1.0
+      },
+      "scores": {
+        "byte_match": 0.15584415584415584,
+        "ged": 0.0,
+        "type_match": 0.0
+      }
+    },
+    "bzip2recover/O0::writeError": {
+      "decompiled": true,
+      "reference": {
+        "byte_match": 0.9130434782608695,
+        "ged": 0.0
+      },
+      "scores": {
+        "byte_match": 0.21428571428571427,
+        "ged": 0.0
+      }
+    }
+  },
+  "schema_version": 1,
+  "summary": {
+    "byte_match": {
+      "mean": 0.11072742044540825,
+      "n": 8
+    },
+    "ged": {
+      "mean": 5.428571428571429,
+      "n": 7
+    },
+    "type_match": {
+      "mean": 0.1,
+      "n": 5
+    }
+  }
+}

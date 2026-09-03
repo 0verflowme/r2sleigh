@@ -165,6 +165,26 @@ impl SourceSignaturePresentation {
     pub fn parameters(&self) -> &[SourceSignatureParameter] {
         &self.parameters
     }
+
+    /// The parameters the prototype names, without the variadic tail.
+    ///
+    /// A prototype that ends in an ellipsis carries it as a trailing
+    /// parameter, so the parameter list on its own over-counts what the callee
+    /// is declared to take by one, and every caller that treated its length as
+    /// the arity said so for every call site of a variadic callee alike.
+    pub fn named_parameters(&self) -> &[SourceSignatureParameter] {
+        match self.parameters.split_last() {
+            Some((last, rest)) if last.is_variadic_tail() => rest,
+            _ => &self.parameters,
+        }
+    }
+
+    /// Whether the callee takes a variadic tail.
+    pub fn is_variadic(&self) -> bool {
+        self.parameters
+            .last()
+            .is_some_and(SourceSignatureParameter::is_variadic_tail)
+    }
 }
 
 /// One parameter of a recovered prototype: what it is called and its spelling.
@@ -191,6 +211,20 @@ impl SourceSignatureParameter {
 
     pub fn type_spelling(&self) -> Option<&str> {
         self.type_spelling.as_deref()
+    }
+
+    /// Whether this entry is the ellipsis rather than a parameter.
+    ///
+    /// This is how the source spells a variadic tail: a trailing entry called
+    /// `...`, which names no storage and stands for however many arguments a
+    /// call chooses to pass. Older captures put the ellipsis in the type half
+    /// instead, so both spellings are recognised -- the same two the source's
+    /// own `r_type_arg_is_vararg` accepts.
+    pub fn is_variadic_tail(&self) -> bool {
+        [self.name(), self.type_spelling()]
+            .into_iter()
+            .flatten()
+            .any(|spelling| spelling.trim() == "...")
     }
 }
 
@@ -491,6 +525,22 @@ impl OwnedFunctionImage {
     }
 }
 
+/// How control reaches the callee at an advisory call site.
+///
+/// A call comes back; a tail transfer does not, and the callee's return is
+/// the caller's. The two tail forms differ in what names the callee. A jump
+/// names its target directly, and the source's function map says the target
+/// is where a function starts. A jump through a loaded value is licensed by
+/// the relocation on the slot the value was loaded from, so the site's target
+/// address is then that slot rather than any code address, and the machine
+/// still has to show that the jump reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdvisoryCallTransfer {
+    Call,
+    TailJump,
+    TailSlot,
+}
+
 /// Advisory call metadata copied from the source snapshot. This projection
 /// does not claim exact call-site identity, so it cannot create a call
 /// certificate. It is retained only for diagnostics and future comparison
@@ -499,6 +549,7 @@ impl OwnedFunctionImage {
 pub struct AdvisoryCallSite {
     instruction_address: u64,
     target_address: u64,
+    transfer: AdvisoryCallTransfer,
     /// What radare2 calls the target. Absent when it has no name for it.
     ///
     /// This spells the call in rendered output and nothing more: it is not
@@ -537,6 +588,12 @@ impl AdvisoryCallSite {
 
     pub const fn target_address(&self) -> u64 {
         self.target_address
+    }
+
+    /// How control reaches the callee: by a call, or by a jump that never
+    /// comes back.
+    pub const fn transfer(&self) -> AdvisoryCallTransfer {
+        self.transfer
     }
 
     /// What radare2 calls the target, when it has a name for it.

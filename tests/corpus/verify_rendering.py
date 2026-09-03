@@ -326,6 +326,35 @@ class FunctionSpec:
         return self.result_bits // 4
 
 
+@dataclass(frozen=True)
+class ScalarSpec:
+    """A function the corpus calls with plain integers rather than a buffer.
+
+    `FunctionSpec` describes the one shape the hash corpus has: a byte buffer,
+    a length, and optionally a seed. Nothing outside that shape can be
+    expressed by it, which is why the semantic gate saw only hash functions.
+    This is the second description: N unsigned 64-bit arguments in, one
+    unsigned integer out, with the argument vectors named here so a function
+    that needs particular operands -- a negative dividend, say -- gets them.
+
+    The interesting shape lives inside the function and in the helpers it
+    calls, not in its interface, so the harness needs to know nothing about
+    structs, frames or recursion in order to score them.
+    """
+
+    result_bits: int
+    arity: int
+    arguments: tuple[tuple[int, ...], ...]
+
+    @property
+    def c_result_type(self) -> str:
+        return f"uint{self.result_bits}_t"
+
+    @property
+    def printf_width(self) -> int:
+        return self.result_bits // 4
+
+
 SPECS: dict[str, FunctionSpec] = {
     "fnv1a32": FunctionSpec(32, 2),
     "fnv1a64": FunctionSpec(64, 2),
@@ -336,6 +365,76 @@ SPECS: dict[str, FunctionSpec] = {
     "murmur3_32": FunctionSpec(32, 3, 0x9747B28C),
     "xxhash32": FunctionSpec(32, 3, 0),
     "pearson": FunctionSpec(8, 2),
+}
+
+# One argument vector set for every shape. The values are chosen so that the
+# operands reach the cases a shape can get wrong: zero and one for the
+# degenerate paths, values whose signed reading is negative for the division
+# shape, INT64_MIN over minus one for the quotient that has no representation,
+# and two full-width mixed patterns so a truncation to 32 bits shows.
+SHAPE_ARGUMENTS: tuple[tuple[int, ...], ...] = (
+    (0x0, 0x0),
+    (0x0, 0x1),
+    (0x1, 0x0),
+    (0x1, 0x1),
+    (0x2, 0x3),
+    (0xC, 0x5),
+    (0xFF, 0x100),
+    (0x7FFFFFFF, 0x80000000),
+    (0xFFFFFFFFFFFFFFFF, 0x1),
+    (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+    (0x8000000000000000, 0xFFFFFFFFFFFFFFFF),
+    (0xFFFFFFFFFFFFFFF9, 0x7),
+    (0x7, 0xFFFFFFFFFFFFFFFD),
+    (0xDEADBEEFCAFEBABE, 0x0123456789ABCDEF),
+    (0x0123456789ABCDEF, 0xFEDCBA9876543210),
+    (0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F),
+)
+
+SHAPE_SPECS: dict[str, ScalarSpec] = {
+    name: ScalarSpec(64, 2, SHAPE_ARGUMENTS)
+    for name in (
+        "shape_variadic",
+        "shape_variadic_local",
+        "shape_call_chain",
+        "shape_struct_pointer",
+        "shape_struct_value",
+        "shape_struct_array",
+        "shape_stack_buffer",
+        "shape_recurse_direct",
+        "shape_recurse_mutual",
+        "shape_signed_divmod",
+        "shape_multiword_return",
+        "shape_pointer_to_pointer",
+        "shape_function_pointer",
+    )
+}
+
+# The helpers each corpus carries. They are not scored, but a rendered call
+# needs its callee defined in the same translation unit, so the sweep captures
+# them under their own marker and `callee_definitions` picks them up by name.
+CORPUS_CALLEES = {
+    "hashes": ("rotl32",),
+    "shapes": (
+        "vfold",
+        "shape_step",
+        "shape_stash",
+        "mixed_touch",
+        "mixed_fold",
+        "shape_mutual_even",
+        "shape_mutual_odd",
+        "wide_make",
+        "indirect_load",
+        "indirect_store",
+        "op_add",
+        "op_xor",
+        "op_mul",
+    ),
+}
+
+CORPUS_SPECS: dict[str, dict[str, Any]] = {
+    "hashes": SPECS,
+    "shapes": SHAPE_SPECS,
 }
 
 
@@ -1367,6 +1466,21 @@ def _matching_brace(text: str, opening: int) -> int | None:
     return None
 
 
+# The renderer, when it declines, emits one comment in place of the function and
+# names why. Reading it is the difference between a cell that says "unparsable"
+# and a cell that says which rule refused, which is the whole value of the gate
+# on a corpus where most cells refuse.
+FALLBACK_REASON_RE = re.compile(
+    r"/\* r2dec fallback: skipped decompilation for (?P<function>\S+) "
+    r"\((?P<reason>.*?)\) \*/"
+)
+
+
+def fallback_reason(section: str) -> str | None:
+    match = FALLBACK_REASON_RE.search(section)
+    return match.group("reason") if match else None
+
+
 def extract_function(section: str, name: str) -> tuple[str | None, str | None]:
     candidates: list[tuple[int, int]] = []
     for line_match in re.finditer(r"(?m)^.*$", section):
@@ -1426,7 +1540,7 @@ def declared_callees(source: str) -> list[str]:
 
 
 def callee_definitions(
-    sections: dict[str, list[str]], source: str
+    sections: dict[str, list[str]], source: str, *, root: str | None = None
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Renderings of the callees, for the same translation unit.
 
@@ -1436,11 +1550,25 @@ def callee_definitions(
     corpus makes. A callee with no section is left out -- at -O1 and above these
     helpers are inlined and have no symbol -- and the caller then fails to link,
     which is the truth about that rendering.
+
+    The closure is transitive. A helper that calls a second helper needs that
+    one too, and mutual recursion between two helpers needs both; taking only
+    the scored function's direct callees left the translation unit short of a
+    definition for reasons that had nothing to do with the rendering. `root` is
+    the scored function's own name, excluded so a recursive call does not ask
+    for a second definition of the function already in the unit.
     """
     definitions: list[str] = []
     notes: list[dict[str, Any]] = []
-    for spelled in declared_callees(source):
-        bare = spelled.removeprefix("sym__")
+    resolved: set[str] = {root} if root is not None else set()
+    pending = [
+        spelled.removeprefix("sym__") for spelled in declared_callees(source)
+    ]
+    while pending:
+        bare = pending.pop(0)
+        if bare in resolved:
+            continue
+        resolved.add(bare)
         found = sections.get(bare, [])
         if len(found) != 1:
             notes.append(
@@ -1457,6 +1585,9 @@ def callee_definitions(
             continue
         definitions.append(body)
         notes.append({"callee": bare, "status": "rendered"})
+        pending.extend(
+            spelled.removeprefix("sym__") for spelled in declared_callees(body)
+        )
     return definitions, notes
 
 
@@ -1914,7 +2045,15 @@ def map_image_data(
     return mapped, blobs, records
 
 
-def cases_for(name: str, spec: FunctionSpec) -> list[dict[str, Any]]:
+def cases_for(name: str, spec: FunctionSpec | ScalarSpec) -> list[dict[str, Any]]:
+    if isinstance(spec, ScalarSpec):
+        return [
+            {
+                "case_id": "args:" + ",".join(f"0x{value:x}" for value in arguments),
+                "arguments": list(arguments),
+            }
+            for arguments in spec.arguments
+        ]
     lengths = [0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 61]
     cases: list[dict[str, Any]] = []
     for length in lengths:
@@ -1959,11 +2098,44 @@ def cases_for(name: str, spec: FunctionSpec) -> list[dict[str, Any]]:
     return cases
 
 
+def scalar_case_arguments(
+    case: dict[str, Any],
+    *,
+    diagnostic: bool,
+    declared_parameters: list[str] | None,
+) -> list[str]:
+    """The call arguments for one scalar case.
+
+    A scalar corpus hands the function integers, so none of the pointer
+    conversion the buffer corpus needs applies. Each value is written at its
+    full width and converted to whatever type the rendering declared for that
+    position: a rendering that recovered a narrower parameter than the source
+    has therefore truncates the operand, which is exactly what the machine
+    would do and is a difference the differential is entitled to see.
+    """
+    literals = [f"UINT64_C({value})" for value in case["arguments"]]
+    if diagnostic:
+        return [f"(unsigned long long){literal}" for literal in literals]
+    if declared_parameters is None:
+        return literals
+    converted = [
+        f"({declared_parameters[position]}){literal}"
+        for position, literal in enumerate(literals)
+        if position < len(declared_parameters)
+    ]
+    # A rendering may recover more parameters than the source has; the corpus
+    # has no value for those, and passes the zero a caller leaves in a register
+    # it never wrote. Fewer is refused earlier as a signature mismatch.
+    return converted + [
+        f"({declared})0" for declared in declared_parameters[len(literals) :]
+    ]
+
+
 def runner_source(
     function_source: str,
     blobs: list[str],
     name: str,
-    spec: FunctionSpec,
+    spec: FunctionSpec | ScalarSpec,
     cases: list[dict[str, Any]],
     *,
     diagnostic: bool,
@@ -1973,6 +2145,19 @@ def runner_source(
     arrays = []
     arms = []
     for index, case in enumerate(cases):
+        if isinstance(spec, ScalarSpec):
+            args = scalar_case_arguments(
+                case,
+                diagnostic=diagnostic,
+                declared_parameters=declared_parameters,
+            )
+            callee = f"dec_{name}"
+            call = f"{callee}({', '.join(args)})"
+            arms.append(
+                f"case {index}u: printf(\"%0{spec.printf_width}\" PRIx{spec.result_bits} \"\\n\", "
+                f"({spec.c_result_type})({call})); return 0;"
+            )
+            continue
         data = bytes.fromhex(case["bytes"])
         initializer = ",".join(str(byte) for byte in data) if data else "0"
         arrays.append(f"static unsigned char case_{index}[] = {{{initializer}}};")
@@ -2079,8 +2264,14 @@ def run_case(executable: Path, index: int) -> dict[str, Any]:
 
 
 def oracle_case(
-    oracle: Path, name: str, spec: FunctionSpec, case: dict[str, Any]
+    oracle: Path, name: str, spec: FunctionSpec | ScalarSpec, case: dict[str, Any]
 ) -> dict[str, Any]:
+    if isinstance(spec, ScalarSpec):
+        command = [str(oracle), name, *(f"0x{value:x}" for value in case["arguments"])]
+        result = run_command(command, timeout=3)
+        if result["status"] == "pass":
+            result["value"] = result["stdout"].strip().lower()
+        return result
     payload = case["bytes"] or "-"
     command = [str(oracle), name, payload]
     if spec.arity == 3:
@@ -2091,7 +2282,8 @@ def oracle_case(
     return result
 
 
-def load_baseline(path: Path) -> dict[str, str]:
+def load_baseline(path: Path, specs: dict[str, Any] | None = None) -> dict[str, str]:
+    specs = SPECS if specs is None else specs
     if not path.exists():
         return {}
     data = json.loads(path.read_text())
@@ -2099,7 +2291,7 @@ def load_baseline(path: Path) -> dict[str, str]:
         raise ValueError(f"unsupported baseline manifest: {path}")
     baseline = {str(key): str(value) for key, value in data["raw_sha256"].items()}
     expected = {
-        f"{config}/{function}" for config in CONFIGS for function in SPECS
+        f"{config}/{function}" for config in CONFIGS for function in specs
     }
     if set(baseline) != expected:
         missing = sorted(expected - set(baseline))
@@ -2128,14 +2320,16 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     output_text = read_exact_text(args.input)
     sections = marked_sections(output_text)
     artifact_root: Path = args.artifact_root
+    corpus_prefix = "" if args.corpus == "hashes" else f"{args.corpus}_"
     raw_dir = artifact_root / "raw"
-    compile_dir = artifact_root / "compile" / args.config
+    compile_dir = artifact_root / "compile" / f"{corpus_prefix}{args.config}"
     raw_dir.mkdir(parents=True, exist_ok=True)
     compile_dir.mkdir(parents=True, exist_ok=True)
-    baseline = load_baseline(args.baseline)
+    specs = CORPUS_SPECS[args.corpus]
+    baseline = load_baseline(args.baseline, specs)
     entries: list[dict[str, Any]] = []
 
-    for name, spec in SPECS.items():
+    for name, spec in specs.items():
         key = f"{args.config}/{name}"
         entry: dict[str, Any] = {
             "config": args.config,
@@ -2166,7 +2360,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         ) = parse_render_audits(found[0])
         section_dir = artifact_root / "raw-sections"
         section_dir.mkdir(parents=True, exist_ok=True)
-        section_path = section_dir / f"{args.config}_{name}.txt"
+        section_path = section_dir / f"{corpus_prefix}{args.config}_{name}.txt"
         write_exact_text(section_path, exact_section)
         section_hash = sha256_text(exact_section)
         entry["generation"].update(
@@ -2196,7 +2390,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 else extraction_error
             )
             entry["generation"].update(
-                {"status": terminal_status, "error": terminal_error}
+                {
+                    "status": terminal_status,
+                    "error": terminal_error,
+                    "fallback_reason": fallback_reason(exact_section),
+                }
             )
             entry["raw"] = {"status": "blocked_generation"}
             entry["diagnostic"] = {"status": "blocked_generation", "rewrites": []}
@@ -2210,7 +2408,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
 
         entry["machine_noise"] = _score_machine_noise(raw_source, args.config)
 
-        raw_path = raw_dir / f"{args.config}_{name}.c"
+        raw_path = raw_dir / f"{corpus_prefix}{args.config}_{name}.c"
         raw_path.write_text(raw_source)
         raw_hash = sha256_text(raw_source)
         entry["generation"].update(
@@ -2253,9 +2451,12 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
 
         declared_parameters = rendered_parameter_types(normalized)
         declared_return = rendered_return_type(normalized, name)
-        expected_parameters = ["const uint8_t *", "size_t"]
-        if spec.arity == 3:
-            expected_parameters.append("uint32_t")
+        if isinstance(spec, ScalarSpec):
+            expected_parameters = ["uint64_t"] * spec.arity
+        else:
+            expected_parameters = ["const uint8_t *", "size_t"]
+            if spec.arity == 3:
+                expected_parameters.append("uint32_t")
         # Reported, never gating: whether the rendering's own signature equals
         # the source's types is the typed-recovery question, and the decompiler
         # documents that it does not claim them.
@@ -2267,7 +2468,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "parameters_match": declared_parameters == expected_parameters,
             "return_matches": declared_return == spec.c_result_type,
         }
-        callee_sources, callee_notes = callee_definitions(sections, raw_mapped)
+        callee_sources, callee_notes = callee_definitions(
+            sections, raw_mapped, root=name
+        )
         if callee_notes:
             entry["callees"] = callee_notes
         raw_program = runner_source(
@@ -2304,7 +2507,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 spec,
                 cases,
                 diagnostic=True,
-                callee_sources=callee_definitions(sections, diagnostic_mapped)[0],
+                callee_sources=callee_definitions(
+                    sections, diagnostic_mapped, root=name
+                )[0],
                 declared_parameters=declared_parameters,
             )
             diagnostic_compile = compile_runner(
@@ -2322,10 +2527,19 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         diagnostic_compile["assumed_widths"] = assumed_widths
         entry["diagnostic"] = diagnostic_compile
 
-        legacy_index = next(
-            index
-            for index, case in enumerate(cases)
-            if case["length"] == len(LEGACY_MESSAGE) and case["seed"] == spec.default_seed
+        # One case decides whether the diagnostic path even produces the right
+        # answer, reported separately from the differential's full sweep. The
+        # buffer corpus uses its historical message; a scalar corpus has no
+        # such case and uses its first argument vector.
+        legacy_index = (
+            0
+            if isinstance(spec, ScalarSpec)
+            else next(
+                index
+                for index, case in enumerate(cases)
+                if case["length"] == len(LEGACY_MESSAGE)
+                and case["seed"] == spec.default_seed
+            )
         )
         oracle_legacy = oracle_case(args.oracle, name, spec, cases[legacy_index])
         if oracle_legacy["status"] != "pass":
@@ -2394,7 +2608,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "config": args.config,
-        "expected_entries": len(SPECS),
+        "corpus": args.corpus,
+        "expected_entries": len(specs),
         "input": str(args.input),
         "binary": str(args.binary),
         "oracle": str(args.oracle),
@@ -2404,7 +2619,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def print_summary(report: dict[str, Any]) -> None:
-    print(f"== {report['config']} ({len(report['entries'])}/{report['expected_entries']} cells)")
+    print(
+        f"== {report.get('corpus', 'hashes')}/{report['config']} "
+        f"({len(report['entries'])}/{report['expected_entries']} cells)"
+    )
     for entry in report["entries"]:
         print(
             f"  {entry['function']:<15}"
@@ -2435,17 +2653,37 @@ def print_summary(report: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("config", choices=tuple(CONFIGS))
+    parser.add_argument(
+        "--corpus",
+        choices=tuple(CORPUS_SPECS),
+        default="hashes",
+        help="which corpus source's functions to score",
+    )
     parser.add_argument("--input", type=Path)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--oracle", type=Path)
     parser.add_argument("--artifact-root", type=Path, default=ROOT / "artifacts")
-    parser.add_argument(
-        "--baseline", type=Path, default=ROOT / "raw-baseline-sha256.json"
-    )
+    parser.add_argument("--baseline", type=Path)
     args = parser.parse_args()
-    args.input = args.input or args.artifact_root / "dumps" / f"out_{args.config}.txt"
-    args.binary = args.binary or args.artifact_root / "bin" / CONFIGS[args.config]
-    args.oracle = args.oracle or args.artifact_root / "bin" / f"oracle_{args.config}"
+    # The hash corpus keeps its historical file names so nothing that reads its
+    # artifacts has to learn a new layout; every other corpus is named.
+    prefix = "" if args.corpus == "hashes" else f"{args.corpus}_"
+    binary_stem = CONFIGS[args.config] if args.corpus == "hashes" else (
+        f"{args.corpus}_{args.config}"
+    )
+    if args.baseline is None:
+        args.baseline = ROOT / (
+            "raw-baseline-sha256.json"
+            if args.corpus == "hashes"
+            else f"raw-baseline-{args.corpus}-sha256.json"
+        )
+    args.input = args.input or (
+        args.artifact_root / "dumps" / f"{prefix}out_{args.config}.txt"
+    )
+    args.binary = args.binary or args.artifact_root / "bin" / binary_stem
+    args.oracle = args.oracle or (
+        args.artifact_root / "bin" / f"{prefix}oracle_{args.config}"
+    )
     for label in ("input", "binary", "oracle"):
         path = getattr(args, label)
         if not path.exists():
@@ -2458,7 +2696,8 @@ def main() -> int:
     report = verify(args)
     result_dir = args.artifact_root / "results"
     result_dir.mkdir(parents=True, exist_ok=True)
-    result_path = result_dir / f"{args.config}.json"
+    prefix = "" if args.corpus == "hashes" else f"{args.corpus}_"
+    result_path = result_dir / f"{prefix}{args.config}.json"
     result_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print_summary(report)
     print(f"  report={result_path}")

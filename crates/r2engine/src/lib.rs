@@ -22,8 +22,13 @@ use serde::{Deserialize, Serialize};
 
 mod json;
 mod policy;
+mod program_cache;
 pub use json::*;
 pub use policy::*;
+pub use program_cache::{
+    PreparedRole, ProgramCacheStats, cache_function_artifact, cached_function_artifact,
+    cached_function_fingerprint, clear_program_cache, program_cache_stats,
+};
 
 mod route;
 
@@ -2625,8 +2630,13 @@ fn trusted_callee_signatures(
                         .return_type()
                         .and_then(|spelling| source_spelled_type(spelling, ptr_bits))
                         .unwrap_or(r2types::CTypeLike::Unknown),
+                    // The ellipsis is not a parameter and has no type. Copying
+                    // it in as one, and then calling the whole prototype
+                    // non-variadic, said `fprintf` takes exactly three
+                    // arguments -- so every call to it was cut to three,
+                    // whatever the machine passed.
                     params: signature
-                        .parameters()
+                        .named_parameters()
                         .iter()
                         .map(|parameter| {
                             parameter
@@ -2635,7 +2645,7 @@ fn trusted_callee_signatures(
                                 .unwrap_or(r2types::CTypeLike::Unknown)
                         })
                         .collect(),
-                    variadic: false,
+                    variadic: signature.is_variadic(),
                 },
             )
         })

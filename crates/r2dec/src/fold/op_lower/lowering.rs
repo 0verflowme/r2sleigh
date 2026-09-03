@@ -1078,7 +1078,7 @@ impl<'a> FoldingContext<'a> {
                                 source_block,
                                 source_op_idx,
                                 &certified_args,
-                            );
+                            )?;
                             let call = CExpr::call_at(
                                 (source_block, source_op_idx),
                                 func_expr,

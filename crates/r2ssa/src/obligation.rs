@@ -2372,6 +2372,7 @@ mod tests {
                         value: crate::semantic::SourceCallArgumentValue::Value(second),
                     },
                 ],
+                fixed_argument_count: Some(2),
                 results: Vec::new(),
                 complete: true,
             },
