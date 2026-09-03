@@ -1991,7 +1991,7 @@ mod tests {
             Ok(CExpr::IntLit(7))
         );
         assert_eq!(
-            ctx.get_expr(dst),
+            ctx.get_expr(dst).map(|expr| expr.unobserved().clone()),
             Ok(CExpr::Var(
                 names
                     .symbol_for_value(dst_value)

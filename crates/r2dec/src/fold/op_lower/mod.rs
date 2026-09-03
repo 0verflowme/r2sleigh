@@ -124,6 +124,53 @@ enum LoweredOp {
     None,
 }
 
+/// An expression that cannot leave operation lowering until its complete
+/// replacement contract has been turned into render cells.
+///
+/// The payload is deliberately opaque outside this module: a renderer may
+/// produce syntax and identify the source-owned thing it replaces, but only
+/// [`FoldingContext::finish_replacement_expr`] can recover the `CExpr`.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "a pending replacement must be finalized into render cells"]
+struct PendingReplacementExpr {
+    expr: CExpr,
+    value: ValueId,
+    source: ReplacementSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementSource {
+    RenderedValue,
+    PlannedInline,
+    CanonicalAccess(r2ssa::StructuredAccessId),
+}
+
+impl PendingReplacementExpr {
+    fn rendered_value(value: ValueId, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::RenderedValue,
+        }
+    }
+
+    fn planned_inline(value: ValueId, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::PlannedInline,
+        }
+    }
+
+    fn canonical_access(value: ValueId, access: r2ssa::StructuredAccessId, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value,
+            source: ReplacementSource::CanonicalAccess(access),
+        }
+    }
+}
+
 pub(crate) type OpLoweringResult<T> = Result<T, OpLoweringRefusal>;
 
 #[derive(Debug, Clone, PartialEq)]

@@ -40,6 +40,20 @@ impl CertifiedMemoryAccessExpr {
     }
 }
 
+/// Syntax selected for a certified memory access before its render-cell
+/// contract is finalized.
+///
+/// Every route returns this enum rather than a `CExpr`. Adding a route without
+/// deciding whether it preserves the plan's ordinary value rendering or
+/// replaces a canonical access therefore fails at the return type; adding a
+/// new contract kind also makes the finalizer's match non-exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "certified memory syntax must pass through its cell finalizer"]
+enum PendingMemoryAccessExpr {
+    Planned(CExpr),
+    Replacement(PendingReplacementExpr),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct CertifiedLinearAddress {
     base: CExpr,
@@ -78,7 +92,7 @@ impl<'a> FoldingContext<'a> {
             })
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         let expr = self
-            .render_certified_memory_expr_for_fact(fact, elem_ty.clone())
+            .finalize_certified_memory_expr_for_fact(fact, elem_ty.clone())
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
         if is_write && !Self::expr_is_store_target_candidate(&expr) {
             return Err(OpLoweringRefusal::missing_machine_projection());
@@ -696,26 +710,6 @@ impl<'a> FoldingContext<'a> {
                 return None;
             }
         };
-        // An address is an operand like any other, and reading it is a read of
-        // the value. This path builds the operand's expression itself rather
-        // than going through the operand-observation path, so the read went
-        // unmarked -- invisible while the address is a computation whose parts
-        // are observed on their way here, and fatal when it is a bare literal,
-        // which is then a planned inline value that no rendered occurrence
-        // accounts for and the journal refuses the function over.
-        let site = self
-            .current_source_op_site()
-            .and_then(|(block_addr, op_idx)| self.normalized_site(block_addr, op_idx));
-        let input_idx = self
-            .prepared_ssa()
-            .and_then(|prepared| prepared.graph().inst(fact.access.inst))
-            .and_then(|inst| inst.inputs.iter().position(|input| *input == fact.address));
-        let expr = match (site, input_idx) {
-            (Some(_), Some(input_idx)) => {
-                self.observe_optional_normalized_input_value_expr(site, input_idx, expr)
-            }
-            _ => expr,
-        };
         Some((addr, expr))
     }
 
@@ -724,37 +718,38 @@ impl<'a> FoldingContext<'a> {
     /// slot's name, a declared member split out of the address, and last the
     /// address itself dereferenced. Each is one lookup; none takes an
     /// expression apart to decide.
-    pub(super) fn render_certified_memory_expr_for_fact(
+    fn render_certified_memory_expr_for_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: CType,
-    ) -> Option<CExpr> {
+    ) -> Option<PendingMemoryAccessExpr> {
         if fact.space != r2il::SpaceId::Ram {
             return None;
         }
         if let Some(array) = self.certified_array_fact_for_memory(fact)
             && (array.base.is_some() || array.index.is_some())
         {
-            return self.render_certified_semantic_array_expr(fact);
+            return self
+                .render_certified_semantic_array_expr(fact)
+                .map(PendingMemoryAccessExpr::Planned);
         }
         if let Some(expr) = self.certified_subscript_expr_for_fact(fact, &elem_ty) {
-            return Some(expr);
+            return Some(PendingMemoryAccessExpr::Replacement(expr));
         }
         if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
-            return Some(expr);
+            return Some(PendingMemoryAccessExpr::Planned(expr));
         }
         let (_, addr_expr) = self.certified_memory_address_expr(fact)?;
         if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {
-            return Some(rendered);
+            return Some(PendingMemoryAccessExpr::Planned(rendered));
         }
         if matches!(addr_expr, CExpr::Binary { .. }) {
             let pointer_bits = self.pointer_bits();
             let byte_address = self
                 .render_certified_linear_byte_address(&addr_expr)
                 .or_else(|| self.integerize_certified_address_expr(&addr_expr, pointer_bits))?;
-            return Some(CExpr::Deref(Box::new(CExpr::cast(
-                CType::ptr(elem_ty),
-                byte_address,
+            return Some(PendingMemoryAccessExpr::Planned(CExpr::Deref(Box::new(
+                CExpr::cast(CType::ptr(elem_ty), byte_address),
             ))));
         }
         // The address is a value, and what it is declared as is what the
@@ -762,7 +757,25 @@ impl<'a> FoldingContext<'a> {
         let ptr_ty = CType::ptr(elem_ty);
         let address_type = self.value_type(fact.address);
         let casted = self.convert_from(addr_expr, address_type.as_ref(), &ptr_ty);
-        Some(CExpr::Deref(Box::new(casted)))
+        Some(PendingMemoryAccessExpr::Planned(CExpr::Deref(Box::new(
+            casted,
+        ))))
+    }
+
+    /// The only extractor for a certified memory route's pending syntax.
+    /// Canonical replacements cannot reach a caller without their structural
+    /// replacement contract being converted to cells here.
+    pub(super) fn finalize_certified_memory_expr_for_fact(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+        elem_ty: CType,
+    ) -> Option<CExpr> {
+        match self.render_certified_memory_expr_for_fact(fact, elem_ty)? {
+            PendingMemoryAccessExpr::Planned(expr) => Some(expr),
+            PendingMemoryAccessExpr::Replacement(replacement) => {
+                Some(self.finish_replacement_expr(replacement))
+            }
+        }
     }
 
     /// The slot's name, for an access that sits at the slot's own offset.

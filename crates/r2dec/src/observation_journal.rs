@@ -2153,6 +2153,7 @@ impl LegacyObservationJournal {
     /// Mark the base SSA value before any per-use machine projection is
     /// applied. This keeps one value disposition independent from the several
     /// exact widths or slices at which that value may be consumed.
+    #[cfg(test)]
     pub(crate) fn observe_normalized_input_value_expr(
         &mut self,
         site: NormalizedOpSite,
@@ -2212,6 +2213,10 @@ impl LegacyObservationJournal {
         let mut order = replaced.to_vec();
         order.sort_unstable();
         order.dedup();
+        let produced = order
+            .iter()
+            .filter_map(|definition| self.source.graph().inst(*definition)?.output)
+            .collect::<BTreeSet<_>>();
         for definition in order {
             let block = self
                 .source
@@ -2258,15 +2263,24 @@ impl LegacyObservationJournal {
                     block,
                 });
                 let input = inst.inputs[input_idx];
-                if self.source.graph().def_inst(input).is_none()
-                    && matches!(
-                        self.plan.disposition(input),
+                if !produced.contains(&input) {
+                    match self.plan.disposition(input) {
+                        Some(ValueDisposition::Bound { .. }) => {}
                         Some(ValueDisposition::Inline { .. })
-                    )
-                    && represented_values.insert(input)
-                {
-                    self.value_slot(input)?;
-                    targets.push(ObservationTarget::Value(input));
+                            if self.source.graph().def_inst(input).is_none() => {}
+                        Some(ValueDisposition::Inline { .. })
+                        | Some(ValueDisposition::Elided { .. })
+                        | Some(ValueDisposition::Refused { .. })
+                        | None => {
+                            return Err(LegacyObservationJournalError::RenderedValueRequired(
+                                input,
+                            ));
+                        }
+                    }
+                    if represented_values.insert(input) {
+                        self.value_slot(input)?;
+                        targets.push(ObservationTarget::Value(input));
+                    }
                 }
             }
         }
@@ -2285,25 +2299,6 @@ impl LegacyObservationJournal {
             marked = CExpr::observed(id, marked);
         }
         Ok(marked)
-    }
-
-    /// Mark the value an inlined expression produces, where it is rendered.
-    ///
-    /// A value is accounted for by being rendered somewhere. A value rendered
-    /// where it is read has no statement of its own, so the site it is rendered
-    /// at is the only place its cell can be marked.
-    pub(crate) fn observe_inlined_value_expr(
-        &mut self,
-        value: ValueId,
-        expr: CExpr,
-    ) -> Result<CExpr, LegacyObservationJournalError> {
-        self.value_slot(value)?;
-        let id = self
-            .allocate_many(vec![ObservationTarget::Value(value)])?
-            .into_iter()
-            .next()
-            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
-        Ok(CExpr::observed(id, expr))
     }
 
     pub(crate) fn observe_certified_value_read_expr(
@@ -3978,9 +3973,7 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"observation-journal-test".to_vec(),
             "sysv64",
-            with_parameter
-                .then_some(SourceAbiParameterSpec::new(0, storage(0x38)))
-                .into_iter(),
+            with_parameter.then_some(SourceAbiParameterSpec::new(0, storage(0x38))),
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -5530,6 +5523,10 @@ mod tests {
         let mut represented_values = BTreeSet::from([value]);
         let mut order = [reader, folded_definition];
         order.sort_unstable();
+        let produced = order
+            .iter()
+            .filter_map(|inst| graph.inst(*inst)?.output)
+            .collect::<BTreeSet<_>>();
         for inst_id in order {
             let inst = graph.inst(inst_id).expect("discharged instruction");
             let block = source
@@ -5572,13 +5569,7 @@ mod tests {
                     block,
                 });
                 let input = inst.inputs[input_idx];
-                if graph.def_inst(input).is_none()
-                    && matches!(
-                        plan.disposition(input),
-                        Some(ValueDisposition::Inline { .. })
-                    )
-                    && represented_values.insert(input)
-                {
+                if !produced.contains(&input) && represented_values.insert(input) {
                     expected.push(ObservationTarget::Value(input));
                 }
             }

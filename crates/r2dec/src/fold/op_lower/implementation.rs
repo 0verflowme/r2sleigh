@@ -487,7 +487,7 @@ impl<'a> FoldingContext<'a> {
                         if fact.value != Some(value) {
                             return None;
                         }
-                        let rendered = self.render_certified_memory_expr_for_fact(
+                        let rendered = self.finalize_certified_memory_expr_for_fact(
                             fact,
                             type_from_size(fact.width),
                         )?;
