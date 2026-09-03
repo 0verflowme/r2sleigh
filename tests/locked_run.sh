@@ -80,6 +80,14 @@ until mkdir "$lock" 2>/dev/null; do
 done
 echo "lock taken" >&2
 
+# Tell the command which directory the lock is, so it may hand it back as soon
+# as it is finished with the installed plugin rather than at exit. Only the
+# capture half of a corpus run needs exclusivity; compiles, oracle runs and
+# verification do not, and with six worktrees queued that is hours. A command
+# that ignores this behaves exactly as before, because cleanup below tolerates
+# finding the directory already gone.
+export R2SLEIGH_PLUGIN_LOCK_HELD="$lock"
+
 after=$(tree_fingerprint)
 if [[ -n $before && $before != $after ]]; then
     cat >&2 <<'CHANGED'
