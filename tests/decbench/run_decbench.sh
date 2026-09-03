@@ -22,6 +22,7 @@ host=${R2SLEIGH_DECBENCH_HOST:-contabo}
 baseline="$root/tests/decbench/baseline.json"
 accept=0
 gc_force=0
+run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
 project=${R2SLEIGH_DECBENCH_PROJECT:-projects/sailr/bzip2.toml}
 opt=${R2SLEIGH_DECBENCH_OPT:-O0}
 
@@ -34,13 +35,16 @@ while [[ $# -gt 0 ]]; do
             # whose marker is still present belongs to a run that has not
             # reported, so it is left alone however old it looks; a marker
             # older than a day is treated as a crash and collected.
-            ssh "${host}" "GC_FORCE='${gc_force}' bash -s" <<'GC'
+            ssh "${host}" "GC_FORCE='${gc_force}' GC_ROOT='${run_root}' bash -s" <<'GC'
 set -euo pipefail
 now=$(date -u +%s)
 force=${GC_FORCE:-0}
-for dir in /root/decbench-*/; do
+# Only this script's own run root. Runs used to live beside unrelated
+# directories under /root, which is how a sweep aimed at stale logs deleted a
+# live build; they were moved out of that namespace, and the collector follows
+# them rather than staying behind to tidy someone else's directories.
+for dir in "${GC_ROOT:?}"/*/; do
     [ -d "$dir" ] || continue
-    case "$dir" in /root/decbench-out/|/root/decbench/|/root/decbench-shared-target/) continue ;; esac
     marker="$dir/.running"
     age=$(( now - $(stat -c %Y "$dir" 2>/dev/null || echo "$now") ))
     if [ -f "$marker" ]; then
@@ -86,7 +90,6 @@ run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
 # which is a live run's tree: two runs here were deleted mid-build by one, and
 # the script reported the failure as a missing install log, which reads like a
 # build error rather than the tree being pulled out from under it.
-run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
 remote="$run_root/$run_id"
 private_home="$remote/home"
 fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
