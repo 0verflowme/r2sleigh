@@ -9392,3 +9392,43 @@ tree's name.
 was told to build with line tables rather than full debug info. One did not, and
 grew a twelve gigabyte debug directory against three or four for the others.
 The setting is now in `Cargo.toml`.
+
+## The first integration measurement, and what it caught
+
+The benchmark harness ran end to end for the first time against the merged
+tree, with the witness present in the installed library and the run compared
+per function against the record. It found five gains, one function lost, and a
+score below what one of the merged branches had measured on its own.
+
+| function | recorded | merged tree |
+| --- | --- | --- |
+| readError | 0.214 | 0.255 |
+| writeError | 0.214 | 0.255 |
+| mallocFail | 0.161 | 0.182 |
+| endsInBz2 | 0.088 | 0.089 |
+| tooManyBlocks | 0.156 | **0.148** |
+| bsClose | 0.000 | **refuses** |
+
+`byte_match` 0.140 over 7 functions against a recorded 0.111 over 8, and
+`type_match` 0.125 over 4 against 0.100 over 5. Both means rose partly because
+the function that stopped rendering had scored zero, which is exactly why the
+record is per function and carries `decompiled` beside each score: a mean that
+improves because a bad case disappeared is not an improvement.
+
+**The merged tree is worse than one of its own branches.** Measured alone, the
+inlining branch put `readError` at 0.400 and `tooManyBlocks` at 0.316; merged,
+they are 0.255 and 0.148. Something integrated after it took back more than half
+of its gain. Only three commits between the two points touch rendering at all:
+the snapshot walked once rather than three times, the post-analysis budget
+derived from the program, and the callback separation. The budget is the least
+likely, because the binary measured here never bound against it either before or
+after.
+
+This is the case the per-function record was built for, and it is worth saying
+what would have happened without it. The aggregate went up. A run that reported
+only `byte_match 0.111 → 0.140` would have read as progress, and both the lost
+function and the halved gain would have travelled forward invisibly.
+
+Note also that `byte_match` and `type_match` are deterministic, unlike the
+timing figures corrected earlier in this document, so a single run of each tree
+settles a comparison between them. Only the timings need interleaving.
