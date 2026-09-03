@@ -201,6 +201,10 @@ def reference_universe(
     rows = {key: dict(row) for key, row in current.rows.items()}
     before = (baseline or {}).get("functions") or {}
     expected = rows_for_cells(before, current.cells)
+    if current.reference_version is not None:
+        # A freshly run reference defines its own complete universe. Pulling old-only
+        # rows into it would hide a population loss and could mix angr versions.
+        return rows, {"expected": len(expected), "absent": []}
     absent = sorted(set(expected) - set(rows))
     for key in absent:
         old = expected[key]

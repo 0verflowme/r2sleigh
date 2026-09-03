@@ -89,11 +89,29 @@ Running it from this repository
 -------------------------------
 
 `run_decbench.sh` does the whole of the above against a Linux host and compares
-the result with `baseline.json`, per function and per metric:
+the result with `baseline.json`, per function and per metric. Its default is the
+acceptance population, not a smoke test: every TOML under `projects/sailr` (26
+at the time this contract was written), every binary each project produces,
+and `O0`, `O1`, and `O2`:
 
 ```
-tests/decbench/run_decbench.sh                    # compare with the record
-tests/decbench/run_decbench.sh --accept-baseline  # record this run instead
+tests/decbench/run_decbench.sh                    # full 26 x 3 sweep
+tests/decbench/run_decbench.sh --accept-baseline  # merge the sweep into the record
+
+# bounded verification or investigation (selection is printed in the report)
+tests/decbench/run_decbench.sh \
+  --project bzip2 --project zlib --opt-level O0 --opt-level O1
+
+# deterministic zero-based shards; merge their generated JSON afterward
+tests/decbench/run_decbench.sh --shard 0/2
+tests/decbench/run_decbench.sh --shard 1/2
+python3 tests/decbench/merge_decbench.py \
+  --input tests/decbench/artifacts/<first>/function_results.json \
+  --input tests/decbench/artifacts/<second>/function_results.json \
+  --output tests/decbench/artifacts/function_results.json
+
+# continue checkpoints left by an interrupted invocation
+tests/decbench/run_decbench.sh --resume decbench-<timestamp>-<pid>
 ```
 
 It needs an ssh alias for a Linux x86-64 host with the radare2 fork built and
@@ -113,6 +131,66 @@ unless that string is in the installed library. `make install` once aborted on
 stale object files, left the previous library in place, and DecBench scored it
 happily. The numbers came back identical to the baseline, which is exactly what
 a change with no effect looks like.
+
+The witness is checked once for every project/optimization cell immediately
+before that project's DecBench invocation. The per-cell records are copied into
+the local run artifact and their count is asserted before reporting. A resumed
+run also checks the tree fingerprint, selection, and DecBench commit before it
+is allowed to reuse its private plugin.
+
+One DecBench invocation handles all selected optimization levels for a project.
+It therefore builds that project once per required optimization and reuses the
+compiled tree for both decompilers instead of rebuilding for separate r2sleigh
+and reference passes. The next project starts only after the finished project's
+result has been checkpointed; its bulky compiled/decompiled tree is then
+removed. This bounds remote disk use by the largest project rather than the
+whole sailr set and makes project-level resume possible.
+
+The plugin still has a private `HOME`, but Cargo's target, registry, and rustup
+toolchains are shared explicitly. Without that separation each old one-cell run
+copied about 2.2 GB into its private home even though the complete bzip2 result
+tree was only about 1.6 MB. Successful sweep directories are deleted
+automatically. `--gc` audits finished/stale directories and `--gc-force`
+removes only those; a current marker and recent interrupted runs remain intact.
+
+Angr is run only when the selected reference cells are absent from
+`baseline.json`, when `--refresh-reference` is requested, or when the installed
+angr version differs from the version recorded in the baseline. A version
+change invalidates the old reference rather than mixing versions. The baseline
+keeps angr's per-function values and rendered flags, so ordinary tree sweeps
+pay only for r2sleigh.
+
+The required metrics are `byte_match`, `ged`, `vj_ged`, and `type_match`.
+Current DecBench upstream contains the VJ implementation but does not register
+it as a standalone metric. `decbench_cli.py` registers that existing algorithm
+only when native `vj_ged` is absent; a native registration wins automatically,
+and the selected source is printed and recorded. This is an unapproximated VJ
+distance, not an alias of DecBench's separately budgeted `ged` metric.
+
+Reading the summary
+-------------------
+
+Every metric is printed twice for each decompiler:
+
+* **rendered mean** is the metric's native mean over functions for which that
+  metric produced a value;
+* **all-function quality mean** uses the entire angr/reference function
+  universe and contributes zero for a refusal or missing value.
+
+`byte_match` and `type_match` already use zero as their worst value. Raw `ged`
+and `vj_ged` are distances where zero is perfect, so filling a refusal with raw
+zero would reward it. Their all-function number therefore maps each rendered
+distance `d` to `1 / (1 + d)` and then fills refusals with zero. The report and
+baseline name that scale explicitly. Function coverage is printed as its own
+rendered/total fraction as well.
+
+Function keys are `project/binary/opt::function`; projects that produce the
+same binary and function names cannot collide. The merger refuses duplicate or
+missing project/optimization cells. On cached-reference sweeps, functions not
+present in r2sleigh's raw result are restored from the reference universe as
+explicit zero-scored refusals. Missing projects, optimization cells, binary
+groups, and function counts are printed rather than silently shrinking the
+population.
 
 What the record is for
 ----------------------

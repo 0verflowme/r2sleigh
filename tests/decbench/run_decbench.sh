@@ -1,55 +1,85 @@
 #!/usr/bin/env bash
-# Measure this tree on DecBench, on a Linux host, and compare with the record.
+# Measure this tree over every DecBench sailr project and optimization level.
 #
-# DecBench is the only measurement this project has that scores the *content*
-# of a rendered function rather than its shape. `byte_match` recompiles the
-# output and compares its assembly to the original; `type_match` scores
-# recovered types against DWARF. Until this script existed both were run by
-# hand, twice, months apart, and every defect they would have caught went
-# unnoticed in between: the argument dropped from a variadic call, the stack
-# pointer drifting eight bytes per call site, the register-named local staged
-# before every argument. The corpus could not see any of them, because it is
-# nine hash functions of one shape.
-#
-# It runs on a remote Linux host because the benchmark's binaries are ELF built
-# by GCC and the metric recompiles them, so the toolchain has to match.
-#
-# usage: tests/decbench/run_decbench.sh [--accept-baseline] [--host <ssh alias>]
+# Defaults are the acceptance population: all 26 sailr projects at O0/O1/O2.
+# One DecBench invocation owns every selected optimization of a project, so its
+# compiled binaries are shared by r2sleigh and (when needed) the cached angr
+# reference. Completed projects are checkpointed independently for resume.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 host=${R2SLEIGH_DECBENCH_HOST:-contabo}
 baseline="$root/tests/decbench/baseline.json"
-accept=0
-gc_force=0
 run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
+fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
+workers=${R2SLEIGH_DECBENCH_WORKERS:-4}
+expected_project_count=${R2SLEIGH_DECBENCH_SAILR_COUNT:-26}
+accept=0
+refresh_reference=0
+gc_force=0
+keep_remote=0
+plan_only=0
+resume_id=
+shard_index=0
+shard_count=1
+declare -a requested_projects=()
+declare -a requested_opts=()
 
-# Keepalives, because a silent connection is the failure this script keeps
-# hitting. A build on a loaded host produces no output for many minutes, and if
-# the link drops in that window neither end notices: the remote work finishes,
-# the local script waits forever, and it reads as a hung build. Six missed
-# thirty-second probes ends it with an error instead.
-ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes)
-project=${R2SLEIGH_DECBENCH_PROJECT:-projects/sailr/bzip2.toml}
-opt=${R2SLEIGH_DECBENCH_OPT:-O0}
+usage() {
+    cat <<'EOF'
+usage: tests/decbench/run_decbench.sh [options]
+
+Sweep selection (defaults to all 26 sailr projects at O0, O1 and O2):
+  --project NAME       select a project; repeatable
+  --opt-level OPT      select O0, O1 or O2; repeatable
+  --shard INDEX/COUNT  select a deterministic zero-based project shard
+
+Execution:
+  --resume RUN_ID      resume an interrupted remote run
+  --workers N          DecBench worker count (default: 4)
+  --refresh-reference  run angr even when this version is cached
+  --accept-baseline    merge this selection into baseline.json
+  --keep-remote        retain the completed remote directory
+  --plan               print the checked selection without starting a run
+  --host SSH_ALIAS     benchmark host (default: contabo)
+
+Cleanup:
+  --gc                 list collectable remote run directories
+  --gc-force           collect finished/stale remote run directories
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --accept-baseline) accept=1; shift ;;
+        --refresh-reference) refresh_reference=1; shift ;;
+        --keep-remote) keep_remote=1; shift ;;
+        --plan) plan_only=1; shift ;;
+        --project) requested_projects+=("$2"); shift 2 ;;
+        --opt-level) requested_opts+=("$2"); shift 2 ;;
+        --shard)
+            if [[ $2 != */* ]]; then
+                echo "--shard must be INDEX/COUNT" >&2
+                exit 64
+            fi
+            shard_index=${2%/*}
+            shard_count=${2#*/}
+            shift 2
+            ;;
+        --resume) resume_id=$2; shift 2 ;;
+        --workers) workers=$2; shift 2 ;;
+        --host) host=$2; shift 2 ;;
         --gc-force) gc_force=1; shift; set -- --gc "$@" ;;
         --gc)
-            # Remove finished run directories, and only those. A directory
-            # whose marker is still present belongs to a run that has not
-            # reported, so it is left alone however old it looks; a marker
-            # older than a day is treated as a crash and collected.
-            ssh "${ssh_keepalive[@]}" "${host}" "GC_FORCE='${gc_force}' GC_ROOT='${run_root}' bash -s" <<'GC'
+            if [[ $run_root != /* || $run_root == / || $run_root == /root ]]; then
+                echo "unsafe remote run root: $run_root" >&2
+                exit 64
+            fi
+            ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes \
+                "$host" "GC_FORCE='$gc_force' GC_ROOT='$run_root' bash -s" <<'GC'
 set -euo pipefail
 now=$(date -u +%s)
 force=${GC_FORCE:-0}
-# Only this script's own run root. Runs used to live beside unrelated
-# directories under /root, which is how a sweep aimed at stale logs deleted a
-# live build; they were moved out of that namespace, and the collector follows
-# them rather than staying behind to tidy someone else's directories.
 for dir in "${GC_ROOT:?}"/*/; do
     [ -d "$dir" ] || continue
     marker="$dir/.running"
@@ -61,158 +91,435 @@ for dir in "${GC_ROOT:?}"/*/; do
             continue
         fi
         why="marker older than a day"
+    elif [ -f "$dir/.complete" ]; then
+        why="finished run"
     elif [ "$age" -lt 86400 ]; then
-        # No marker and recent. This is either a run that started before
-        # markers existed or one someone else made by hand, and "unknown" is
-        # not "finished". Deleting one of these once killed a live build and
-        # looked exactly like a compiler error to the agent that owned it.
-        echo "no marker but recent, left alone: $dir"
+        echo "interrupted but resumable, left alone: $dir"
         continue
     else
-        why="no marker and older than a day"
+        why="interrupted and older than a day"
     fi
-    if [ "$force" != "1" ]; then
+    if [ "$force" != 1 ]; then
         echo "would collect ($why): $dir"
         continue
     fi
-    rm -rf "$dir"
+    rm -rf -- "$dir"
     echo "collected ($why): $dir"
 done
 GC
             exit 0
             ;;
-        --host) host=$2; shift 2 ;;
-        *) echo "usage: $0 [--accept-baseline] [--gc] [--gc-force] [--host <ssh alias>]" >&2; exit 64 ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
     esac
 done
 
-# A private radare2 plugin directory per run. radare2 reads user plugins from
-# $HOME, so two trees measuring at once otherwise overwrite each other's
-# library and each scores the other's work. This needs no cooperation from
-# whoever else is on the host.
-run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
-# Runs live under one directory rather than directly in /root, and the
-# difference is not cosmetic. Older manual runs left `/root/decbench-*.log`
-# files behind, and a cleanup for those also matches `/root/decbench-<stamp>/`,
-# which is a live run's tree: two runs here were deleted mid-build by one, and
-# the script reported the failure as a missing install log, which reads like a
-# build error rather than the tree being pulled out from under it.
+if [[ $run_root != /* || $run_root == / || $run_root == /root ]]; then
+    echo "unsafe remote run root: $run_root" >&2
+    exit 64
+fi
+if [[ ! $workers =~ ^[1-9][0-9]*$ ]]; then
+    echo "workers must be a positive integer" >&2
+    exit 64
+fi
+if [[ ! $shard_index =~ ^[0-9]+$ || ! $shard_count =~ ^[1-9][0-9]*$ ]] \
+    || (( shard_index >= shard_count )); then
+    echo "invalid zero-based shard $shard_index/$shard_count" >&2
+    exit 64
+fi
+for opt in "${requested_opts[@]}"; do
+    case $opt in O0|O1|O2) ;; *) echo "unsupported optimization: $opt" >&2; exit 64 ;; esac
+done
+if (( ${#requested_opts[@]} == 0 )); then
+    requested_opts=(O0 O1 O2)
+fi
+
+ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes)
+remote_project_listing=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "find /root/decbench/projects/sailr -maxdepth 1 -type f -name '*.toml' -printf '%f\\n' | sed 's/\\.toml$//' | sort")
+declare -a all_projects=()
+while IFS= read -r name; do
+    [[ -n $name ]] && all_projects+=("$name")
+done <<<"$remote_project_listing"
+if (( ${#all_projects[@]} != expected_project_count )); then
+    echo "expected $expected_project_count sailr projects, host has ${#all_projects[@]}" >&2
+    printf '  %s\n' "${all_projects[@]}" >&2
+    exit 70
+fi
+
+declare -a candidates=()
+if (( ${#requested_projects[@]} == 0 )); then
+    candidates=("${all_projects[@]}")
+else
+    for wanted in "${requested_projects[@]}"; do
+        found=0
+        for available in "${all_projects[@]}"; do
+            if [[ $wanted == "$available" ]]; then
+                found=1
+                break
+            fi
+        done
+        if (( ! found )); then
+            echo "unknown sailr project: $wanted" >&2
+            exit 64
+        fi
+        candidates+=("$wanted")
+    done
+fi
+
+declare -a projects=()
+for ((i = 0; i < ${#candidates[@]}; i++)); do
+    if (( i % shard_count == shard_index )); then
+        projects+=("${candidates[$i]}")
+    fi
+done
+if (( ${#projects[@]} == 0 )); then
+    echo "shard $shard_index/$shard_count selects no projects" >&2
+    exit 64
+fi
+
+required_metrics=(byte_match ged vj_ged type_match)
+available_metrics=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "cd /root/decbench && ./venv/bin/python -c 'import decbench.metrics; from decbench.metrics.registry import MetricRegistry; print(\" \".join(sorted(MetricRegistry.list_registered())))'")
+vj_ged_source=native
+for metric in "${required_metrics[@]}"; do
+    if [[ " $available_metrics " != *" $metric "* ]]; then
+        if [[ $metric == vj_ged ]] && ssh "${ssh_keepalive[@]}" "$host" \
+            "test -f /root/decbench/decbench/metrics/vj_ged.py"; then
+            vj_ged_source="tree compatibility registration of DecBench's vj_ged helper"
+        else
+            echo "required DecBench metric is unavailable on $host: $metric" >&2
+            echo "registered metrics: $available_metrics" >&2
+            exit 70
+        fi
+    fi
+done
+
+decbench_commit=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "git -C /root/decbench rev-parse HEAD")
+angr_version=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "cd /root/decbench && ./venv/bin/python -c 'import importlib.metadata; print(importlib.metadata.version(\"angr\"))'")
+baseline_version=$(python3 - "$baseline" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = json.loads(p.read_text()) if p.exists() else {}
+print((d.get("reference") or {}).get("version") or "")
+PY
+)
+baseline_cells=$(python3 - "$baseline" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = json.loads(p.read_text()) if p.exists() else {}
+print("\n".join((d.get("selection") or {}).get("cells") or []))
+PY
+)
+
+include_reference=$refresh_reference
+reference_reason="explicit refresh"
+if [[ $angr_version != "$baseline_version" ]]; then
+    include_reference=1
+    reference_reason="angr version changed (${baseline_version:-uncached} -> $angr_version)"
+fi
+for project in "${projects[@]}"; do
+    for opt in "${requested_opts[@]}"; do
+        if ! grep -Fqx "$project/$opt" <<<"$baseline_cells"; then
+            include_reference=1
+            reference_reason="baseline lacks part of this selection"
+        fi
+    done
+done
+if (( ! include_reference )); then
+    reference_reason="angr $angr_version is cached for every selected cell"
+fi
+
+echo "population ${#projects[@]}/${#all_projects[@]} sailr projects, ${#requested_opts[@]} opt levels"
+echo "shard      $shard_index/$shard_count"
+printf 'projects   %s\n' "${projects[*]}"
+printf 'opts       %s\n' "${requested_opts[*]}"
+echo "metrics    ${required_metrics[*]}"
+echo "vj_ged     $vj_ged_source"
+echo "decbench   $decbench_commit"
+echo "reference  $reference_reason"
+echo "execution  one build/decompile/evaluate invocation per project for all selected opts"
+if (( plan_only )); then
+    exit 0
+fi
+
+tree_commit=$(git -C "$root" rev-parse HEAD)
+tree_fingerprint=$(
+    { git -C "$root" rev-parse HEAD; git -C "$root" diff --no-ext-diff --binary HEAD; } \
+        | shasum -a 256 | awk '{print $1}'
+)
+if [[ -n $resume_id ]]; then
+    if [[ ! $resume_id =~ ^decbench-[A-Za-z0-9._-]+$ ]]; then
+        echo "invalid resume run id: $resume_id" >&2
+        exit 64
+    fi
+    run_id=$resume_id
+else
+    run_id="decbench-$(date -u +%Y%m%dT%H%M%S)-$$"
+fi
 remote="$run_root/$run_id"
 private_home="$remote/home"
-fork_remote=${R2SLEIGH_R2_FORK_REMOTE:-/root/r2sleigh-fork-radare2}
+artifact_root="$root/tests/decbench/artifacts/$run_id"
 
-# A string only this tree contains, so a build that failed to install cannot be
-# mistaken for a change with no effect. That has already cost two measurements:
-# `make install` aborted on stale object files, the previous library stayed in
-# place, and the numbers came back identical to the baseline.
-witness="r2sleigh-witness-$(git -C "$root" rev-parse --short HEAD)-$(date -u +%s)"
+selection_projects=$(IFS=,; echo "${projects[*]}")
+selection_opts=$(IFS=,; echo "${requested_opts[*]}")
+if [[ -n $resume_id ]]; then
+    resume_metadata=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$remote/run.meta' 2>/dev/null" || true)
+    if [[ -z $resume_metadata ]]; then
+        echo "no resumable run metadata at $remote" >&2
+        exit 66
+    fi
+    for expected in \
+        "tree_fingerprint=$tree_fingerprint" \
+        "projects=$selection_projects" \
+        "opts=$selection_opts" \
+        "decbench_commit=$decbench_commit"; do
+        if ! grep -Fqx "$expected" <<<"$resume_metadata"; then
+            echo "resume metadata mismatch: $expected" >&2
+            exit 70
+        fi
+    done
+    witness=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$remote/witness'")
+    echo "resuming   $run_id"
+else
+    witness="r2sleigh-witness-${tree_commit:0:12}-$(date -u +%s)"
+    ssh "${ssh_keepalive[@]}" "$host" "test ! -e '$remote' && mkdir -p '$remote/results' '$remote/completed' '$remote/logs' '$remote/witness-checks' '$remote/tree'"
+    ssh "${ssh_keepalive[@]}" "$host" "cat > '$remote/run.meta'" <<EOF
+tree_commit=$tree_commit
+tree_fingerprint=$tree_fingerprint
+projects=$selection_projects
+opts=$selection_opts
+decbench_commit=$decbench_commit
+angr_version=$angr_version
+include_reference=$include_reference
+vj_ged_source=$vj_ged_source
+EOF
+    ssh "${ssh_keepalive[@]}" "$host" "printf '%s\n' '$witness' > '$remote/witness'"
+    git -C "$root" ls-files -z \
+        | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 \
+            "$root/" "$host:$remote/tree/"
+    ssh "${ssh_keepalive[@]}" "$host" "cat >> '$remote/tree/crates/r2engine/src/lib.rs'" <<EOF
+#[used]
+#[unsafe(no_mangle)]
+pub static DECBENCH_WITNESS: &str = "$witness";
+EOF
+fi
 
-echo "run     $run_id"
-echo "witness $witness"
+echo "run        $run_id"
+echo "witness    $witness"
+ssh "${ssh_keepalive[@]}" "$host" "date -u +%s > '$remote/.running'"
+cleanup_marker() {
+    ssh "${ssh_keepalive[@]}" "$host" "rm -f -- '$remote/.running'" 2>/dev/null || true
+}
+trap cleanup_marker EXIT
 
-# A marker that says this directory is in use, removed when the run finishes.
-# Several runs share the host, and a blanket `rm -rf /root/decbench-*` to clear
-# stale ones deleted a live run mid-build, which looks exactly like a build
-# failure and is not one. `--gc` below removes only directories without a live
-# marker, and nobody should be deleting them by hand instead.
-ssh "${ssh_keepalive[@]}" "$host" "mkdir -p '$remote' && date -u +%s > '$remote/.running'"
-trap 'ssh "${ssh_keepalive[@]}" "$host" "rm -f '"'$remote/.running'"'" 2>/dev/null || true' EXIT
-
-ssh "${ssh_keepalive[@]}" "$host" "mkdir -p '$remote/tree'"
-git -C "$root" ls-files -z | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 "$root/" "$host:$remote/tree/"
-
-# The plugin's C is compiled against the radare2 fork, and this project changes
-# that fork. A tree whose C calls an API the host's fork does not have fails to
-# build, so the fork travels with the plugin rather than being assumed current.
-# The build check below turns that into a loud failure rather than a measurement
-# of whatever was installed before, but only if the fork is actually brought up
-# to date first.
+# The plugin C is compiled against this repository's radare2 fork. Synchronize
+# tracked fork files before installing; the stamp describes copied content, not
+# the host checkout's unrelated .git HEAD.
 fork_local=${R2SLEIGH_R2_FORK:-$(cd "$root/.." && pwd)/radare2}
-if [ -d "$fork_local/.git" ]; then
-    # The comparison is against a stamp this script writes, not against the
-    # host's git HEAD: only tracked files are copied, so the host's `.git` never
-    # advances and its HEAD would always disagree.
+if [[ -d $fork_local/.git ]]; then
     want=$(git -C "$fork_local" rev-parse HEAD)
-    have=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
-    if [ "$want" != "$have" ]; then
-        echo "radare2 fork: host at ${have:-none}, this tree wants $want; syncing and rebuilding"
+    have=$(ssh "${ssh_keepalive[@]}" "$host" \
+        "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
+    if [[ $want != "$have" ]]; then
+        echo "radare2 fork: syncing and rebuilding $want"
         git -C "$fork_local" ls-files -z \
-            | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 "$fork_local/" "$host:$fork_remote/"
-        ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
+            | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 \
+                "$fork_local/" "$host:$fork_remote/"
+        ssh "${ssh_keepalive[@]}" "$host" "FORK_REMOTE='$fork_remote' WANT='$want' bash -s" <<'REMOTE'
 set -euo pipefail
-cd '$fork_remote'
-git config --global --add safe.directory '$fork_remote' 2>/dev/null || true
+cd "$FORK_REMOTE"
+git config --global --add safe.directory "$FORK_REMOTE" 2>/dev/null || true
 find . -name '*.o' -newer configure -delete 2>/dev/null || true
 ./configure --prefix=/usr/local >/tmp/r2-configure.log 2>&1 || { tail -20 /tmp/r2-configure.log; exit 70; }
 make -j4 >/tmp/r2-make.log 2>&1 || { tail -30 /tmp/r2-make.log; exit 70; }
 make install >/tmp/r2-install.log 2>&1 || { tail -20 /tmp/r2-install.log; exit 70; }
-printf '%s\n' '$want' > '$fork_remote/.r2sleigh-synced-from'
+printf '%s\n' "$WANT" > "$FORK_REMOTE/.r2sleigh-synced-from"
 radare2 -v | head -1
-EOF
+REMOTE
     else
         echo "radare2 fork: host already at $want"
     fi
 fi
-# `#[used]` and an exported symbol, not a `const`. A `const` is inlined at
-# its use sites and this one has none, so nothing reaches the binary and the
-# check below failed on every tree it was ever pointed at -- a guard that
-# always fires is as useless as one that never does, and this one hid a
-# working install behind a stale-plugin error.
-ssh "${ssh_keepalive[@]}" "$host" "cat >> $remote/tree/crates/r2engine/src/lib.rs" <<WITNESS
-#[used]
-#[unsafe(no_mangle)]
-pub static DECBENCH_WITNESS: &str = "$witness";
-WITNESS
 
-ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
+# HOME remains private so another worktree cannot replace this run's plugin.
+# Cargo and rustup state are explicitly shared: leaving them under private HOME
+# duplicated 2.2 GB per run even though the benchmark output was only 1.6 MB.
+if ! ssh "${ssh_keepalive[@]}" "$host" \
+    "HOME='$private_home' WITNESS='$witness' bash -s" <<'VERIFY'
 set -euo pipefail
-mkdir -p '$private_home'
-export HOME='$private_home'
-cd '$remote/tree'
-# One build directory for every run on this host. Each run copies its own tree,
-# so without this each of them compiles the whole dependency graph from nothing,
-# and eight of those on four cores is slower in aggregate than the same eight
-# taking turns. Cargo's own lock does the taking turns; the crates that differ
-# between two trees are the only ones recompiled.
-export CARGO_TARGET_DIR=\${R2SLEIGH_DECBENCH_TARGET:-/root/decbench-shared-target}
-LOCAL_R2_DIR='$fork_remote' make -C r2plugin RUST_FEATURES=all-archs install >'$remote/install.log' 2>&1 || {
-    # A missing log here does not mean the build failed to write one: the
-    # host is shared, and this run's whole tree can be removed underneath it
-    # while it builds. Say which happened, because "install failed" sent one
-    # reader looking at a compiler for a directory that no longer existed.
-    if [ ! -d '$remote/tree' ]; then
-        echo "this run's remote tree was removed while it was building" >&2
-        exit 72
+lib=$(find "$HOME/.local/share/radare2/plugins" -name 'libr2sleigh_plugin.*' -print -quit 2>/dev/null || true)
+[ -n "$lib" ] && grep -a -q "$WITNESS" "$lib"
+VERIFY
+then
+    ssh "${ssh_keepalive[@]}" "$host" \
+        "REMOTE='$remote' PRIVATE_HOME='$private_home' FORK_REMOTE='$fork_remote' WITNESS='$witness' bash -s" <<'INSTALL'
+set -euo pipefail
+mkdir -p "$PRIVATE_HOME"
+export HOME="$PRIVATE_HOME"
+export CARGO_HOME=/root/.cargo
+export RUSTUP_HOME=/root/.rustup
+export CARGO_TARGET_DIR=${R2SLEIGH_DECBENCH_TARGET:-/root/decbench-shared-target}
+cd "$REMOTE/tree"
+LOCAL_R2_DIR="$FORK_REMOTE" make -C r2plugin RUST_FEATURES=all-archs install >"$REMOTE/install.log" 2>&1 || {
+    tail -30 "$REMOTE/install.log"
+    exit 70
+}
+lib=$(find "$PRIVATE_HOME/.local/share/radare2/plugins" -name 'libr2sleigh_plugin.*' -print -quit)
+[ -n "$lib" ] || { echo "no plugin library was installed" >&2; exit 70; }
+grep -a -q "$WITNESS" "$lib" || {
+    echo "the installed library is not this tree: witness absent" >&2
+    exit 70
+}
+echo "installed $lib, witness present"
+INSTALL
+else
+    echo "resumed plugin install, witness present"
+fi
+
+run_started=$(date -u +%s)
+disk_available_before=$(ssh "${ssh_keepalive[@]}" "$host" "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
+for project in "${projects[@]}"; do
+    if ssh "${ssh_keepalive[@]}" "$host" "test -f '$remote/completed/$project'"; then
+        echo "resume: $project already complete"
+        continue
     fi
-    tail -20 '$remote/install.log'; exit 70; }
-lib=\$(find '$private_home/.local/share/radare2/plugins' -name 'libr2sleigh_plugin.*' | head -1)
-if [ -z "\$lib" ]; then echo "no plugin library was installed" >&2; exit 70; fi
-if ! grep -a -q '$witness' "\$lib"; then
-    echo "the installed library is not this tree's: witness string absent" >&2
+    echo "project $project (${requested_opts[*]})"
+    ssh "${ssh_keepalive[@]}" "$host" \
+        "REMOTE='$remote' PRIVATE_HOME='$private_home' PROJECT='$project' OPTS='$selection_opts' WORKERS='$workers' INCLUDE_REFERENCE='$include_reference' WITNESS='$witness' bash -s" <<'RUN'
+set -euo pipefail
+work="$REMOTE/work/$PROJECT"
+mkdir -p "$work" "$REMOTE/results" "$REMOTE/logs" "$REMOTE/witness-checks"
+lib=$(find "$PRIVATE_HOME/.local/share/radare2/plugins" -name 'libr2sleigh_plugin.*' -print -quit)
+[ -n "$lib" ] || { echo "no private plugin before $PROJECT" >&2; exit 70; }
+grep -a -q "$WITNESS" "$lib" || {
+    echo "witness absent before $PROJECT" >&2
+    exit 70
+}
+: >"$REMOTE/witness-checks/$PROJECT.tsv"
+IFS=, read -r -a opts <<<"$OPTS"
+for opt in "${opts[@]}"; do
+    printf '%s\t%s\t%s\n' "$PROJECT" "$opt" "$WITNESS" \
+        | tee -a "$REMOTE/witness-checks/$PROJECT.tsv"
+    echo "witness verified: $PROJECT/$opt"
+done
+
+stop="$work/.monitor-stop"
+samples="$REMOTE/logs/$PROJECT.disk.tsv"
+rm -f -- "$stop"
+monitor() {
+    while [ ! -f "$stop" ]; do
+        used=$(du -sb "$REMOTE" 2>/dev/null | awk '{print $1}')
+        avail=$(df -B1 --output=avail "$REMOTE" | tail -1 | tr -d ' ')
+        printf '%s\t%s\t%s\n' "$(date -u +%s)" "${used:-0}" "${avail:-0}" >>"$samples"
+        sleep 15
+    done
+}
+monitor &
+monitor_pid=$!
+started=$(date -u +%s)
+
+export HOME="$PRIVATE_HOME"
+export CARGO_HOME=/root/.cargo
+export RUSTUP_HOME=/root/.rustup
+cd /root/decbench
+cmd=(./venv/bin/python "$REMOTE/tree/tests/decbench/decbench_cli.py" run "projects/sailr/$PROJECT.toml")
+for opt in "${opts[@]}"; do cmd+=(-O "$opt"); done
+cmd+=(-d r2sleigh)
+if [ "$INCLUDE_REFERENCE" = 1 ]; then cmd+=(-d angr); fi
+cmd+=(-m ged -m vj_ged -m byte_match -m type_match -j "$WORKERS" -o "$work/out")
+set +e
+"${cmd[@]}" 2>&1 | tee "$REMOTE/logs/$PROJECT.log" | sed "s/^/  $PROJECT: /"
+status=${PIPESTATUS[0]}
+set -e
+touch "$stop"
+wait "$monitor_pid"
+if [ "$status" -ne 0 ]; then exit "$status"; fi
+test -f "$work/out/function_results.json"
+cp "$work/out/function_results.json" "$REMOTE/results/$PROJECT.json"
+cp "$work/out/scoreboard.toml" "$REMOTE/results/$PROJECT.scoreboard.toml"
+ended=$(date -u +%s)
+bytes=$(du -sb "$work" | awk '{print $1}')
+printf '%s\t%s\t%s\n' "$PROJECT" "$((ended - started))" "$bytes" \
+    >>"$REMOTE/project-stats.tsv"
+printf '%s\n' "$ended" >"$REMOTE/completed/$PROJECT"
+rm -rf -- "$work"
+RUN
+done
+
+mkdir -p "$artifact_root/raw"
+for project in "${projects[@]}"; do
+    scp "${ssh_keepalive[@]}" -q "$host:$remote/results/$project.json" \
+        "$artifact_root/raw/$project.json"
+    scp "${ssh_keepalive[@]}" -q "$host:$remote/results/$project.scoreboard.toml" \
+        "$artifact_root/raw/$project.scoreboard.toml"
+done
+scp "${ssh_keepalive[@]}" -q "$host:$remote/run.meta" "$artifact_root/run.meta"
+scp "${ssh_keepalive[@]}" -q "$host:$remote/project-stats.tsv" "$artifact_root/project-stats.tsv"
+mkdir -p "$artifact_root/witness-checks"
+for project in "${projects[@]}"; do
+    scp "${ssh_keepalive[@]}" -q "$host:$remote/witness-checks/$project.tsv" \
+        "$artifact_root/witness-checks/$project.tsv"
+    scp "${ssh_keepalive[@]}" -q "$host:$remote/logs/$project.disk.tsv" \
+        "$artifact_root/$project.disk.tsv"
+done
+
+expected_witness_checks=$(( ${#projects[@]} * ${#requested_opts[@]} ))
+actual_witness_checks=$(awk 'NF { n++ } END { print n + 0 }' "$artifact_root"/witness-checks/*.tsv)
+if (( actual_witness_checks != expected_witness_checks )); then
+    echo "witness coverage mismatch: $actual_witness_checks/$expected_witness_checks" >&2
     exit 70
 fi
-echo "installed \$lib, witness present"
-EOF
+echo "witness checks: $actual_witness_checks/$expected_witness_checks project/opt runs"
 
-ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
-set -euo pipefail
-export HOME='$private_home'
-cd /root/decbench
-# Output streams rather than going to a remote log. A silent run is
-# indistinguishable from a hung one, and this measurement has hung twice while
-# the host was loaded by other work.
-./venv/bin/decbench run '$project' -O '$opt' -d r2sleigh -d angr \
-    -m ged -m byte_match -m type_match -j 4 --binary-limit 1 \
-    -o '$remote/out' 2>&1 | tee '$remote/decbench.log' | sed 's/^/  decbench: /'
-test -f '$remote/out/function_results.json'
-EOF
+merge_args=(--output "$artifact_root/function_results.json")
+for project in "${projects[@]}"; do
+    merge_args+=(--input "$artifact_root/raw/$project.json")
+    for opt in "${requested_opts[@]}"; do
+        merge_args+=(--expected-cell "$project/$opt")
+    done
+done
+python3 "$root/tests/decbench/merge_decbench.py" "${merge_args[@]}"
+cp "$artifact_root/function_results.json" "$root/tests/decbench/artifacts/function_results.json"
 
-mkdir -p "$root/tests/decbench/artifacts"
-scp -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -q "$host:$remote/out/function_results.json" "$root/tests/decbench/artifacts/function_results.json"
-scp -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -q "$host:$remote/out/scoreboard.toml" "$root/tests/decbench/artifacts/scoreboard.toml"
-ssh "${ssh_keepalive[@]}" "$host" "rm -rf '$remote'"
+report_args=(
+    --results "$artifact_root/function_results.json"
+    --baseline "$baseline"
+)
+if (( accept )); then report_args+=(--accept-baseline); fi
+set +e
+python3 "$root/tests/decbench/report_decbench.py" "${report_args[@]}"
+report_status=$?
+set -e
 
-python3 "$root/tests/decbench/report_decbench.py" \
-    --results "$root/tests/decbench/artifacts/function_results.json" \
-    --baseline "$baseline" \
-    $([[ $accept == 1 ]] && echo --accept-baseline)
+run_finished=$(date -u +%s)
+wall_seconds=$((run_finished - run_started))
+disk_available_after=$(ssh "${ssh_keepalive[@]}" "$host" "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
+peak_run_bytes=$(awk 'BEGIN { m=0 } { if ($2 > m) m=$2 } END { print m }' "$artifact_root"/*.disk.tsv)
+max_disk_delta=$((disk_available_before - disk_available_after))
+if (( max_disk_delta < 0 )); then max_disk_delta=0; fi
+selected_cells=$(( ${#projects[@]} * ${#requested_opts[@]} ))
+full_cells=$(( expected_project_count * 3 ))
+full_wall_seconds=$(( wall_seconds * full_cells / selected_cells ))
+printf 'cost: wall %ss; peak run directory %.2f GiB; host disk delta %.2f GiB\n' \
+    "$wall_seconds" \
+    "$(awk -v n="$peak_run_bytes" 'BEGIN { print n / 1073741824 }')" \
+    "$(awk -v n="$max_disk_delta" 'BEGIN { print n / 1073741824 }')"
+printf 'full 26x3 extrapolation: %.2f hours serial; %.2f GiB peak with per-project GC\n' \
+    "$(awk -v n="$full_wall_seconds" 'BEGIN { print n / 3600 }')" \
+    "$(awk -v n="$peak_run_bytes" 'BEGIN { print n / 1073741824 }')"
+
+trap - EXIT
+if (( keep_remote )); then
+    ssh "${ssh_keepalive[@]}" "$host" \
+        "rm -f -- '$remote/.running'; date -u +%s > '$remote/.complete'"
+    echo "remote run retained for --resume/--gc: $remote"
+else
+    ssh "${ssh_keepalive[@]}" "$host" "rm -rf -- '$remote'"
+    echo "garbage-collected finished remote run: $remote"
+fi
+exit "$report_status"

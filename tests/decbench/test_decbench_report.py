@@ -111,6 +111,23 @@ class ReportTests(unittest.TestCase):
             0.25,
         )
 
+    def test_fresh_reference_does_not_import_old_only_functions(self) -> None:
+        current = report.collect(payload("one", 0.5))
+        current.reference_version = "new"
+        baseline = {
+            "functions": {
+                "one/same-name/O0::old_only": {
+                    "decompiled": False,
+                    "scores": {},
+                    "reference_decompiled": True,
+                    "reference": {"byte_match": 0.9},
+                }
+            }
+        }
+        rows, fill = report.reference_universe(current, baseline)
+        self.assertEqual(set(rows), {"one/same-name/O0::same_function"})
+        self.assertEqual(fill["absent"], [])
+
     def test_merge_rejects_silent_missing_cell(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing project/opt cells: one/O1"):
             merger.merge([payload("one", 0.5)], {"one/O0", "one/O1"})
