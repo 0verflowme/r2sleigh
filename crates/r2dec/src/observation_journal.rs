@@ -1169,14 +1169,8 @@ impl MarkedNativeDraft {
             occurrences.writes(),
         )
         .map_err(NativePlacementFailure::Application)?;
-        for binding in removals.bindings {
-            for occurrence in occurrences.writes().iter().filter(|w| w.binding == binding) {
-                self.journal.placement_elided_writes.insert(occurrence.inst);
-            }
-        }
         self.journal
-            .placement_elided_observations
-            .extend(removals.observations);
+            .record_placement_removals(removals, occurrences.writes());
         let undeclared = crate::unrendered::names_mentioned_without_a_declaration(&self.function);
         if !undeclared.is_empty() {
             return Err(NativePlacementFailure::UndeclaredNames {
@@ -1382,6 +1376,30 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
+    /// Consume placement's complete removal report as one cell contract.
+    ///
+    /// The removed binding identifies every defining instruction whose
+    /// statement disappeared. The exact removed markers identify the value,
+    /// use, write, and effect cells those statements carried. Keeping the
+    /// report opaque until this method consumes both halves prevents a caller
+    /// from forwarding only the cell family it happened to remember.
+    fn record_placement_removals(
+        &mut self,
+        removals: crate::placement::PlacementRemovals,
+        writes: &[crate::placement::FinalBindingWrite],
+    ) {
+        let (bindings, observations) = removals.into_contract();
+        for binding in bindings {
+            self.placement_elided_writes.extend(
+                writes
+                    .iter()
+                    .filter(|write| write.binding == binding)
+                    .map(|write| write.inst),
+            );
+        }
+        self.placement_elided_observations.extend(observations);
+    }
+
     pub(crate) fn checkpoint(&self) -> ObservationJournalCheckpoint {
         ObservationJournalCheckpoint {
             target_len: self.targets.len(),
@@ -2520,22 +2538,46 @@ impl LegacyObservationJournal {
         Ok(())
     }
 
-    fn account_materialized_phi_occurrences(&mut self) {
+    fn record_removed_value(
+        slot: &mut Option<LegacyValueObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyValueObservation::Elided(reason));
+        }
+    }
+
+    fn record_removed_use(
+        slot: &mut Option<LegacyUseObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyUseObservation::Elided(reason));
+        }
+    }
+
+    fn record_removed_write(
+        slot: &mut Option<LegacyWriteObservation>,
+        reason: r2ssa::ledger::ElisionReason,
+    ) {
+        if slot.is_none() {
+            *slot = Some(LegacyWriteObservation::Elided(reason));
+        }
+    }
+
+    fn account_removed_occurrences(&mut self) {
         let graph = self.source.graph();
         for inst in self.materialized_removed_phis.clone() {
             let reason = r2ssa::ledger::ElisionReason::MaterializedPhiEdges;
-            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                && slot.is_none()
-            {
-                *slot = Some(LegacyWriteObservation::Elided(reason));
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                Self::record_removed_write(slot, reason);
             }
             let inputs = graph.inst(inst).map_or(0, |inst| inst.inputs.len());
             for input_idx in 0..inputs {
                 if let Some(row) = self.uses.get_mut(inst.0 as usize)
                     && let Some(slot) = row.get_mut(input_idx)
-                    && slot.is_none()
                 {
-                    *slot = Some(LegacyUseObservation::Elided(reason));
+                    Self::record_removed_use(slot, reason);
                 }
             }
         }
@@ -2547,26 +2589,22 @@ impl LegacyObservationJournal {
         // are closed out.
         let reason = r2ssa::ledger::ElisionReason::DeadUnusedTemporary;
         for inst in self.placement_elided_writes.clone() {
-            if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                && slot.is_none()
-            {
-                *slot = Some(LegacyWriteObservation::Elided(reason));
+            if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                Self::record_removed_write(slot, reason);
             }
             let Some(instruction) = graph.inst(inst) else {
                 continue;
             };
             if let Some(output) = instruction.output
                 && let Some(slot) = self.values.get_mut(output.0 as usize)
-                && slot.is_none()
             {
-                *slot = Some(LegacyValueObservation::Elided(reason));
+                Self::record_removed_value(slot, reason);
             }
             for input_idx in 0..instruction.inputs.len() {
                 if let Some(row) = self.uses.get_mut(inst.0 as usize)
                     && let Some(slot) = row.get_mut(input_idx)
-                    && slot.is_none()
                 {
-                    *slot = Some(LegacyUseObservation::Elided(reason));
+                    Self::record_removed_use(slot, reason);
                 }
             }
         }
@@ -2588,25 +2626,20 @@ impl LegacyObservationJournal {
             };
             match target {
                 ObservationTarget::Value(value) => {
-                    if let Some(slot) = self.values.get_mut(value.0 as usize)
-                        && slot.is_none()
-                    {
-                        *slot = Some(LegacyValueObservation::Elided(reason));
+                    if let Some(slot) = self.values.get_mut(value.0 as usize) {
+                        Self::record_removed_value(slot, reason);
                     }
                 }
                 ObservationTarget::Use { site, .. } => {
                     if let Some(row) = self.uses.get_mut(site.inst.0 as usize)
                         && let Some(slot) = row.get_mut(site.input_idx)
-                        && slot.is_none()
                     {
-                        *slot = Some(LegacyUseObservation::Elided(reason));
+                        Self::record_removed_use(slot, reason);
                     }
                 }
                 ObservationTarget::Write { inst, .. } => {
-                    if let Some(slot) = self.writes.get_mut(inst.0 as usize)
-                        && slot.is_none()
-                    {
-                        *slot = Some(LegacyWriteObservation::Elided(reason));
+                    if let Some(slot) = self.writes.get_mut(inst.0 as usize) {
+                        Self::record_removed_write(slot, reason);
                     }
                 }
                 // A stack access answers through the object it addresses, and a
@@ -2661,9 +2694,24 @@ impl LegacyObservationJournal {
                 )
             });
             if unobserved && let Some(slot) = self.values.get_mut(index) {
-                *slot = Some(LegacyValueObservation::Elided(reason));
+                Self::record_removed_value(slot, reason);
             }
         }
+    }
+
+    /// Apply all absent-occurrence answers in their required dependency order.
+    ///
+    /// Placement's exact removal report must close its cells before an
+    /// identity merge or coalesced copy asks whether every consumer vanished.
+    /// Keeping that order behind one call prevents sealing from classifying a
+    /// removed consumer as an undeclared object.
+    fn apply_absent_occurrence_contracts(
+        &mut self,
+        symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    ) -> Result<(), LegacyObservationJournalError> {
+        self.account_removed_occurrences();
+        self.account_values_rendered_by_binding(symbol_bindings)?;
+        self.account_coalesced_copy_outputs(symbol_bindings)
     }
 
     fn first_unaccounted_render_observation(&self) -> Option<LegacyObservationJournalError> {
@@ -3222,9 +3270,7 @@ impl LegacyObservationJournal {
         // exact removals before deciding whether a coalesced output has any
         // rendered consumer; doing this in the opposite order mistakes a
         // consumer placement removed for an undeclared C object.
-        self.account_materialized_phi_occurrences();
-        self.account_values_rendered_by_binding(&symbol_bindings)?;
-        if let Err(error) = self.account_coalesced_copy_outputs(&symbol_bindings) {
+        if let Err(error) = self.apply_absent_occurrence_contracts(&symbol_bindings) {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
         if let Some(error) = self.first_unaccounted_render_observation() {
@@ -4435,6 +4481,64 @@ mod tests {
             .expect("final effect occurrences seal independently of V/U/W");
         assert_eq!(effects.occurrence_count(obligation), Some(1));
         assert_eq!(effects.surviving().collect::<Vec<_>>(), [(obligation, 1)]);
+    }
+
+    #[test]
+    fn conflicting_use_elision_reasons_refuse_instead_of_picking_one() {
+        let mut slot = None;
+        record_same(
+            &mut slot,
+            LegacyUseObservation::Elided(r2ssa::ledger::ElisionReason::CoalescedCopy),
+        )
+        .expect("the first proof owns the empty use cell");
+        assert_eq!(
+            record_same(
+                &mut slot,
+                LegacyUseObservation::Elided(r2ssa::ledger::ElisionReason::RedundantPhiEdge),
+            ),
+            Err(()),
+            "a second, different elision proof may not replace the first"
+        );
+    }
+
+    #[test]
+    fn placement_effect_elision_is_considered_only_at_zero_occurrences() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligation = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .find(|id| matches!(id.instruction.site, r2ssa::CanonicalInstructionSite::Op(_)))
+            .expect("fixture has an operation-backed obligation");
+        let removed = journal
+            .allocate_many(vec![ObservationTarget::Effect(obligation)])
+            .expect("one removed effect observation")[0];
+        journal.placement_elided_observations.insert(removed);
+        journal.account_removed_occurrences();
+
+        let obligations = BTreeSet::from([obligation]);
+        function.body.push(
+            journal
+                .observe_effect_stmt(&obligations, CStmt::Return(None))
+                .expect("one surviving effect occurrence"),
+        );
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("effect observations seal independently of V/U/W");
+        assert!(effects.placement_removed_effect(obligation));
+        assert_eq!(effects.occurrence_count(obligation), Some(1));
+
+        let origins =
+            NormalizationOrigins::for_unchanged(source.source().function(), source.source());
+        let ledger =
+            crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
+        assert!(matches!(
+            ledger.outcome(&obligation),
+            r2ssa::ledger::Outcome::Rendered { .. }
+        ));
     }
 
     #[test]
