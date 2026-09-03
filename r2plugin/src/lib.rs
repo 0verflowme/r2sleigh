@@ -29,7 +29,7 @@ use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, SSA_JSON_SCHEMA_VERSION, SSAOpInfo,
     export_instruction, op_json_named, ssa_op_to_info,
 };
-use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
+use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, TrustedSleighProfile};
 #[cfg(test)]
 use r2types::recover_vars_arch_profile;
 use std::ffi::{CStr, CString};
@@ -1997,6 +1997,30 @@ struct SleighLanguage {
     /// so ARM32 stays "ARM" across all four A32/Thumb x LE/BE languages; the
     /// language actually chosen is reported by its selector key instead.
     name: &'static str,
+    /// The canonical thread-owned profile when this exact bundle is trusted.
+    shared_profile: Option<TrustedSleighProfile>,
+}
+
+impl SleighLanguage {
+    fn shared(profile: TrustedSleighProfile) -> Self {
+        let (sla, pspec, name) = profile.specification();
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: Some(profile),
+        }
+    }
+
+    #[cfg(any(feature = "arm", feature = "mips"))]
+    fn analysis_only(sla: &'static [u8], pspec: &'static str, name: &'static str) -> Self {
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: None,
+        }
+    }
 }
 
 /// Resolve a selector key to the one Sleigh language it names.
@@ -2006,112 +2030,80 @@ struct SleighLanguage {
 /// the wrong language is well-formed and confidently wrong, which is worse
 /// than no disassembly at all.
 fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
-    let (sla, pspec, name) = match arch {
+    let language = match arch {
         #[cfg(feature = "x86")]
-        "x86-64" | "x86_64" | "x64" | "amd64" => (
-            sleigh_config::processor_x86::SLA_X86_64,
-            sleigh_config::processor_x86::PSPEC_X86_64,
-            "x86-64",
-        ),
+        "x86-64" | "x86_64" | "x64" | "amd64" => {
+            SleighLanguage::shared(TrustedSleighProfile::X86_64)
+        }
         #[cfg(feature = "x86")]
-        "x86" | "x86-32" | "i386" | "i686" => (
-            sleigh_config::processor_x86::SLA_X86,
-            sleigh_config::processor_x86::PSPEC_X86,
-            "x86",
-        ),
+        "x86" | "x86-32" | "i386" | "i686" => SleighLanguage::shared(TrustedSleighProfile::X86),
         // ARM32. `ARMt.pspec` sets TMode=0 (A32) and `ARMtTHUMB.pspec` sets
         // TMode=1 (Thumb); `ARMCortex.pspec` also sets TMode=1 and plants a
         // Cortex-M vector table over ram:0x0-0x40, so it is only ever right for
         // a Cortex-M image and never for Linux/Android userland.
         #[cfg(feature = "arm")]
-        "arm" | "arm32" | "arm-le" => (
-            sleigh_config::processor_arm::SLA_ARM8_LE,
-            sleigh_config::processor_arm::PSPEC_ARMT,
-            "ARM",
-        ),
+        "arm" | "arm32" | "arm-le" => SleighLanguage::shared(TrustedSleighProfile::ArmCortexLe),
         #[cfg(feature = "arm")]
-        "armbe" | "arm-be" | "armeb" => (
+        "armbe" | "arm-be" | "armeb" => SleighLanguage::analysis_only(
             sleigh_config::processor_arm::SLA_ARM8_BE,
             sleigh_config::processor_arm::PSPEC_ARMT,
             "ARM",
         ),
         #[cfg(feature = "arm")]
-        "thumb" | "thumb-le" => (
+        "thumb" | "thumb-le" => SleighLanguage::analysis_only(
             sleigh_config::processor_arm::SLA_ARM8_LE,
             sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
             "ARM",
         ),
         #[cfg(feature = "arm")]
-        "thumbbe" | "thumb-be" | "thumbeb" => (
+        "thumbbe" | "thumb-be" | "thumbeb" => SleighLanguage::analysis_only(
             sleigh_config::processor_arm::SLA_ARM8_BE,
             sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
             "ARM",
         ),
         #[cfg(feature = "arm")]
-        "arm64" | "arm64e" | "aarch64" => (
-            sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-            sleigh_config::processor_aarch64::PSPEC_AARCH64,
-            "aarch64",
-        ),
+        "arm64" | "arm64e" | "aarch64" => {
+            SleighLanguage::shared(TrustedSleighProfile::Aarch64AppleSilicon)
+        }
         #[cfg(feature = "arm")]
-        "arm64be" | "aarch64be" | "aarch64_be" => (
+        "arm64be" | "aarch64be" | "aarch64_be" => SleighLanguage::analysis_only(
             sleigh_config::processor_aarch64::SLA_AARCH64BE,
             sleigh_config::processor_aarch64::PSPEC_AARCH64,
             "aarch64",
         ),
         #[cfg(feature = "mips")]
-        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => (
-            sleigh_config::processor_mips::SLA_MIPS32BE,
-            sleigh_config::processor_mips::PSPEC_MIPS32,
-            "mips32be",
-        ),
+        "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Be)
+        }
         #[cfg(feature = "mips")]
-        "mipsel" | "mips32le" | "mips32el" => (
-            sleigh_config::processor_mips::SLA_MIPS32LE,
-            sleigh_config::processor_mips::PSPEC_MIPS32,
-            "mips32le",
-        ),
+        "mipsel" | "mips32le" | "mips32el" => {
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Le)
+        }
         // MIPS Release 6 dropped and re-encoded instructions the pre-R6
         // languages still accept, so R6 needs its own slaspec.
         #[cfg(feature = "mips")]
-        "mips32r6be" => (
+        "mips32r6be" => SleighLanguage::analysis_only(
             sleigh_config::processor_mips::SLA_MIPS32R6BE,
             sleigh_config::processor_mips::PSPEC_MIPS32R6,
             "mips32r6be",
         ),
         #[cfg(feature = "mips")]
-        "mips32r6le" => (
+        "mips32r6le" => SleighLanguage::analysis_only(
             sleigh_config::processor_mips::SLA_MIPS32R6LE,
             sleigh_config::processor_mips::PSPEC_MIPS32R6,
             "mips32r6le",
         ),
         #[cfg(feature = "mips")]
-        "mips64" | "mips64be" => (
-            sleigh_config::processor_mips::SLA_MIPS64BE,
-            sleigh_config::processor_mips::PSPEC_MIPS64,
-            "mips64be",
-        ),
+        "mips64" | "mips64be" => SleighLanguage::shared(TrustedSleighProfile::Mips64Be),
         #[cfg(feature = "mips")]
-        "mips64el" | "mips64le" => (
-            sleigh_config::processor_mips::SLA_MIPS64LE,
-            sleigh_config::processor_mips::PSPEC_MIPS64,
-            "mips64le",
-        ),
+        "mips64el" | "mips64le" => SleighLanguage::shared(TrustedSleighProfile::Mips64Le),
         #[cfg(feature = "riscv")]
-        "riscv64" | "rv64" | "rv64gc" => (
-            sleigh_config::processor_riscv::SLA_RISCV_LP64D,
-            sleigh_config::processor_riscv::PSPEC_RV64GC,
-            "riscv64",
-        ),
+        "riscv64" | "rv64" | "rv64gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV64Gc),
         #[cfg(feature = "riscv")]
-        "riscv32" | "rv32" | "rv32gc" => (
-            sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
-            sleigh_config::processor_riscv::PSPEC_RV32GC,
-            "riscv32",
-        ),
+        "riscv32" | "rv32" | "rv32gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV32Gc),
         _ => return None,
     };
-    Some(SleighLanguage { sla, pspec, name })
+    Some(language)
 }
 
 /// Selector keys this build can serve, for the refusal message.
@@ -2152,8 +2144,12 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             )
         });
     };
-    let spec = build_arch_spec(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
-    let dis = Disassembler::from_sla(lang.sla, lang.pspec, lang.name).map_err(|e| e.to_string())?;
+    let dis = match lang.shared_profile {
+        Some(profile) => Disassembler::shared_profile_for_analysis(profile),
+        None => Disassembler::from_sla(lang.sla, lang.pspec, lang.name),
+    }
+    .map_err(|e| e.to_string())?;
+    let spec = dis.arch_spec().clone();
     Ok((spec, dis))
 }
 
@@ -6861,6 +6857,51 @@ mod integration_tests {
 
         drop_test_ffi_string(profile_ptr);
         drop_test_context(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn context_and_trusted_lift_share_one_profile_in_either_order() {
+        for context_first in [true, false] {
+            std::thread::spawn(move || {
+                let arch = CString::new("x86-64").expect("architecture name");
+                let (ctx_ptr, trusted) = if context_first {
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile after context");
+                    (ctx_ptr, trusted)
+                } else {
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile before context");
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    (ctx_ptr, trusted)
+                };
+
+                assert!(!ctx_ptr.is_null(), "context must initialize");
+                let context = unsafe { &*ctx_ptr };
+                let analysis = context.disasm.as_ref().expect("analysis disassembler");
+                assert!(
+                    analysis.shares_loaded_specification(&trusted),
+                    "both initialization orders must reach the same parsed profile"
+                );
+
+                let mut bytes = vec![0x90];
+                bytes.resize(16, 0);
+                assert!(
+                    analysis.lift_genuine_block(&bytes, 0x1000, 1).is_err(),
+                    "the C context must remain non-certifying"
+                );
+                assert!(
+                    trusted.lift_genuine_block(&bytes, 0x1000, 1).is_ok(),
+                    "the source-owned view must retain certifying authority"
+                );
+                drop_test_context(ctx_ptr);
+            })
+            .join()
+            .expect("profile ownership test thread");
+        }
     }
 
     #[test]

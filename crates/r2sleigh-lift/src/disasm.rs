@@ -27,6 +27,20 @@ use crate::{LiftError, Result};
 
 /// A disassembler that uses libsla to lift instructions to r2il.
 pub struct Disassembler {
+    /// One thread-confined parse of the selected Sleigh language.
+    loaded: Rc<LoadedSleigh>,
+    /// Opaque authority present only for an embedded trusted Sleigh profile.
+    genuine_authority: Option<GenuineLiftAuthority>,
+    trusted_profile: Option<TrustedSleighProfile>,
+}
+
+/// Parsed state shared by certifying and non-certifying views on one thread.
+///
+/// `GhidraSleigh` owns a C++ object that is neither `Send` nor `Sync`, so this
+/// state can only be shared through `Rc` and the thread-local profile owner
+/// below. Keeping the authority beside the parse lets trusted views retain one
+/// session identity without exposing it through non-certifying views.
+struct LoadedSleigh {
     /// The underlying Ghidra Sleigh instance
     sleigh: GhidraSleigh,
     /// Architecture name
@@ -37,7 +51,9 @@ pub struct Disassembler {
     space_map: HashMap<AddressSpaceId, SpaceId>,
     /// Register the processor spec names as the program counter.
     program_counter: String,
-    /// Opaque authority present only for an embedded trusted Sleigh profile.
+    /// Architecture metadata extracted during this parse.
+    arch: Arc<r2il::ArchSpec>,
+    /// Authority retained by the owner and handed only to certifying views.
     genuine_authority: Option<GenuineLiftAuthority>,
     trusted_profile: Option<TrustedSleighProfile>,
 }
@@ -74,7 +90,8 @@ pub enum TrustedSleighProfile {
 }
 
 impl TrustedSleighProfile {
-    fn specification(self) -> (&'static [u8], &'static str, &'static str) {
+    /// Exact embedded language selected by this profile.
+    pub fn specification(self) -> (&'static [u8], &'static str, &'static str) {
         match self {
             #[cfg(feature = "x86")]
             Self::X86 => (
@@ -1296,7 +1313,7 @@ impl<'a> PcodeSource for DisasmInstructionWrapper<'a> {
     fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
         usize::try_from(idx)
             .ok()
-            .and_then(|idx| self.disasm.space_map.get(&AddressSpaceId::new(idx)))
+            .and_then(|idx| self.disasm.loaded.space_map.get(&AddressSpaceId::new(idx)))
             .copied()
     }
 }
@@ -1334,12 +1351,12 @@ fn build_register_name_map(sleigh: &GhidraSleigh) -> HashMap<(u64, u32), String>
 }
 
 impl Disassembler {
-    fn from_sla_parts(
+    fn load_sla_parts(
         sla_bytes: &[u8],
         pspec: &str,
         arch_name: &str,
         trusted_profile: Option<TrustedSleighProfile>,
-    ) -> Result<Self> {
+    ) -> Result<Rc<LoadedSleigh>> {
         let sleigh = GhidraSleigh::builder()
             .processor_spec(pspec)
             .map_err(|e| LiftError::Parse(format!("Invalid processor spec: {}", e)))?
@@ -1358,26 +1375,52 @@ impl Disassembler {
             )
         });
 
-        Ok(Self {
+        Ok(Rc::new(LoadedSleigh {
             program_counter: program_counter_from_pspec(pspec),
             sleigh,
             arch_name: arch_name.to_string(),
             reg_name_map,
             space_map: extracted.space_map,
+            arch,
             genuine_authority,
             trusted_profile,
-        })
+        }))
     }
 
-    /// Construct from a pinned, embedded processor specification.
+    fn from_loaded(loaded: Rc<LoadedSleigh>, certifying: bool) -> Self {
+        let (genuine_authority, trusted_profile) = if certifying {
+            (loaded.genuine_authority.clone(), loaded.trusted_profile)
+        } else {
+            (None, None)
+        };
+        Self {
+            loaded,
+            genuine_authority,
+            trusted_profile,
+        }
+    }
+
+    fn from_sla_parts(
+        sla_bytes: &[u8],
+        pspec: &str,
+        arch_name: &str,
+        trusted_profile: Option<TrustedSleighProfile>,
+    ) -> Result<Self> {
+        let certifying = trusted_profile.is_some();
+        let loaded = Self::load_sla_parts(sla_bytes, pspec, arch_name, trusted_profile)?;
+        Ok(Self::from_loaded(loaded, certifying))
+    }
+
+    /// Construct a fresh certifying view from a pinned embedded specification.
     ///
-    /// This is the only constructor that can mint genuine lift authority.
+    /// Prefer [`Self::shared_trusted_profile`] for session work; this cold path
+    /// remains useful when an intentionally independent authority is required.
     pub fn from_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
         let (sla_bytes, pspec, arch_name) = profile.specification();
         Self::from_sla_parts(sla_bytes, pspec, arch_name, Some(profile))
     }
 
-    /// The one loaded instance of an embedded profile, loaded on first ask.
+    /// The sole owner of a loaded embedded profile on this thread.
     ///
     /// Building a disassembler parses the whole compiled `.sla` and rebuilds
     /// the register and address-space tables from it. Measured on the x86-64
@@ -1400,21 +1443,56 @@ impl Disassembler {
     /// its own, which is one per embedded profile per lifting thread. The bound
     /// is the number of profiles the build embeds, at most eleven and in
     /// practice one.
-    fn shared_trusted_profile(profile: TrustedSleighProfile) -> Result<Rc<Self>> {
+    fn shared_loaded_profile(profile: TrustedSleighProfile) -> Result<Rc<LoadedSleigh>> {
         thread_local! {
-            static LOADED: RefCell<HashMap<TrustedSleighProfile, Rc<Disassembler>>> =
+            static LOADED: RefCell<HashMap<TrustedSleighProfile, Rc<LoadedSleigh>>> =
                 RefCell::new(HashMap::new());
         }
-        if let Some(loaded) = LOADED.with(|cache| cache.borrow().get(&profile).map(Rc::clone)) {
-            return Ok(loaded);
-        }
-        // Built outside the borrow: loading is fallible and can itself reach
-        // this function for another profile.
-        let loaded = Rc::new(Self::from_trusted_profile(profile)?);
-        LOADED.with(|cache| {
-            cache.borrow_mut().insert(profile, Rc::clone(&loaded));
-        });
+        let loaded = if let Some(loaded) =
+            LOADED.with(|cache| cache.borrow().get(&profile).map(Rc::clone))
+        {
+            loaded
+        } else {
+            // Built outside the borrow: loading is fallible and can itself
+            // reach this function for another profile.
+            let (sla_bytes, pspec, arch_name) = profile.specification();
+            let loaded = Self::load_sla_parts(sla_bytes, pspec, arch_name, Some(profile))?;
+            LOADED.with(|cache| {
+                cache.borrow_mut().insert(profile, Rc::clone(&loaded));
+            });
+            loaded
+        };
         Ok(loaded)
+    }
+
+    /// A certifying view of the thread-owned embedded profile.
+    pub fn shared_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
+        Ok(Self::from_loaded(
+            Self::shared_loaded_profile(profile)?,
+            true,
+        ))
+    }
+
+    /// A non-certifying view of the same thread-owned embedded profile.
+    ///
+    /// This is for consumers such as the radare2 architecture context: they
+    /// need disassembly and architecture metadata, but their raw byte inputs
+    /// are not the source-owned snapshots required to mint genuine authority.
+    pub fn shared_profile_for_analysis(profile: TrustedSleighProfile) -> Result<Self> {
+        Ok(Self::from_loaded(
+            Self::shared_loaded_profile(profile)?,
+            false,
+        ))
+    }
+
+    /// Whether two views use the exact same parsed C++ Sleigh instance.
+    pub fn shares_loaded_specification(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.loaded, &other.loaded)
+    }
+
+    /// Architecture metadata extracted from this loaded specification.
+    pub fn arch_spec(&self) -> &r2il::ArchSpec {
+        &self.loaded.arch
     }
 
     /// Lift every byte of one opaque source capture with the one exact embedded
@@ -1554,7 +1632,7 @@ impl Disassembler {
 
     /// Get the architecture name.
     pub fn arch_name(&self) -> &str {
-        &self.arch_name
+        &self.loaded.arch_name
     }
 
     /// The register this processor uses as its program counter.
@@ -1564,22 +1642,23 @@ impl Disassembler {
     /// Writing a branch target to the wrong name leaves the branch with no
     /// effect at all.
     pub fn program_counter(&self) -> &str {
-        &self.program_counter
+        &self.loaded.program_counter
     }
 
     /// Get the default code address space.
     pub fn default_code_space(&self) -> AddressSpace {
-        self.sleigh.default_code_space()
+        self.loaded.sleigh.default_code_space()
     }
 
     /// List all address spaces.
     pub fn address_spaces(&self) -> Vec<AddressSpace> {
-        self.sleigh.address_spaces()
+        self.loaded.sleigh.address_spaces()
     }
 
     /// Get a register's varnode data by name.
     pub fn register(&self, name: &str) -> Result<VarnodeData> {
-        self.sleigh
+        self.loaded
+            .sleigh
             .register_from_name(name)
             .map_err(|e| LiftError::Parse(format!("Unknown register '{}': {}", name, e)))
     }
@@ -1601,17 +1680,17 @@ impl Disassembler {
             return None;
         }
 
-        if let Some(name) = self.reg_name_map.get(&(vn.offset, vn.size)) {
+        if let Some(name) = self.loaded.reg_name_map.get(&(vn.offset, vn.size)) {
             return Some(name.clone());
         }
 
         // Get the register address space
-        let reg_space = self.sleigh.address_space_by_name("register")?;
+        let reg_space = self.loaded.sleigh.address_space_by_name("register")?;
 
         // Create a VarnodeData to query libsla
         let varnode_data = VarnodeData::new(Address::new(reg_space, vn.offset), vn.size as usize);
 
-        self.sleigh.register_name(&varnode_data)
+        self.loaded.sleigh.register_name(&varnode_data)
     }
 
     /// Format a varnode as a human-readable string, resolving register names.
@@ -1667,7 +1746,7 @@ impl Disassembler {
     /// normalization required to preserve the instruction's control graph.
     /// No mnemonic, user-op name, or inferred metadata participates.
     fn lift_canonical(&self, bytes: &[u8], addr: u64) -> Result<R2ILBlock> {
-        let code_space = self.sleigh.default_code_space();
+        let code_space = self.loaded.sleigh.default_code_space();
         let address = Address::new(code_space, addr);
 
         // Create an instruction loader from the bytes
@@ -1675,6 +1754,7 @@ impl Disassembler {
 
         // Disassemble to P-code
         let pcode = self
+            .loaded
             .sleigh
             .disassemble_pcode(&loader, address)
             .map_err(|e| LiftError::Parse(format!("Disassembly failed: {e}")))?;
@@ -1845,11 +1925,12 @@ impl Disassembler {
 
     /// Disassemble and get native assembly mnemonic.
     pub fn disasm_native(&self, bytes: &[u8], addr: u64) -> Result<(String, usize)> {
-        let code_space = self.sleigh.default_code_space();
+        let code_space = self.loaded.sleigh.default_code_space();
         let address = Address::new(code_space, addr);
         let loader = ByteLoader::new(bytes, addr);
 
         let native = self
+            .loaded
             .sleigh
             .disassemble_native(&loader, address)
             .map_err(|e| LiftError::Parse(format!("Disassembly failed: {}", e)))?;
@@ -1914,9 +1995,12 @@ impl Disassembler {
         // contribute to out-of-band op metadata without altering canonical
         // Sleigh operations or operands.
         let mut analysis = block.clone();
-        annotate_semantic_metadata_with_hints(&mut analysis, &self.arch_name, options, |vn| {
-            self.register_name(vn)
-        });
+        annotate_semantic_metadata_with_hints(
+            &mut analysis,
+            &self.loaded.arch_name,
+            options,
+            |vn| self.register_name(vn),
+        );
         block.op_metadata = analysis.op_metadata;
     }
 
@@ -2558,12 +2642,16 @@ impl Disassembler {
 
     /// Convert a libsla AddressSpace using the exact metadata-extraction map.
     fn translate_space(&self, space: &AddressSpace) -> Result<SpaceId> {
-        self.space_map.get(&space.id).copied().ok_or_else(|| {
-            LiftError::Unsupported(format!(
-                "Sleigh emitted unmapped address space '{}' ({})",
-                space.name, space.id
-            ))
-        })
+        self.loaded
+            .space_map
+            .get(&space.id)
+            .copied()
+            .ok_or_else(|| {
+                LiftError::Unsupported(format!(
+                    "Sleigh emitted unmapped address space '{}' ({})",
+                    space.name, space.id
+                ))
+            })
     }
 }
 
@@ -4347,7 +4435,7 @@ mod tests {
             .expect("trusted profile authority");
         let spaces = disassembler.address_spaces();
 
-        assert_eq!(spaces.len(), disassembler.space_map.len());
+        assert_eq!(spaces.len(), disassembler.loaded.space_map.len());
         for space in spaces {
             let mapped = disassembler
                 .translate_space(&space)
@@ -4695,8 +4783,16 @@ mod sleigh_profile_load_cost {
         let second =
             Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("second ask");
         assert!(
-            Rc::ptr_eq(&first, &second),
-            "the second ask must be the same loaded profile, not another copy"
+            first.shares_loaded_specification(&second),
+            "the second ask must use the same loaded profile, not another parse"
+        );
+        assert!(
+            first
+                .genuine_authority
+                .as_ref()
+                .zip(second.genuine_authority.as_ref())
+                .is_some_and(|(first, second)| first.same_session(second)),
+            "trusted views must preserve the loaded profile's session authority"
         );
         assert_eq!(first.trusted_profile, Some(TrustedSleighProfile::X86_64));
         assert!(first.genuine_authority.is_some());
