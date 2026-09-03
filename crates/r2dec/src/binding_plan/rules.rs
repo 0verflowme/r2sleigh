@@ -583,7 +583,6 @@ fn duplicable_bound_literals(
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
     }
-    let boundary_rendered = boundary_rendered_values(source_owned.source());
     let literal_candidates = graph
         .values
         .iter()
@@ -596,72 +595,7 @@ fn duplicable_bound_literals(
         })
         .map(|value| value.id)
         .collect::<BTreeSet<_>>();
-    literal_candidates
-        .iter()
-        .copied()
-        // And something must still be rendered where the definition was. A
-        // block that renders nothing cannot answer for the instructions in
-        // it: the ledger reports `BlockNotRendered` and refuses the function,
-        // which is what `murmur3_32` did at x86-64 -O1 and -O2 once bound
-        // literals became inlinable.
-        //
-        // A reader in the same block is not enough, and assuming it was is
-        // what the first attempt got wrong: that reader can itself be a value
-        // the plan inlines, and the block empties anyway. What keeps a block
-        // on the page is an instruction whose output is bound, and the only
-        // extra inlining this pass performs is the candidates themselves --
-        // so an instruction bound under the conservative answer and not a
-        // candidate is bound under this one too, and its statement is the
-        // one that keeps the block.
-        // And the value must not be one a boundary depends on. A return
-        // value, a register composition, a return address or the exit stack
-        // pointer seeds a `LiveValueProducer` obligation on the instruction
-        // that defines it -- `seed_value_definition` -- and that obligation
-        // says the definition must render. The boundary spells such a value
-        // through its own path, which does not go through the inline
-        // machinery, so inlining it leaves the obligation with no occurrence
-        // and the function refuses. `murmur3_32` at x86-64 -O1 and -O2 is the
-        // case: one register literal, live at a boundary, one refused
-        // obligation.
-        //
-        // This is also why a literal in a lowering temporary never had the
-        // problem. A boundary is expressed in architectural storage, so the
-        // lifter's own scratch is never live at one.
-        .filter(|value| !boundary_rendered.contains(value))
-        .collect()
-}
-
-/// Values a return boundary spells through its own path.
-///
-/// These are exactly the values `seed_value_definition` seeds a
-/// `LiveValueProducer` obligation for at a return: the returned values, the
-/// pieces of a register composition, the return address, and the exit stack
-/// pointer. The obligation kind alone is far wider than this -- filtering on
-/// it turned away every candidate, including the page base that motivated
-/// the admission -- because the same kind is seeded elsewhere for values the
-/// inline machinery does render.
-fn boundary_rendered_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
-    let mut values = BTreeSet::new();
-    for boundary in source.facts().boundaries.returns.values() {
-        for value in &boundary.values {
-            values.insert(value.value);
-        }
-        for composition in &boundary.register_compositions {
-            values.insert(composition.base.value);
-            for overlay in &composition.overlays {
-                values.insert(overlay.definition.value);
-            }
-        }
-        if let Some(return_address) = boundary.return_address {
-            values.insert(return_address.value);
-        }
-        if let Some(r2ssa::SourceReturnStackPointerFact::ReachingValue { value, .. }) =
-            boundary.exit_stack_pointer
-        {
-            values.insert(value);
-        }
-    }
-    values
+    literal_candidates.iter().copied().collect()
 }
 
 fn inlinable_core(
