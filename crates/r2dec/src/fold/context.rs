@@ -729,7 +729,19 @@ impl<'a> FoldingContext<'a> {
                 EffectOccurrenceKind::Expression => match &inst.payload {
                     r2ssa::InstPayload::Op(
                         r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::BranchInd { .. },
-                    ) => obligation.id.kind == ObligationKind::ControlTransfer,
+                    ) => {
+                        obligation.id.kind == ObligationKind::ControlTransfer
+                            || rendered_call.is_some_and(|fact| {
+                                fact.disposition.is_terminal_return()
+                                    && (obligation.id.kind == ObligationKind::Call
+                                        || (obligation.id.kind == ObligationKind::CallArgument
+                                            && !obligation.inputs.is_empty()
+                                            && obligation
+                                                .inputs
+                                                .iter()
+                                                .all(|input| fact.proof_values.contains(input))))
+                            })
+                    }
                     r2ssa::InstPayload::Op(r2ssa::SSAOp::CBranch { .. }) => matches!(
                         obligation.id.kind,
                         ObligationKind::ControlPredicate | ObligationKind::ControlTransfer

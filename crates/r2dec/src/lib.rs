@@ -4198,29 +4198,27 @@ impl Decompiler {
                 crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
             );
         }
-        // A transfer whose target is not a block of this function cannot be
-        // linearized either. The terminator arm below spells every target as
-        // `goto loc_<addr>`, and a target outside the function has no block to
-        // carry that label: the emitted `goto` names a label the function never
-        // defines. That is a wrong answer twice over -- the C does not compile,
-        // and where it did it would claim a transfer inside this function that
-        // the machine makes into another one. A direct tail call is the common
-        // shape here and it needs a callsite, not a jump.
-        //
-        // This is a guard over a missing capability, not the capability. It
-        // stops being right the moment a transfer that leaves the function has
-        // a real form: a callsite interface offered by the source layer for a
-        // branch whose target lies outside this function's bounds, rendered as
-        // a terminal call with no fallthrough. Delete this block in the commit
-        // that lands that form. A guard left standing over a case the renderer
-        // can express is a workaround wearing a refusal's clothes.
+        // An unclassified transfer whose target is not a block of this function
+        // cannot be linearized. The terminator arm below spells it as
+        // `goto loc_<addr>`, but an outside target has no block to carry that
+        // label. A source-proven tail jump is different: its callsite fact
+        // renders a terminal return in the folded body, so the absent target is
+        // no longer a label the linear form owes. Every other outside branch
+        // stays behind this refusal; a target that is not a function entry is
+        // still a jump, and inventing a call for it would be a wrong answer.
         let own_blocks: std::collections::BTreeSet<u64> =
             blocks.iter().map(|block| block.addr).collect();
         if blocks.iter().any(|block| {
+            let terminal_call = block.ops.iter().enumerate().any(|(op_idx, _)| {
+                fold_ctx
+                    .certified_call_render_fact_for_op(block.addr, op_idx)
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+            });
             func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
-                Self::linearized_transfer_targets(&cfg_block.terminator)
-                    .iter()
-                    .any(|target| !own_blocks.contains(target))
+                !terminal_call
+                    && Self::linearized_transfer_targets(&cfg_block.terminator)
+                        .iter()
+                        .any(|target| !own_blocks.contains(target))
             })
         }) {
             return Err(
@@ -4310,6 +4308,15 @@ impl Decompiler {
         block: &r2ssa::FunctionSSABlock,
     ) -> Option<CStmt> {
         let terminator = &func.cfg().get_block(block.addr)?.terminator;
+        if matches!(terminator, BlockTerminator::Branch { .. })
+            && block.ops.iter().enumerate().any(|(op_idx, _)| {
+                fold_ctx
+                    .certified_call_render_fact_for_op(block.addr, op_idx)
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+            })
+        {
+            return None;
+        }
         match terminator {
             BlockTerminator::ConditionalBranch {
                 true_target,
@@ -4794,8 +4801,9 @@ impl Decompiler {
                 ));
             }
         };
-        let inferred_ret_type =
-            evidence_return_type(prepared, input.source_owned_facts().evidence_types());
+        let inferred_ret_type = r2types::exact_source_return_type(prepared).unwrap_or_else(|| {
+            evidence_return_type(prepared, input.source_owned_facts().evidence_types())
+        });
         let signature_ret_type = render_signature.and_then(|sig| sig.ret_type.clone());
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {

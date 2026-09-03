@@ -18,6 +18,7 @@ use r2source::{
 
 use crate::function::SSAFunction;
 use crate::graph::SsaGraph;
+use crate::span::StorageSpans;
 use crate::var::SSAVar;
 
 /// One argument slot the machine code proves the function reads.
@@ -172,6 +173,27 @@ pub fn recover_interface(
     func: &SSAFunction,
     slots: &SourceConventionSlots,
 ) -> Option<RecoveredInterface> {
+    recover_interface_inner(func, slots, None)
+}
+
+/// Recover an interface while retaining exact source-owned call boundaries.
+///
+/// This is the production path. The context is provisional only in that it
+/// does not yet contain the function interface being recovered; its call-site
+/// identities and interfaces are already final source facts.
+pub(crate) fn recover_interface_with_context(
+    func: &SSAFunction,
+    slots: &SourceConventionSlots,
+    machine_context: &crate::SourceMachineContext,
+) -> Option<RecoveredInterface> {
+    recover_interface_inner(func, slots, Some(machine_context))
+}
+
+fn recover_interface_inner(
+    func: &SSAFunction,
+    slots: &SourceConventionSlots,
+    machine_context: Option<&crate::SourceMachineContext>,
+) -> Option<RecoveredInterface> {
     if slots.argument_slots().is_empty() {
         return None;
     }
@@ -181,7 +203,18 @@ pub fn recover_interface(
     // seals the recovered interface into the final artifact. A cheaper raw-use
     // scan cannot distinguish program inputs from preserved machine state.
     let graph = SsaGraph::from_function(func);
-    let facts = crate::semantic::PreparedFunctionFacts::collect(func, &graph);
+    let facts = if let Some(machine_context) = machine_context {
+        let storage_spans = StorageSpans::compute(func, &graph);
+        crate::semantic::PreparedFunctionFacts::collect_with_context(
+            func,
+            &graph,
+            &storage_spans,
+            &crate::AssumptionSet::default(),
+            machine_context,
+        )
+    } else {
+        crate::semantic::PreparedFunctionFacts::collect(func, &graph)
+    };
     if !facts.obligations.is_complete() {
         r2il::refusal_evidence!(
             "interface-recovery",
@@ -191,9 +224,15 @@ pub fn recover_interface(
         return None;
     }
 
-    let mut result = None;
+    let exact_tail_result = exact_tail_result_storage(&facts);
+    let mut result = exact_tail_result.flatten();
     let mut live_out = crate::liveout::FunctionLiveOut::default();
-    if let Some(candidate) = slots.result_slot() {
+    // An exact tail-call interface owns this boundary. Looking at the value
+    // present before the branch would instead mistake a call argument for the
+    // value the callee returns into the same register.
+    if exact_tail_result.is_none()
+        && let Some(candidate) = slots.result_slot()
+    {
         let candidate_live_out =
             crate::liveout::FunctionLiveOut::compute(func, &graph, &[candidate]);
         if !candidate_live_out.is_empty() && candidate_live_out.unresolved_blocks().next().is_none()
@@ -218,9 +257,17 @@ pub fn recover_interface(
     // A carrier passed straight to a call is read by that call, so it belongs
     // in the same evidence as an explicit entry read. The prefix rule below is
     // unchanged and still stops at the first candidate slot nothing observes.
-    for storage in passed_through_entry_storages(&facts.boundaries) {
-        if !reads.contains(&storage) {
-            reads.push(storage);
+    // Context-free recovery historically has no exact call interfaces, but
+    // retain its boundary projection as a local analysis facility. Production
+    // contextual recovery uses the call boundary only for the tail result:
+    // making an implicit preserved argument into a formal parameter also
+    // requires every consumer to agree that its new graph value is spellable,
+    // which is a separate contract from terminal-transfer recovery.
+    if machine_context.is_none() {
+        for storage in passed_through_entry_storages(&facts.boundaries) {
+            if !reads.contains(&storage) {
+                reads.push(storage);
+            }
         }
     }
     let mut parameters = Vec::new();
@@ -245,6 +292,32 @@ pub fn recover_interface(
     Some(RecoveredInterface {
         parameters: parameters.into_boxed_slice(),
         result,
+    })
+}
+
+/// The result carrier licensed by every source-proven tail boundary.
+///
+/// `Some(None)` is an exact void result; `None` means there is no complete,
+/// unanimous tail boundary and ordinary live-out recovery remains responsible.
+fn exact_tail_result_storage(
+    facts: &crate::semantic::PreparedFunctionFacts,
+) -> Option<Option<CanonicalStorageId>> {
+    let mut results = facts
+        .call_sites
+        .by_id
+        .values()
+        .filter(|call| call.transfer == crate::CallSiteTransfer::TailCall)
+        .map(|call| {
+            let boundary = facts.boundaries.calls.get(&call.id)?;
+            boundary.complete.then_some(boundary.result_kind?)
+        });
+    let first = results.next()??;
+    if results.any(|result| result != Some(first)) {
+        return None;
+    }
+    Some(match first {
+        SourceCallResult::Void => None,
+        SourceCallResult::Register { storage } => Some(storage),
     })
 }
 

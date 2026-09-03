@@ -245,15 +245,20 @@ pub(crate) fn certified_boundary_read_values(
         values.insert(selector);
     }
 
-    if matches!(
-        payload,
-        r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. })
-    ) && let Some(certificate) = certificates
+    if let Some(certificate) = certificates
         .callsites_by_inst
         .get(&at)
         .and_then(|call_site| certificates.callsites.get(call_site))
         .filter(|certificate| {
-            certificate.at == at && (certificate.block_addr, certificate.op_index) == site
+            certificate.at == at
+                && (certificate.block_addr, certificate.op_index) == site
+                && (matches!(
+                    payload,
+                    r2ssa::InstPayload::Op(
+                        r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }
+                    )
+                ) || certificate.transfer == r2ssa::CallSiteTransfer::TailCall
+                    && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. })))
         })
     {
         values.extend(
