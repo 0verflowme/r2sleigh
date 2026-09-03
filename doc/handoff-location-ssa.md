@@ -9320,6 +9320,49 @@ The lesson for whoever adds the next rendering path: the cells a path must
 fill are not the cells its author thinks about, they are the cells the path it
 replaced used to fill. Diff the two.
 
+### DecBench: type_match did not move, and why
+
+Measured on `bzip2recover` at `-O0` against `tests/decbench/baseline.json`,
+with the witness check passing so the library scored is this tree's:
+
+    metric        this tree        baseline         angr
+    byte_match    0.140 over 7     0.111 over 8     0.602 over 15
+    type_match    0.125 over 4     0.100 over 5     0.591 over 11
+    ged           5.000 over 6     5.429 over 7     5.538 over 13
+    type_match perfect functions      0                   3
+
+**Read the means with care; they are misleading here and the per-function
+numbers are not.** `type_match` is unchanged on every function that scores
+one -- `endsInBz2` 0.5, `mallocFail` 0.0, `tooManyBlocks` 0.0, `bsPutBit` 0.0.
+The aggregate rose from 0.100 to 0.125 for exactly one reason: `bsClose`
+scored 0.0 and stopped being decompiled, so a zero left the denominator. A
+metric averaged over "functions we rendered" improves when a bad one refuses,
+which is the trap this record exists to expose. Zero perfect functions is the
+honest state and it has not changed.
+
+**Why the array work does not show here.** Rendering every function of the
+binary and counting, there is exactly one subscript in the whole output:
+
+    ((int32_t *)tmp_11f80_5)[3] = (uint32_t)1;
+
+The seven functions r2sleigh renders on this binary are small I/O helpers --
+`readError`, `writeError`, `mallocFail`, `bsPutBit`, `endsInBz2` -- with
+almost no indexed access between them. The feature fires 21 times on the hash
+corpus and once here, and that is a fact about the workload rather than about
+the rules. Anyone expecting this metric to move on array recovery needs a
+binary whose *rendered* functions index arrays; picking a benchmark whose
+rendered subset lacks the construct measures nothing. That one subscript is a
+store, which at least proves the store path is live end to end.
+
+**`bsClose` is not this work.** It refuses with `unrepresentable operation`
+from `lib.rs:4230`, which fires when a block's transfer target leaves the
+function's own blocks -- the tail-call linearisation path, in code this branch
+never touched, and not an accounting refusal of any kind. It arrived with the
+merged tail-call work. A definitive attribution wants a benchmark run on the
+integration branch with these commits absent; the evidence short of that is
+that the refusal is a control-flow decision and every change here is in terms,
+rules and cell accounting.
+
 ### Declared member and proven stride are one owner, not a ranking
 
 These look like two authorities over one access and cannot both answer.
