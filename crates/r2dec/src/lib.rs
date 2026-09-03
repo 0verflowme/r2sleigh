@@ -6365,89 +6365,96 @@ mod tests {
             size: 8,
         };
         let rsp = Varnode::register(0x28, 8);
-        let rax = Varnode::register(0x00, 8);
-        let mut ops: Vec<R2ILOp> = Vec::new();
-        let mut meta = std::collections::BTreeMap::new();
-        // call: push the return address, transfer.
-        let first = ops.len();
-        ops.push(R2ILOp::IntSub {
+        let rip = Varnode::register(0x30, 8);
+
+        // One arm calls and one does not, so their restored stack pointers
+        // meet in a phi that is also the same machine object.
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::unique(0x80, 1),
+        });
+        let mut no_call = R2ILBlock::new(0x1004, 4);
+        no_call.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut call_ops = vec![R2ILOp::IntSub {
             dst: rsp.clone(),
             a: rsp.clone(),
             b: Varnode::constant(8, 8),
-        });
-        ops.push(R2ILOp::Store {
+        }];
+        call_ops.push(R2ILOp::Store {
             space: SpaceId::Ram,
             addr: rsp.clone(),
-            val: Varnode::constant(0x1005, 8),
+            val: Varnode::constant(0x100d, 8),
         });
-        ops.push(R2ILOp::Call {
+        call_ops.push(R2ILOp::Call {
             target: Varnode::constant(0x2000, 8),
         });
-        for i in first..ops.len() {
-            meta.insert(
+        let mut call_meta = std::collections::BTreeMap::new();
+        for i in 0..call_ops.len() {
+            call_meta.insert(
                 i,
                 r2il::OpMetadata {
-                    instruction_addr: Some(0x1000),
+                    instruction_addr: Some(0x1008),
                     ..Default::default()
                 },
             );
         }
-        // a read of the stack pointer after the call, feeding the result
-        let second = ops.len();
-        ops.push(R2ILOp::IntAdd {
-            dst: rax.clone(),
-            a: rsp.clone(),
-            b: Varnode::constant(0x10, 8),
+        call_ops.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
         });
-        for i in second..ops.len() {
-            meta.insert(
-                i,
-                r2il::OpMetadata {
-                    instruction_addr: Some(0x1005),
-                    ..Default::default()
-                },
-            );
-        }
-        // ret: load the return address off the stack, pop it, transfer.
-        let rip = Varnode::register(0x30, 8);
-        let third = ops.len();
-        ops.push(R2ILOp::Load {
+        let called = R2ILBlock {
+            addr: 0x1008,
+            size: 8,
+            ops: call_ops,
+            switch_info: None,
+            op_metadata: call_meta,
+        };
+
+        let mut exit_ops = vec![R2ILOp::Load {
             dst: rip.clone(),
             space: SpaceId::Ram,
             addr: rsp.clone(),
-        });
-        ops.push(R2ILOp::IntAdd {
+        }];
+        exit_ops.push(R2ILOp::IntAdd {
             dst: rsp.clone(),
             a: rsp.clone(),
             b: Varnode::constant(8, 8),
         });
-        ops.push(R2ILOp::Return {
+        exit_ops.push(R2ILOp::Return {
             target: rip.clone(),
         });
-        for i in third..ops.len() {
-            meta.insert(
+        let mut exit_meta = std::collections::BTreeMap::new();
+        for i in 0..exit_ops.len() {
+            exit_meta.insert(
                 i,
                 r2il::OpMetadata {
-                    instruction_addr: Some(0x1009),
+                    instruction_addr: Some(0x1010),
                     ..Default::default()
                 },
             );
         }
-        let block = R2ILBlock {
-            addr: 0x1000,
-            size: 16,
-            ops,
+        let exit = R2ILBlock {
+            addr: 0x1010,
+            size: 4,
+            ops: exit_ops,
             switch_info: None,
-            op_metadata: meta,
+            op_metadata: exit_meta,
         };
+        let blocks = [entry, no_call, called, exit];
 
         let interface = r2ssa::SourceFunctionInterface::new_exact(
             b"restore-fixture".to_vec(),
             "sysv64",
-            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
-            r2ssa::SourceFunctionReturn::Register {
-                storage: storage(0),
-            },
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+            r2ssa::SourceFunctionReturn::Void,
             std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
         )
         .and_then(|i| i.with_return_address_storage(storage(0x30)))
@@ -6455,18 +6462,28 @@ mod tests {
         .expect("interface")
         .with_preserved_call_carriers(true, true);
         let prepared =
-            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            r2ssa::SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
                 .expect("prepared")
                 .with_name("restore_demo");
         let restores = prepared
             .function()
-            .get_block(0x1000)
-            .expect("entry")
+            .get_block(0x1008)
+            .expect("call arm")
             .ops
             .iter()
             .filter(|op| matches!(op, r2ssa::SSAOp::CallRestore { .. }))
             .count();
         assert_eq!(restores, 1, "the call moved the carrier, so it is restored");
+        assert!(
+            prepared
+                .function()
+                .get_block(0x1010)
+                .expect("join")
+                .phis
+                .iter()
+                .any(|phi| phi.canonical_storage == Some(storage(0x28))),
+            "the called and uncalled paths must merge their stack carriers"
+        );
         let input = source_owned_decompiler_input(
             prepared,
             (r2types::DecompileRouteKind::Standard, "restore route", None),
