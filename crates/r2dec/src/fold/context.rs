@@ -399,6 +399,11 @@ impl<'a> FoldingContext<'a> {
         {
             Ok(marked) => marked,
             Err(error) => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "could not mark discharged value {value:?} definitions={discharged:?}: {error:?}"
+                    );
+                }
                 self.retain_first_observation_error(error);
                 return fallback;
             }

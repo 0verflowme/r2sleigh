@@ -1109,6 +1109,11 @@ fn insert_elided_use(
 ) -> Result<(), CertificateElidedCellsError> {
     match uses.insert(site, reason) {
         Some(existing) if existing != reason => {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!(
+                    "conflicting use {site:?}: certificate reason {existing:?}, new reason {reason:?}"
+                );
+            }
             Err(CertificateElidedCellsError::ConflictingUse(site))
         }
         _ => Ok(()),

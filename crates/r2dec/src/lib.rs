@@ -6502,6 +6502,118 @@ mod tests {
         );
     }
 
+    /// A restore whose certified output is dead still has no C occurrence.
+    #[test]
+    fn an_unused_restored_stack_pointer_renders() {
+        let arch = test_arch_for_decompile();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let rsp = Varnode::register(0x28, 8);
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::unique(0x80, 1),
+        });
+        let mut no_call = R2ILBlock::new(0x1004, 4);
+        no_call.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut called = R2ILBlock::new(0x1008, 8);
+        called.push(R2ILOp::IntSub {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        called.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: rsp,
+            val: Varnode::constant(0x100d, 8),
+        });
+        called.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        for i in 0..called.ops.len() {
+            called.op_metadata.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1008),
+                    ..Default::default()
+                },
+            );
+        }
+        called.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut exit = R2ILBlock::new(0x1010, 4);
+        exit.push(R2ILOp::Breakpoint);
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"unused-restore-fixture".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|i| i.with_return_address_storage(storage(0x30)))
+        .and_then(|i| i.with_stack_pointer_storage(storage(0x28)))
+        .expect("interface")
+        .with_preserved_call_carriers(true, true);
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[entry, no_call, called, exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared")
+        .with_name("unused_restore_demo");
+        let restore_outputs = prepared
+            .graph()
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.payload,
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::CallRestore { .. })
+                )
+            })
+            .filter_map(|inst| inst.output)
+            .collect::<Vec<_>>();
+        assert_eq!(restore_outputs.len(), 1, "one stack carrier is restored");
+        let structural_unused = prepared
+            .obligations()
+            .structural_unused_values(
+                prepared.graph(),
+                prepared.unobserved_merges().unobserved_uses(),
+            )
+            .expect("complete structural-value inventory");
+        assert!(
+            restore_outputs
+                .iter()
+                .all(|value| structural_unused.contains(value)),
+            "the regression requires an unused restore output"
+        );
+
+        let input = source_owned_decompiler_input(
+            prepared,
+            (r2types::DecompileRouteKind::Standard, "restore route", None),
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+        assert!(
+            !output.contains("native render refusal"),
+            "an unused restored carrier must not refuse the function: {output}"
+        );
+        assert!(
+            output.contains("0 unaccounted"),
+            "the structural elision accounts for the restore operand: {output}"
+        );
+    }
+
     fn test_arch_for_decompile() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         let registers = [

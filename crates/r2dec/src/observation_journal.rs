@@ -1588,6 +1588,7 @@ impl LegacyObservationJournal {
                 // it, and names the carrier it means, which is that proof. A
                 // restore the convention does not speak for is declined
                 // exactly as an unproven program copy is.
+                let is_call_restore = matches!(op, r2ssa::SSAOp::CallRestore { .. });
                 let src = match op {
                     r2ssa::SSAOp::Copy { src, .. } => src,
                     r2ssa::SSAOp::CallRestore { src, dst }
@@ -1595,7 +1596,12 @@ impl LegacyObservationJournal {
                     {
                         src
                     }
-                    _ => continue,
+                    _ => {
+                        if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!("call restore at {site:?} has no preserved-carrier fact");
+                        }
+                        continue;
+                    }
                 };
                 // A restore's source is the carrier as the function was
                 // entered with it whenever the call is the first one, and that
@@ -1638,10 +1644,18 @@ impl LegacyObservationJournal {
                         program_copy = Some(*inst);
                         None
                     }
-                    None => continue,
+                    None => {
+                        if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!("call restore at {site:?} has no normalization origin");
+                        }
+                        continue;
+                    }
                 };
                 let projection = &normalized_projections[block_id.0 as usize][op_idx];
                 let Some(output) = projection.output else {
+                    if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!("call restore at {site:?} has no output projection");
+                    }
                     continue;
                 };
                 let input = match incoming {
@@ -1652,6 +1666,9 @@ impl LegacyObservationJournal {
                     None => projection.inputs.first(),
                 };
                 let Some(input) = input else {
+                    if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!("call restore at {site:?} has no input projection");
+                    }
                     continue;
                 };
                 // A restore states the convention rather than performing a
@@ -1666,8 +1683,18 @@ impl LegacyObservationJournal {
                 {
                     continue;
                 }
+                let dispositions = (
+                    plan.disposition(input.value),
+                    plan.disposition(output.value),
+                );
+                if is_call_restore && std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "call restore at {site:?} projects input {:?} {:?}, output {:?} {:?}",
+                        input.value, dispositions.0, output.value, dispositions.1
+                    );
+                }
                 if matches!(
-                    (plan.disposition(input.value), plan.disposition(output.value)),
+                    dispositions,
                     (
                         Some(ValueDisposition::Bound { binding: input }),
                         Some(ValueDisposition::Bound { binding: output }),
@@ -1809,7 +1836,14 @@ impl LegacyObservationJournal {
         for site in origins.noop_sites() {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::RedundantPhiEdge) {
                 Some(r2ssa::ledger::ElisionReason::RedundantPhiEdge) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                Some(existing) => {
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!(
+                            "conflicting use {site:?}: certificate reason {existing:?}, normalization reason RedundantPhiEdge"
+                        );
+                    }
+                    return Err(LegacyObservationJournalError::ConflictingUse(site));
+                }
             }
         }
         let coalesced_carrier_uses = self
@@ -1820,7 +1854,14 @@ impl LegacyObservationJournal {
         for site in coalesced_carrier_uses {
             match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedCopy) {
                 Some(r2ssa::ledger::ElisionReason::CoalescedCopy) | None => {}
-                Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                Some(existing) => {
+                    if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                        eprintln!(
+                            "conflicting use {site:?}: certificate reason {existing:?}, normalization reason CoalescedCopy"
+                        );
+                    }
+                    return Err(LegacyObservationJournalError::ConflictingUse(site));
+                }
             }
         }
         for inst in self.coalesced_carrier_phi_writes.iter().copied() {
@@ -1870,7 +1911,14 @@ impl LegacyObservationJournal {
                 match elided_uses.insert(site, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
                 {
                     Some(r2ssa::ledger::ElisionReason::CoalescedImmutablePhi) | None => {}
-                    Some(_) => return Err(LegacyObservationJournalError::ConflictingUse(site)),
+                    Some(existing) => {
+                        if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                            eprintln!(
+                                "conflicting use {site:?}: certificate reason {existing:?}, normalization reason CoalescedImmutablePhi"
+                            );
+                        }
+                        return Err(LegacyObservationJournalError::ConflictingUse(site));
+                    }
                 }
             }
             match elided_writes.insert(inst.id, r2ssa::ledger::ElisionReason::CoalescedImmutablePhi)
@@ -1881,7 +1929,7 @@ impl LegacyObservationJournal {
                 }
             }
         }
-        let refused_uses = self
+        let mut refused_uses = self
             .plan
             .machine_projection()
             .use_dispositions()
@@ -1900,7 +1948,7 @@ impl LegacyObservationJournal {
                     })
             })
             .collect::<Vec<_>>();
-        let refused_writes = self
+        let mut refused_writes = self
             .plan
             .machine_projection()
             .write_dispositions()
@@ -1913,13 +1961,16 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>();
 
         // Definitions whose values the plan proves nobody reads have no
-        // statement to carry their cells. The structural case owns no operands
-        // or semantic obligation; an unused call clobber is the example. A
-        // pre-placement dead computation also loses the operand reads and the
-        // LiveValueProducer obligation its statement would have carried. Only
-        // that dependency obligation is authorized here: any observable effect
-        // on the same instruction remains at zero occurrences and the effect
-        // ledger refuses it instead of relabelling it dead.
+        // statement to carry their cells. A structural definition owns no
+        // semantic obligation, but it may still have dependency operands: a
+        // call restore reads the carrier it certifies unchanged. Once the
+        // structural output is unused, those operands have zero occurrences
+        // with the statement too. A pre-placement dead computation likewise
+        // loses its operand reads and the LiveValueProducer obligation its
+        // statement would have carried. Only that dependency obligation is
+        // authorized here: any observable effect on the same instruction
+        // remains at zero occurrences and the effect ledger refuses it instead
+        // of relabelling it dead.
         //
         // This is deliberately not done for every elided value. Most elisions
         // mean some other rendering answers for the value, and claiming its
@@ -1944,9 +1995,6 @@ impl LegacyObservationJournal {
                 continue;
             }
             elided_writes.entry(inst).or_insert(*reason);
-            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
-                continue;
-            }
             let instruction = graph
                 .inst(inst)
                 .expect("the exact definition was validated above");
@@ -1954,6 +2002,9 @@ impl LegacyObservationJournal {
                 elided_uses
                     .entry(UseSite { inst, input_idx })
                     .or_insert(*reason);
+            }
+            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
+                continue;
             }
             self.dead_unused_value_effects.extend(
                 source
@@ -2016,13 +2067,33 @@ impl LegacyObservationJournal {
             )
             .map_err(|()| LegacyObservationJournalError::ConflictingValue(value))?;
         }
+        // A refusal says that a use or write cannot be rendered. It is not a
+        // second answer for a cell a source certificate has already proved has
+        // no occurrence. Stack-frame setup is the concrete overlap: its memory
+        // operand has no standalone memory context, but the whole instruction
+        // disappears under the exact frame round-trip certificate, so there is
+        // nothing left for that missing context to refuse.
+        //
+        // Filter per cell, after every certificate and normalization elision
+        // has been assembled. Filtering by instruction kind would suppress live
+        // uses beside an elided one; filtering values would let an elision hide
+        // a different rendered occurrence. The maps are the zero-occurrence
+        // proof domain and therefore the only admissible precedence rule.
+        retain_only_unanswered_refusals(&mut refused_uses, &elided_uses);
+        retain_only_unanswered_refusals(&mut refused_writes, &elided_writes);
         for value in nonrendered_values {
             self.record_nonrendered_value(value)?;
         }
         for (site, reason) in elided_uses {
             let slot = self.use_slot_mut(site)?;
-            record_same(slot, LegacyUseObservation::Elided(reason))
-                .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))?;
+            if record_same(slot, LegacyUseObservation::Elided(reason)).is_err() {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!(
+                        "conflicting use {site:?}: recorded {slot:?}, elision reason {reason:?}"
+                    );
+                }
+                return Err(LegacyObservationJournalError::ConflictingUse(site));
+            }
         }
         for (inst, reason) in elided_writes {
             let slot = self.write_slot_mut(inst)?;
@@ -2692,8 +2763,17 @@ impl LegacyObservationJournal {
                 let value = ValueId(index as u32);
                 if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                     let graph = self.source.graph();
+                    let targets = self
+                        .targets
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(id, target)| {
+                            matches!(target, ObservationTarget::Value(target) if *target == value)
+                                .then_some(id)
+                        })
+                        .collect::<Vec<_>>();
                     eprintln!(
-                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?} readers={readers:?}",
+                        "unaccounted value {value:?} disposition {:?} def {:?} uses={uses} storage={storage:?} readers={readers:?} targets={targets:?}",
                         self.plan.disposition(value),
                         graph
                             .def_inst(value)
@@ -2718,15 +2798,43 @@ impl LegacyObservationJournal {
                             .map(|s| (s.space, s.offset, s.size))
                     );
                     for site in graph.use_sites(value) {
+                        let reader = graph.inst(site.inst);
+                        let output = reader.and_then(|inst| inst.output);
                         eprintln!(
-                            "   use {site:?} -> {:?}",
-                            graph
-                                .inst(site.inst)
-                                .map(|inst| format!("{:?}", inst.payload)
-                                    .chars()
-                                    .take(110)
-                                    .collect::<String>())
+                            "   use {site:?} answer={:?} projection={:?} output={output:?} output_disposition={:?} -> {:?}",
+                            self.uses
+                                .get(site.inst.0 as usize)
+                                .and_then(|row| row.get(site.input_idx)),
+                            self.plan.use_disposition(*site),
+                            output.and_then(|value| self.plan.disposition(value)),
+                            reader.map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(110)
+                                .collect::<String>())
                         );
+                    }
+                    let other_unaccounted = self
+                        .values
+                        .iter()
+                        .enumerate()
+                        .skip(index + 1)
+                        .filter(|(_, observation)| observation.is_none())
+                        .map(|(index, _)| {
+                            let value = ValueId(index as u32);
+                            let definition = graph
+                                .def_inst(value)
+                                .and_then(|inst| graph.inst(inst))
+                                .map(|inst| {
+                                    format!("{:?}", inst.payload)
+                                        .chars()
+                                        .take(70)
+                                        .collect::<String>()
+                                });
+                            (value, self.plan.disposition(value), definition)
+                        })
+                        .collect::<Vec<_>>();
+                    if !other_unaccounted.is_empty() {
+                        eprintln!("other unaccounted values: {other_unaccounted:?}");
                     }
                 }
                 return Some(LegacyObservationJournalError::RenderedValueRequired(value));
@@ -2737,8 +2845,21 @@ impl LegacyObservationJournal {
                 if observation.is_none() {
                     if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
                         let graph = self.source.graph();
+                        let site = UseSite {
+                            inst: InstId(inst as u32),
+                            input_idx,
+                        };
+                        let targets = self
+                            .targets
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(id, target)| {
+                                matches!(target, ObservationTarget::Use { site: target, .. } if *target == site)
+                                    .then_some(id)
+                            })
+                            .collect::<Vec<_>>();
                         eprintln!(
-                            "unaccounted use inst={inst} input={input_idx} payload={:?}",
+                            "unaccounted use inst={inst} input={input_idx} payload={:?} targets={targets:?}",
                             graph.inst(InstId(inst as u32)).map(|inst| format!(
                                 "{:?}",
                                 inst.payload
@@ -2931,8 +3052,14 @@ impl LegacyObservationJournal {
             }
         };
         let slot = self.use_slot_mut(site)?;
-        record_same(slot, observation)
-            .map_err(|()| LegacyObservationJournalError::ConflictingUse(site))
+        if record_same(slot, observation).is_err() {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!("conflicting use {site:?}: recorded {slot:?}, refusal {observation:?}");
+            }
+            Err(LegacyObservationJournalError::ConflictingUse(site))
+        } else {
+            Ok(())
+        }
     }
 
     /// Record an upstream refusal for a write that therefore has no AST node.
@@ -3185,8 +3312,26 @@ impl LegacyObservationJournal {
                     }
                     ObservationTarget::Use {
                         site, observation, ..
-                    } => record_same(&mut uses[site.inst.0 as usize][site.input_idx], observation)
-                        .map_err(|()| LegacyObservationJournalError::ConflictingUse(site)),
+                    } => {
+                        let slot = &mut uses[site.inst.0 as usize][site.input_idx];
+                        if record_same(slot, observation).is_err() {
+                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                eprintln!(
+                                    "conflicting use {site:?}: recorded {slot:?}, rendered {observation:?}, payload={:?}",
+                                    self.source.graph().inst(site.inst).map(|inst| format!(
+                                        "{:?}",
+                                        inst.payload
+                                    )
+                                    .chars()
+                                    .take(120)
+                                    .collect::<String>())
+                                );
+                            }
+                            Err(LegacyObservationJournalError::ConflictingUse(site))
+                        } else {
+                            Ok(())
+                        }
+                    }
                     ObservationTarget::Write {
                         inst, observation, ..
                     } => record_same(&mut writes[inst.0 as usize], observation)
@@ -3577,6 +3722,13 @@ fn record_same<T: Copy + Eq>(slot: &mut Option<T>, observation: T) -> Result<(),
     }
 }
 
+fn retain_only_unanswered_refusals<T: Ord>(
+    refused: &mut Vec<T>,
+    elided: &BTreeMap<T, r2ssa::ledger::ElisionReason>,
+) {
+    refused.retain(|cell| !elided.contains_key(cell));
+}
+
 fn classify_value_node(
     value: ValueId,
     node: RenderObservationNode<'_>,
@@ -3921,6 +4073,24 @@ mod tests {
         StructuredRegionKind, StructuredRegionMarker, seal_structured_body,
     };
     use crate::symbol::{ExternalKind, SymbolRole};
+
+    #[test]
+    fn exact_zero_occurrence_answer_precedes_refusal_per_use() {
+        let elided = UseSite {
+            inst: InstId(7),
+            input_idx: 0,
+        };
+        let still_refused = UseSite {
+            inst: InstId(7),
+            input_idx: 1,
+        };
+        let mut refused = vec![elided, still_refused];
+        let elisions = BTreeMap::from([(elided, r2ssa::ledger::ElisionReason::StackFrame)]);
+
+        retain_only_unanswered_refusals(&mut refused, &elisions);
+
+        assert_eq!(refused, vec![still_refused]);
+    }
 
     fn source_owned() -> SourceOwnedFunctionFacts {
         let mut block = R2ILBlock::new(0x1000, 4);
