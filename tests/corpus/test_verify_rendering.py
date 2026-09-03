@@ -1001,6 +1001,7 @@ class VerificationTests(unittest.TestCase):
             dump.write_text("a dump with no corpus markers\n")
             args = argparse.Namespace(
                 config="x64_O0",
+                corpus="hashes",
                 input=dump,
                 binary=root / "binary-not-needed",
                 oracle=root / "oracle-not-needed",
@@ -1064,6 +1065,7 @@ class VerificationTests(unittest.TestCase):
             dump.write_text(dump_text)
             args = argparse.Namespace(
                 config="x64_O2",
+                corpus="hashes",
                 input=dump,
                 binary=root / "binary-not-needed",
                 oracle=root / "oracle-not-needed",

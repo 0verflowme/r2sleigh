@@ -4209,6 +4209,14 @@ impl Decompiler {
         // and where it did it would claim a transfer inside this function that
         // the machine makes into another one. A direct tail call is the common
         // shape here and it needs a callsite, not a jump.
+        //
+        // This is a guard over a missing capability, not the capability. It
+        // stops being right the moment a transfer that leaves the function has
+        // a real form: a callsite interface offered by the source layer for a
+        // branch whose target lies outside this function's bounds, rendered as
+        // a terminal call with no fallthrough. Delete this block in the commit
+        // that lands that form. A guard left standing over a case the renderer
+        // can express is a workaround wearing a refusal's clothes.
         let own_blocks: std::collections::BTreeSet<u64> =
             blocks.iter().map(|block| block.addr).collect();
         if blocks.iter().any(|block| {
