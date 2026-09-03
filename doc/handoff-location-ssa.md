@@ -10368,3 +10368,72 @@ the fix is the two-pass restructuring rather than a wider gate. That is the
 design question this file has recorded once before, now with the probe output
 that names the gate, the two renderings that show what the proxy is
 protecting, and one way of breaking the circularity ruled out.
+
+
+## The fixed point, built: what it buys and the one refusal it costs
+
+The two-pass construction is in. The partition is built once from the
+conservative answer that admits no bound literal -- exactly what
+`inlinable_values` returned before -- and a literal that is a **one-member
+component** there is admitted on a second pass. Nothing coalesces with a
+one-member component by definition, so removing that value removes its own
+object and no other object loses a writer; `fnv1a64`'s accumulator shares an
+object, is not a singleton, and stays bound, so the ten-cell breakage the
+storage-class proxy prevented is still prevented -- now by the property the
+proxy stood in for.
+
+Termination is by construction. Pass one does not depend on pass two, so
+there is no iteration, no bound to choose, and nothing to observe converging.
+The second pass is deliberately conservative rather than maximal: a candidate
+that would become a singleton only after other candidates are inlined is
+declined. That is the safe direction and it is why the relaxed-eligibility
+estimate is not needed -- which matters, because that estimate is unsound, as
+recorded above.
+
+It stays one answerer. `inlinable_values` keeps its signature and is still the
+only place inlining is decided; `component_eligible_with` and
+`binding_components_with` take that decision as an argument so the partition
+is *read against* it rather than guessing at it.
+
+**The payoff is confirmed on the cell that motivated it.**
+
+    #define _pearson_tab__r2sleigh_addr 0x100001e6cULL
+    extern char _pearson_tab[];
+    uint64_t tmp_11f80_2 = (uint64_t)&_pearson_tab;
+
+The page base inlines, the fold recombines it with its `0xe6c`, the object
+lookup runs, and `arm64_O0 pearson` names its table instead of dereferencing a
+bare page base. Across the corpus, `literal_only_declarations` falls 103 -> 70
+and `self_assignments` 225 -> 133.
+
+**And it costs two cells, which is where this stops.** `murmur3_32` at x86-64
+-O1 and -O2 refuse: one obligation of 145, `LiveValueProducer`, with
+`Refused { layer: Codegen, reason: BlockNotRendered }`. The inline trace says
+exactly one value is newly admitted in that function -- `R9_1`, a register
+literal, alone in its binding, four readers -- so the admission and the
+refusal are one-to-one.
+
+Three hypotheses were tried against it and all three were wrong, which is
+worth recording so the next attempt does not repeat them:
+
+  * *The block empties because its only statement was inlined.* Requiring a
+    reader in the defining block did not fix it.
+  * *That reader is itself inlined, so the block empties anyway.* Requiring an
+    instruction in the block whose output is bound under the conservative
+    answer and is not itself a candidate did not fix it either.
+  * *It is the storage class after all.* It is not; the same admission on
+    `pearson` renders and seals.
+
+So `BlockNotRendered` here is not obviously about the defining block being
+empty, and the next step is to establish which instruction the refused
+obligation names -- the id is `CanonicalInstructionId { block_addr:
+0x10000085c, site: Op(34) }`, in source coordinates, while the trace reports
+the definition in graph coordinates as `BlockId(3), ordinal 110`. Those were
+never reconciled, and every hypothesis above assumed they were the same
+instruction without checking. That is the first thing to check and it needs a
+probe, not a reading.
+
+Until then the branch is red on two of fifty-four on `--gate differential`,
+with no wrong answers -- both cells refuse rather than miscompute. Reverting
+`6f0cd8d..be06880` returns the corpus to 54 of 54 and gives up the naming and
+the thirty-three literal declarations.
