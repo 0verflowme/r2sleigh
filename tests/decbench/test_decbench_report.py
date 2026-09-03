@@ -82,6 +82,19 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary["ged"]["rendered"], {"n": 1, "mean": 3.0})
         self.assertEqual(summary["ged"]["all_functions"]["mean"], 0.125)
 
+    def test_requested_metric_is_reported_when_every_function_refuses(self) -> None:
+        rows = {
+            "one/bin/O0::no": {
+                "decompiled": False,
+                "scores": {},
+                "reference_decompiled": False,
+                "reference": {},
+            }
+        }
+        metric = report.summarise(rows, {"vj_ged"})["metrics"]["vj_ged"]
+        self.assertEqual(metric["rendered"], {"n": 0, "mean": None})
+        self.assertEqual(metric["all_functions"]["mean"], 0.0)
+
     def test_cached_reference_defines_refused_function_universe(self) -> None:
         current = report.collect(payload("one", 0.5))
         baseline = {

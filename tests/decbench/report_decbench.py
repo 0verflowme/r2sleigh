@@ -137,9 +137,12 @@ def _mean(values: list[float]) -> dict:
     }
 
 
-def summarise(rows: dict[str, dict]) -> dict:
+def summarise(
+    rows: dict[str, dict], expected_metrics: set[str] | None = None
+) -> dict:
     metrics = sorted(
-        {
+        set(expected_metrics or ())
+        | {
             metric
             for row in rows.values()
             for column in ("scores", "reference")
@@ -259,7 +262,7 @@ def measured_record(current: Collected, rows: dict[str, dict]) -> dict:
         },
         "groups": sorted(current.groups),
         "functions": dict(sorted(rows.items())),
-        "summary": summarise(rows),
+        "summary": summarise(rows, current.metrics),
     }
 
 
@@ -334,7 +337,7 @@ def merge_baseline(old: dict | None, measured: dict) -> dict:
         },
         "groups": sorted(groups),
         "functions": dict(sorted(functions.items())),
-        "summary": summarise(functions),
+        "summary": summarise(functions, set(metric_cells)),
     }
 
 
@@ -381,7 +384,7 @@ def compare(measured: dict, baseline: dict) -> int:
         baseline.get("functions") or {}, set(measured["selection"]["cells"])
     )
     rows = measured["functions"]
-    before_summary = summarise(before)
+    before_summary = summarise(before, set(measured["summary"]["metrics"]))
     now_summary = measured["summary"]
     bp = before_summary["population"]
     np = now_summary["population"]
