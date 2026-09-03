@@ -10941,3 +10941,35 @@ inference:
   whole-binary sweep taken from this worktree before the merge, with and
   without this change, so they arrived with the reapply. They are the second of
   the three regression families the coverage sweep found.
+
+## The flag carriers are declared by their component, not by their value
+
+Removing dead values from the binding plan left the flag-carrier count exactly
+where it was, at 192, and the null result is more informative than the change.
+
+The reasoning ran: 14,323 flag-named values on x86-64 at -O0 stay bound because
+nothing reads them, so eliminating a value nothing reads should remove the
+declaration. Dead values are now excluded from plan membership and their cells
+closed, and the count did not move, because **a storage component that contains
+a dead flag value usually also contains a live one**. The component survives,
+and the declaration is minted from the component rather than from the value. So
+the name on the page belongs to a binding that is genuinely needed; what is dead
+is one member of it.
+
+That is the third correction to this one framing. It was called an inlining
+problem for as long as the noise gate existed; a probe showed the values were
+unread rather than un-inlined; and now the declaration turns out not to be
+per-value at all. Each correction came from measuring rather than reading, and
+each was one level below the last.
+
+The remaining work is therefore at component granularity: whether a component
+whose live members are all architectural flags needs a name in the rendered C at
+all, which is a different question from whether any of its values is dead.
+
+Worth keeping from the same work: the reader audit found three more channels the
+graph does not record, alongside the call arguments found earlier. Semantic
+returns, switch selectors, and identity call-result carriers consumed by
+derived-width results are all real readers with no use site, and they now share
+one canonical path. Every one of them was a value that would have looked dead
+and was not, so the zero-reader count is only safe to act on because they are
+counted.
