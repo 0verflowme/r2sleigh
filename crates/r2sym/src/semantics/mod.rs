@@ -9,7 +9,6 @@ mod plan;
 mod region;
 mod vm;
 
-pub(crate) use artifact::TargetQueryRouteInput;
 pub use artifact::{
     ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactReport,
     SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
@@ -57,4 +56,3 @@ pub use vm::{
     VmMemoryCondition, VmMemoryRegionRef, VmStateUpdate, VmStepSummary, VmTransferArm, VmUnaryOp,
     VmValueExpr, has_strong_vm_evidence, strong_vm_step_summary,
 };
-pub(crate) use vm::{build_vm_step_summary, classify_interpreter_like};

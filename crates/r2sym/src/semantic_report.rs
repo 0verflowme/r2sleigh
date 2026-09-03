@@ -12,10 +12,6 @@ pub struct CompiledSemanticInfo {
     pub stage: String,
     pub granularity: String,
     pub execution: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replay_seed_fingerprint: Option<String>,
     pub query_plan: crate::QueryPlan,
     pub type_plan: crate::TypePlan,
     pub decompile_plan: crate::DecompilePlan,
@@ -513,10 +509,6 @@ fn vm_step_summary_info_from_sym(vm_step: &crate::VmStepSummary) -> VmStepSummar
     }
 }
 
-pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(compiled, None)
-}
-
 fn memory_summary_region_label(region: &crate::BackwardMemoryRegion) -> String {
     match region {
         crate::BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
@@ -603,20 +595,7 @@ fn semantic_memory_summaries(native: Option<&crate::NativeArtifactBody>) -> Vec<
     summaries
 }
 
-pub fn compiled_semantic_info_with_replay_seed(
-    compiled: &crate::SemanticArtifact,
-    replay_seed: &crate::ReplaySeed,
-) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(
-        compiled,
-        Some(crate::stable_replay_seed_fingerprint(replay_seed)),
-    )
-}
-
-fn compiled_semantic_info_with_seed(
-    compiled: &crate::SemanticArtifact,
-    replay_seed_fingerprint: Option<u64>,
-) -> CompiledSemanticInfo {
+pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSemanticInfo {
     let native = compiled.native_body();
     let memory_summaries = semantic_memory_summaries(native);
     let native_worker_summary_kinds = native_worker_summary_kinds(native);
@@ -641,9 +620,6 @@ fn compiled_semantic_info_with_seed(
             crate::ExecutionModel::Vm => "vm",
         }
         .to_string(),
-        seed_mode: replay_seed_fingerprint.map(|_| "replay".to_string()),
-        replay_seed_fingerprint: replay_seed_fingerprint
-            .map(|fingerprint| format!("0x{fingerprint:x}")),
         query_plan: compiled.query_plan(),
         type_plan: compiled.type_plan(),
         decompile_plan: compiled.decompile_plan(),
