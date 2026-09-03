@@ -22,8 +22,13 @@ use serde::{Deserialize, Serialize};
 
 mod json;
 mod policy;
+mod program_cache;
 pub use json::*;
 pub use policy::*;
+pub use program_cache::{
+    PreparedRole, ProgramCacheStats, cache_function_artifact, cached_function_artifact,
+    cached_function_fingerprint, clear_program_cache, program_cache_stats,
+};
 
 mod route;
 

@@ -1973,6 +1973,37 @@ pub fn encode_snapshot_set(
     snapshot: &OwnedFunctionSnapshot,
     callees: &[OwnedFunctionSnapshot],
 ) -> Result<Vec<u8>, SnapshotWireError> {
+    encode_snapshot_parts(snapshot, callees, snapshot.source_revision_identity())
+}
+
+/// Encode one body as a cache key: every field it carries, with the capture
+/// tag replaced by this function's own content identity.
+///
+/// The tag is the reason a plain re-encoding cannot key a callee. A callee
+/// collected beside a root inherits the *root's* revision identity, so the
+/// same body reached from two callers serializes to two different buffers and
+/// a byte-exact key never matches the one case a callee cache exists to serve.
+/// Radare2 records what the body's own tag would have been as its content
+/// identity, and this writes that in the tag's place.
+///
+/// Substituting is safe in the direction that matters. Every other field is
+/// still written and still compared byte for byte, so two different bodies are
+/// still told apart by the bytes that describe them; the substituted field is
+/// a hash *of those same bytes*, so it adds no claim the rest of the buffer
+/// does not already make. On a radare2 that predates the content identity the
+/// two are equal and this degrades to the plain encoding, which is a key that
+/// misses rather than one that is wrong.
+pub fn encode_snapshot_cache_key(
+    snapshot: &OwnedFunctionSnapshot,
+) -> Result<Vec<u8>, SnapshotWireError> {
+    encode_snapshot_parts(snapshot, &[], snapshot.source_content_identity())
+}
+
+fn encode_snapshot_parts(
+    snapshot: &OwnedFunctionSnapshot,
+    callees: &[OwnedFunctionSnapshot],
+    revision_identity: &[u8],
+) -> Result<Vec<u8>, SnapshotWireError> {
     let mut writer = SnapshotWireWriter::new();
     write_machine_profile(&mut writer, snapshot.machine())?;
     write_function_identity(&mut writer, snapshot.function());
@@ -1984,7 +2015,7 @@ pub fn encode_snapshot_set(
     for site in snapshot.advisory_calls() {
         write_call_site(&mut writer, site)?;
     }
-    writer.bytes(snapshot.source_revision_identity())?;
+    writer.bytes(revision_identity)?;
     writer.bytes(snapshot.source_content_identity())?;
     match snapshot.function_interface() {
         Some(interface) => {
@@ -3479,6 +3510,32 @@ mod tests {
         assert_eq!(reader.string().expect("rbp"), "rbp");
         assert_eq!(reader.optional_string().expect("absent"), None);
         reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn a_cache_key_keys_a_body_by_itself_rather_than_by_its_caller() {
+        // Two captures of one body differ in exactly one field: the capture
+        // tag, which is the caller's. A key that carried it would make the
+        // same callee under two callers two different keys, which is the one
+        // case a callee cache exists to serve.
+        let body = sample_snapshot(None).with_source_content_identity(Box::from(&b"own-body"[..]));
+        let key = encode_snapshot_cache_key(&body).expect("encode a cache key");
+        let decoded = decode_snapshot(&key).expect("decode the cache key");
+        assert_eq!(decoded.source_revision_identity(), b"own-body");
+        assert_eq!(decoded.source_content_identity(), b"own-body");
+        // Everything else the lift reads is still there and still compared.
+        assert_eq!(decoded.function().address(), body.function().address());
+        assert_eq!(
+            decoded.image().entry_address(),
+            body.image().entry_address()
+        );
+        assert_eq!(decoded.machine().arch_id(), body.machine().arch_id());
+        // And it is not simply the plain encoding under another name.
+        assert_ne!(
+            encode_snapshot(&body).expect("plain encoding"),
+            key,
+            "the fixture must make the tag and the content differ"
+        );
     }
 
     #[test]
