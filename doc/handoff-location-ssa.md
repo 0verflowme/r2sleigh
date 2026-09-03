@@ -10202,3 +10202,30 @@ reads a script by byte offset as it executes and five wrappers were running at
 the time. Running instances kept their descriptor on the old inode and the next
 invocation picked up the split, which is the technique to use for every edit to
 a script this project runs concurrently.
+
+## The gate this session has been using cannot fail on a wrong answer
+
+`run_matrix.sh --gate measurement` checks that every column was *measured*. Its
+only failures are `not_run`: a column that produced no record. It does not
+require the raw compile to pass, the differential to agree with the oracle, or
+the snapshot to match. It exits zero with a cell rendering the wrong value.
+
+That is what the name says, and it is a useful thing to have. The error was
+mine: I briefed every agent in this session to treat it as *the* merge gate, and
+reported branches as green on the strength of it. A run on the integration
+branch exited zero while one differential cell failed and eight diagnostic cells
+computed wrong values, and nothing in the exit status said so.
+
+**The correctness gate is `--gate differential`.** It subsumes the others: raw
+must compile and pass, the differential must agree with the source-built oracle
+*on the raw basis* rather than on the repaired one, and the snapshot must match
+or have been accepted. Use it before merging anything, and read `measurement`
+for what it is, a check that the harness still measures.
+
+One consequence for reading the diagnostic column. It exists to repair raw
+output that does not compile, and raw now passes on all fifty-four cells, so
+every diagnostic cell is a repair of something that needed none. The eight that
+compute wrong values are the repair heuristics mis-firing on output whose shape
+improved, not the decompiler getting an answer wrong: the same eight cells pass
+the differential on the raw basis. A column that only reports on a fallback
+nobody takes is measuring itself.
