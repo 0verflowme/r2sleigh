@@ -49,6 +49,7 @@ witness="r2sleigh-witness-$(git -C "$root" rev-parse --short HEAD)-$(date -u +%s
 echo "run     $run_id"
 echo "witness $witness"
 
+ssh "$host" "mkdir -p '$remote/tree'"
 git -C "$root" ls-files -z | rsync -a --files-from=- --from0 "$root/" "$host:$remote/tree/"
 ssh "$host" "printf 'pub const DECBENCH_WITNESS: &str = \"%s\";\n' '$witness' >> $remote/tree/crates/r2engine/src/lib.rs"
 
