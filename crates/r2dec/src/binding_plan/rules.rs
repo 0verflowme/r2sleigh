@@ -593,6 +593,29 @@ fn duplicable_bound_literals(
                 .copied()
                 .is_some_and(|root| r2rewrite::machine_expr_is_literal(projection, root))
         })
+        // And something must still be rendered where the definition was. A
+        // literal whose readers all sit in other blocks leaves its own block
+        // with no statement, and a block that renders nothing cannot answer
+        // for the instructions in it -- the ledger says `BlockNotRendered`
+        // and refuses the function, which is what `murmur3_32` did at x86-64
+        // -O1 and -O2. One reader in the defining block is enough to keep the
+        // block on the page, and it is the same reason the single-use path
+        // already requires its reader to follow the definition in the same
+        // block.
+        .filter(|value| {
+            let Some(definition) = graph
+                .def_inst(value.id)
+                .and_then(|inst| graph.inst(inst))
+                .map(|inst| inst.block)
+            else {
+                return false;
+            };
+            graph.use_sites(value.id).iter().any(|site| {
+                graph
+                    .inst(site.inst)
+                    .is_some_and(|inst| inst.block == definition)
+            })
+        })
         .map(|value| value.id)
         .collect()
 }
