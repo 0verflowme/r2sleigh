@@ -5441,6 +5441,15 @@ fn restate_string_conversions_in_expr(
         *expr = CExpr::cast(required.clone(), source);
         return;
     }
+    // A render marker and a bracket are metadata: what the place asks of the
+    // expression it asks of the expression under them. Falling through to the
+    // generic descent instead dropped the requirement, and every statement
+    // whose right-hand side carries an occurrence marker -- which is most of
+    // them -- was walked as though nothing had been asked of it.
+    if let CExpr::Observed { expr, .. } | CExpr::Paren(expr) = expr {
+        restate_string_conversions_in_expr(expr, pointer_bits, required, symbols);
+        return;
+    }
     // An assignment tells its right-hand side what is wanted: the type of
     // the object being written. A compound assignment says the same thing:
     // `x &= m` converts `m` to x's type exactly as `x = x & m` would.
@@ -6010,6 +6019,38 @@ fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mask_under_a_render_marker_still_takes_the_type_that_reads_it() {
+        // The shape every statement has in production: the right-hand side
+        // carries an occurrence marker. `X1_0 & -0x4` on a `uint64_t` is a
+        // signedness-changing conversion, because `-0x4` is an `int`
+        // whatever value it denotes, and the marker must not hide the ask.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "X1_0".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mask = CExpr::UIntLit(0xffff_ffff_ffff_fffc);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(BinaryOp::BitAnd, CExpr::Var(name), mask))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(&mut expr, 64, Some(&CType::u64()), Some(&table));
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the masking, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask must say it is a uint64_t, got {right:?}"
+        );
+    }
 
     #[test]
     fn a_string_address_drops_the_conversions_spelled_for_its_number() {
