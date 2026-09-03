@@ -2196,7 +2196,6 @@ pub struct EngineAnalyzeRequest {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub semantic_mode: EngineSemanticMode,
     pub include_interproc_summary_set: bool,
     pub execution: EngineExecutionControl,
@@ -2214,7 +2213,6 @@ pub struct EngineAnalyzeRequestParts {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2334,7 +2332,6 @@ pub struct EngineAnalyzeRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2345,7 +2342,6 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -2766,7 +2762,6 @@ impl EngineAnalyzeRequest {
             reg_type_hints: parts.reg_type_hints,
             parsed_context: parts.parsed_context,
             interproc_max_iterations: parts.interproc_max_iterations,
-            symbolic_scope: parts.symbolic_scope,
             semantic_mode,
             include_interproc_summary_set: parts.include_interproc_summary_set,
             execution: EngineExecutionControl::default(),
@@ -2781,7 +2776,7 @@ impl EngineAnalyzeRequest {
     /// Attach one request-local trusted SSA owner.
     ///
     /// The exact retained lift replaces every detached identity, block,
-    /// architecture, source snapshot, type hint, external context, scope, and
+    /// architecture, source snapshot, type hint, external context, and
     /// precomputed-semantic input. Root-only interprocedural solving remains
     /// enabled when requested because it derives solely from this exact owner.
     /// Trusted authority remains request-local.
@@ -2809,7 +2804,6 @@ impl EngineAnalyzeRequest {
             ..r2types::ParsedExternalContext::default()
         };
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);
-        self.symbolic_scope = None;
         self.semantic_mode = EngineSemanticMode::Full;
         self.trusted_ssa = Some(trusted);
         self
@@ -2876,7 +2870,6 @@ fn engine_analyze_request_input_from_function(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -2898,7 +2891,6 @@ fn engine_analyze_request_parts_from_input(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -2939,7 +2931,6 @@ pub struct EngineFunctionDecompileRequestInput {
     ptr_bits: Option<u32>,
     parsed_context: r2types::ParsedExternalContext,
     interproc_max_iterations: usize,
-    symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
@@ -2958,7 +2949,6 @@ impl EngineFunctionDecompileRequestInput {
             ptr_bits,
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -3008,16 +2998,6 @@ impl EngineFunctionDecompileRequestInput {
         );
         self
     }
-
-    pub fn with_interproc_scope(
-        mut self,
-        interproc_max_iterations: usize,
-        symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    ) -> Self {
-        self.interproc_max_iterations = interproc_max_iterations.max(1);
-        self.symbolic_scope = symbolic_scope;
-        self
-    }
 }
 
 impl EngineFunctionDecompileRequest {
@@ -3033,7 +3013,6 @@ impl EngineFunctionDecompileRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             )
@@ -3090,7 +3069,6 @@ pub struct EngineFunctionAnalysisArtifactRequestInput {
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -3100,7 +3078,6 @@ pub struct EngineFunctionAnalysisReportRequestInput {
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iters: usize,
     pub interproc_converged: bool,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub writeback_budget: r2types::TypeWritebackMutationBudget,
     pub writeback_apply_policy: r2types::TypeWritebackApplyPolicy,
 }
@@ -3115,7 +3092,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3137,7 +3113,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3200,7 +3175,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3226,7 +3200,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3377,7 +3350,6 @@ impl EngineSession {
             scope_report,
         } = request;
         let analysis = analysis.canonicalize_trusted();
-        let symbolic_scope = analysis.symbolic_scope.clone();
         let response = self.analyze(analysis)?;
         let summary = response
             .artifact
@@ -3391,7 +3363,6 @@ impl EngineSession {
             converged,
             summary,
             scope_report: scope_report.as_ref(),
-            symbolic_scope: symbolic_scope.as_ref(),
         });
         Some(EngineInterprocSummaryReportResponse {
             report,
@@ -4630,7 +4601,6 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
 struct InterprocSummaryBuildInput<'a> {
     pub analysis: &'a EngineAnalysis,
     pub max_iterations: usize,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
     /// Bodies of the functions the root calls, captured with it. Without these
     /// every direct call is an unresolved callee, and the solver has to mark
     /// every pointer argument read, written and escaped.
@@ -4641,31 +4611,11 @@ fn build_prepared_interproc_summary_set(
     input: InterprocSummaryBuildInput<'_>,
 ) -> Result<r2ssa::PreparedInterprocSummarySet, r2ssa::PreparedInterprocSummaryError> {
     let root = r2ssa::InterprocFunctionId(input.analysis.ssa_func.function().entry);
-    let symbolic_scope = input.symbolic_scope.filter(|scope| {
-        scope.root_id() == root
-            && scope.root().is_some_and(|scope_root| {
-                scope_root.id == root
-                    && scope_root.prepared.function().entry == root.0
-                    && scope_root.prepared.authority() == input.analysis.ssa_func().authority()
-            })
-    });
     let mut functions = vec![r2ssa::PreparedInterprocFunctionInput {
         id: root,
         name: input.analysis.ssa_func.function().name.clone(),
         prepared: &input.analysis.ssa_func,
     }];
-    if let Some(scope) = symbolic_scope {
-        for function in scope.functions().values() {
-            if function.id == root {
-                continue;
-            }
-            functions.push(r2ssa::PreparedInterprocFunctionInput {
-                id: function.id,
-                name: function.name.clone(),
-                prepared: &function.prepared,
-            });
-        }
-    }
     for callee in input.trusted_callees {
         let id = r2ssa::InterprocFunctionId(callee.function().entry);
         if id == root || functions.iter().any(|function| function.id == id) {
@@ -4714,7 +4664,6 @@ fn build_engine_analysis_artifact(
         match build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
             analysis: &semantic_analysis,
             max_iterations: request.interproc_max_iterations,
-            symbolic_scope: request.symbolic_scope.as_ref(),
             trusted_callees: &request.trusted_callees,
         }) {
             Ok(summary) => Some(summary),
@@ -4754,7 +4703,6 @@ fn build_engine_analysis_artifact(
             }
             return maybe_compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
                 interproc_summary_set.as_ref(),
             );
         }
@@ -4762,7 +4710,7 @@ fn build_engine_analysis_artifact(
             r2sym::compile_semantic_artifact_default_with_scope(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
+                None,
             )
         })
     })();
@@ -4806,7 +4754,6 @@ fn build_engine_analysis_artifact(
 
 fn maybe_compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> Option<r2sym::SemanticArtifact> {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
@@ -4820,7 +4767,7 @@ fn maybe_compile_semantic_artifact_for_analysis(
         if !vm_route_evidence
             && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
                 ssa_func,
-                symbolic_scope,
+                None,
                 interproc_summaries,
                 false,
             )
@@ -4837,7 +4784,6 @@ fn maybe_compile_semantic_artifact_for_analysis(
     }
     Some(compile_semantic_artifact_for_analysis(
         ssa_func,
-        symbolic_scope,
         interproc_summaries,
     ))
 }
@@ -4862,7 +4808,6 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 
 fn compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
 ) -> r2sym::SemanticArtifact {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
@@ -4870,9 +4815,7 @@ fn compile_semantic_artifact_for_analysis(
     if !vm_route_evidence
         && let Some(summaries) = interproc_summaries
         && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
-            ssa_func,
-            symbolic_scope,
-            summaries,
+            ssa_func, None, summaries,
         )
     {
         return artifact;
@@ -4881,7 +4824,7 @@ fn compile_semantic_artifact_for_analysis(
         && should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary)
         && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
             ssa_func,
-            symbolic_scope,
+            None,
             interproc_summaries,
             false,
         )
@@ -4894,7 +4837,7 @@ fn compile_semantic_artifact_for_analysis(
     let mut artifact = r2sym::compile_semantic_artifact_default_with_scope(
         &z3::Context::thread_local(),
         ssa_func,
-        symbolic_scope,
+        None,
     );
     if let Some(summaries) = interproc_summaries {
         r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
@@ -5775,7 +5718,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert!(Arc::ptr_eq(
@@ -5832,7 +5774,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
 
@@ -5876,7 +5817,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Optional,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -6100,30 +6040,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_interproc_summary_json_merges_symbolic_scope_report() {
-        let root_blocks = const_return_blocks(0x401000, 0);
-        let helper_blocks = const_return_blocks(0x402000, 1);
-        let root_prepared =
-            Arc::new(r2ssa::SsaArtifact::for_symbolic(&root_blocks, None).expect("root prepared"));
-        let helper_prepared = Arc::new(
-            r2ssa::SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper prepared"),
-        );
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x401000),
-                    name: Some("root".to_string()),
-                    prepared: root_prepared,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x402000),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("scope");
+    fn engine_interproc_summary_json_preserves_supplied_scope_report() {
         let existing_scope = serde_json::json!({
             "payloads": [{ "function_addr": 0x403000u64, "function_name": "seeded" }],
             "seeds": [{ "id": 0x403000u64, "name": "seeded" }],
@@ -6136,19 +6053,11 @@ mod tests {
             converged: true,
             summary: None,
             scope_report: Some(&existing_scope),
-            symbolic_scope: Some(&scope),
         });
-        let scope = interproc.scope.expect("merged scope");
 
         assert_eq!(interproc.iterations, 1);
         assert_eq!(interproc.max_iterations, 1);
-        assert_eq!(scope["phase"], "symbolic_scope");
-        assert_eq!(scope["payloads"].as_array().expect("payloads").len(), 2);
-        assert_eq!(scope["seeds"].as_array().expect("seeds").len(), 2);
-        assert_eq!(scope["payloads"][1]["function_addr"], 0x402000);
-        assert_eq!(scope["payloads"][1]["function_name"], "helper");
-        assert_eq!(scope["seeds"][1]["id"], 0x402000);
-        assert_eq!(scope["seeds"][1]["name"], "helper");
+        assert_eq!(interproc.scope, Some(existing_scope));
     }
 
     #[test]
@@ -6334,7 +6243,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -6370,7 +6278,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 32),
             interproc_max_iterations: 2,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -6406,7 +6313,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::parse_external_context_json("{}", 32),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert_eq!(grouped.function_name, "sym.grouped");
@@ -6497,7 +6403,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         };
 
@@ -6527,7 +6432,7 @@ mod tests {
     }
 
     #[test]
-    fn interproc_summary_scope_requires_exact_root_and_source_helper_provenance() {
+    fn interproc_summary_build_uses_only_trusted_callee_bodies() {
         let root_addr = 0x401000;
         let helper_addr = 0x402000;
         let root_blocks = const_return_blocks(root_addr, 0);
@@ -6571,60 +6476,23 @@ mod tests {
             .expect("helper prepared"),
         );
         let analysis = EngineAnalysis::from_prepared_ssa(Arc::clone(&root_prepared));
-        let exact_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root_prepared),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: Arc::clone(&helper_prepared),
-                },
-            ],
-        )
-        .expect("exact scope");
-        let foreign_root = Arc::new(
-            r2ssa::SsaArtifact::for_decompile_with_interface(&root_blocks, Some(&arch), interface)
-                .expect("foreign root prepared"),
-        );
-        let foreign_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: foreign_root,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("foreign scope");
-        let solve = |symbolic_scope| {
+        let solve = |trusted_callees: &[Arc<r2ssa::SsaArtifact>]| {
             build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
                 analysis: &analysis,
                 max_iterations: 1,
-                symbolic_scope,
-                trusted_callees: &[],
+                trusted_callees,
             })
         };
 
         assert_eq!(
-            solve(Some(&exact_scope)).expect_err("manual helper must not become source evidence"),
+            solve(&[helper_prepared]).expect_err("manual helper must not become source evidence"),
             r2ssa::PreparedInterprocSummaryError::ManualFunction
         );
 
-        let foreign = solve(Some(&foreign_scope)).expect("root-only prepared summary set");
-        assert_eq!(foreign.report().diagnostics.scope_size, 1);
+        let root_only = solve(&[]).expect("root-only prepared summary set");
+        assert_eq!(root_only.report().diagnostics.scope_size, 1);
         assert!(
-            !foreign
+            !root_only
                 .report()
                 .summaries
                 .contains_key(&r2ssa::InterprocFunctionId(helper_addr))
@@ -7056,7 +6924,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             semantic_mode: EngineSemanticMode::Full,
             include_interproc_summary_set: true,
             execution: EngineExecutionControl::default(),
@@ -7125,7 +6992,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         })
     }
@@ -7850,7 +7716,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             })
             .with_cancellation(cancellation);
@@ -8189,7 +8054,7 @@ mod tests {
                 .with_name("dbg.init_node"),
         );
 
-        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None, None);
+        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None);
 
         assert_ne!(
             artifact.granularity,
@@ -8271,7 +8136,7 @@ mod tests {
         );
 
         assert!(should_skip_unbounded_semantic_artifact_after_worker_preprobe(&loop_ssa, None));
-        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None, None).is_none());
+        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None).is_none());
     }
 
     #[test]
@@ -8293,7 +8158,7 @@ mod tests {
         );
         assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
 
-        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None, None)
+        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None)
             .expect("vm artifact should not be refused before classification");
 
         assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
@@ -9134,7 +8999,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9171,7 +9035,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9206,7 +9069,6 @@ mod tests {
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iters: 5,
                 interproc_converged: true,
-                symbolic_scope: None,
                 writeback_budget: r2types::TypeWritebackMutationBudget::new(7, 11, 13),
                 writeback_apply_policy: type_writeback_apply_policy_for_mode(
                     EngineTypeWritebackMode::Balanced,
@@ -9242,7 +9104,6 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 9,
-                symbolic_scope: None,
             },
         );
 
@@ -9279,7 +9140,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9312,7 +9172,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 2,
                 lifted_blocks: 1,
@@ -9382,7 +9241,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9436,7 +9294,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 1,
                 lifted_blocks: 0,
@@ -9496,7 +9353,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9549,7 +9405,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
@@ -9595,7 +9450,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9644,7 +9498,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9689,7 +9542,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9732,7 +9584,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -9761,7 +9612,6 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 3,
-                symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
                 trusted_ssa: None,

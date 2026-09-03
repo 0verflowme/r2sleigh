@@ -2719,7 +2719,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iters: 1,
             interproc_converged: false,
-            symbolic_scope: None,
             writeback_budget,
             writeback_apply_policy,
         },
@@ -2765,7 +2764,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             max_iterations: 1,
             converged: false,
             scope_report: None,
-            symbolic_scope: None,
         },
     );
     Some(EngineV2Output {
