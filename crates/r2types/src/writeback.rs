@@ -1019,15 +1019,15 @@ impl TypeWritebackAnalysis {
         }
         let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
-        let (applied_constraints, return_type_changed) =
+        let (changed_parameters, return_type_changed) =
             SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
                 self.source.as_ref(),
                 &mut self.function_facts,
             );
-        if (applied_constraints > 0 || return_type_changed)
+        if (changed_parameters > 0 || return_type_changed)
             && !self.refresh_plan_after_source_constraints(
                 &prior_facts,
-                applied_constraints,
+                changed_parameters,
                 return_type_changed,
             )
         {
@@ -1083,7 +1083,7 @@ impl TypeWritebackAnalysis {
     fn refresh_plan_after_source_constraints(
         &mut self,
         prior_facts: &FunctionFacts,
-        expected_constraints: usize,
+        expected_parameter_changes: usize,
         expected_return_type_change: bool,
     ) -> bool {
         let Some(signature) = self
@@ -1139,7 +1139,7 @@ impl TypeWritebackAnalysis {
                 .then_some(slot)
             })
             .collect::<BTreeSet<_>>();
-        if changed_slots.len() != expected_constraints {
+        if changed_slots.len() != expected_parameter_changes {
             return false;
         }
         let return_type_changed = prior_signature.and_then(|signature| signature.ret_type.as_ref())

@@ -28,6 +28,51 @@ fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDispo
     }
 }
 
+/// Give the C object that owns a parameter the same admitted type as its
+/// render-authorized signature declaration.
+///
+/// A binding may contain later SSA versions whose operation-local evidence
+/// differs from the incoming value. That affects conversions at those writes;
+/// it cannot change the type of the one C object introduced by the function
+/// declarator. Keeping the binding and declarator in agreement lets typed
+/// boundaries spell those conversions instead of emitting an internally
+/// inconsistent function.
+fn apply_parameter_declaration_types(
+    source_owned: &SourceOwnedFunctionFacts,
+    parameters: &[Option<ParameterDisposition>],
+    bindings: &mut [Binding],
+    ptr_bits: u32,
+) {
+    let Some(signature) = source_owned
+        .report()
+        .type_facts()
+        .render_authorized_signature()
+    else {
+        return;
+    };
+    for (slot, disposition) in parameters.iter().enumerate() {
+        let Some(ParameterDisposition::Bound {
+            binding,
+            width_bits,
+        }) = disposition
+        else {
+            continue;
+        };
+        let Some(ty) = signature
+            .params
+            .get(slot)
+            .and_then(|parameter| parameter.ty.as_ref())
+        else {
+            continue;
+        };
+        let Some(binding) = bindings.get_mut(binding.0 as usize) else {
+            continue;
+        };
+        binding.declaration_type =
+            super::rules::admit_declaration(ty.clone(), *width_bits, ptr_bits);
+    }
+}
+
 /// Compute the transitive closure of every exact upstream coalescing set.
 ///
 /// Constants are deliberately outside the relation: they are expressions that
@@ -711,6 +756,15 @@ impl BindingPlan {
             });
         }
         refuse_conflicting_parameter_bindings(&mut parameters);
+        apply_parameter_declaration_types(
+            source_owned,
+            &parameters,
+            &mut bindings,
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+        );
 
         let mut stack_objects = BTreeMap::new();
         if let Some(render) = source_owned.report().render() {

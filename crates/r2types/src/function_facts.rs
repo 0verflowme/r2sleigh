@@ -1642,12 +1642,13 @@ impl SourceOwnedFunctionFacts {
     /// Parameter-slot resolution needs a coherent ABI. When the source does not
     /// carry one there are no parameter slots to resolve, so the steps keyed on
     /// them have nothing to do; every other piece of evidence is still valid and
-    /// is still attached. Returns the number of call-argument type constraints
-    /// applied and whether the exact source return type changed the signature.
+    /// is still attached. Returns the number of parameter declarations that
+    /// changed and whether the return declaration changed in the final signature.
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
     ) -> (usize, bool) {
+        let prior_signature = report.types.merged_signature.clone();
         let mut enriched = report.clone();
         let mut usage = source.facts().assumption_usage.clone();
         usage.extend(enriched.assumption_usage());
@@ -1658,18 +1659,37 @@ impl SourceOwnedFunctionFacts {
             .machine_context()
             .memory_model()
             .default_address_bits();
-        let applied_constraints = enriched.apply_certified_call_argument_type_constraints(ptr_bits);
+        enriched.apply_certified_call_argument_type_constraints(ptr_bits);
         enriched.apply_recovered_evidence_types(source, ptr_bits);
         // Exact immutable interface evidence outranks advisory propagation.
         // Apply it after recovered call evidence so the latter cannot rewrite
         // a declared signedness or logical projection through a weak scalar.
-        let return_type_changed = enriched.apply_exact_source_return_type(source);
+        enriched.apply_exact_source_return_type(source);
         // Type constraints may change advisory member/carrier types. Rebuild
         // once more so the sealed render projection is a pure function of the
         // final type facts and the exact retained source.
         Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
+        let final_signature = enriched.types.merged_signature.as_ref();
+        let changed_parameters = final_signature.map_or(0, |signature| {
+            signature
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(slot, parameter)| {
+                    prior_signature
+                        .as_ref()
+                        .and_then(|signature| signature.params.get(*slot))
+                        .and_then(|parameter| parameter.ty.as_ref())
+                        != parameter.ty.as_ref()
+                })
+                .count()
+        });
+        let return_type_changed = prior_signature
+            .as_ref()
+            .and_then(|signature| signature.ret_type.as_ref())
+            != final_signature.and_then(|signature| signature.ret_type.as_ref());
         *report = enriched;
-        (applied_constraints, return_type_changed)
+        (changed_parameters, return_type_changed)
     }
 
     fn rebuild_source_owned_decompile_evidence(
