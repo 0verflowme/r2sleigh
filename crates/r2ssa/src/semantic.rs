@@ -8786,16 +8786,24 @@ fn collect_call_sites(
                 SSAOp::Call { target } | SSAOp::CallInd { target } => {
                     (target.clone(), CallSiteTransfer::Call)
                 }
-                SSAOp::Branch { target }
+                SSAOp::Branch { target } | SSAOp::BranchInd { target }
                     if machine_context.is_some_and(|context| {
-                        context.is_tail_jump_call_site(id)
+                        context.is_tail_call_site(id)
                             && raw_identity.is_some_and(|identity| {
-                                graph
-                                    .value_id_for_var(target)
-                                    .and_then(|value| graph.value(value))
-                                    .is_some_and(|value| {
-                                        value.canonical_storage == Some(identity.target())
-                                    })
+                                identity.op_index() == op_idx
+                                    && match op {
+                                        SSAOp::Branch { .. } => graph
+                                            .value_id_for_var(target)
+                                            .and_then(|value| graph.value(value))
+                                            .is_some_and(|value| {
+                                                value.canonical_storage == Some(identity.target())
+                                            }),
+                                        SSAOp::BranchInd { .. } => {
+                                            identity.target().space
+                                                == crate::CanonicalStorageSpace::Ram
+                                        }
+                                        _ => false,
+                                    }
                             })
                     }) =>
                 {

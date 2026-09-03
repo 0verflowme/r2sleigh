@@ -28,7 +28,7 @@ pub use r2source::{
     SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 21;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 22;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -524,7 +524,7 @@ pub struct SourceMachineContext {
     register_geometry_state: MachineRegisterGeometryState,
     register_projections: Box<[RegisterProjection]>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
-    tail_jump_call_sites: BTreeSet<CallSiteId>,
+    tail_call_sites: BTreeSet<CallSiteId>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
@@ -856,7 +856,7 @@ impl SourceMachineContext {
         convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
-        Self::from_blocks_with_interfaces_and_tail_jumps(
+        Self::from_blocks_with_interfaces_and_tail_calls(
             blocks,
             arch,
             function_interface,
@@ -867,14 +867,14 @@ impl SourceMachineContext {
         )
     }
 
-    pub(crate) fn from_blocks_with_interfaces_and_tail_jumps(
+    pub(crate) fn from_blocks_with_interfaces_and_tail_calls(
         blocks: &[R2ILBlock],
         arch: Option<&ArchSpec>,
         function_interface: Option<SourceFunctionInterface>,
         machine_roles: SourceMachineRoles,
         convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
-        tail_jump_identities: Vec<SourceCallSiteIdentity>,
+        tail_call_identities: Vec<SourceCallSiteIdentity>,
     ) -> Self {
         // The architecture says where it returns a value, for a function whose
         // ABI was never recovered.
@@ -1007,8 +1007,8 @@ impl SourceMachineContext {
                 && frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch)
                 && return_mechanism_matches_machine(interface, arch, &memory_model);
         }
-        let (raw_call_sites_by_id, tail_jump_call_sites) =
-            collect_raw_call_site_identities(blocks, &tail_jump_identities);
+        let (raw_call_sites_by_id, tail_call_sites) =
+            collect_raw_call_site_identities(blocks, &tail_call_identities);
         let raw_call_sites = raw_call_sites_by_id
             .values()
             .copied()
@@ -1087,7 +1087,7 @@ impl SourceMachineContext {
             register_geometry_state,
             register_projections,
             raw_call_sites_by_id,
-            tail_jump_call_sites,
+            tail_call_sites,
             call_site_interfaces: call_site_interfaces_by_identity,
             memory_spaces_by_op,
         }
@@ -1304,8 +1304,8 @@ impl SourceMachineContext {
         self.raw_call_sites_by_id.get(&call_site).copied()
     }
 
-    pub fn is_tail_jump_call_site(&self, call_site: CallSiteId) -> bool {
-        self.tail_jump_call_sites.contains(&call_site)
+    pub fn is_tail_call_site(&self, call_site: CallSiteId) -> bool {
+        self.tail_call_sites.contains(&call_site)
     }
 
     pub const fn call_site_interfaces(
@@ -1462,7 +1462,7 @@ impl SourceMachineContext {
         for (call_site, identity) in &self.raw_call_sites_by_id {
             writer.u32(call_site.0);
             write_call_identity(&mut writer, *identity);
-            writer.bool(self.tail_jump_call_sites.contains(call_site));
+            writer.bool(self.tail_call_sites.contains(call_site));
         }
         writer.usize(self.call_site_interfaces.len());
         for interface in self.call_site_interfaces.values() {
@@ -1552,26 +1552,32 @@ fn ssa_memory_space(op: &SSAOp) -> Option<SpaceId> {
 
 fn collect_raw_call_site_identities(
     blocks: &[R2ILBlock],
-    tail_jump_identities: &[SourceCallSiteIdentity],
+    tail_call_identities: &[SourceCallSiteIdentity],
 ) -> (
     BTreeMap<CallSiteId, SourceCallSiteIdentity>,
     BTreeSet<CallSiteId>,
 ) {
-    let tail_jump_identities = tail_jump_identities
+    let tail_call_identities = tail_call_identities
         .iter()
         .copied()
         .filter(|identity| {
             blocks.iter().any(|block| {
                 identity.block_addr() == block.addr
                     && identity.op_index() + 1 == block.ops.len()
-                    && block.ops.get(identity.op_index()).is_some_and(|op| {
-                        matches!(op, R2ILOp::Branch { target }
-                            if CanonicalStorageId::from_varnode(target) == identity.target())
-                    })
+                    && match block.ops.get(identity.op_index()) {
+                        Some(R2ILOp::Branch { target }) => {
+                            CanonicalStorageId::from_varnode(target) == identity.target()
+                        }
+                        Some(R2ILOp::BranchInd { .. }) => {
+                            terminal_indirect_loaded_slot(block, identity.op_index())
+                                == Some(identity.target())
+                        }
+                        _ => false,
+                    }
             })
         })
         .collect::<BTreeSet<_>>();
-    let authorized_tail_jumps = &tail_jump_identities;
+    let authorized_tail_calls = &tail_call_identities;
     let mut raw_calls = blocks
         .iter()
         .flat_map(|block| {
@@ -1594,7 +1600,16 @@ fn collect_raw_call_site_identities(
                                 op_index,
                                 CanonicalStorageId::from_varnode(target),
                             );
-                            if !authorized_tail_jumps.contains(&identity) {
+                            if !authorized_tail_calls.contains(&identity) {
+                                return None;
+                            }
+                            identity
+                        }
+                        R2ILOp::BranchInd { .. } => {
+                            let target = terminal_indirect_loaded_slot(block, op_index)?;
+                            let identity =
+                                SourceCallSiteIdentity::new(block.addr, op_index, target);
+                            if !authorized_tail_calls.contains(&identity) {
                                 return None;
                             }
                             identity
@@ -1613,12 +1628,137 @@ fn collect_raw_call_site_identities(
             break;
         };
         let call_site = CallSiteId(index);
-        if tail_jump_identities.contains(&identity) {
+        if tail_call_identities.contains(&identity) {
             tails.insert(call_site);
         }
         by_id.insert(call_site, identity);
     }
     (by_id, tails)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawValueOrigin {
+    Constant { value: u64, size: u32 },
+    LoadedSlot(CanonicalStorageId),
+}
+
+fn truncated_raw_value(value: u64, size: u32) -> u64 {
+    match size {
+        0 | 8.. => value,
+        bytes => value & (u64::MAX >> (64 - bytes * 8)),
+    }
+}
+
+fn raw_value_origin(
+    origins: &BTreeMap<CanonicalStorageId, RawValueOrigin>,
+    value: &r2il::Varnode,
+) -> Option<RawValueOrigin> {
+    match value.space {
+        SpaceId::Const => Some(RawValueOrigin::Constant {
+            value: truncated_raw_value(value.offset, value.size),
+            size: value.size,
+        }),
+        // On x86-64 an indirect memory operand is lifted as the RAM value
+        // itself, with no defining load. Its canonical storage is the slot.
+        SpaceId::Ram => Some(RawValueOrigin::LoadedSlot(
+            CanonicalStorageId::from_varnode(value),
+        )),
+        _ => origins
+            .get(&CanonicalStorageId::from_varnode(value))
+            .copied(),
+    }
+}
+
+/// The canonical RAM slot whose loaded value a terminal indirect branch reads.
+///
+/// This is one fact with two lifted representations. x86-64 may put the RAM
+/// varnode directly on `BranchInd`, leaving it undefined in SSA. AArch64 loads
+/// the slot through an exactly folded address and copies the result through a
+/// register into the program counter. A single forward reaching-origin pass
+/// recognizes both without depending on a variable name or architecture.
+///
+/// The pass is `O(n log s)` for `n` operations and `s` distinct storages in the
+/// block. Unsupported definitions clear their destination, so an older origin
+/// can never survive a clobber and become false evidence.
+pub(crate) fn terminal_indirect_loaded_slot(
+    block: &R2ILBlock,
+    branch_op_index: usize,
+) -> Option<CanonicalStorageId> {
+    if branch_op_index + 1 != block.ops.len() {
+        return None;
+    }
+    let R2ILOp::BranchInd { target } = block.ops.get(branch_op_index)? else {
+        return None;
+    };
+
+    let mut origins = BTreeMap::<CanonicalStorageId, RawValueOrigin>::new();
+    for op in &block.ops[..branch_op_index] {
+        let Some(output) = op.output() else {
+            continue;
+        };
+        let output_storage = CanonicalStorageId::from_varnode(output);
+        let origin = match op {
+            R2ILOp::Copy { src, .. } => raw_value_origin(&origins, src),
+            R2ILOp::IntAdd { a, b, dst } => {
+                match (raw_value_origin(&origins, a), raw_value_origin(&origins, b)) {
+                    (
+                        Some(RawValueOrigin::Constant { value: left, .. }),
+                        Some(RawValueOrigin::Constant { value: right, .. }),
+                    ) => Some(RawValueOrigin::Constant {
+                        value: truncated_raw_value(left.wrapping_add(right), dst.size),
+                        size: dst.size,
+                    }),
+                    _ => None,
+                }
+            }
+            R2ILOp::IntSub { a, b, dst } => {
+                match (raw_value_origin(&origins, a), raw_value_origin(&origins, b)) {
+                    (
+                        Some(RawValueOrigin::Constant { value: left, .. }),
+                        Some(RawValueOrigin::Constant { value: right, .. }),
+                    ) => Some(RawValueOrigin::Constant {
+                        value: truncated_raw_value(left.wrapping_sub(right), dst.size),
+                        size: dst.size,
+                    }),
+                    _ => None,
+                }
+            }
+            R2ILOp::Load {
+                dst,
+                space: SpaceId::Ram,
+                addr,
+            } => match raw_value_origin(&origins, addr) {
+                Some(RawValueOrigin::Constant { value, .. }) => {
+                    Some(RawValueOrigin::LoadedSlot(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Ram,
+                        offset: value,
+                        size: dst.size,
+                    }))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match origin {
+            Some(origin) => {
+                origins.insert(output_storage, origin);
+            }
+            None => {
+                origins.remove(&output_storage);
+            }
+        }
+    }
+
+    match raw_value_origin(&origins, target)? {
+        RawValueOrigin::LoadedSlot(slot)
+            if slot.space == CanonicalStorageSpace::Ram
+                && slot.size != 0
+                && slot.offset.checked_add(u64::from(slot.size)).is_some() =>
+        {
+            Some(slot)
+        }
+        RawValueOrigin::Constant { .. } | RawValueOrigin::LoadedSlot(_) => None,
+    }
 }
 
 fn memory_space(op: &R2ILOp) -> Option<SpaceId> {
@@ -1922,8 +2062,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 21);
-        assert_eq!(x86_context.schema_version(), 21);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 22);
+        assert_eq!(x86_context.schema_version(), 22);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64
@@ -3070,7 +3210,7 @@ mod tests {
         });
         let identity =
             SourceCallSiteIdentity::new(block.addr, 0, CanonicalStorageId::from_varnode(&target));
-        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
             &[block.clone()],
             None,
             None,
@@ -3083,7 +3223,7 @@ mod tests {
             context.raw_call_site_identity(CallSiteId(0)),
             Some(identity)
         );
-        assert!(context.is_tail_jump_call_site(CallSiteId(0)));
+        assert!(context.is_tail_call_site(CallSiteId(0)));
 
         let wrong_target = SourceCallSiteIdentity::new(
             block.addr,
@@ -3093,7 +3233,7 @@ mod tests {
                 ..identity.target()
             },
         );
-        let unproved = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+        let unproved = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
             &[block],
             None,
             None,
@@ -3103,7 +3243,7 @@ mod tests {
             vec![wrong_target],
         );
         assert!(unproved.raw_call_sites_by_id().is_empty());
-        assert!(!unproved.is_tail_jump_call_site(CallSiteId(0)));
+        assert!(!unproved.is_tail_call_site(CallSiteId(0)));
     }
 
     #[test]
