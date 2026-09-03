@@ -162,12 +162,62 @@ impl PendingReplacementExpr {
         }
     }
 
-    fn canonical_access(value: ValueId, access: r2ssa::StructuredAccessId, expr: CExpr) -> Self {
+    fn canonical_access(fact: &r2types::MemoryAccessRenderFact, expr: CExpr) -> Self {
+        Self {
+            expr,
+            value: fact.address,
+            source: ReplacementSource::CanonicalAccess(fact.access),
+        }
+    }
+}
+
+/// Complete, one-shot input to the observation journal's cell derivation.
+///
+/// Production construction is private to operation lowering. Render helpers
+/// can return [`PendingReplacementExpr`], but no other module can assemble an
+/// ad hoc value/instruction/effect tuple and present it as a replacement.
+#[derive(Debug)]
+pub(crate) struct RenderedReplacementContract {
+    expr: CExpr,
+    value: ValueId,
+    replaced: Vec<r2ssa::InstId>,
+    obligations: BTreeSet<r2ssa::SemanticObligationId>,
+}
+
+impl RenderedReplacementContract {
+    fn new(
+        expr: CExpr,
+        value: ValueId,
+        replaced: Vec<r2ssa::InstId>,
+        obligations: BTreeSet<r2ssa::SemanticObligationId>,
+    ) -> Self {
         Self {
             expr,
             value,
-            source: ReplacementSource::CanonicalAccess(access),
+            replaced,
+            obligations,
         }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CExpr,
+        ValueId,
+        Vec<r2ssa::InstId>,
+        BTreeSet<r2ssa::SemanticObligationId>,
+    ) {
+        (self.expr, self.value, self.replaced, self.obligations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        expr: CExpr,
+        value: ValueId,
+        replaced: Vec<r2ssa::InstId>,
+        obligations: BTreeSet<r2ssa::SemanticObligationId>,
+    ) -> Self {
+        Self::new(expr, value, replaced, obligations)
     }
 }
 

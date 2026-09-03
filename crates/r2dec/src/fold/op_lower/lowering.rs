@@ -81,12 +81,11 @@ impl<'a> FoldingContext<'a> {
             })
             .collect::<BTreeSet<_>>();
         let fallback = expr.clone();
-        match journal.borrow_mut().observe_rendered_replacement_expr(
-            value,
-            &replaced,
-            &obligations,
-            expr,
-        ) {
+        let contract = RenderedReplacementContract::new(expr, value, replaced, obligations);
+        match journal
+            .borrow_mut()
+            .observe_rendered_replacement_expr(contract)
+        {
             Ok(marked) => marked,
             Err(error) => {
                 self.retain_first_observation_error(error);

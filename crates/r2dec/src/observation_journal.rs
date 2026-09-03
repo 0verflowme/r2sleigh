@@ -2202,11 +2202,12 @@ impl LegacyObservationJournal {
     /// final declaration placement without inventing an operand index.
     /// Derive every cell one rendered replacement owns.
     ///
-    /// `value` is what the replacement renders and `replaced` is the complete
-    /// set of definitions whose statements the replacement supersedes. Those
-    /// are the only facts a rendering path supplies. This owner derives the
-    /// value, use, write, literal, and effect targets from the source graph and
-    /// attaches them to the same concrete occurrence.
+    /// The opaque input says what the replacement rendered and carries the
+    /// complete set of definitions and effects derived by operation lowering.
+    /// No other production module can construct it. This owner derives the
+    /// value, use, write, and literal targets from the source graph, validates
+    /// the effect targets against the source inventory, and attaches every
+    /// target to the same concrete occurrence.
     ///
     /// A replaced producer must be inline in the sealed plan. Duplicability is
     /// not a rendering disposition: accepting a bound output here would mark
@@ -2220,15 +2221,13 @@ impl LegacyObservationJournal {
     /// the root and produced values.
     pub(crate) fn observe_rendered_replacement_expr(
         &mut self,
-        value: ValueId,
-        replaced: &[InstId],
-        obligations: &BTreeSet<SemanticObligationId>,
-        expr: CExpr,
+        contract: crate::fold::op_lower::RenderedReplacementContract,
     ) -> Result<CExpr, LegacyObservationJournalError> {
+        let (expr, value, replaced, obligations) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
         let mut represented_values = BTreeSet::from([value]);
-        let mut order = replaced.to_vec();
+        let mut order = replaced;
         order.sort_unstable();
         order.dedup();
         let produced = order
@@ -2304,12 +2303,12 @@ impl LegacyObservationJournal {
         }
 
         for obligation in obligations {
-            if !self.effect_occurrences.contains_key(obligation) {
+            if !self.effect_occurrences.contains_key(&obligation) {
                 return Err(LegacyObservationJournalError::InvalidEffectObligation(
-                    *obligation,
+                    obligation,
                 ));
             }
-            targets.push(ObservationTarget::Effect(*obligation));
+            targets.push(ObservationTarget::Effect(obligation));
         }
 
         let mut marked = expr;
@@ -5613,10 +5612,12 @@ mod tests {
         let before = journal.targets.len();
         let marked = journal
             .observe_rendered_replacement_expr(
-                value,
-                &[reader, folded_definition],
-                &obligations,
-                CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::IntLit(1), CExpr::IntLit(2)),
+                    value,
+                    vec![reader, folded_definition],
+                    obligations.clone(),
+                ),
             )
             .expect("a two-instruction discharge");
 
@@ -5750,10 +5751,12 @@ mod tests {
 
         assert_eq!(
             journal.observe_rendered_replacement_expr(
-                rendered,
-                &[definition],
-                &BTreeSet::new(),
-                CExpr::IntLit(1),
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::IntLit(1),
+                    rendered,
+                    vec![definition],
+                    BTreeSet::new(),
+                ),
             ),
             Err(LegacyObservationJournalError::RenderedValueRequired(bound)),
             "a replacement cannot absorb a producer the plan still renders separately"

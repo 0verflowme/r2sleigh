@@ -79,11 +79,7 @@ impl<'a> FoldingContext<'a> {
             base: Box::new(base_expr),
             index: Box::new(index_expr),
         };
-        Some(PendingReplacementExpr::canonical_access(
-            fact.address,
-            fact.access,
-            expr,
-        ))
+        Some(PendingReplacementExpr::canonical_access(fact, expr))
     }
 
     /// The base at the type the subscript reads through.
