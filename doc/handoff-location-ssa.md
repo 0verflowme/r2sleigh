@@ -9353,3 +9353,42 @@ of the sweep's 1.49 seconds is still unattributed, which makes it the largest
 unmeasured thing the plugin does. And the C context and the Rust trusted profile
 parse the same `.sla` file separately, at 302 milliseconds, which is the **third**
 place this project has found the same parse happening twice.
+
+## Working rules for parallel worktrees, learned the expensive way
+
+Several worktrees building and measuring at once produced four distinct
+failures in one session, three of them destructive, and none of them visible in
+the output of the thing that failed. They are recorded here because each one
+looked like a defect in the work rather than in the surroundings.
+
+**Reclaim a build directory, never a worktree.** A `target/` costs a rebuild to
+delete. A worktree can hold uncommitted work and can still be the workspace of
+an agent that is between steps, so removing one because its branch merged
+destroys work and orphans whoever was using it. That happened here, and only a
+commit-early habit saved the contents.
+
+**Never delete by glob on a shared host.** A sweep of stale directories matched
+a live run's source tree and deleted it underneath the compiler, twice, which
+reads as a build that failed before writing its log. The fix that holds is
+structural rather than careful: runs live under their own root that a sweep of
+the old namespace cannot match, they write a marker while live, and the
+collector spares anything marked, anything younger than a day whose state is
+unknown, and reports rather than removes unless forced.
+
+**Interleave every before-and-after.** Sequential blocks on a shared host
+measured the machine's load, not the change: one change read as four-fold
+sequentially and about nineteen per cent interleaved. A private plugin
+directory stops another worktree overwriting the binary; only interleaving
+stops the machine overwriting the answer.
+
+**A build outside a lock is a different tree from the one measured inside it.**
+The lock wrapper builds before it queues so a cold build does not block others,
+and the command it runs builds again once it holds the lock. Anything edited
+during the wait is what gets measured, silently. It now fingerprints the tree on
+both sides and refuses rather than report one tree's numbers under another
+tree's name.
+
+**Put a build setting in the manifest, not in the instructions.** Every worktree
+was told to build with line tables rather than full debug info. One did not, and
+grew a twelve gigabyte debug directory against three or four for the others.
+The setting is now in `Cargo.toml`.
