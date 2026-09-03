@@ -2398,7 +2398,7 @@ fn source_spelled_type(spelling: &str, ptr_bits: u32) -> Option<r2types::CTypeLi
     }
     // A structural spelling stays structural so width-aware analysis keeps
     // working; a named one is carried by name so it renders as itself.
-    let mut ty = match r2types::parse_type_like_spec(&base_spelling, ptr_bits) {
+    let mut ty = match r2types::parse_c_type_like(&base_spelling, ptr_bits) {
         Some(r2types::CTypeLike::Void) => r2types::CTypeLike::Void,
         Some(
             structural @ (r2types::CTypeLike::Struct(_)

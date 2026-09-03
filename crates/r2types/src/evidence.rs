@@ -724,7 +724,7 @@ impl<'a> EvidenceBuilder<'a> {
             CTypeLike::Union(name) => Some(self.arena.unknown_alias(format!("union {name}"))),
             CTypeLike::Enum(name) => Some(self.arena.unknown_alias(format!("enum {name}"))),
             CTypeLike::Typedef(name) => {
-                let resolved = crate::facts::parse_type_like_spec(name, self.ptr_bits)?;
+                let resolved = crate::parse_c_type_like(name, self.ptr_bits)?;
                 if matches!(resolved, CTypeLike::Typedef(_)) {
                     return Some(self.arena.unknown_alias(name.clone()));
                 }

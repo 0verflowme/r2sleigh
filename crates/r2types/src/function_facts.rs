@@ -10,7 +10,7 @@ use crate::facts::{
     OutParamCertificateEvidence, OutParamCertificateSource, SignatureCertificateSource,
     SignatureProjectionResult, VisibleBindingKind,
 };
-use crate::{CTypeLike, normalize_external_type_name, parse_type_like_spec};
+use crate::{CTypeLike, normalize_external_type_name, parse_c_type_like};
 
 pub type OpSiteKey = (u64, usize);
 pub type MemoryOpSiteKey = (u64, usize, bool);
@@ -845,7 +845,7 @@ fn field_certificate_width_matches(
 ) -> bool {
     cert.field_type
         .as_deref()
-        .and_then(|field_type| parse_type_like_spec(field_type, ptr_bits))
+        .and_then(|field_type| parse_c_type_like(field_type, ptr_bits))
         .and_then(|ty| type_like_size_bytes(&ty, ptr_bits))
         .is_none_or(|width| width == u64::from(access_width))
 }
@@ -2353,7 +2353,7 @@ impl FunctionFacts {
                 field_type: cert
                     .field_type
                     .as_deref()
-                    .and_then(|ty| parse_type_like_spec(ty, ptr_bits)),
+                    .and_then(|ty| parse_c_type_like(ty, ptr_bits)),
                 access_width: memory.width,
             })
             .collect()

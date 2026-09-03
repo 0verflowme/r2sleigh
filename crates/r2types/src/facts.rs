@@ -1173,7 +1173,13 @@ fn apply_signature_projection_to_existing(
                 }
             }
         };
-        if should_replace_return && existing.ret_type != hint.ret_type {
+        let return_is_different = match (existing.ret_type.as_ref(), hint.ret_type.as_ref()) {
+            (Some(existing), Some(hint)) => {
+                !crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits)
+            }
+            (existing, hint) => existing != hint,
+        };
+        if should_replace_return && return_is_different {
             existing.ret_type = hint.ret_type.clone();
             changed = true;
         }
@@ -1216,7 +1222,15 @@ fn apply_signature_projection_to_existing(
                     )
             }
         };
-        if should_replace_ty && existing_param.ty.as_ref() != Some(hint_ty) {
+        if should_replace_ty
+            && existing_param.ty.as_ref().is_none_or(|existing_ty| {
+                !crate::signature_infer::signature_types_are_equivalent(
+                    existing_ty,
+                    hint_ty,
+                    ptr_bits,
+                )
+            })
+        {
             existing_param.ty = Some(hint_ty.clone());
             changed = true;
         }
@@ -1491,158 +1505,6 @@ fn merge_local_field_accesses(
 fn dedup_preserving_order(items: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     items.retain(|item| seen.insert(item.clone()));
-}
-
-pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
-    let mut ty = spec.trim();
-    if ty.is_empty() {
-        return None;
-    }
-
-    let mut array_size = None;
-    if let Some(start) = ty.rfind('[')
-        && ty.ends_with(']')
-    {
-        let len_str = &ty[start + 1..ty.len() - 1];
-        array_size = if len_str.is_empty() {
-            Some(None)
-        } else {
-            len_str.parse::<usize>().ok().map(Some)
-        };
-        ty = ty[..start].trim_end();
-    }
-
-    let mut ptr_count = 0usize;
-    while let Some(rest) = ty.strip_suffix('*') {
-        ptr_count += 1;
-        ty = rest.trim_end();
-    }
-    let qualifier_filtered = ty
-        .split_whitespace()
-        .filter(|token| {
-            !matches!(
-                token.to_ascii_lowercase().as_str(),
-                "const"
-                    | "volatile"
-                    | "restrict"
-                    | "__restrict"
-                    | "__restrict__"
-                    | "__const"
-                    | "__const__"
-                    | "__volatile"
-                    | "__volatile__"
-            )
-        })
-        .collect::<Vec<_>>();
-    let qualifier_filtered_storage = (qualifier_filtered.len() != ty.split_whitespace().count())
-        .then(|| qualifier_filtered.join(" "));
-    if let Some(filtered) = qualifier_filtered_storage.as_deref() {
-        ty = filtered.trim();
-    }
-
-    let normalize_base = |raw: &str| {
-        raw.chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let base_key = normalize_base(ty);
-
-    let mut base = if let Some(rest) = base_key.strip_prefix("int")
-        && let Some(bits) = rest.strip_suffix("_t")
-    {
-        bits.parse::<u32>().ok().map(|bits| CTypeLike::Int {
-            bits,
-            signedness: Signedness::Signed,
-        })
-    } else if let Some(rest) = base_key.strip_prefix("uint")
-        && let Some(bits) = rest.strip_suffix("_t")
-    {
-        bits.parse::<u32>().ok().map(|bits| CTypeLike::Int {
-            bits,
-            signedness: Signedness::Unsigned,
-        })
-    } else {
-        match base_key.as_str() {
-            "void" => Some(CTypeLike::Void),
-            "bool" | "_bool" => Some(CTypeLike::Bool),
-            "char" | "signedchar" => Some(CTypeLike::Int {
-                bits: 8,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedchar" => Some(CTypeLike::Int {
-                bits: 8,
-                signedness: Signedness::Unsigned,
-            }),
-            "short" | "shortint" | "signedshort" | "signedshortint" => Some(CTypeLike::Int {
-                bits: 16,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedshort" | "unsignedshortint" => Some(CTypeLike::Int {
-                bits: 16,
-                signedness: Signedness::Unsigned,
-            }),
-            "signed" | "int" | "signedint" => Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            }),
-            "unsigned" | "unsignedint" => Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Unsigned,
-            }),
-            "long" | "longint" | "signedlong" | "signedlongint" | "longlong" | "longlongint"
-            | "signedlonglong" | "signedlonglongint" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedlong"
-            | "unsignedlongint"
-            | "unsignedlonglong"
-            | "unsignedlonglongint"
-            | "size_t" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Unsigned,
-            }),
-            "ssize_t" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Signed,
-            }),
-            "float" => Some(CTypeLike::Float(32)),
-            "double" => Some(CTypeLike::Float(64)),
-            "unknown" | "unknown_t" | "undefined" | "undefined_t" => Some(CTypeLike::Unknown),
-            _ if ty.to_ascii_lowercase().starts_with("struct ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Struct(name.to_string())),
-            _ if ty.to_ascii_lowercase().starts_with("union ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Union(name.to_string())),
-            _ if ty.to_ascii_lowercase().starts_with("enum ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Enum(name.to_string())),
-            _ if is_c_typedef_name(ty) => Some(CTypeLike::Typedef(ty.to_string())),
-            _ => None,
-        }
-    }?;
-
-    if let Some(size) = array_size {
-        base = CTypeLike::Array(Box::new(base), size);
-    }
-    for _ in 0..ptr_count {
-        base = CTypeLike::Pointer(Box::new(base));
-    }
-    Some(base)
-}
-
-fn is_c_typedef_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -2237,44 +2099,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_type_like_spec_accepts_const_qualified_pointers() {
-        let signed_char_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Int {
-            bits: 8,
-            signedness: Signedness::Signed,
-        }));
-        let void_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Void));
-
-        assert_eq!(
-            parse_type_like_spec("char const *", 64),
-            Some(signed_char_ptr.clone())
-        );
-        assert_eq!(
-            parse_type_like_spec("const char *", 64),
-            Some(signed_char_ptr)
-        );
-        assert_eq!(parse_type_like_spec("void const *", 64), Some(void_ptr));
-    }
-
-    #[test]
-    fn parse_type_like_spec_accepts_external_typedef_pointers() {
-        assert_eq!(
-            parse_type_like_spec("FILE *", 64),
-            Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
-                "FILE".to_string()
-            ))))
-        );
-    }
-
-    #[test]
-    fn parse_type_like_spec_canonicalizes_c_bool_spelling() {
-        assert_eq!(parse_type_like_spec("_Bool", 64), Some(CTypeLike::Bool));
-        assert_eq!(
-            parse_type_like_spec("_Bool *", 64),
-            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
-        );
-    }
-
-    #[test]
     fn weak_summary_kind_projection_rejects_anonymous_fcn_signature() {
         let original = FunctionSignatureSpec {
             ret_type: Some(test_int(64)),
@@ -2412,5 +2236,29 @@ mod tests {
         assert_eq!(signature.ret_type, Some(test_typedef("ssize_t")));
         assert_eq!(signature.params[0].name, "count");
         assert_eq!(signature.params[0].ty, Some(test_typedef("size_t")));
+    }
+
+    #[test]
+    fn equivalent_signature_spellings_do_not_report_a_rewrite() {
+        let source_int = test_typedef("int");
+        let canonical_int = test_int(32);
+        let original = FunctionSignatureSpec {
+            ret_type: Some(source_int.clone()),
+            params: vec![test_param("value", source_int)],
+        };
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(original.clone()),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::strong_summary(FunctionSignatureSpec {
+            ret_type: Some(canonical_int.clone()),
+            params: vec![test_param("value", canonical_int)],
+        });
+
+        let result = facts.apply_signature_projection("sym.identity", projection, 64);
+
+        assert!(result.was_applied());
+        assert!(!result.changed);
+        assert_eq!(facts.merged_signature, Some(original));
     }
 }

@@ -285,29 +285,36 @@ pub fn render_c_type_like(ty: &CTypeLike) -> String {
 
 /// Parse a C type spelling into the model.
 ///
-/// This is the inverse of `render_c_type_like`, and it exists because the tree
-/// had no canonical one: six separate parsers had grown at the seams where a
-/// type had been stored as a rendered string, and they did not agree with each
-/// other. A spelling is data arriving from radare2's type database, from DWARF,
-/// or from our own renderer, so the parser has to accept more spellings than
-/// the renderer emits -- `unsigned int` as well as `uint32_t`, `char *` as well
-/// as `char*`.
+/// This is the partial inverse of `render_c_type_like`. A spelling is data
+/// arriving from radare2's type database, from DWARF, or from our own renderer,
+/// so the parser accepts more spellings than the renderer emits -- `unsigned
+/// int` as well as `uint32_t`, `char *` as well as `char*`. It still refuses a
+/// spelling it cannot place instead of minting a plausible typedef from
+/// malformed text.
 ///
 /// `ptr_bits` is a parameter rather than an assumption because the width of
 /// `long` and `size_t` is a property of the target, and guessing it is how two
 /// of the previous parsers came to disagree.
-pub fn parse_c_type_like(spelling: &str, ptr_bits: u32) -> CTypeLike {
+pub fn parse_c_type_like(spelling: &str, ptr_bits: u32) -> Option<CTypeLike> {
     let normalized = crate::external::normalize_type_spelling(spelling);
     parse_normalized(normalized.trim(), ptr_bits)
 }
 
-fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
+fn parse_normalized(spelling: &str, ptr_bits: u32) -> Option<CTypeLike> {
     let spelling = spelling.trim();
-    if spelling.is_empty() || spelling == "/* unknown */" {
-        return CTypeLike::Unknown;
+    if spelling.is_empty() {
+        return None;
+    }
+    if matches!(
+        spelling.to_ascii_lowercase().as_str(),
+        "/* unknown */" | "unknown" | "unknown_t" | "undefined" | "undefined_t"
+    ) {
+        return Some(CTypeLike::Unknown);
     }
     if let Some(inner) = spelling.strip_suffix('*') {
-        return CTypeLike::Pointer(Box::new(parse_normalized(inner, ptr_bits)));
+        return Some(CTypeLike::Pointer(Box::new(parse_normalized(
+            inner, ptr_bits,
+        )?)));
     }
     if let Some(open) = spelling.rfind('[')
         && spelling.ends_with(']')
@@ -316,15 +323,18 @@ fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
         let len = if len.is_empty() {
             None
         } else {
-            len.parse::<usize>().ok()
+            Some(len.parse::<usize>().ok()?)
         };
-        return CTypeLike::Array(Box::new(parse_normalized(&spelling[..open], ptr_bits)), len);
+        return Some(CTypeLike::Array(
+            Box::new(parse_normalized(&spelling[..open], ptr_bits)?),
+            len,
+        ));
     }
     if let Some(bits) = spelling
         .strip_prefix("struct r2sleigh_bits_")
         .and_then(|bits| bits.parse::<u32>().ok())
     {
-        return CTypeLike::BitVector(bits);
+        return Some(CTypeLike::BitVector(bits));
     }
     for (keyword, build) in [
         ("struct ", CTypeLike::Struct as fn(String) -> CTypeLike),
@@ -332,32 +342,42 @@ fn parse_normalized(spelling: &str, ptr_bits: u32) -> CTypeLike {
         ("enum ", CTypeLike::Enum as fn(String) -> CTypeLike),
     ] {
         if let Some(name) = spelling.strip_prefix(keyword) {
-            return build(name.trim().to_string());
+            let name = name.trim();
+            return is_c_type_identifier(name).then(|| build(name.to_string()));
         }
     }
     if spelling.contains("(*)") {
         // A spelling reached here only says it is a function pointer; the
         // signature it was written with is not recovered from the text.
-        return CTypeLike::Function {
+        return Some(CTypeLike::Function {
             ret: Box::new(CTypeLike::Unknown),
             params: Vec::new(),
-        };
+        });
     }
 
     let collapsed = spelling.split_whitespace().collect::<Vec<_>>().join(" ");
-    if let Some(width) = fixed_width_integer(&collapsed) {
-        return width;
+    let classification = collapsed.to_ascii_lowercase();
+    if let Some(width) = fixed_width_integer(&classification) {
+        return Some(width);
     }
-    match collapsed.as_str() {
-        "void" => CTypeLike::Void,
-        "bool" | "_Bool" => CTypeLike::Bool,
-        "float" => CTypeLike::Float(32),
-        "double" | "long double" => CTypeLike::Float(64),
-        _ => match named_integer_bits(&collapsed, ptr_bits) {
-            Some((bits, signedness)) => CTypeLike::Int { bits, signedness },
-            None => CTypeLike::Typedef(collapsed),
-        },
+    match classification.as_str() {
+        "void" => Some(CTypeLike::Void),
+        "bool" | "_bool" => Some(CTypeLike::Bool),
+        "float" => Some(CTypeLike::Float(32)),
+        "double" | "long double" => Some(CTypeLike::Float(64)),
+        _ => named_integer_bits(&classification, ptr_bits)
+            .map(|(bits, signedness)| CTypeLike::Int { bits, signedness })
+            .or_else(|| is_c_type_identifier(&collapsed).then_some(CTypeLike::Typedef(collapsed))),
     }
+}
+
+fn is_c_type_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// The `intN_t` family, including the `__int128_t` spelling that is the only
@@ -423,15 +443,72 @@ mod tests {
     fn radare_dotted_spellings_reach_the_same_type() {
         let foo = CTypeLike::Pointer(Box::new(CTypeLike::Struct("Foo".to_string())));
         for spelling in ["struct.Foo*", "struct.Foo *", "struct Foo*", "struct Foo *"] {
-            assert_eq!(parse_c_type_like(spelling, 64), foo, "{spelling}");
+            assert_eq!(
+                parse_c_type_like(spelling, 64),
+                Some(foo.clone()),
+                "{spelling}"
+            );
         }
         assert_eq!(
             parse_c_type_like("union.Bar*", 64),
-            CTypeLike::Pointer(Box::new(CTypeLike::Union("Bar".to_string())))
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Union(
+                "Bar".to_string()
+            ))))
         );
         assert_eq!(
             parse_c_type_like("type.Foo", 64),
-            CTypeLike::Typedef("Foo".to_string())
+            Some(CTypeLike::Typedef("Foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn unplaceable_spellings_are_refused_instead_of_becoming_types() {
+        for spelling in [
+            "",
+            "not a type",
+            "type.Namespace.member",
+            "not a type *",
+            "uint8_t[not-a-length]",
+            "struct Name trailing",
+        ] {
+            assert_eq!(parse_c_type_like(spelling, 64), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn qualified_pointer_spellings_reach_the_same_type() {
+        let signed_char_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Int {
+            bits: 8,
+            signedness: Signedness::Signed,
+        }));
+        let void_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+
+        for spelling in ["char const *", "char const*", "const char *"] {
+            assert_eq!(
+                parse_c_type_like(spelling, 64),
+                Some(signed_char_ptr.clone()),
+                "{spelling}"
+            );
+        }
+        assert_eq!(parse_c_type_like("void __const*", 64), Some(void_ptr));
+    }
+
+    #[test]
+    fn external_typedef_pointer_is_structurally_placeable() {
+        assert_eq!(
+            parse_c_type_like("FILE *", 64),
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
+                "FILE".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn c_bool_spellings_reach_the_same_type() {
+        assert_eq!(parse_c_type_like("_Bool", 64), Some(CTypeLike::Bool));
+        assert_eq!(
+            parse_c_type_like("_Bool *", 64),
+            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
         );
     }
 
@@ -473,7 +550,7 @@ mod tests {
         for case in &cases {
             let rendered = render_c_type_like(case);
             let parsed = parse_c_type_like(&rendered, 64);
-            if parsed != *case {
+            if parsed.as_ref() != Some(case) {
                 lossy.push(format!("{case:?} rendered {rendered:?} parsed {parsed:?}"));
             }
         }
@@ -559,7 +636,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_c_type_like(spelling, ptr_bits),
-                expected,
+                Some(expected),
                 "{spelling}"
             );
         }
@@ -581,10 +658,10 @@ mod tests {
         assert_eq!(render_c_type_like(&unknown), "int32_t");
         assert_eq!(
             parse_c_type_like("int32_t", 64),
-            CTypeLike::Int {
+            Some(CTypeLike::Int {
                 bits: 32,
                 signedness: Signedness::Signed,
-            }
+            })
         );
     }
 
@@ -593,17 +670,17 @@ mod tests {
     fn target_width_spellings_follow_the_pointer_width_given() {
         assert_eq!(
             parse_c_type_like("long", 32),
-            CTypeLike::Int {
+            Some(CTypeLike::Int {
                 bits: 32,
                 signedness: Signedness::Signed
-            }
+            })
         );
         assert_eq!(
             parse_c_type_like("long", 64),
-            CTypeLike::Int {
+            Some(CTypeLike::Int {
                 bits: 64,
                 signedness: Signedness::Signed
-            }
+            })
         );
     }
 

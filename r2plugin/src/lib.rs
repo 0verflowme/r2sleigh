@@ -2481,11 +2481,11 @@ fn parse_known_function_signatures(
                         .get("type")
                         .or_else(|| arg_obj.get("ty"))
                         .and_then(|v| v.as_str())
-                        .and_then(|raw| r2types::parse_type_like_spec(raw, ptr_bits));
+                        .and_then(|raw| r2types::parse_c_type_like(raw, ptr_bits));
                     params.push(ty.unwrap_or(r2types::CTypeLike::Unknown));
                 } else if let Some(raw) = arg.as_str() {
                     params.push(
-                        r2types::parse_type_like_spec(raw, ptr_bits)
+                        r2types::parse_c_type_like(raw, ptr_bits)
                             .unwrap_or(r2types::CTypeLike::Unknown),
                     );
                 }
@@ -2493,7 +2493,7 @@ fn parse_known_function_signatures(
         } else if let Some(argtypes) = obj.get("argtypes").and_then(|v| v.as_array()) {
             for raw in argtypes.iter().filter_map(|v| v.as_str()) {
                 params.push(
-                    r2types::parse_type_like_spec(raw, ptr_bits)
+                    r2types::parse_c_type_like(raw, ptr_bits)
                         .unwrap_or(r2types::CTypeLike::Unknown),
                 );
             }
@@ -2506,7 +2506,7 @@ fn parse_known_function_signatures(
             .or_else(|| obj.get("rettype"))
             .or_else(|| obj.get("type"))
             .and_then(|v| v.as_str())
-            .and_then(|raw| r2types::parse_type_like_spec(raw, ptr_bits))
+            .and_then(|raw| r2types::parse_c_type_like(raw, ptr_bits))
             .unwrap_or(r2types::CTypeLike::Unknown);
 
         let variadic = obj
@@ -3969,7 +3969,7 @@ fn merge_slot_type_overrides_into_signature(
     }
 
     for (slot, raw_ty) in slot_type_overrides {
-        let Some(parsed) = r2types::parse_type_like_spec(raw_ty, ptr_bits) else {
+        let Some(parsed) = r2types::parse_c_type_like(raw_ty, ptr_bits) else {
             continue;
         };
         let param = &mut sig.params[*slot];
