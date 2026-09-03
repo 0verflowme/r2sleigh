@@ -283,12 +283,33 @@ fn upstream_zero_occurrence_outcome(
         return Outcome::Elided(ElisionReason::DirectControlTarget);
     }
 
+    // The obligation names an instruction in source coordinates and every
+    // other view of it is in graph coordinates, so the two are reconciled
+    // here rather than by whoever reads the refusal. Three hypotheses about
+    // one refusal were built on the assumption that the refused obligation
+    // and a newly inlined value named the same instruction, and none of them
+    // checked.
+    let refused_output = source_inst
+        .and_then(|inst| graph.inst(inst))
+        .and_then(|inst| inst.output)
+        .map(|output| {
+            (
+                output,
+                graph
+                    .value(output)
+                    .map(|value| value.var.display_name())
+                    .unwrap_or_default(),
+            )
+        });
     r2il::refusal_evidence!(
         "zero-occurrence-outcome",
-        "kind={:?} component={:?} block={:#x} source_inst={source_inst:?} inputs={:?}",
+        "kind={:?} component={:?} block={:#x} source_inst={source_inst:?}          graph_block={:?} output={refused_output:?} inputs={:?}",
         id.kind,
         id.instruction.site,
         id.instruction.block_addr,
+        source_inst
+            .and_then(|inst| graph.inst(inst))
+            .map(|inst| (inst.block, inst.ordinal)),
         prepared
             .obligations()
             .obligations()

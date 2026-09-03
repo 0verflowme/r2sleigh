@@ -559,7 +559,7 @@ pub(super) fn inlinable_values(
         .filter(|component| component.members.len() == 1)
         .filter_map(|component| component.members.first().copied())
         .collect::<BTreeSet<_>>();
-    let admitted = duplicable_bound_literals(projection, source_owned, &alone, &conservative);
+    let admitted = duplicable_bound_literals(projection, source_owned, &alone);
     if admitted.is_empty() {
         return conservative;
     }
@@ -577,13 +577,13 @@ fn duplicable_bound_literals(
     projection: &r2ssa::MachineProjection,
     source_owned: &SourceOwnedFunctionFacts,
     alone: &BTreeSet<ValueId>,
-    conservative: &BTreeSet<ValueId>,
 ) -> BTreeSet<ValueId> {
     let graph = source_owned.source().graph();
     let mut expr_by_value = std::collections::BTreeMap::new();
     for entity in projection.entities() {
         expr_by_value.insert(entity.output().value(), entity.root());
     }
+    let boundary_live_definitions = boundary_live_definitions(source_owned.source());
     let literal_candidates = graph
         .values
         .iter()
@@ -613,22 +613,38 @@ fn duplicable_bound_literals(
         // so an instruction bound under the conservative answer and not a
         // candidate is bound under this one too, and its statement is the
         // one that keeps the block.
+        // And the value must not be one a boundary depends on. A return
+        // value, a register composition, a return address or the exit stack
+        // pointer seeds a `LiveValueProducer` obligation on the instruction
+        // that defines it -- `seed_value_definition` -- and that obligation
+        // says the definition must render. The boundary spells such a value
+        // through its own path, which does not go through the inline
+        // machinery, so inlining it leaves the obligation with no occurrence
+        // and the function refuses. `murmur3_32` at x86-64 -O1 and -O2 is the
+        // case: one register literal, live at a boundary, one refused
+        // obligation.
+        //
+        // This is also why a literal in a lowering temporary never had the
+        // problem. A boundary is expressed in architectural storage, so the
+        // lifter's own scratch is never live at one.
         .filter(|value| {
-            let Some(definition) = graph
-                .def_inst(*value)
-                .and_then(|inst| graph.inst(inst))
-                .map(|inst| inst.block)
-            else {
-                return false;
-            };
-            graph.insts.iter().any(|inst| {
-                inst.block == definition
-                    && inst.output.is_some_and(|output| {
-                        output != *value
-                            && !conservative.contains(&output)
-                            && !literal_candidates.contains(&output)
-                    })
-            })
+            !boundary_live_definitions.contains(&graph.def_inst(*value).unwrap_or(InstId(u32::MAX)))
+        })
+        .collect()
+}
+
+/// Instructions a boundary requires to render, by the obligation it seeds.
+fn boundary_live_definitions(source: &r2ssa::SsaArtifact) -> BTreeSet<InstId> {
+    let obligations = source.obligations();
+    obligations
+        .obligations()
+        .keys()
+        .filter(|id| id.kind == r2ssa::SemanticObligationKind::LiveValueProducer)
+        .filter_map(|id| {
+            obligations
+                .instructions()
+                .get(&id.instruction)
+                .and_then(|disposition| disposition.source.graph_inst())
         })
         .collect()
 }
