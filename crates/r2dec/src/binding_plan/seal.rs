@@ -294,6 +294,7 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
         .ok_or(BindingPlanBuildError::Seal(
             BindingPlanSourceMismatch::Authority,
         ))?;
+    let unread = super::rules::unread_defined_values(source);
     let resolved = seal_binding_components(source_owned, machine_projection)?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
@@ -367,6 +368,12 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
         if structural_unused.contains(&graph_value.id) {
             values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
                 r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+            ));
+            continue;
+        }
+        if unread.contains(&graph_value.id) {
+            values[graph_value.id.0 as usize] = Some(UpstreamValueDisposition::Elided(
+                r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
             ));
             continue;
         }
@@ -546,6 +553,7 @@ impl BindingPlan {
             .ok_or(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::Authority,
             ))?;
+        let unread = super::rules::unread_defined_values(source);
         for (index, graph_value) in graph.values.iter().enumerate() {
             if graph_value.id.0 as usize != index {
                 return Err(BindingPlanBuildError::Seal(
@@ -618,7 +626,8 @@ impl BindingPlan {
                         && !direct_call_targets.contains(&value)
                         && !stack_frame_values.contains(&value)
                         && !stack_geometry_values.contains(&value)
-                        && !structural_unused.contains(&value) => {}
+                        && !structural_unused.contains(&value)
+                        && !unread.contains(&value) => {}
                 ValueDisposition::Elided { reason, proof }
                     if *reason == r2ssa::ledger::ElisionReason::UnobservedMerge
                         && proof.authority == *source.authority()
@@ -665,6 +674,11 @@ impl BindingPlan {
                         && proof.authority == *source.authority()
                         && proof.value == value
                         && structural_unused.contains(&value) => {}
+                ValueDisposition::Elided { reason, proof }
+                    if *reason == r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+                        && proof.authority == *source.authority()
+                        && proof.value == value
+                        && unread.contains(&value) => {}
                 ValueDisposition::Elided { .. } => {
                     return Err(BindingPlanBuildError::Seal(
                         BindingPlanSourceMismatch::InvalidElisionProof { value },

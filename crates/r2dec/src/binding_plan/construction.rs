@@ -385,6 +385,7 @@ impl BindingPlan {
             .ok_or(BindingPlanBuildError::Seal(
                 BindingPlanSourceMismatch::Authority,
             ))?;
+        let unread = super::rules::unread_defined_values(source);
         let mut literal_by_value = BTreeMap::<ValueId, MachineExprId>::new();
         for (expr_id, expr) in machine_projection.arena().iter() {
             if let MachineExprKind::Constant { binding, .. } = expr.kind() {
@@ -485,6 +486,14 @@ impl BindingPlan {
             } else if call_return_addresses.contains(&graph_value.id) {
                 dispositions[index] = ValueDisposition::Elided {
                     reason: r2ssa::ledger::ElisionReason::CallReturnAddress,
+                    proof: ValueElisionProof {
+                        authority: source.authority().clone(),
+                        value: graph_value.id,
+                    },
+                };
+            } else if unread.contains(&graph_value.id) {
+                dispositions[index] = ValueDisposition::Elided {
+                    reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
                     proof: ValueElisionProof {
                         authority: source.authority().clone(),
                         value: graph_value.id,

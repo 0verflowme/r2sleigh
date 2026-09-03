@@ -226,6 +226,7 @@ pub(super) fn component_eligible_with(
     let direct_call_targets = certified_direct_call_target_values(source);
     let stack_frame_values = certified_stack_frame_values(source);
     let stack_geometry_values = certified_stack_geometry_values(source);
+    let unread = unread_defined_values(source);
     let structural_unused = source
         .obligations()
         .structural_unused_values(graph, source.unobserved_merges().unobserved_uses())
@@ -246,8 +247,40 @@ pub(super) fn component_eligible_with(
                 && !stack_geometry_values.contains(&value.id)
                 && !structural_unused.contains(&value.id)
                 && !inlinable.contains(&value.id)
+                && !unread.contains(&value.id)
         })
         .collect())
+}
+
+/// Values defined in this function that no graph or certified boundary reads.
+///
+/// Entry values are deliberately outside this set: an exact interface can own
+/// an unused parameter declaration independently of a body read. Constants
+/// likewise have no defining instruction to remove. For a defined value, the
+/// graph use table plus the complete graphless boundary-reader inventory is the
+/// closed read domain, so membership is a linear pass with `O(log n)` indexed
+/// certificate lookups.
+pub(super) fn unread_defined_values(source: &r2ssa::SsaArtifact) -> BTreeSet<ValueId> {
+    let certified = certified_value_readers(source);
+    source
+        .graph()
+        .values
+        .iter()
+        .filter(|value| source.graph().def_inst(value.id).is_some())
+        .filter(|value| source.graph().use_sites(value.id).is_empty())
+        .filter(|value| !certified.contains_key(&value.id))
+        .map(|value| value.id)
+        .collect()
+}
+
+fn certified_value_readers(source: &r2ssa::SsaArtifact) -> BTreeMap<ValueId, Vec<InstId>> {
+    let mut readers = BTreeMap::<ValueId, Vec<InstId>>::new();
+    for inst in &source.graph().insts {
+        for value in super::certified_boundary_read_values(source, inst.id) {
+            readers.entry(value).or_default().push(inst.id);
+        }
+    }
+    readers
 }
 
 /// The type one object is declared with.
@@ -633,12 +666,7 @@ fn inlinable_core(
     // carriers read by derived-width results. A graph-only count made call
     // arguments look dead here before that case was fixed; counting only that
     // certificate kind would make the same mistake for the other three.
-    let mut certified_readers = BTreeMap::<ValueId, Vec<InstId>>::new();
-    for inst in &graph.insts {
-        for value in super::certified_boundary_read_values(source, inst.id) {
-            certified_readers.entry(value).or_default().push(inst.id);
-        }
-    }
+    let certified_readers = certified_value_readers(source);
     // Of those graphless reads, call arguments are the one kind the renderer
     // can currently consume from an inline expression. Return, switch and
     // derived-result markers require a binding symbol, so they count as reads

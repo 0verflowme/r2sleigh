@@ -40,6 +40,7 @@ fn source_owned_blocks_with_stack_slots(
     arch.add_register(RegisterDef::new("RIP", 0x30, 8));
     arch.add_register(RegisterDef::new("RDI", 0x38, 8));
     arch.add_register(RegisterDef::new("EDI", 0x38, 4));
+    arch.add_register(RegisterDef::new("CF", 0x40, 1));
     arch.register_projections = vec![
         RegisterProjection {
             written: RegisterStorage { offset: 0, size: 8 },
@@ -138,6 +139,22 @@ fn source_owned_blocks_with_stack_slots(
                 slice: RegisterBitSlice {
                     lsb_bit_offset: 0,
                     size_bits: 64,
+                },
+            },
+        },
+        RegisterProjection {
+            written: RegisterStorage {
+                offset: 0x40,
+                size: 1,
+            },
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage {
+                    offset: 0x40,
+                    size: 1,
+                },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 8,
                 },
             },
         },
@@ -283,6 +300,66 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
 }
 
 #[test]
+fn unread_defined_value_is_elided_before_it_can_become_a_binding() {
+    let source_owned = source_owned([
+        R2ILOp::IntCarry {
+            dst: Varnode::register(0x40, 1),
+            a: Varnode::register(0x38, 8),
+            b: Varnode::constant(1, 8),
+        },
+        R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        },
+    ]);
+    let source = source_owned.source();
+    let graph = source.graph();
+    let dead = graph
+        .values
+        .iter()
+        .find(|value| {
+            value.canonical_storage.is_some_and(|storage| {
+                storage.space == CanonicalStorageSpace::Register
+                    && storage.offset == 0x40
+                    && storage.size == 1
+            }) && graph.def_inst(value.id).is_some()
+        })
+        .expect("defined CF value")
+        .id;
+    assert!(graph.use_sites(dead).is_empty());
+    assert!(rules::unread_defined_values(source).contains(&dead));
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("dead-value-aware plan");
+    assert!(matches!(
+        plan.disposition(dead),
+        Some(ValueDisposition::Elided {
+            reason: r2ssa::ledger::ElisionReason::DeadUnusedTemporary,
+            proof,
+        }) if proof.authority == *source.authority() && proof.value == dead
+    ));
+    assert!(
+        binding_components(&source_owned, &test_projection(&source_owned))
+            .expect("construction components")
+            .iter()
+            .all(|component| !component.members.contains(&dead))
+    );
+    assert!(
+        seal_binding_components(&source_owned, &test_projection(&source_owned))
+            .expect("independent components")
+            .iter()
+            .all(|component| !component.members.contains(&dead))
+    );
+    assert_eq!(
+        build_upstream_shadow_oracle(&source_owned, &test_projection(&source_owned))
+            .expect("upstream oracle")
+            .value_disposition(dead),
+        Some(UpstreamValueDisposition::Elided(
+            r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+        ))
+    );
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
 fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
     let source_owned = source_owned([
         R2ILOp::Copy {
@@ -335,15 +412,22 @@ fn exact_source_return_address_fact_alone_authorizes_control_target_elision() {
         ))
     );
 
-    let semantic_return = source
+    let semantic_return_certificate = source
         .facts()
         .certificates
         .returns_by_inst
         .values()
         .next()
         .and_then(|index| source.facts().certificates.returns.get(*index))
-        .expect("semantic return certificate")
-        .value;
+        .expect("semantic return certificate");
+    let semantic_return = semantic_return_certificate.value;
+    assert!(source.graph().use_sites(semantic_return).is_empty());
+    assert!(certified_boundary_read(
+        source,
+        semantic_return,
+        semantic_return_certificate.at
+    ));
+    assert!(!rules::unread_defined_values(source).contains(&semantic_return));
     let mut forged = plan;
     forged.dispositions[semantic_return.0 as usize] = ValueDisposition::Elided {
         reason: r2ssa::ledger::ElisionReason::ReturnControl,

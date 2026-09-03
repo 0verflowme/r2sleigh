@@ -301,6 +301,14 @@ fn upstream_zero_occurrence_outcome(
                     .unwrap_or_default(),
             )
         });
+    // The binding plan proved this definition's output has neither a graph use
+    // nor a certified boundary read before lowering began. The journal omitted
+    // the definition and named its producer obligation exactly; this function
+    // is reached only for zero surviving occurrences, so the obligation can be
+    // closed without hiding an occurrence that actually rendered.
+    if effects.dead_unused_value_effect(id) {
+        return Outcome::Elided(ElisionReason::DeadUnusedTemporary);
+    }
     // Placement removed the statement this obligation's only occurrence sat
     // on, because nothing reads the object that statement wrote. The value,
     // use and write cells are already answered with that same fact; the
