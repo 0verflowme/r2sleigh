@@ -14379,8 +14379,6 @@ mod tests {
             role_identity: None,
             closure_functions: 1,
             helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: Default::default(),
             region_summaries: Vec::new(),
             worker_summaries: Vec::new(),
         }

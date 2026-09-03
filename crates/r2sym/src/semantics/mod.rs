@@ -1,5 +1,4 @@
 mod artifact;
-mod cache;
 mod claims;
 mod classify;
 mod compiler;
@@ -10,11 +9,11 @@ mod region;
 mod vm;
 
 pub use artifact::{
-    ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactReport,
-    SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity, SemanticEvidenceCoverage,
-    SemanticEvidenceProvenance, SemanticEvidenceReason, SemanticEvidenceSoundness, SliceClass,
+    ResidualReason, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
+    SemanticArtifactReport, SemanticConfidence, SemanticEvidence, SemanticEvidenceAmbiguity,
+    SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
+    SemanticEvidenceSoundness, SliceClass,
 };
-pub use cache::{SEMANTIC_ARTIFACT_SCHEMA_VERSION, stable_scope_hash};
 pub use claims::{
     SEMANTIC_CLAIM_SCHEMA_VERSION, SemanticClaim, SemanticClaimKind, SemanticClaimSource,
     SemanticClaimSummary, SemanticTypeSeedKind, SummaryRoleCertificate, SummaryRouteCertificate,

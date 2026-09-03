@@ -4706,7 +4706,6 @@ fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
         r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
         r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
         r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
         r2sym::SliceClass::GenericLarge => "generic_large",
@@ -4717,8 +4716,6 @@ fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &'static str
     match reason {
         r2sym::ResidualReason::MissingArch => "missing_arch",
         r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
         r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }

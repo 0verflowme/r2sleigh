@@ -19,7 +19,6 @@ use super::vm::InterpreterKind;
 pub enum SliceClass {
     Wrapper,
     Worker,
-    RecursiveGroup,
     InterpreterSwitch,
     InterpreterIndirect,
     GenericLarge,
@@ -29,10 +28,10 @@ pub enum SliceClass {
 pub enum ResidualReason {
     MissingArch,
     LargeCfg,
-    SummaryBudgetExhausted,
-    SccBudgetExhausted,
     InterpreterRequiresStepSummary,
 }
+
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SemanticConfidence {
@@ -868,7 +867,6 @@ mod tests {
         SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
         SemanticEvidenceSoundness, SliceClass,
     };
-    use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
         RefinementStage,
@@ -894,8 +892,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },
@@ -1021,8 +1017,6 @@ mod tests {
             residuals in proptest::collection::vec(prop_oneof![
                 Just(ResidualReason::MissingArch),
                 Just(ResidualReason::LargeCfg),
-                Just(ResidualReason::SummaryBudgetExhausted),
-                Just(ResidualReason::SccBudgetExhausted),
                 Just(ResidualReason::InterpreterRequiresStepSummary),
             ], 0..8),
             ambiguous in proptest::collection::vec(any::<u64>(), 0..8),

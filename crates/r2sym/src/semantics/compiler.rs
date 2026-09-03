@@ -7,16 +7,16 @@ use r2ssa::{
 };
 use z3::Context;
 
-use crate::sim::{DerivedSummaryDiagnostics, SummaryProfile, source_arch_spec};
+use crate::sim::{SummaryProfile, source_arch_spec};
 
 use super::artifact::{
-    ResidualReason, SemanticArtifact, SemanticArtifactBody, SemanticArtifactReport,
+    ResidualReason, SEMANTIC_ARTIFACT_SCHEMA_VERSION, SemanticArtifact, SemanticArtifactBody,
+    SemanticArtifactReport,
 };
-use super::cache::SEMANTIC_ARTIFACT_SCHEMA_VERSION;
 use super::classify::classify_slice;
 use super::facts::{
     CollectedNativeSemanticRegions, SymbolicFunctionFactDiagnostics,
-    collect_canonical_semantic_regions_with_scope_and_profile,
+    collect_canonical_semantic_regions_with_profile,
     collect_large_cfg_canonical_semantic_regions_with_limit,
 };
 use super::region::{
@@ -25,22 +25,13 @@ use super::region::{
 };
 use super::vm::{build_vm_step_summary, classify_interpreter_like};
 
-fn residual_reasons(
-    diagnostics: &DerivedSummaryDiagnostics,
-    fact_diagnostics: &SymbolicFunctionFactDiagnostics,
-) -> Vec<ResidualReason> {
+fn residual_reasons(fact_diagnostics: &SymbolicFunctionFactDiagnostics) -> Vec<ResidualReason> {
     let mut reasons = Vec::new();
     if fact_diagnostics.skipped_missing_arch {
         reasons.push(ResidualReason::MissingArch);
     }
     if fact_diagnostics.skipped_large_cfg {
         reasons.push(ResidualReason::LargeCfg);
-    }
-    if diagnostics.budget_exhausted > 0 {
-        reasons.push(ResidualReason::SummaryBudgetExhausted);
-    }
-    if diagnostics.scc_budget_exhausted > 0 {
-        reasons.push(ResidualReason::SccBudgetExhausted);
     }
     reasons
 }
@@ -61,25 +52,16 @@ fn normalized_residual_reasons(
 
 fn semantic_stage_for(
     helper_functions: usize,
-    derived_summaries: usize,
-    diagnostics: &DerivedSummaryDiagnostics,
     collected: &CollectedNativeSemanticRegions,
     vm_step_ready: bool,
 ) -> RefinementStage {
     if vm_step_ready {
         return RefinementStage::Compiled;
     }
-    if derived_summaries > 0 && !collected.diagnostics.skipped_large_cfg {
-        return RefinementStage::Compiled;
-    }
     if collected.diagnostics.skipped_large_cfg && has_island_compiled_semantics(collected) {
         return RefinementStage::Compiled;
     }
-    if helper_functions > 0
-        || collected.diagnostics.skipped_large_cfg
-        || diagnostics.budget_exhausted > 0
-        || diagnostics.scc_budget_exhausted > 0
-    {
+    if helper_functions > 0 || collected.diagnostics.skipped_large_cfg {
         return RefinementStage::Residual;
     }
     if collected.diagnostics.skipped_missing_arch {
@@ -182,8 +164,7 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
     }
 
     let helper_functions = summary.direct_callees.len();
-    let derived_diagnostics = DerivedSummaryDiagnostics::default();
-    let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
+    let slice_class = classify_slice(func, helper_functions, None, false);
     let slice_class = if named_worker_family
         && !matches!(
             slice_class,
@@ -216,8 +197,6 @@ pub fn compile_summary_dense_worker_artifact_from_interproc_summary(
                 ),
                 closure_functions,
                 helper_functions,
-                derived_summaries: 0,
-                derived_diagnostics,
                 region_summaries: Vec::new(),
                 worker_summaries,
             },
@@ -294,11 +273,10 @@ pub fn compile_native_worker_summary_artifact(
         return None;
     }
 
-    let derived_diagnostics = DerivedSummaryDiagnostics::default();
     let helper_functions = summary
         .map(|summary| summary.direct_callees.len())
         .unwrap_or(0);
-    let slice_class = classify_slice(func, helper_functions, &derived_diagnostics, None, false);
+    let slice_class = classify_slice(func, helper_functions, None, false);
     let slice_class = if named_worker_family
         && !matches!(
             slice_class,
@@ -354,8 +332,6 @@ pub fn compile_native_worker_summary_artifact(
         slice_class,
         closure_functions,
         helper_functions,
-        derived_summaries: 0,
-        derived_diagnostics,
         collected,
         interpreter: None,
         vm_step: None,
@@ -397,8 +373,6 @@ struct BuildSemanticArtifactInput {
     slice_class: crate::SliceClass,
     closure_functions: usize,
     helper_functions: usize,
-    derived_summaries: usize,
-    derived_diagnostics: DerivedSummaryDiagnostics,
     collected: CollectedNativeSemanticRegions,
     interpreter: Option<super::vm::InterpreterDispatchSummary>,
     vm_step: Option<super::vm::VmStepSummary>,
@@ -416,8 +390,6 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
         slice_class,
         closure_functions,
         helper_functions,
-        derived_summaries,
-        derived_diagnostics,
         collected,
         interpreter,
         vm_step,
@@ -448,8 +420,6 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
                     role_identity,
                     closure_functions,
                     helper_functions,
-                    derived_summaries,
-                    derived_diagnostics: derived_diagnostics.clone(),
                     region_summaries: collected.region_summaries,
                     worker_summaries: collected.worker_summaries,
                 },
@@ -462,8 +432,6 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
                 role_identity,
                 closure_functions,
                 helper_functions,
-                derived_summaries,
-                derived_diagnostics: derived_diagnostics.clone(),
                 region_summaries: collected.region_summaries,
                 worker_summaries: collected.worker_summaries,
             },
@@ -488,7 +456,7 @@ fn build_semantic_artifact_report(input: BuildSemanticArtifactInput) -> Semantic
             skipped_large_cfg: collected.diagnostics.skipped_large_cfg,
             residual_reasons: normalized_residual_reasons(
                 suppress_large_cfg_reason,
-                residual_reasons(&derived_diagnostics, &collected.diagnostics),
+                residual_reasons(&collected.diagnostics),
             ),
             interpreter: interpreter_diagnostic,
             ambiguous_targets,
@@ -534,8 +502,6 @@ fn compile_function_semantics_from_current_inputs(
     let symbol_map = HashMap::new();
     let closure_functions = 1;
     let helper_functions = 0;
-    let derived_diagnostics = DerivedSummaryDiagnostics::default();
-    let derived_summaries = 0usize;
     let mut collected = CollectedNativeSemanticRegions::default();
     let interpreter = classify_interpreter_like(func);
     let vm_step_candidate = interpreter
@@ -559,7 +525,6 @@ fn compile_function_semantics_from_current_inputs(
             collected = collect_large_cfg_canonical_semantic_regions_with_limit(
                 ctx,
                 func,
-                None,
                 arch,
                 &symbol_map,
                 summary_profile,
@@ -571,13 +536,7 @@ fn compile_function_semantics_from_current_inputs(
             } else {
                 ExecutionModel::Native
             };
-            let stage = semantic_stage_for(
-                helper_functions,
-                derived_summaries,
-                &derived_diagnostics,
-                &collected,
-                vm_step_ready,
-            );
+            let stage = semantic_stage_for(helper_functions, &collected, vm_step_ready);
             let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
                 && collected.diagnostics.skipped_large_cfg
                 && has_island_compiled_semantics(&collected);
@@ -587,13 +546,8 @@ fn compile_function_semantics_from_current_inputs(
                 &collected.regions,
                 has_island_compiled_regions,
             );
-            let slice_class = classify_slice(
-                func,
-                helper_functions,
-                &derived_diagnostics,
-                interpreter.as_ref(),
-                vm_step_ready,
-            );
+            let slice_class =
+                classify_slice(func, helper_functions, interpreter.as_ref(), vm_step_ready);
             return build_semantic_artifact(
                 Arc::clone(func),
                 BuildSemanticArtifactInput {
@@ -607,8 +561,6 @@ fn compile_function_semantics_from_current_inputs(
                     slice_class,
                     closure_functions,
                     helper_functions,
-                    derived_summaries,
-                    derived_diagnostics: derived_diagnostics.clone(),
                     collected,
                     interpreter: interpreter.clone(),
                     vm_step: vm_step.clone(),
@@ -617,10 +569,9 @@ fn compile_function_semantics_from_current_inputs(
             );
         }
 
-        collected = collect_canonical_semantic_regions_with_scope_and_profile(
+        collected = collect_canonical_semantic_regions_with_profile(
             ctx,
             func,
-            None,
             Some(arch),
             &symbol_map,
             summary_profile,
@@ -633,13 +584,7 @@ fn compile_function_semantics_from_current_inputs(
     } else {
         ExecutionModel::Native
     };
-    let stage = semantic_stage_for(
-        helper_functions,
-        derived_summaries,
-        &derived_diagnostics,
-        &collected,
-        vm_step_ready,
-    );
+    let stage = semantic_stage_for(helper_functions, &collected, vm_step_ready);
     let has_island_compiled_regions = matches!(execution, ExecutionModel::Native)
         && collected.diagnostics.skipped_large_cfg
         && has_island_compiled_semantics(&collected);
@@ -649,13 +594,7 @@ fn compile_function_semantics_from_current_inputs(
         &collected.regions,
         has_island_compiled_regions,
     );
-    let slice_class = classify_slice(
-        func,
-        helper_functions,
-        &derived_diagnostics,
-        interpreter.as_ref(),
-        vm_step_ready,
-    );
+    let slice_class = classify_slice(func, helper_functions, interpreter.as_ref(), vm_step_ready);
     build_semantic_artifact(
         Arc::clone(func),
         BuildSemanticArtifactInput {
@@ -669,8 +608,6 @@ fn compile_function_semantics_from_current_inputs(
             slice_class,
             closure_functions,
             helper_functions,
-            derived_summaries,
-            derived_diagnostics: derived_diagnostics.clone(),
             collected,
             interpreter,
             vm_step,
@@ -2012,13 +1949,7 @@ mod tests {
             worker_summaries: Vec::new(),
         };
 
-        let stage = semantic_stage_for(
-            0,
-            0,
-            &DerivedSummaryDiagnostics::default(),
-            &collected,
-            false,
-        );
+        let stage = semantic_stage_for(0, &collected, false);
         let prepared = Arc::new(
             SsaArtifact::for_symbolic(
                 &[R2ILBlock {
@@ -2046,8 +1977,6 @@ mod tests {
                 slice_class: crate::SliceClass::Worker,
                 closure_functions: 0,
                 helper_functions: 0,
-                derived_summaries: 0,
-                derived_diagnostics: DerivedSummaryDiagnostics::default(),
                 collected,
                 interpreter: None,
                 vm_step: None,

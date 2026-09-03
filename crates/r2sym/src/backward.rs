@@ -1,18 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
 
 use r2ssa::graph::{InstPayload, ValueId};
-use r2ssa::{
-    CallBoundarySlot, CallSiteId, CanonicalStorageSpace, PredicateId, SourceCallArgumentValue,
-    SsaArtifact,
-};
+use r2ssa::{CanonicalStorageSpace, PredicateId, SsaArtifact};
 use serde::{Deserialize, Serialize};
 use z3::Context;
 use z3::ast::{Ast, BV, Bool};
 use z3::{SatResult as Z3SatResult, Solver};
 
-use crate::sim::{CallConv, DerivedFunctionSummary};
 use crate::state::SymState;
 use crate::value::SymValue;
 use crate::{
@@ -261,12 +255,6 @@ pub struct CompiledBackwardCondition {
 }
 
 #[derive(Clone)]
-pub(crate) struct DerivedCallSummaryView<'ctx> {
-    pub summary: Rc<DerivedFunctionSummary<'ctx>>,
-    pub callconv: CallConv,
-}
-
-#[derive(Clone)]
 struct ReversePath {
     block_addr: u64,
     phi_predecessors: BTreeMap<u64, u64>,
@@ -285,7 +273,6 @@ struct ValueTranslator<'a, 'ctx> {
     state: &'a SymState<'ctx>,
     memory_index: &'a BackwardMemoryIndex,
     phi_predecessors: &'a BTreeMap<u64, u64>,
-    call_contexts: &'a HashMap<CallSiteId, CallTransformContext<'ctx>>,
     memo: HashMap<ValueId, SymValue<'ctx>>,
     visiting: HashSet<ValueId>,
     assumption_constraints: Vec<Bool>,
@@ -334,49 +321,18 @@ impl BackwardMemoryIndex {
     }
 }
 
-#[derive(Clone)]
-struct CallTransformContext<'ctx> {
-    summary: Rc<DerivedFunctionSummary<'ctx>>,
-    callconv: CallConv,
-    args: Vec<SymValue<'ctx>>,
-}
-
-enum SummaryLocationMatch {
-    Match(Vec<NormalizedMemoryLocation>),
-    NoMatch,
-    Residual,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct LocationGroupRank {
-    region_rank: u8,
-    inexact_offset: bool,
-    span: u64,
-    offset_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct LocationGroupTieBreak {
-    region_discriminant: u8,
-    region_id: u32,
-    arg_index: usize,
-    min_offset: i64,
-}
-
 impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
     fn new(
         func: &'a SsaArtifact,
         state: &'a SymState<'ctx>,
         memory_index: &'a BackwardMemoryIndex,
         phi_predecessors: &'a BTreeMap<u64, u64>,
-        call_contexts: &'a HashMap<CallSiteId, CallTransformContext<'ctx>>,
     ) -> Self {
         Self {
             func,
             state,
             memory_index,
             phi_predecessors,
-            call_contexts,
             memo: HashMap::new(),
             visiting: HashSet::new(),
             assumption_constraints: Vec::new(),
@@ -469,15 +425,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                         .ok_or(EvalUnsupported::Unsupported)?;
                     self.eval_ssa_var(source)
                 }
-                InstPayload::Op(op) => {
-                    let block_addr = self
-                        .func
-                        .graph()
-                        .block(inst.block)
-                        .map(|block| block.addr)
-                        .ok_or(EvalUnsupported::Unsupported)?;
-                    self.eval_op(inst_id, block_addr, op)
-                }
+                InstPayload::Op(op) => self.eval_op(inst_id, op),
             }
         } else {
             Ok(read_input_var(self.state, var))
@@ -500,7 +448,6 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
     fn eval_op(
         &mut self,
         inst_id: r2ssa::graph::InstId,
-        block_addr: u64,
         op: &r2ssa::SSAOp,
     ) -> Result<SymValue<'ctx>, EvalUnsupported> {
         let ctx = self.state.context();
@@ -530,26 +477,7 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 let addr_value = self.eval_ssa_var(addr)?;
                 let structural_locations =
                     self.normalized_memory_locations(addr).unwrap_or_default();
-                let call_ctx = self.call_context_for_inst(inst_id, block_addr).cloned();
-                let mut resolved_locations = None;
-                if let Some(call_ctx) = call_ctx {
-                    let resolved = self
-                        .resolved_memory_locations(&addr_value, dst.size)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(is_specific_memory_location)
-                        .collect::<Vec<_>>();
-                    if let Some(summary_value) = self.summary_memory_value(
-                        &call_ctx,
-                        &addr_value,
-                        &resolved,
-                        &structural_locations,
-                        dst.size,
-                    ) {
-                        return Ok(summary_value);
-                    }
-                    resolved_locations = Some(resolved);
-                }
+                let mut resolved_locations: Option<Vec<NormalizedMemoryLocation>> = None;
                 if addr_value.as_concrete().is_some() {
                     let resolved = resolved_locations.take().unwrap_or_else(|| {
                         self.resolved_memory_locations(&addr_value, dst.size)
@@ -662,248 +590,8 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 let high = low.saturating_add(dst.size * 8).saturating_sub(1);
                 Ok(value.extract(ctx, high, low))
             }
-            CallDefine { dst } => self.eval_call_define(inst_id, block_addr, dst),
+            CallDefine { .. } => Err(EvalUnsupported::Unsupported),
             _ => Err(EvalUnsupported::Unsupported),
-        }
-    }
-
-    fn eval_call_define(
-        &mut self,
-        inst_id: r2ssa::graph::InstId,
-        block_addr: u64,
-        dst: &r2ssa::SSAVar,
-    ) -> Result<SymValue<'ctx>, EvalUnsupported> {
-        let Some(call_ctx) = self.call_context_for_inst(inst_id, block_addr) else {
-            return Err(EvalUnsupported::Unsupported);
-        };
-        let is_result = if call_ctx.callconv.is_source_owned() {
-            call_ctx
-                .callconv
-                .result_storage()
-                .is_some_and(|result_storage| {
-                    self.func.graph().canonical_storage_for_var(dst) == Some(result_storage)
-                })
-        } else {
-            call_ctx.callconv.ret_register_name().is_some_and(|name| {
-                register_aliases(name)
-                    .iter()
-                    .any(|alias| dst.name.eq_ignore_ascii_case(alias))
-            })
-        };
-        if !is_result {
-            return Err(EvalUnsupported::Unsupported);
-        }
-        let (value, coverage) = summary_return_value(self.state, call_ctx)?;
-        if let Some(coverage) = coverage {
-            self.note_assumption(coverage);
-        }
-        Ok(value)
-    }
-
-    fn call_context_for_inst(
-        &self,
-        inst_id: r2ssa::graph::InstId,
-        block_addr: u64,
-    ) -> Option<&CallTransformContext<'ctx>> {
-        let (inst_block_addr, op_idx) = self.func.inst_op_site(inst_id)?;
-        if inst_block_addr != block_addr {
-            return None;
-        }
-        self.func.get_block(block_addr)?;
-        for scan_idx in (0..op_idx).rev() {
-            let scan_inst = self
-                .func
-                .graph()
-                .inst_id_for_op_site(block_addr, scan_idx)?;
-            let Some(call_id) = self.func.call_sites().by_inst.get(&scan_inst).copied() else {
-                continue;
-            };
-            if let Some(context) = self.call_contexts.get(&call_id) {
-                return Some(context);
-            }
-        }
-        let predecessors =
-            if let Some(predecessor) = self.phi_predecessors.get(&block_addr).copied() {
-                vec![predecessor]
-            } else {
-                let preds = self.func.predecessors(block_addr);
-                if preds.len() == 1 { preds } else { Vec::new() }
-            };
-        for predecessor in predecessors {
-            let predecessor_block = self.func.get_block(predecessor)?;
-            for scan_idx in (0..predecessor_block.ops.len()).rev() {
-                let scan_inst = self
-                    .func
-                    .graph()
-                    .inst_id_for_op_site(predecessor, scan_idx)?;
-                let Some(call_id) = self.func.call_sites().by_inst.get(&scan_inst).copied() else {
-                    continue;
-                };
-                if let Some(context) = self.call_contexts.get(&call_id) {
-                    return Some(context);
-                }
-            }
-        }
-        None
-    }
-
-    fn summary_memory_value(
-        &mut self,
-        call_ctx: &CallTransformContext<'ctx>,
-        addr: &SymValue<'ctx>,
-        resolved: &[NormalizedMemoryLocation],
-        structural: &[NormalizedMemoryLocation],
-        size: u32,
-    ) -> Option<SymValue<'ctx>> {
-        let mut actual_locations = resolved.to_vec();
-        if actual_locations.is_empty() {
-            actual_locations.extend(structural.iter().cloned());
-        }
-        if actual_locations.is_empty() {
-            actual_locations.extend(summary_memory_locations(call_ctx, addr));
-        }
-        if actual_locations.is_empty() {
-            return None;
-        }
-        let fallback_summary_locations = summary_memory_locations(call_ctx, addr);
-        let substitutions = build_call_substitutions(self.state, call_ctx);
-        let location_groups = group_normalized_locations(&actual_locations);
-        let candidate_groups = if location_groups.len() <= 1 {
-            location_groups
-        } else if let Some(best_group) = select_best_location_group(location_groups) {
-            vec![best_group]
-        } else {
-            self.memory_residual_fallbacks += 1;
-            return None;
-        };
-        for location_group in candidate_groups {
-            let summary_group = match self.summary_match_locations(call_ctx, &location_group) {
-                SummaryLocationMatch::Match(group) => group,
-                SummaryLocationMatch::NoMatch => {
-                    if fallback_summary_locations.is_empty() {
-                        continue;
-                    }
-                    fallback_summary_locations.clone()
-                }
-                SummaryLocationMatch::Residual => {
-                    self.memory_residual_fallbacks += 1;
-                    continue;
-                }
-            };
-            let mut matches = call_ctx
-                .summary
-                .cases
-                .iter()
-                .filter_map(|case| {
-                    let covering =
-                        select_covering_writes(&case.memory_writes, &summary_group, size);
-                    if covering.is_empty() || covering_writes_are_ambiguous(&covering) {
-                        return None;
-                    }
-                    let (location, write) = select_best_covering_write(covering)?;
-                    let guard = substitute_bool(&case.guard, &substitutions);
-                    let value = substitute_value(
-                        self.state.context(),
-                        &slice_write_value(self.state.context(), write, location.offset, size),
-                        &substitutions,
-                    );
-                    Some((guard, value))
-                })
-                .collect::<Vec<_>>();
-            let alias_heavy = call_ctx.summary.cases.iter().any(|case| {
-                covering_writes_are_ambiguous(&select_covering_writes(
-                    &case.memory_writes,
-                    &summary_group,
-                    size,
-                ))
-            });
-            if alias_heavy {
-                self.memory_residual_fallbacks += 1;
-                continue;
-            }
-            if matches.is_empty() {
-                continue;
-            }
-
-            let mut merged = self.state.mem_read(addr, size);
-            for (guard, value) in matches.drain(..).rev() {
-                merged = ite_value(self.state.context(), &guard, &value, &merged);
-            }
-            self.record_memory_term(&location_group, size, &merged);
-            self.memory_substitutions += 1;
-            return Some(merged);
-        }
-        None
-    }
-
-    fn summary_match_locations(
-        &self,
-        call_ctx: &CallTransformContext<'ctx>,
-        actual_group: &[NormalizedMemoryLocation],
-    ) -> SummaryLocationMatch {
-        if actual_group.is_empty() {
-            return SummaryLocationMatch::NoMatch;
-        }
-        if actual_group
-            .iter()
-            .all(|location| matches!(location.region, BackwardMemoryRegion::Argument { .. }))
-        {
-            return SummaryLocationMatch::Match(actual_group.to_vec());
-        }
-        let mut actual_regions = actual_group
-            .iter()
-            .filter_map(|location| match &location.region {
-                BackwardMemoryRegion::Region(region) => Some(region.clone()),
-                BackwardMemoryRegion::Argument { .. } => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if actual_regions.len() != 1 {
-            return SummaryLocationMatch::Residual;
-        }
-
-        let actual_region = actual_regions.pop_first().expect("single region");
-        if actual_region.kind == MemoryRegionKind::EscapedUnknown {
-            return SummaryLocationMatch::NoMatch;
-        }
-
-        let mut translated = BTreeMap::<usize, BTreeSet<i64>>::new();
-        let pointer_args = summary_pointer_arg_indices(call_ctx);
-        for (arg_index, base) in call_ctx.args.iter().enumerate() {
-            if !pointer_args.is_empty() && !pointer_args.contains(&arg_index) {
-                continue;
-            }
-            let Some(base_locations) = self.resolved_memory_locations(base, 1) else {
-                continue;
-            };
-            for base_location in base_locations {
-                let BackwardMemoryRegion::Region(base_region) = &base_location.region else {
-                    continue;
-                };
-                if base_region.kind == MemoryRegionKind::EscapedUnknown {
-                    continue;
-                }
-                if *base_region != actual_region {
-                    continue;
-                }
-                let offsets = translated.entry(arg_index).or_default();
-                for actual in actual_group {
-                    offsets.insert(actual.offset.saturating_sub(base_location.offset));
-                }
-            }
-        }
-
-        match translated.len() {
-            0 => SummaryLocationMatch::NoMatch,
-            1 => SummaryLocationMatch::Match(translated_arg_locations(
-                translated
-                    .into_iter()
-                    .next()
-                    .expect("single translated arg"),
-            )),
-            _ => select_best_translated_arg(translated)
-                .map(translated_arg_locations)
-                .map(SummaryLocationMatch::Match)
-                .unwrap_or(SummaryLocationMatch::Residual),
         }
     }
 
@@ -1228,24 +916,14 @@ pub fn compile_target_precondition<'ctx>(
     initial_state: &SymState<'ctx>,
     target_addr: u64,
 ) -> Option<CompiledBackwardCondition> {
-    compile_target_precondition_with_summaries(func, initial_state, target_addr, &HashMap::new())
-}
-
-pub(crate) fn compile_target_precondition_with_summaries<'ctx>(
-    func: &SsaArtifact,
-    initial_state: &SymState<'ctx>,
-    target_addr: u64,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
-) -> Option<CompiledBackwardCondition> {
     let reverse_paths = enumerate_reverse_paths(func, target_addr, DEFAULT_REVERSE_PATH_LIMIT)?;
-    compile_reverse_paths(func, initial_state, reverse_paths, None, call_summaries)
+    compile_reverse_paths(func, initial_state, reverse_paths, None)
 }
 
-pub(crate) fn compile_branch_preconditions_with_summaries<'ctx>(
+pub(crate) fn compile_branch_preconditions<'ctx>(
     func: &SsaArtifact,
     initial_state: &SymState<'ctx>,
     block_addr: u64,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
 ) -> Option<(CompiledBackwardCondition, CompiledBackwardCondition)> {
     let predicate = func
         .predicates()
@@ -1253,70 +931,7 @@ pub(crate) fn compile_branch_preconditions_with_summaries<'ctx>(
         .iter()
         .find_map(|(id, fact)| (fact.block_addr == block_addr).then_some(*id))?;
     let reverse_paths = enumerate_reverse_paths(func, block_addr, DEFAULT_REVERSE_PATH_LIMIT)?;
-    compile_reverse_paths_for_branch(
-        func,
-        initial_state,
-        reverse_paths,
-        predicate,
-        call_summaries,
-    )
-}
-
-pub fn compile_derived_summary_return_postcondition<'ctx, F>(
-    state: &SymState<'ctx>,
-    summary: &DerivedFunctionSummary<'ctx>,
-    callconv: &CallConv,
-    postcondition: F,
-) -> Option<CompiledBackwardCondition>
-where
-    F: Fn(&SymValue<'ctx>) -> Bool,
-{
-    if summary.cases.is_empty() {
-        return None;
-    }
-
-    let call =
-        callconv.collect_call_info(state, summary.arg_count_hint.max(callconv.arg_capacity()));
-    let substitutions = build_summary_substitutions(state, summary, &call);
-    let mut terms = Vec::new();
-    for case in &summary.cases {
-        let Some(return_value) = &case.return_value else {
-            continue;
-        };
-        let guard = substitute_bool(&case.guard, &substitutions);
-        let value = substitute_value(state.context(), return_value, &substitutions);
-        let post = postcondition(&value);
-        terms.push(guard & post);
-    }
-    if terms.is_empty() {
-        return None;
-    }
-    let predicate = or_all(state.context(), &terms);
-    let simplified = predicate.simplify();
-    Some(CompiledBackwardCondition {
-        summary: BackwardConditionSummary {
-            simplified: simplified.to_string(),
-            terms: terms
-                .iter()
-                .map(|term| term.simplify().to_string())
-                .collect(),
-            memory_terms: Vec::new(),
-            backward_memory_substitutions: 0,
-            backward_memory_candidate_enumerations: 0,
-            backward_memory_residual_fallbacks: 0,
-            precision: if matches!(
-                summary.completion,
-                crate::sim::DerivedSummaryCompletion::Exact
-            ) {
-                BackwardConditionPrecision::Exact
-            } else {
-                BackwardConditionPrecision::ResidualSearchRequired
-            },
-            supported_paths: terms.len(),
-            total_paths: terms.len(),
-        },
-        predicate: simplified,
-    })
+    compile_reverse_paths_for_branch(func, initial_state, reverse_paths, predicate)
 }
 
 fn enumerate_reverse_paths(
@@ -1380,14 +995,12 @@ fn compile_reverse_paths<'ctx>(
     initial_state: &SymState<'ctx>,
     (paths, truncated): (Vec<ReversePath>, bool),
     extra_predicate: Option<(PredicateId, bool)>,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
 ) -> Option<CompiledBackwardCondition> {
     compile_reverse_paths_with_extra(
         func,
         initial_state,
         (paths, truncated),
         extra_predicate,
-        call_summaries,
         |_, _| Ok(None),
     )
 }
@@ -1397,7 +1010,6 @@ fn compile_reverse_paths_with_extra<'ctx, F>(
     initial_state: &SymState<'ctx>,
     reverse_paths: (Vec<ReversePath>, bool),
     extra_predicate: Option<(PredicateId, bool)>,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
     mut extra_constraint: F,
 ) -> Option<CompiledBackwardCondition>
 where
@@ -1410,7 +1022,6 @@ where
         func,
         initial_state,
         reverse_paths,
-        call_summaries,
         1,
         |translator, path| {
             if let Some((predicate, truth)) = extra_predicate {
@@ -1431,13 +1042,11 @@ fn compile_reverse_paths_for_branch<'ctx>(
     initial_state: &SymState<'ctx>,
     reverse_paths: (Vec<ReversePath>, bool),
     predicate: PredicateId,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
 ) -> Option<(CompiledBackwardCondition, CompiledBackwardCondition)> {
     let mut compiled = compile_reverse_path_alternatives(
         func,
         initial_state,
         reverse_paths,
-        call_summaries,
         2,
         |translator, _| {
             let condition = translator.eval_predicate(predicate, true)?;
@@ -1452,7 +1061,6 @@ fn compile_reverse_path_alternatives<'ctx, F>(
     func: &SsaArtifact,
     initial_state: &SymState<'ctx>,
     (paths, truncated): (Vec<ReversePath>, bool),
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
     alternative_count: usize,
     mut alternatives: F,
 ) -> Option<Vec<CompiledBackwardCondition>>
@@ -1476,15 +1084,8 @@ where
     let memory_index = BackwardMemoryIndex::new(func);
 
     for path in &paths {
-        let call_contexts =
-            build_call_transform_contexts(func, initial_state, path, call_summaries, &memory_index);
-        let mut translator = ValueTranslator::new(
-            func,
-            initial_state,
-            &memory_index,
-            &path.phi_predecessors,
-            &call_contexts,
-        );
+        let mut translator =
+            ValueTranslator::new(func, initial_state, &memory_index, &path.phi_predecessors);
         let path_supported = path.assumptions.iter().all(|(predicate, truth)| {
             let Ok(condition) = translator.eval_predicate(*predicate, *truth) else {
                 return false;
@@ -1600,180 +1201,6 @@ fn finish_reverse_path_compilation(
     })
 }
 
-fn build_call_transform_contexts<'ctx>(
-    func: &SsaArtifact,
-    initial_state: &SymState<'ctx>,
-    path: &ReversePath,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
-    memory_index: &BackwardMemoryIndex,
-) -> HashMap<CallSiteId, CallTransformContext<'ctx>> {
-    if call_summaries.is_empty() {
-        return HashMap::new();
-    }
-
-    let sequence = path_block_sequence(path);
-    // This map is retained only for explicitly advisory/manual call
-    // conventions. Source-owned summaries consume the sealed call-boundary
-    // facts below and never classify an SSA variable by spelling.
-    let mut advisory_arg_state = BTreeMap::<usize, ValueId>::new();
-    let mut contexts = HashMap::new();
-
-    for (seq_index, block_addr) in sequence.iter().enumerate() {
-        let Some(block) = func.get_block(*block_addr) else {
-            continue;
-        };
-        if seq_index > 0 {
-            let predecessor = sequence[seq_index - 1];
-            for phi in &block.phis {
-                if let Some(arg_index) = advisory_ssa_call_arg_slot_index(&phi.dst)
-                    && let Some((_, source)) =
-                        phi.sources.iter().find(|(pred, _)| *pred == predecessor)
-                    && let Some(value_id) = func.graph().value_id_for_var(source)
-                {
-                    advisory_arg_state.insert(arg_index, value_id);
-                }
-            }
-        }
-
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            let Some(inst_id) = func.graph().inst_id_for_op_site(*block_addr, op_idx) else {
-                continue;
-            };
-            if let Some(call_id) = func.call_sites().by_inst.get(&inst_id).copied()
-                && let Some(callsite) = func.call_sites().by_id.get(&call_id)
-                && let Some(target) = callsite.direct_target
-                && let Some(view) = call_summaries.get(&target)
-            {
-                let context_snapshot = contexts.clone();
-                let mut translator = ValueTranslator::new(
-                    func,
-                    initial_state,
-                    memory_index,
-                    &path.phi_predecessors,
-                    &context_snapshot,
-                );
-                let args = if view.callconv.is_source_owned() {
-                    exact_source_call_arguments(
-                        func,
-                        initial_state,
-                        call_id,
-                        callsite.at,
-                        view,
-                        &mut translator,
-                    )
-                } else {
-                    Some(
-                        (0..view.callconv.arg_capacity())
-                            .map(|index| {
-                                advisory_arg_state
-                                    .get(&index)
-                                    .copied()
-                                    .and_then(|value_id| translator.eval_value_id(value_id).ok())
-                                    .unwrap_or_else(|| {
-                                        view.callconv
-                                            .arg_register_name(index)
-                                            .map(|reg| {
-                                                read_register_from_state(
-                                                    initial_state,
-                                                    reg,
-                                                    view.callconv.arg_bits(),
-                                                )
-                                            })
-                                            .unwrap_or_else(|| {
-                                                SymValue::unknown(view.callconv.arg_bits())
-                                            })
-                                    })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                };
-                let Some(args) = args else {
-                    continue;
-                };
-                contexts.insert(
-                    call_id,
-                    CallTransformContext {
-                        summary: view.summary.clone(),
-                        callconv: view.callconv.clone(),
-                        args,
-                    },
-                );
-            }
-
-            if let Some(dst) = op.dst()
-                && let Some(arg_index) = advisory_ssa_call_arg_slot_index(dst)
-                && let Some(value_id) = func.graph().value_id_for_var(dst)
-            {
-                advisory_arg_state.insert(arg_index, value_id);
-            }
-        }
-    }
-
-    contexts
-}
-
-fn exact_source_call_arguments<'ctx>(
-    func: &SsaArtifact,
-    initial_state: &SymState<'ctx>,
-    call_id: CallSiteId,
-    call_inst: r2ssa::graph::InstId,
-    view: &DerivedCallSummaryView<'ctx>,
-    translator: &mut ValueTranslator<'_, 'ctx>,
-) -> Option<Vec<SymValue<'ctx>>> {
-    let boundary = func.facts().boundaries.calls.get(&call_id)?;
-    if !boundary.complete || boundary.call_site != call_id || boundary.at != call_inst {
-        return None;
-    }
-
-    let mut by_index = BTreeMap::new();
-    for argument in &boundary.arguments {
-        let CallBoundarySlot::Register { index, storage } = argument.slot else {
-            // Stack arguments need an exact memory-boundary projection; a
-            // register CallConv cannot silently reinterpret them.
-            return None;
-        };
-        let index = usize::try_from(index).ok()?;
-        if view.callconv.argument_storage(index) != Some(storage) {
-            return None;
-        }
-        let value = match argument.value {
-            SourceCallArgumentValue::Value(value_id) => {
-                let graph_value = func.graph().value(value_id)?;
-                if graph_value.canonical_storage != Some(storage) {
-                    return None;
-                }
-                translator.eval_value_id(value_id).ok()?
-            }
-            SourceCallArgumentValue::PreservedEntry => {
-                view.callconv.read_argument(initial_state, index)?
-            }
-        };
-        if value.is_unknown() {
-            return None;
-        }
-        if by_index.insert(index, value).is_some() {
-            return None;
-        }
-    }
-    if by_index.keys().copied().ne(0..by_index.len())
-        || by_index.len() < view.summary.arg_count_hint
-    {
-        return None;
-    }
-    Some(by_index.into_values().collect())
-}
-
-fn path_block_sequence(path: &ReversePath) -> Vec<u64> {
-    let mut blocks = vec![path.block_addr];
-    let mut current = path.block_addr;
-    while let Some(predecessor) = path.phi_predecessors.get(&current).copied() {
-        blocks.push(predecessor);
-        current = predecessor;
-    }
-    blocks.reverse();
-    blocks
-}
-
 fn and_all(_ctx: &Context, terms: &[Bool]) -> Bool {
     match terms {
         [] => Bool::from_bool(true),
@@ -1807,290 +1234,6 @@ fn value_to_bool(ctx: &Context, value: &SymValue<'_>) -> Bool {
     value.to_bv(ctx).eq(BV::from_u64(0, value.bits())).not()
 }
 
-fn build_summary_substitutions<'ctx>(
-    state: &SymState<'ctx>,
-    summary: &DerivedFunctionSummary<'ctx>,
-    call: &crate::sim::CallInfo<'ctx>,
-) -> Vec<(BV, BV)> {
-    let mut substitutions = Vec::new();
-    for (index, symbol) in &summary.arg_symbols {
-        let Some(actual) = call.args.get(*index) else {
-            continue;
-        };
-        let adjusted = adjust_bits(state.context(), actual.clone(), symbol.bits());
-        substitutions.push((
-            symbol.to_bv(state.context()),
-            adjusted.to_bv(state.context()),
-        ));
-    }
-    for input in &summary.memory_inputs {
-        let Some(base) = call.args.get(input.arg_index) else {
-            continue;
-        };
-        let actual = adjust_bits(
-            state.context(),
-            state.mem_read(base, input.size),
-            input.symbol.bits(),
-        );
-        substitutions.push((
-            input.symbol.to_bv(state.context()),
-            actual.to_bv(state.context()),
-        ));
-    }
-    substitutions
-}
-
-fn build_call_substitutions<'ctx>(
-    state: &SymState<'ctx>,
-    call_ctx: &CallTransformContext<'ctx>,
-) -> Vec<(BV, BV)> {
-    let mut substitutions = Vec::new();
-    for (index, symbol) in &call_ctx.summary.arg_symbols {
-        let Some(actual) = call_ctx.args.get(*index) else {
-            continue;
-        };
-        let adjusted = adjust_bits(state.context(), actual.clone(), symbol.bits());
-        substitutions.push((
-            symbol.to_bv(state.context()),
-            adjusted.to_bv(state.context()),
-        ));
-    }
-    for input in &call_ctx.summary.memory_inputs {
-        let Some(base) = call_ctx.args.get(input.arg_index) else {
-            continue;
-        };
-        let actual = adjust_bits(
-            state.context(),
-            state.mem_read(base, input.size),
-            input.symbol.bits(),
-        );
-        substitutions.push((
-            input.symbol.to_bv(state.context()),
-            actual.to_bv(state.context()),
-        ));
-    }
-    substitutions
-}
-
-fn summary_return_value<'ctx>(
-    state: &SymState<'ctx>,
-    call_ctx: &CallTransformContext<'ctx>,
-) -> Result<(SymValue<'ctx>, Option<Bool>), EvalUnsupported> {
-    if call_ctx.summary.cases.is_empty() {
-        return Err(EvalUnsupported::Unsupported);
-    }
-    let substitutions = build_call_substitutions(state, call_ctx);
-    let mut merged = SymValue::unknown(call_ctx.callconv.ret_bits());
-    let mut matched = false;
-    let mut guards = Vec::new();
-    for case in call_ctx.summary.cases.iter().rev() {
-        let Some(return_value) = &case.return_value else {
-            continue;
-        };
-        let guard = substitute_bool(&case.guard, &substitutions);
-        let value = substitute_value(state.context(), return_value, &substitutions);
-        merged = ite_value(state.context(), &guard, &value, &merged);
-        guards.push(guard);
-        matched = true;
-    }
-    matched
-        .then(|| {
-            let coverage = matches!(
-                call_ctx.summary.completion,
-                crate::sim::DerivedSummaryCompletion::Exact
-            )
-            .then(|| or_all(state.context(), &guards));
-            (merged, coverage)
-        })
-        .ok_or(EvalUnsupported::Unsupported)
-}
-
-fn summary_memory_locations<'ctx>(
-    call_ctx: &CallTransformContext<'ctx>,
-    addr: &SymValue<'ctx>,
-) -> Vec<NormalizedMemoryLocation> {
-    let Some(concrete_addr) = addr.as_concrete() else {
-        return Vec::new();
-    };
-    let pointer_args = summary_pointer_arg_indices(call_ctx);
-    let mut locations = Vec::new();
-    for (index, base) in call_ctx.args.iter().enumerate() {
-        if !pointer_args.is_empty() && !pointer_args.contains(&index) {
-            continue;
-        }
-        let Some(base_addr) = base.as_concrete() else {
-            continue;
-        };
-        if let Some(offset) = signed_offset_between(base_addr, concrete_addr) {
-            locations.push(NormalizedMemoryLocation {
-                region: BackwardMemoryRegion::Argument { index },
-                offset,
-            });
-        }
-    }
-    locations
-}
-
-fn summary_pointer_arg_indices<'ctx>(call_ctx: &CallTransformContext<'ctx>) -> BTreeSet<usize> {
-    let mut indices = BTreeSet::new();
-    for input in &call_ctx.summary.memory_inputs {
-        indices.insert(input.arg_index);
-    }
-    for case in &call_ctx.summary.cases {
-        for write in &case.memory_writes {
-            indices.insert(write.arg_index);
-        }
-    }
-    indices
-}
-
-fn translated_arg_locations(
-    (arg_index, offsets): (usize, BTreeSet<i64>),
-) -> Vec<NormalizedMemoryLocation> {
-    offsets
-        .into_iter()
-        .map(|offset| NormalizedMemoryLocation {
-            region: BackwardMemoryRegion::Argument { index: arg_index },
-            offset,
-        })
-        .collect()
-}
-
-fn memory_region_rank(region: &BackwardMemoryRegion) -> u8 {
-    match region {
-        BackwardMemoryRegion::Argument { .. } => 0,
-        BackwardMemoryRegion::Region(region) => match region.kind {
-            MemoryRegionKind::Stack => 1,
-            MemoryRegionKind::Global => 2,
-            MemoryRegionKind::Replay => 3,
-            MemoryRegionKind::Input => 4,
-            MemoryRegionKind::Heap => 5,
-            MemoryRegionKind::EscapedUnknown => 6,
-        },
-    }
-}
-
-fn offsets_span(offsets: &BTreeSet<i64>) -> u64 {
-    match (offsets.first().copied(), offsets.last().copied()) {
-        (Some(lo), Some(hi)) => hi.saturating_sub(lo).unsigned_abs(),
-        _ => 0,
-    }
-}
-
-fn location_group_rank(group: &[NormalizedMemoryLocation]) -> Option<LocationGroupRank> {
-    let region = group.first()?.region.clone();
-    let offsets = group
-        .iter()
-        .map(|location| location.offset)
-        .collect::<BTreeSet<_>>();
-    let span = offsets_span(&offsets);
-    Some(LocationGroupRank {
-        region_rank: memory_region_rank(&region),
-        inexact_offset: span != 0,
-        span,
-        offset_count: offsets.len(),
-    })
-}
-
-fn location_group_tie_break(group: &[NormalizedMemoryLocation]) -> Option<LocationGroupTieBreak> {
-    let region = group.first()?.region.clone();
-    let min_offset = group
-        .iter()
-        .map(|location| location.offset)
-        .min()
-        .unwrap_or(0);
-    Some(match region {
-        BackwardMemoryRegion::Argument { index } => LocationGroupTieBreak {
-            region_discriminant: 0,
-            region_id: 0,
-            arg_index: index,
-            min_offset,
-        },
-        BackwardMemoryRegion::Region(region) => LocationGroupTieBreak {
-            region_discriminant: 1,
-            region_id: region.id.0,
-            arg_index: 0,
-            min_offset,
-        },
-    })
-}
-
-fn select_best_location_group(
-    groups: Vec<Vec<NormalizedMemoryLocation>>,
-) -> Option<Vec<NormalizedMemoryLocation>> {
-    if groups.len() <= 1 {
-        return groups.into_iter().next();
-    }
-
-    let mut ranked = groups
-        .into_iter()
-        .filter_map(|group| {
-            Some((
-                location_group_rank(&group)?,
-                location_group_tie_break(&group)?,
-                group,
-            ))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    if ranked.len() > 1 && ranked[0].0 == ranked[1].0 {
-        None
-    } else {
-        ranked.into_iter().next().map(|(_, _, group)| group)
-    }
-}
-
-fn translated_offsets_rank(offsets: &BTreeSet<i64>) -> (bool, u64, usize) {
-    let span = offsets_span(offsets);
-    (span != 0, span, offsets.len())
-}
-
-fn select_best_translated_arg(
-    translated: BTreeMap<usize, BTreeSet<i64>>,
-) -> Option<(usize, BTreeSet<i64>)> {
-    if translated.len() <= 1 {
-        return translated.into_iter().next();
-    }
-
-    let mut ranked = translated
-        .into_iter()
-        .map(|(arg_index, offsets)| (translated_offsets_rank(&offsets), arg_index, offsets))
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    if ranked.len() > 1 && ranked[0].0 == ranked[1].0 {
-        None
-    } else {
-        ranked
-            .into_iter()
-            .next()
-            .map(|(_, arg_index, offsets)| (arg_index, offsets))
-    }
-}
-
-fn group_normalized_locations(
-    locations: &[NormalizedMemoryLocation],
-) -> Vec<Vec<NormalizedMemoryLocation>> {
-    let mut grouped = BTreeMap::<BackwardMemoryRegion, BTreeSet<i64>>::new();
-    for location in locations {
-        grouped
-            .entry(location.region.clone())
-            .or_default()
-            .insert(location.offset);
-    }
-    grouped
-        .into_iter()
-        .map(|(region, offsets)| {
-            offsets
-                .into_iter()
-                .map(|offset| NormalizedMemoryLocation {
-                    region: region.clone(),
-                    offset,
-                })
-                .collect()
-        })
-        .collect()
-}
-
 fn apply_delta_offsets(
     base_locations: &[NormalizedMemoryLocation],
     deltas: &[i64],
@@ -2113,89 +1256,6 @@ fn apply_delta_offsets(
         .collect()
 }
 
-fn select_covering_writes<'a, 'ctx>(
-    writes: &'a [crate::sim::DerivedMemoryWrite<'ctx>],
-    locations: &[NormalizedMemoryLocation],
-    size: u32,
-) -> Vec<(
-    NormalizedMemoryLocation,
-    &'a crate::sim::DerivedMemoryWrite<'ctx>,
-)> {
-    writes
-        .iter()
-        .flat_map(|write| {
-            locations.iter().filter_map(move |location| {
-                (matches!(
-                    location.region,
-                    BackwardMemoryRegion::Argument { index } if index == write.arg_index
-                ) && {
-                    let write_start = write.offset as i128;
-                    let write_end = write_start.saturating_add(write.size as i128);
-                    let read_start = location.offset as i128;
-                    let read_end = read_start.saturating_add(size as i128);
-                    write_start <= read_start && write_end >= read_end
-                })
-                .then_some((location.clone(), write))
-            })
-        })
-        .collect()
-}
-
-fn select_best_covering_write<'a, 'ctx>(
-    covering: Vec<(
-        NormalizedMemoryLocation,
-        &'a crate::sim::DerivedMemoryWrite<'ctx>,
-    )>,
-) -> Option<(
-    NormalizedMemoryLocation,
-    &'a crate::sim::DerivedMemoryWrite<'ctx>,
-)> {
-    covering
-        .into_iter()
-        .min_by_key(|(location, write)| (write.size, write.offset, location.offset))
-}
-
-fn covering_writes_are_ambiguous<'a, 'ctx>(
-    covering: &[(
-        NormalizedMemoryLocation,
-        &'a crate::sim::DerivedMemoryWrite<'ctx>,
-    )],
-) -> bool {
-    let distinct = covering
-        .iter()
-        .filter_map(|(location, write)| match location.region {
-            BackwardMemoryRegion::Argument { index } => {
-                Some((index, location.offset, write.arg_index))
-            }
-            BackwardMemoryRegion::Region(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    distinct.len() > 1
-}
-
-fn slice_write_value<'ctx>(
-    ctx: &'ctx Context,
-    write: &crate::sim::DerivedMemoryWrite<'ctx>,
-    offset: i64,
-    size: u32,
-) -> SymValue<'ctx> {
-    if write.offset == offset && write.size == size {
-        return write.value.clone();
-    }
-    let relative = offset.saturating_sub(write.offset) as u64;
-    let low_bit = (relative * 8) as u32;
-    let high_bit = low_bit + (size * 8) - 1;
-    adjust_bits(ctx, write.value.clone(), write.size * 8).extract(ctx, high_bit, low_bit)
-}
-
-fn signed_offset_between(base: u64, addr: u64) -> Option<i64> {
-    if addr >= base {
-        i64::try_from(addr - base).ok()
-    } else {
-        i64::try_from(base - addr).ok().map(|delta| -delta)
-    }
-}
-
 fn is_specific_memory_location(location: &NormalizedMemoryLocation) -> bool {
     !matches!(
         &location.region,
@@ -2204,10 +1264,6 @@ fn is_specific_memory_location(location: &NormalizedMemoryLocation) -> bool {
             ..
         })
     )
-}
-
-fn advisory_ssa_call_arg_slot_index(var: &r2ssa::SSAVar) -> Option<usize> {
-    ssa_register_arg_index(var)
 }
 
 fn memory_address_symbol_component(address: &r2ssa::RelativeMemoryAddress) -> String {
@@ -2223,107 +1279,6 @@ fn memory_address_symbol_component(address: &r2ssa::RelativeMemoryAddress) -> St
         }
         r2ssa::RelativeMemoryAddress::Unknown => "unknown".to_string(),
     }
-}
-
-fn ssa_register_arg_index(var: &r2ssa::SSAVar) -> Option<usize> {
-    let display = var.display_name();
-    if let Some((prefix, _)) = split_version(&display)
-        && let Some(index) = callconv_arg_index(prefix)
-    {
-        return Some(index);
-    }
-    callconv_arg_index(&display).or_else(|| callconv_arg_index(&var.name))
-}
-
-fn callconv_arg_index(name: &str) -> Option<usize> {
-    let upper = name.to_ascii_uppercase();
-    match upper.as_str() {
-        "RDI" | "EDI" => Some(0),
-        "RSI" | "ESI" => Some(1),
-        "RDX" | "EDX" => Some(2),
-        "RCX" | "ECX" => Some(3),
-        "R8" | "R8D" => Some(4),
-        "R9" | "R9D" => Some(5),
-        _ => None,
-    }
-}
-
-fn register_aliases(base: &str) -> Vec<&str> {
-    match base {
-        "RAX" => vec!["RAX", "EAX"],
-        "RDI" => vec!["RDI", "EDI"],
-        "RSI" => vec!["RSI", "ESI"],
-        "RDX" => vec!["RDX", "EDX"],
-        "RCX" => vec!["RCX", "ECX"],
-        "R8" => vec!["R8", "R8D"],
-        "R9" => vec!["R9", "R9D"],
-        _ => vec![base],
-    }
-}
-
-fn read_register_from_state<'ctx>(state: &SymState<'ctx>, base: &str, bits: u32) -> SymValue<'ctx> {
-    for alias in register_aliases(base) {
-        if let Some(key) = find_register_key(state, alias) {
-            return state.get_register_sized(&key, bits);
-        }
-    }
-    SymValue::unknown(bits)
-}
-
-fn find_register_key<'ctx>(state: &SymState<'ctx>, base: &str) -> Option<String> {
-    let mut best: Option<(u32, String)> = None;
-    for key in state.registers().keys() {
-        if let Some((prefix, version)) = split_version(key) {
-            if prefix.eq_ignore_ascii_case(base)
-                && best
-                    .as_ref()
-                    .is_none_or(|(best_version, _)| version > *best_version)
-            {
-                best = Some((version, key.clone()));
-            }
-        } else if key.eq_ignore_ascii_case(base) {
-            return Some(key.clone());
-        }
-    }
-    best.map(|(_, key)| key)
-}
-
-fn split_version(name: &str) -> Option<(&str, u32)> {
-    let (prefix, suffix) = name.rsplit_once('_')?;
-    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let version = suffix.parse().ok()?;
-    Some((prefix, version))
-}
-
-fn substitute_value<'ctx>(
-    ctx: &'ctx Context,
-    value: &SymValue<'ctx>,
-    substitutions: &[(BV, BV)],
-) -> SymValue<'ctx> {
-    if substitutions.is_empty() {
-        return value.clone();
-    }
-    let pairs = substitutions
-        .iter()
-        .map(|(from, to)| (from, to))
-        .collect::<Vec<_>>();
-    catch_unwind(AssertUnwindSafe(|| value.to_bv(ctx).substitute(&pairs)))
-        .map(|substituted| SymValue::symbolic_tainted(substituted, value.bits(), value.get_taint()))
-        .unwrap_or_else(|_| SymValue::unknown(value.bits()))
-}
-
-fn substitute_bool(ast: &Bool, substitutions: &[(BV, BV)]) -> Bool {
-    if substitutions.is_empty() {
-        return ast.clone();
-    }
-    let pairs = substitutions
-        .iter()
-        .map(|(from, to)| (from, to))
-        .collect::<Vec<_>>();
-    catch_unwind(AssertUnwindSafe(|| ast.substitute(&pairs)))
-        .unwrap_or_else(|_| Bool::from_bool(true))
 }
 
 fn ite_value<'ctx>(
@@ -2352,10 +1307,9 @@ fn adjust_bits<'ctx>(ctx: &'ctx Context, value: SymValue<'ctx>, bits: u32) -> Sy
 
 #[cfg(test)]
 mod tests {
-    use r2il::{AddressSpace, ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
     use r2ssa::{
-        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentSpec,
-        SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface,
+        CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
         SourceFunctionReturn,
     };
     use z3::Context;
@@ -2378,88 +1332,6 @@ mod tests {
             size,
             meta: None,
         }
-    }
-
-    fn exact_call_boundary_artifact(include_call_interface: bool) -> SsaArtifact {
-        let mut arch = ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_space(AddressSpace::ram(8));
-        arch.add_register(RegisterDef::new("ARG_A", 0x20, 8));
-        arch.add_register(RegisterDef::new("ARG_B", 0x28, 8));
-        arch.add_register(RegisterDef::new("SP", 0x30, 8));
-        arch.add_register(RegisterDef::new("RA", 0x38, 8));
-
-        let arg_a = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0x20,
-            size: 8,
-        };
-        let arg_b = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0x28,
-            size: 8,
-        };
-        let stack_pointer = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0x30,
-            size: 8,
-        };
-        let return_address = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0x38,
-            size: 8,
-        };
-        let target = Varnode::constant(0x2000, 8);
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Call {
-            target: target.clone(),
-        });
-        block.push(R2ILOp::Return {
-            target: Varnode::constant(0, 8),
-        });
-        let interface = SourceFunctionInterface::new_exact(
-            b"r2sym-exact-backward-call".to_vec(),
-            "sysv",
-            [
-                SourceAbiParameterSpec::new(0, arg_a),
-                SourceAbiParameterSpec::new(1, arg_b),
-            ],
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer))
-        .and_then(|interface| interface.with_return_address_storage(return_address))
-        .expect("exact caller interface");
-        let call_interfaces = include_call_interface
-            .then(|| {
-                SourceCallSiteInterface::new(
-                    b"r2sym-exact-backward-call".to_vec(),
-                    SourceCallSiteIdentity::new(
-                        0x1000,
-                        0,
-                        CanonicalStorageId::from_varnode(&target),
-                    ),
-                    true,
-                    "sysv",
-                    [
-                        SourceCallArgumentSpec::new(0, arg_a),
-                        SourceCallArgumentSpec::new(1, arg_b),
-                    ],
-                    false,
-                    false,
-                    SourceCallResult::Void,
-                )
-                .expect("exact callsite interface")
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        SsaArtifact::for_decompile_with_interfaces(
-            &[block],
-            Some(&arch),
-            Some(interface),
-            call_interfaces,
-        )
-        .expect("exact backward call artifact")
     }
 
     #[test]
@@ -2581,155 +1453,6 @@ mod tests {
         assert!(when_true.summary.simplified.contains("memory_object_"));
         assert_ne!(when_true.summary.simplified, "true");
         assert_ne!(when_true.summary.simplified, "false");
-    }
-
-    #[test]
-    fn select_best_location_group_prefers_stable_exact_region() {
-        let global_group = vec![NormalizedMemoryLocation {
-            region: BackwardMemoryRegion::Region(BackwardRegionRef {
-                id: MemoryRegionId(1),
-                kind: MemoryRegionKind::Global,
-                name: "global".to_string(),
-            }),
-            offset: 4,
-        }];
-        let heap_group = vec![
-            NormalizedMemoryLocation {
-                region: BackwardMemoryRegion::Region(BackwardRegionRef {
-                    id: MemoryRegionId(2),
-                    kind: MemoryRegionKind::Heap,
-                    name: "heap".to_string(),
-                }),
-                offset: 4,
-            },
-            NormalizedMemoryLocation {
-                region: BackwardMemoryRegion::Region(BackwardRegionRef {
-                    id: MemoryRegionId(2),
-                    kind: MemoryRegionKind::Heap,
-                    name: "heap".to_string(),
-                }),
-                offset: 8,
-            },
-        ];
-
-        let best =
-            select_best_location_group(vec![heap_group, global_group.clone()]).expect("best group");
-        assert_eq!(best, global_group);
-    }
-
-    #[test]
-    fn select_best_translated_arg_ties_remain_residual() {
-        let translated = BTreeMap::from([
-            (0usize, BTreeSet::from([0i64])),
-            (1usize, BTreeSet::from([0i64])),
-        ]);
-        assert!(select_best_translated_arg(translated).is_none());
-    }
-
-    #[test]
-    fn advisory_ssa_call_arg_slot_index_tracks_written_abi_registers() {
-        assert_eq!(
-            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RDI", 1, 8)),
-            Some(0)
-        );
-        assert_eq!(
-            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("EDX", 3, 4)),
-            Some(2)
-        );
-        assert_eq!(
-            advisory_ssa_call_arg_slot_index(&r2ssa::SSAVar::new("RAX", 1, 8)),
-            None
-        );
-    }
-
-    #[test]
-    fn exact_backward_call_arguments_use_sealed_storage_boundary_not_register_names() {
-        let func = exact_call_boundary_artifact(true);
-        let (&call_id, callsite) = func.call_sites().by_id.iter().next().expect("callsite");
-        let callconv = CallConv::for_prepared(&func).expect("source-owned callconv");
-        let ctx = Context::thread_local();
-        let mut state = SymState::new(&ctx, func.entry);
-        state.set_concrete("ARG_A_0", 0x11, 64);
-        state.set_concrete("ARG_B_0", 0x22, 64);
-        let view = DerivedCallSummaryView {
-            summary: Rc::new(DerivedFunctionSummary {
-                id: r2ssa::InterprocFunctionId(0x2000),
-                name: None,
-                arg_count_hint: 2,
-                arg_symbols: Vec::new(),
-                memory_inputs: Vec::new(),
-                cases: Vec::new(),
-                completion: crate::sim::DerivedSummaryCompletion::Exact,
-            }),
-            callconv,
-        };
-        let memory_index = BackwardMemoryIndex::new(&func);
-        let phi_predecessors = BTreeMap::new();
-        let call_contexts = HashMap::new();
-        let mut translator = ValueTranslator::new(
-            &func,
-            &state,
-            &memory_index,
-            &phi_predecessors,
-            &call_contexts,
-        );
-
-        let args = exact_source_call_arguments(
-            &func,
-            &state,
-            call_id,
-            callsite.at,
-            &view,
-            &mut translator,
-        )
-        .expect("sealed source call arguments");
-
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0].as_concrete(), Some(0x11));
-        assert_eq!(args[1].as_concrete(), Some(0x22));
-    }
-
-    #[test]
-    fn exact_backward_call_arguments_refuse_incomplete_source_boundary() {
-        let func = exact_call_boundary_artifact(false);
-        let (&call_id, callsite) = func.call_sites().by_id.iter().next().expect("callsite");
-        let callconv = CallConv::for_prepared(&func).expect("source-owned callconv");
-        let ctx = Context::thread_local();
-        let state = SymState::new(&ctx, func.entry);
-        let view = DerivedCallSummaryView {
-            summary: Rc::new(DerivedFunctionSummary {
-                id: r2ssa::InterprocFunctionId(0x2000),
-                name: None,
-                arg_count_hint: 2,
-                arg_symbols: Vec::new(),
-                memory_inputs: Vec::new(),
-                cases: Vec::new(),
-                completion: crate::sim::DerivedSummaryCompletion::Exact,
-            }),
-            callconv,
-        };
-        let memory_index = BackwardMemoryIndex::new(&func);
-        let phi_predecessors = BTreeMap::new();
-        let call_contexts = HashMap::new();
-        let mut translator = ValueTranslator::new(
-            &func,
-            &state,
-            &memory_index,
-            &phi_predecessors,
-            &call_contexts,
-        );
-
-        assert!(
-            exact_source_call_arguments(
-                &func,
-                &state,
-                call_id,
-                callsite.at,
-                &view,
-                &mut translator,
-            )
-            .is_none()
-        );
     }
 
     #[test]

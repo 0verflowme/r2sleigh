@@ -10,7 +10,7 @@ use z3::Context;
 
 use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
-    BackwardMemoryRegion, compile_branch_preconditions_with_summaries,
+    BackwardMemoryRegion, compile_branch_preconditions,
 };
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::{seed_default_state_for_arch, seed_default_state_for_prepared};
@@ -18,10 +18,7 @@ use crate::semantics::{
     SemanticArtifact, SemanticArtifactBody, SemanticEvidence, SemanticEvidenceAmbiguity,
     SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
 };
-use crate::sim::{
-    DerivedSummaryCompletion, DerivedSummarySet, PreparedFunctionScope, SummaryProfile,
-    SummaryRegistry,
-};
+use crate::sim::{SummaryProfile, SummaryRegistry};
 use crate::solver::SatResult;
 use crate::{SemanticMemoryAddress, SymState};
 
@@ -280,6 +277,16 @@ struct JoinedLargeCfgMemoryTerm {
     offset_hi: i64,
     exact_offset: bool,
     effect_count: usize,
+}
+
+fn summary_memory_location_expr(arg_index: usize, offset: i64) -> String {
+    if offset == 0 {
+        format!("*arg{arg_index}")
+    } else if offset > 0 {
+        format!("*(arg{arg_index} + 0x{:x})", offset as u64)
+    } else {
+        format!("*(arg{arg_index} - 0x{:x})", offset.unsigned_abs())
+    }
 }
 
 fn summary_effect_expr(kind: SummaryMemoryEffectKind, arg_index: usize, offset: i64) -> String {
@@ -575,107 +582,6 @@ fn control_fact_evidence(
     }
 }
 
-fn derived_summary_memory_term_evidence(
-    completion: DerivedSummaryCompletion,
-    exact_value: bool,
-) -> SemanticEvidence {
-    match completion {
-        DerivedSummaryCompletion::Exact if exact_value => SemanticEvidence::exact(),
-        DerivedSummaryCompletion::Exact => SemanticEvidence::exact(),
-        DerivedSummaryCompletion::OverApprox => {
-            SemanticEvidence::likely(SemanticEvidenceReason::PartialPathCoverage)
-                .with_coverage(SemanticEvidenceCoverage::Bounded)
-                .with_provenance(SemanticEvidenceProvenance::Normalized)
-        }
-        DerivedSummaryCompletion::BudgetExhausted => {
-            SemanticEvidence::heuristic(SemanticEvidenceReason::SummaryBudget)
-                .with_coverage(SemanticEvidenceCoverage::Bounded)
-                .with_provenance(SemanticEvidenceProvenance::Normalized)
-                .with_budget_limited(true)
-        }
-        DerivedSummaryCompletion::Unknown => {
-            SemanticEvidence::heuristic(SemanticEvidenceReason::ValueOpaque)
-                .with_coverage(SemanticEvidenceCoverage::Bounded)
-        }
-    }
-}
-
-fn summary_memory_location_expr(arg_index: usize, offset: i64) -> String {
-    if offset == 0 {
-        format!("*arg{arg_index}")
-    } else if offset > 0 {
-        format!("*(arg{arg_index} + 0x{:x})", offset as u64)
-    } else {
-        format!("*(arg{arg_index} - 0x{:x})", offset.unsigned_abs())
-    }
-}
-
-fn derive_summary_memory_terms_by_anchor<'ctx>(
-    func: &SsaArtifact,
-    branch_blocks: &[(u64, u64, u64)],
-    derived: &DerivedSummarySet<'ctx>,
-) -> BTreeMap<u64, Vec<BackwardMemoryCondition>> {
-    let hot_blocks = branch_blocks
-        .iter()
-        .flat_map(|(block, true_target, false_target)| [*block, *true_target, *false_target])
-        .collect::<BTreeSet<_>>();
-    let mut by_anchor = BTreeMap::<u64, Vec<BackwardMemoryCondition>>::new();
-    let max_islands = branch_blocks.len().max(1) * 3;
-
-    let mut call_blocks = func
-        .call_sites()
-        .by_id
-        .values()
-        .filter_map(|call| {
-            let target = call.direct_target?;
-            let summary = derived.summaries.get(&InterprocFunctionId(target))?;
-            if summary
-                .cases
-                .iter()
-                .all(|case| case.memory_writes.is_empty())
-            {
-                return None;
-            }
-            let (block_addr, _) = func.inst_op_site(call.at)?;
-            Some((!hot_blocks.contains(&block_addr), block_addr, summary))
-        })
-        .collect::<Vec<_>>();
-    call_blocks.sort_by_key(|(cold_block, block_addr, _)| (*cold_block, *block_addr));
-
-    for (_, block_addr, summary) in call_blocks.into_iter().take(max_islands) {
-        let terms = by_anchor.entry(block_addr).or_default();
-        for case in &summary.cases {
-            for write in &case.memory_writes {
-                let exact_value = write.value.is_concrete();
-                let evidence =
-                    derived_summary_memory_term_evidence(summary.completion, exact_value);
-                let term = BackwardMemoryCondition {
-                    region: crate::BackwardMemoryRegion::Argument {
-                        index: write.arg_index,
-                    },
-                    address: if matches!(summary.completion, DerivedSummaryCompletion::Exact) {
-                        SemanticMemoryAddress::exact(write.offset)
-                    } else {
-                        SemanticMemoryAddress::bounded(write.offset, write.offset)
-                            .expect("single-point derived summary memory bound")
-                    },
-                    size: write.size,
-                    evidence,
-                    binding: None,
-                    expr: summary_memory_location_expr(write.arg_index, write.offset),
-                    value_expr: Some(write.value.to_string()),
-                    exact_value,
-                };
-                if !terms.contains(&term) {
-                    terms.push(term);
-                }
-            }
-        }
-    }
-
-    by_anchor
-}
-
 fn symbolic_condition_hint(summary: Option<&BackwardConditionSummary>) -> Option<String> {
     summary
         .map(|compiled| compiled.simplified.trim().to_string())
@@ -878,38 +784,9 @@ where
     (branch_facts, diagnostics)
 }
 
-fn install_derived_summary_set<'ctx>(
-    explorer: &mut PathExplorer<'ctx>,
-    registry: &SummaryRegistry<'ctx>,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    derived: &DerivedSummarySet<'ctx>,
-    symbol_map: &HashMap<u64, String>,
-) {
-    let prepared = scope
-        .and_then(|scope| scope.root())
-        .map(|root| root.prepared.as_ref())
-        .unwrap_or(func);
-    let _ = registry.install_interproc_summary_report_for_function(
-        explorer,
-        prepared,
-        &derived.interproc,
-        symbol_map,
-    );
-    let _ = registry.install_derived_summaries_for_function(
-        explorer,
-        prepared,
-        &derived.summaries,
-        symbol_map,
-    );
-    let _ = registry.install_known_symbols_for_function(explorer, prepared, symbol_map);
-}
-
 fn install_symbolic_fact_hooks<'ctx>(
-    ctx: &'ctx Context,
     explorer: &mut PathExplorer<'ctx>,
     func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
     arch: &ArchSpec,
     summary_profile: SummaryProfile,
     symbol_map: &HashMap<u64, String>,
@@ -919,13 +796,6 @@ fn install_symbolic_fact_hooks<'ctx>(
     else {
         return;
     };
-    if let Some(scope) = scope
-        && let Ok(derived) =
-            registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
-    {
-        install_derived_summary_set(explorer, &registry, func, Some(scope), &derived, symbol_map);
-        return;
-    }
     let _ = registry.install_known_symbols_for_function(explorer, func, symbol_map);
 }
 
@@ -940,16 +810,12 @@ fn compiled_branch_reachability_statuses<'ctx>(
     initial_state: &SymState<'ctx>,
     block_addr: u64,
 ) -> (CompiledReachability, CompiledReachability) {
-    let derived_summaries = explorer.derived_call_summary_views();
-    if func_contains_calls(func) && derived_summaries.is_empty() {
+    if func_contains_calls(func) {
         return ((None, None), (None, None));
     }
-    let Some((true_compiled, false_compiled)) = compile_branch_preconditions_with_summaries(
-        func,
-        initial_state,
-        block_addr,
-        &derived_summaries,
-    ) else {
+    let Some((true_compiled, false_compiled)) =
+        compile_branch_preconditions(func, initial_state, block_addr)
+    else {
         return ((None, None), (None, None));
     };
     let evaluate = |compiled: crate::backward::CompiledBackwardCondition| {
@@ -1065,63 +931,9 @@ fn predicate_depends_on_call_result(func: &SsaArtifact, block_addr: u64) -> bool
     value_depends_on_call_result(func, predicate.condition, &mut visited)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_canonical_semantic_regions_with_derived<'ctx>(
-    ctx: &'ctx Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: &ArchSpec,
-    symbol_map: &HashMap<u64, String>,
-    summary_profile: SummaryProfile,
-    registry: &SummaryRegistry<'ctx>,
-    derived: &DerivedSummarySet<'ctx>,
-) -> CollectedNativeSemanticRegions {
-    collect_canonical_semantic_regions_with_derived_for_branch_blocks(
-        ctx,
-        func,
-        scope,
-        arch,
-        &collect_branch_blocks(func),
-        summary_profile,
-        registry,
-        derived,
-        symbol_map,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_canonical_semantic_regions_with_derived_for_branch_blocks<'ctx>(
-    ctx: &'ctx Context,
-    func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
-    arch: &ArchSpec,
-    branch_blocks: &[(u64, u64, u64)],
-    summary_profile: SummaryProfile,
-    registry: &SummaryRegistry<'ctx>,
-    derived: &DerivedSummarySet<'ctx>,
-    symbol_map: &HashMap<u64, String>,
-) -> CollectedNativeSemanticRegions {
-    let (branch_facts, diagnostics) =
-        collect_branch_observations_for_branch_blocks(ctx, func, arch, branch_blocks, |explorer| {
-            install_derived_summary_set(explorer, registry, func, scope, derived, symbol_map);
-        });
-    let _ = summary_profile;
-    CollectedNativeSemanticRegions {
-        regions: build_canonical_regions(
-            &branch_facts,
-            &derive_summary_memory_terms_by_anchor(func, branch_blocks, derived),
-            &diagnostics,
-        ),
-        diagnostics,
-        region_summaries: Vec::new(),
-        worker_summaries: Vec::new(),
-    }
-}
-
 pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
     ctx: &Context,
     func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
     arch: &ArchSpec,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
@@ -1137,49 +949,6 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
             region_summaries: Vec::new(),
             worker_summaries: Vec::new(),
         }
-    } else if let Some(scope) = scope {
-        let branch_blocks = limited_branch_blocks(func, branch_limit);
-        if let Some(registry) =
-            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
-            && let Ok(derived) =
-                registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
-        {
-            collect_canonical_semantic_regions_with_derived_for_branch_blocks(
-                ctx,
-                func,
-                Some(scope),
-                arch,
-                &branch_blocks,
-                summary_profile,
-                &registry,
-                &derived,
-                symbol_map,
-            )
-        } else {
-            let (branch_facts, diagnostics) = collect_branch_observations_for_branch_blocks(
-                ctx,
-                func,
-                arch,
-                &branch_blocks,
-                |explorer| {
-                    install_symbolic_fact_hooks(
-                        ctx,
-                        explorer,
-                        func,
-                        None,
-                        arch,
-                        summary_profile,
-                        symbol_map,
-                    );
-                },
-            );
-            CollectedNativeSemanticRegions {
-                regions: build_canonical_regions(&branch_facts, &BTreeMap::new(), &diagnostics),
-                diagnostics,
-                region_summaries: Vec::new(),
-                worker_summaries: Vec::new(),
-            }
-        }
     } else {
         let branch_blocks = limited_branch_blocks(func, branch_limit);
         let (branch_facts, diagnostics) = collect_branch_observations_for_branch_blocks(
@@ -1188,15 +957,7 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
             arch,
             &branch_blocks,
             |explorer| {
-                install_symbolic_fact_hooks(
-                    ctx,
-                    explorer,
-                    func,
-                    None,
-                    arch,
-                    summary_profile,
-                    symbol_map,
-                );
+                install_symbolic_fact_hooks(explorer, func, arch, summary_profile, symbol_map);
             },
         );
         CollectedNativeSemanticRegions {
@@ -1225,10 +986,9 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
     collected
 }
 
-pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
+pub(super) fn collect_canonical_semantic_regions_with_profile(
     ctx: &Context,
     func: &SsaArtifact,
-    scope: Option<&PreparedFunctionScope>,
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
@@ -1251,29 +1011,10 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
         return collect_large_cfg_canonical_semantic_regions_with_limit(
             ctx,
             func,
-            scope,
             arch,
             symbol_map,
             summary_profile,
             large_cfg_branch_limit(func),
-        );
-    }
-
-    if let Some(scope) = scope
-        && let Some(registry) =
-            SummaryRegistry::with_profile_for_arch_and_symbols(arch, symbol_map, summary_profile)
-        && let Ok(derived) =
-            registry.derive_source_owned_symbolic_summaries(ctx, scope, Some(arch), symbol_map)
-    {
-        return collect_canonical_semantic_regions_with_derived(
-            ctx,
-            func,
-            Some(scope),
-            arch,
-            symbol_map,
-            summary_profile,
-            &registry,
-            &derived,
         );
     }
 
@@ -1284,15 +1025,7 @@ pub(super) fn collect_canonical_semantic_regions_with_scope_and_profile(
         arch,
         &branch_blocks,
         |explorer| {
-            install_symbolic_fact_hooks(
-                ctx,
-                explorer,
-                func,
-                None,
-                arch,
-                summary_profile,
-                symbol_map,
-            );
+            install_symbolic_fact_hooks(explorer, func, arch, summary_profile, symbol_map);
         },
     );
     CollectedNativeSemanticRegions {
@@ -1774,8 +1507,6 @@ mod tests {
                         role_identity: None,
                         closure_functions: 1,
                         helper_functions: 0,
-                        derived_summaries: 0,
-                        derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
                         region_summaries: Vec::new(),
                         worker_summaries: Vec::new(),
                     },
@@ -1861,8 +1592,6 @@ mod tests {
                         role_identity: None,
                         closure_functions: 1,
                         helper_functions: 0,
-                        derived_summaries: 0,
-                        derived_diagnostics: crate::sim::DerivedSummaryDiagnostics::default(),
                         region_summaries: Vec::new(),
                         worker_summaries: Vec::new(),
                     },

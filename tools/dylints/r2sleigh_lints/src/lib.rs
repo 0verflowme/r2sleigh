@@ -9927,7 +9927,6 @@ fn r2engine_decompile_raw_request_stays_private() {
         "pub fn single_function(",
         "pub fn with_input_quality(",
         "interproc_max_iterations: 1",
-        "symbolic_scope: None",
     ] {
         assert!(
             source.contains(required),

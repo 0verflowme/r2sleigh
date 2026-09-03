@@ -6527,8 +6527,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 4,
                     helper_functions: 3,
-                    derived_summaries: 0,
-                    derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },
