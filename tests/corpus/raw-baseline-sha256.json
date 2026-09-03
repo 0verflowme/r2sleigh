@@ -53,7 +53,7 @@
     "x64_O2/murmur3_32": "79e23aea7c04fc831160e72b222cada15eaef30e2248a1636c126c4a1d35537a",
     "x64_O2/pearson": "c9c68e85f2e3cfdec8649d03427784497a9a407da4a522dfec4aafd847e4dbc2",
     "x64_O2/sdbm": "7458d9077f961657ac2faa140e9b06144aa350e24f81bb373adbb3ec725c7848",
-    "x64_O2/xxhash32": "59a8a2df84c88de0e316376ddcf0ac9589bfa790f2b71bb558d36dea7a1e337f"
+    "x64_O2/xxhash32": "d3987aea296bf6f69e06abdf00682ea10e78434f3be7e9e5a7aa4094c437891f"
   },
   "schema_version": 1
 }
