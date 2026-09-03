@@ -296,7 +296,7 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn certified_member_fact_for_memory(
+    pub(super) fn certified_member_fact_for_memory(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
     ) -> Option<&r2types::MemberAccessRenderFact> {

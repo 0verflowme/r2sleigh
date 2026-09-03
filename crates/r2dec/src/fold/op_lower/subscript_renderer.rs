@@ -28,6 +28,15 @@ impl<'a> FoldingContext<'a> {
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: &CType,
     ) -> Option<CExpr> {
+        // A declared aggregate outranks a proven address equivalence. Both
+        // statements are true -- the cell at `p + 8` is `((T *)p)[1]` -- but
+        // the source says that cell is a named struct field, and spelling it
+        // as an array element claims a shape the declared type contradicts.
+        // The member path owns this access, and where it cannot render one
+        // the dereference stands.
+        if self.certified_member_fact_for_memory(fact).is_some() {
+            return None;
+        }
         let names = self.inputs.binding_names?;
         let plan = names.plan();
         let canonical = plan.canonical();
