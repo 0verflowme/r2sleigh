@@ -18567,6 +18567,32 @@
       }
     },
     "population": {
+      "cells": {
+        "bzip2/O0": {
+          "binaries": 2,
+          "functions": 128,
+          "reference_rendered": 125,
+          "rendered": 69
+        },
+        "bzip2/O1": {
+          "binaries": 2,
+          "functions": 125,
+          "reference_rendered": 123,
+          "rendered": 29
+        },
+        "zlib/O0": {
+          "binaries": 7,
+          "functions": 798,
+          "reference_rendered": 791,
+          "rendered": 614
+        },
+        "zlib/O1": {
+          "binaries": 7,
+          "functions": 717,
+          "reference_rendered": 715,
+          "rendered": 2
+        }
+      },
       "coverage": 0.40384615384615385,
       "functions": 1768,
       "reference_coverage": 0.9920814479638009,

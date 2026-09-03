@@ -50,12 +50,23 @@ def payload(project: str, score: float | None, decompiled: bool = True) -> dict:
 class ReportTests(unittest.TestCase):
     def test_project_is_part_of_function_key(self) -> None:
         merged = merger.merge([payload("one", 0.5), payload("two", 0.75)])
-        rows = report.collect(merged).rows
+        collected = report.collect(merged)
+        rows = collected.rows
         self.assertEqual(
             set(rows),
             {
                 "one/same-name/O0::same_function",
                 "two/same-name/O0::same_function",
+            },
+        )
+        measured = report.measured_record(collected, rows)
+        self.assertEqual(
+            measured["summary"]["population"]["cells"]["one/O0"],
+            {
+                "binaries": 1,
+                "functions": 1,
+                "rendered": 1,
+                "reference_rendered": 0,
             },
         )
 

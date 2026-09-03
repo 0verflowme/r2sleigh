@@ -207,6 +207,33 @@ def summarise(
     }
 
 
+def cell_populations(
+    cells: set[str], groups: set[str], rows: dict[str, dict]
+) -> dict[str, dict]:
+    """Count each selected cell in one deterministic pass over groups and rows."""
+    counts = {
+        cell: {
+            "binaries": 0,
+            "functions": 0,
+            "rendered": 0,
+            "reference_rendered": 0,
+        }
+        for cell in sorted(cells)
+    }
+    for group in groups:
+        cell = group_cell(group)
+        if cell in counts:
+            counts[cell]["binaries"] += 1
+    for key, row in rows.items():
+        cell = key_cell(key)
+        if cell not in counts:
+            continue
+        counts[cell]["functions"] += 1
+        counts[cell]["rendered"] += int(row["decompiled"])
+        counts[cell]["reference_rendered"] += int(row["reference_decompiled"])
+    return counts
+
+
 def rows_for_cells(rows: dict[str, dict], cells: set[str]) -> dict[str, dict]:
     return {key: row for key, row in rows.items() if key_cell(key) in cells}
 
@@ -244,6 +271,10 @@ def reference_universe(
 
 
 def measured_record(current: Collected, rows: dict[str, dict]) -> dict:
+    summary = summarise(rows, current.metrics)
+    summary["population"]["cells"] = cell_populations(
+        current.cells, current.groups, rows
+    )
     return {
         "schema_version": 2,
         "reference": {
@@ -262,7 +293,7 @@ def measured_record(current: Collected, rows: dict[str, dict]) -> dict:
         },
         "groups": sorted(current.groups),
         "functions": dict(sorted(rows.items())),
-        "summary": summarise(rows, current.metrics),
+        "summary": summary,
     }
 
 
@@ -319,6 +350,10 @@ def merge_baseline(old: dict | None, measured: dict) -> dict:
         for metric, cells_for_metric in metric_cells.items()
         if cells_for_metric & all_cells
     }
+    summary = summarise(functions, set(metric_cells))
+    summary["population"]["cells"] = cell_populations(
+        all_cells, groups, functions
+    )
     return {
         "schema_version": 2,
         "reference": {
@@ -337,7 +372,7 @@ def merge_baseline(old: dict | None, measured: dict) -> dict:
         },
         "groups": sorted(groups),
         "functions": dict(sorted(functions.items())),
-        "summary": summarise(functions, set(metric_cells)),
+        "summary": summary,
     }
 
 
@@ -364,6 +399,13 @@ def print_summary(measured: dict, raw_count: int, reference_fill: dict) -> None:
         f"{population['reference_rendered']}/{population['functions']} "
         f"({population['reference_coverage']:.1%})"
     )
+    print("cell populations: binaries, functions, rendered, reference-rendered")
+    for cell, counts in population["cells"].items():
+        print(
+            f"  {cell:20} {counts['binaries']:3} binaries, "
+            f"{counts['functions']:5} functions, {counts['rendered']:5} rendered, "
+            f"{counts['reference_rendered']:5} reference-rendered"
+        )
     print("metrics: rendered mean | all-function quality mean (refusal=0)")
     for metric, data in measured["summary"]["metrics"].items():
         rendered = data["rendered"]
