@@ -9162,3 +9162,174 @@ them:
 The shape run was executed twice under the lock and produced identical column
 totals both times, so the fourteen renderings and the eight differential passes
 are reproducible rather than a scheduling artifact.
+
+## Declaration placement, classified: thirty cells, five causes
+
+The shape corpus's largest single blocker is declaration placement -- thirty of
+seventy-eight cells, against sixteen for machine projection and eight for the
+observation journal. The map that named it could not say *why*, only which
+category refused, and this project has repeatedly found one symptom hiding
+several causes. So the first thing done here was to classify, not to fix.
+
+The method: render all thirteen shapes on all six configurations in one locked
+session with `R2DEC_TRACE_REFUSAL=1`, split the transcript per function, and
+read the refusal-evidence lines that fell inside each section. Two evidence
+sites carry the answer -- `placement-decision` at `observation_journal.rs:1111`
+names the binding, its reason and every occurrence placement found for it, and
+`binding-symbol-observed` at `placement.rs:1737` names a binding whose mention
+in the sealed tree had no active marker.
+
+One thing had to be added to `binding-symbol-observed` before it could
+separate two causes that read identically: whether an authorising marker
+exists *anywhere* in the journal. Without it, "no marker was ever recorded"
+and "a marker was recorded and did not survive onto this node" produce the
+same line, and they are different defects with different fixes. The evidence
+now lists every target in the journal that would have authorised this exact
+binding and access, under `authorizing_elsewhere=`.
+
+### The table
+
+| cell | refusal | cause | binding(s) named |
+| --- | --- | --- | --- |
+| x64_O0/shape_variadic | missing_definition | A | stack_m184, stack_m183, stack_m182, stack_m181, stack_m48, stack_m40 |
+| x64_O0/shape_call_chain | unobserved_binding_write | C | stack_m56 |
+| x64_O0/shape_struct_value | unobserved_binding_write | C | stack_m40 |
+| x64_O0/shape_recurse_direct | read_before_assignment | E | RAX_5 |
+| x64_O0/shape_recurse_mutual | unobserved_binding_write | C | stack_m32 |
+| x64_O0/shape_multiword_return | unobserved_binding_write | C | stack_m40 |
+| x64_O0/shape_pointer_to_pointer | unobserved_binding_write | D | RAX_16 |
+| x64_O0/shape_function_pointer | missing_definition | B | RCX_5, RAX_13 |
+| x64_O1/shape_variadic | missing_definition | A | stack_m216, stack_m215, stack_m214, stack_m213, stack_m80, stack_m72, stack_m64 |
+| x64_O1/shape_call_chain | missing_definition | A | stack_m96, stack_m88, stack_m80 |
+| x64_O1/shape_struct_value | missing_definition | A | stack_m40, stack_m32 |
+| x64_O1/shape_struct_array | missing_definition | A | stack_m112 (indexed) |
+| x64_O1/shape_recurse_mutual | missing_definition | A | stack_m48 |
+| x64_O1/shape_pointer_to_pointer | unobserved_binding_write | C | RAX_14 |
+| x64_O1/shape_function_pointer | missing_definition | B | RAX_7 |
+| x64_O2/shape_variadic | missing_definition | A | stack_m216, stack_m215, stack_m214, stack_m213, stack_m80, stack_m72, stack_m64 |
+| x64_O2/shape_call_chain | missing_definition | A | stack_m96 … stack_m56 (six) |
+| x64_O2/shape_struct_value | missing_definition | A | stack_m40, stack_m32 |
+| x64_O2/shape_recurse_mutual | missing_definition | A | stack_m48 |
+| x64_O2/shape_function_pointer | missing_definition | A+B | RAX_4, RAX_8, RAX_12, RAX_16 and five stack slots |
+| arm64_O0/shape_variadic | missing_definition | A | stack_m200, stack_m199, stack_m198, stack_m197 |
+| arm64_O0/shape_call_chain | unobserved_binding_write | C | stack_m64 |
+| arm64_O0/shape_struct_value | unobserved_binding_write | C | stack_m48 |
+| arm64_O0/shape_recurse_direct | missing_definition | B | X0_2 |
+| arm64_O0/shape_recurse_mutual | unobserved_binding_write | C | stack_m40 |
+| arm64_O0/shape_multiword_return | unobserved_binding_write | C | stack_m48 |
+| arm64_O0/shape_pointer_to_pointer | unobserved_binding_write | D | X0_3 |
+| arm64_O1/shape_variadic | missing_definition | A | stack_m264 … stack_m261 |
+| arm64_O2/shape_variadic | missing_definition | A | stack_m264 … stack_m261 |
+| arm64_O2/shape_call_chain | missing_definition | A | stack_m88, stack_m80, stack_m72 |
+
+Cause A 14 cells, B 3, A and B together in one cell, C 9, D 2, E 1. Thirty.
+
+### Cause A -- a frame slot the callee writes through a pointer (15 cells)
+
+Every one of these bindings is a `BindingRole::StackObject` whose occurrence
+list is reads and nothing else: `reads=[(block, StackAccess(...))] writes=[]`.
+Placement then takes `placement.rs:3241` -- no write occurrence and not
+entry-declared, therefore `MissingDefinition` -- and it is not wrong to ask the
+question. The object really is read with nothing in this function writing it.
+
+What writes it is a *call*, and the rendering shows exactly why the link is
+lost. `arm64_O1/shape_call_chain` is the one cell of this family that renders
+(with a wrong arity, separately owned), and it renders this:
+
+```c
+uint64_t stack_m72;
+stack_m72 = (uint64_t)0;
+uint64_t tmp_11f80_2 = (uint64_t)SP_0 + (uint64_t)24;
+sym__shape_stash((uint64_t)tmp_11f80_2, ...);
+uint64_t X20_1 = stack_m72;          /* reads what the call wrote */
+```
+
+The source is `shape_stash(&first, …)` then a read of `first`. The frame slot
+and the pointer handed to the callee are the *same object*, and the rendering
+spells them two unrelated ways: the slot as the program variable `stack_m72`,
+the pointer as arithmetic on `SP_0`. Nothing ties the call to the object, so
+placement sees a read with no writer, and the emitted C would read a variable
+the callee never touched.
+
+The fact needed already exists and is not consulted here.
+`r2ssa::ObjectModel::object_for_value(value, space)` resolves an address value
+to the object it names, which is what would let the argument render `&stack_m72`
+instead of `SP_0 + 24`. `certified_stack_var_expr_for_object`
+(`fold/stack.rs:7`) already spells a certified frame object as its program
+variable, but only for the *contents* of a load or store; there is no path that
+spells a frame object's *address*.
+
+Two things follow, and the second is a design fork rather than a defect:
+
+- The lowering must render a certified frame object's address as `&stack_mNN`
+  (or as the bare name where the object is an array, which is what
+  `shape_variadic`'s `buffer` and `shape_struct_array`'s `table` need). This
+  also removes `SP_0` from these renderings entirely, since the SP arithmetic
+  exists only because the address had no other spelling.
+- Placement then still finds no *write* occurrence, because the write is inside
+  the callee. The rule that would answer it is that **an address-taken frame
+  object's definition is its declaration**: C gives the storage automatic
+  duration at the declaration, and the callee's write is visible in the source
+  the reader gets. That is the same argument `BindingRole::EntryValue` already
+  makes in its own doc comment -- "the object exists from function entry holding
+  an indeterminate value, exactly as the machine does" -- applied to a frame
+  slot, whose storage the prologue allocates. It is not the same as blanket
+  entry-declaring every `StackObject`, which would also hide a slot whose store
+  was genuinely lost.
+
+This overlaps work another agent owns. `SP_0` rendering as an uninitialised
+local with no definition is on their list, and it is the same missing spelling
+seen from the other side: give the address a name and `SP_0` stops being
+referenced. Whoever takes it should take both.
+
+### Cause B -- a register read with no definition (4 cells)
+
+`reads=[(block, Use(...))] writes=[]` on a register binding.
+`x64_O0/shape_function_pointer` names `RCX_5` and `RAX_13`,
+`x64_O2` names four more `RAX_*`, and `arm64_O0/shape_recurse_direct` names
+`X0_2`. Every one is a call result: the value a call produced, read afterwards,
+with no write occurrence recorded for it. That is the call-boundary defect
+another agent owns -- the same one that renders `shape_call_chain` with arity 0
+-- reaching placement rather than the renderer. Left alone.
+
+### Cause C -- the marker exists and is not on the node (9 cells)
+
+The `authorizing_elsewhere=` field settles this one. For every cell here the
+journal *does* hold a target that would authorise the access, and the node
+being audited does not carry it. `x64_O0/shape_call_chain` is representative:
+
+```
+Write binding=BindingId(50) name="stack_m56" members=[]
+  authorizing_elsewhere=["211:StackAccess { access: { inst: InstId(73) }, …, is_write: true }"]
+  active=[Other, Other, Other, Other,
+          "Write { inst: InstId(61), projection: Full, block: … }", Other]
+```
+
+Observation 211 marks a write of this exact binding through the structured
+access at `InstId(73)`; the mention being audited sits under a marker for
+`InstId(61)`, a different instruction whose output belongs to a different
+binding. Eight of the nine are stack objects with no SSA members at all
+(`members=[]`), which means their only possible authorisation is a
+`StackAccess` marker; the ninth, `x64_O1/shape_pointer_to_pointer`'s `RAX_14`,
+is a register binding with two members and the same shape of failure.
+
+This is a marker-plumbing defect and is self-contained: `observe_stack_access_expr`
+(`observation_journal.rs:2137`) attaches the marker to the address expression
+of a certified load or store, so a second mention of the same symbol reaching
+the tree by another route has none.
+
+### Cause D -- no marker anywhere (2 cells)
+
+`x64_O0/shape_pointer_to_pointer` (`RAX_16`, members `[222]`) and
+`arm64_O0/shape_pointer_to_pointer` (`X0_3`, members `[158]`) have
+`authorizing_elsewhere=[]`: nothing in the journal would authorise a write of
+these bindings, and the tree writes them anyway, under a marker for another
+instruction's output. This is the moving-occurrence mechanism losing a write
+rather than a read.
+
+### Cause E -- read and write at the same instruction (1 cell)
+
+`x64_O0/shape_recurse_direct`: `RAX_5` reads at `Use(InstId(155), 0)` and
+`Use(InstId(163), 0)` and writes at `InstId(155)`. The read that refuses is the
+one on the instruction that defines it, so the binding coalesced a version it
+reads with the version it writes and no earlier assignment survives.
