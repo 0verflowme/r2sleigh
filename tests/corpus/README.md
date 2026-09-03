@@ -87,6 +87,54 @@ Before accepting, inspect the raw files and the matrix report. Never update the
 manifest merely to make a mechanical stage pass; a changed byte during such a
 stage means the change was not mechanical.
 
+## The shape corpus, a second gate
+
+`hashes.c` is nine variations on one program shape: a loop over bytes
+accumulating an integer. No struct, no array of structs, no recursion, no
+variadic call, no signed division, no multi-word return, no pointer to a
+pointer. Three defects found by an external benchmark were invisible to the 54
+cells for exactly that reason.
+
+`shapes.c` is a second source with thirteen functions whose shapes the hash
+corpus cannot express, and `shapes_oracle.c` includes it the way `oracle.c`
+includes `hashes.c`. Every scored function is
+`uint64_t shape_*(uint64_t, uint64_t)`, so the harness hands it two integers and
+compares one back; the shape under test lives in the body and in the noinline
+helpers it calls, which the verifier pulls in transitively from their own
+renderings.
+
+```bash
+tests/corpus/locked_shapes.sh --gate shapes-measurement
+```
+
+It is a separate script with its own gate names, so the 54 hash cells keep
+gating merges unchanged. Its results are `results/shapes_<config>.json` and
+`results/shapes-matrix.json`, and it prints a per-cell map naming, for every
+red cell, the rule that refused. Many cells are red today and that is the point:
+the map is the deliverable, and `doc/handoff-location-ssa.md` carries the
+current reading of it.
+
+Gates, weakest first:
+
+- `shapes-measurement` -- every cell produced a record. Fails only if the
+  harness stopped measuring.
+- `shapes-snapshot` -- every rendering matches `raw-baseline-shapes-sha256.json`.
+  Opt-in only, and deliberately not implied by the correctness gates: most of
+  these cells are refusal comments, and pinning their text would make an
+  improvement read as a regression.
+- `shapes-raw` -- the emitted C compiles strictly for every cell.
+- `shapes-differential` -- every cell agrees with the source-built oracle from a
+  raw-backed executable.
+
+Promote a shape by adding its name to `REQUIRED_DIFFERENTIAL` in
+`run_shapes.sh` once its six cells pass; when all thirteen are listed,
+`shapes-differential` becomes the gate and the list can go. Promote only on
+evidence from `locked_shapes.sh`, never a bare invocation.
+
+Adding a function means adding it to `SHAPE_SPECS` in `verify_rendering.py` and
+nowhere else: `corpus_names.py` reads the scored functions and helper callees
+out of that one table for both the sweep and the run script.
+
 ## Accounting and interpretation
 
 Compiling and running output does not prove that its CFG, types, or control flow
