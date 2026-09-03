@@ -158,7 +158,16 @@ Angr is run only when the selected reference cells are absent from
 angr version differs from the version recorded in the baseline. A version
 change invalidates the old reference rather than mixing versions. The baseline
 keeps angr's per-function values and rendered flags, so ordinary tree sweeps
-pay only for r2sleigh.
+pay only for r2sleigh. Missing reference cells refresh angr at project
+granularity: one incomplete project does not cause completed projects in the
+same sweep to rerun angr, while all requested optimization levels still share
+that project's single DecBench invocation.
+
+The final cost line measures end-to-end wall time, the peak size of the
+garbage-collected run directory, the peak host disk consumption observed while
+a project is live, and the retained host disk change. The 26-by-3 projection
+uses the observed project/optimization-cell rate and is deliberately labeled an
+extrapolation rather than a promise about differently sized projects.
 
 The required metrics are `byte_match`, `ged`, `vj_ged`, and `type_match`.
 Current DecBench upstream contains the VJ implementation but does not register

@@ -15,8 +15,16 @@ def merge(payloads: list[dict], expected_cells: set[str] | None = None) -> dict:
     metrics: set[str] = set()
     versions: dict[str, str] = {}
     perfect_values: dict[str, float] = {}
+    decompiler_cells: dict[str, set[str]] = {}
     for payload in payloads:
-        decompilers.update(payload.get("decompilers") or [])
+        payload_decompilers = set(payload.get("decompilers") or [])
+        payload_groups = payload.get("groups") or []
+        payload_cells = {
+            f"{group['project']}/{group['opt_level']}" for group in payload_groups
+        }
+        decompilers.update(payload_decompilers)
+        for decompiler in payload_decompilers:
+            decompiler_cells.setdefault(decompiler, set()).update(payload_cells)
         metrics.update(payload.get("metrics") or [])
         perfect_values.update(payload.get("perfect_values") or {})
         for decompiler, version in (payload.get("decompiler_versions") or {}).items():
@@ -26,7 +34,7 @@ def merge(payloads: list[dict], expected_cells: set[str] | None = None) -> dict:
                     f"mixed {decompiler} versions: {old!r} and {version!r}"
                 )
             versions[decompiler] = version
-        for group in payload.get("groups") or []:
+        for group in payload_groups:
             key = f"{group['project']}/{group['binary']}/{group['opt_level']}"
             if key in groups:
                 raise ValueError(f"duplicate binary group: {key}")
@@ -58,6 +66,10 @@ def merge(payloads: list[dict], expected_cells: set[str] | None = None) -> dict:
         "sweep": {
             "expected_cells": sorted(expected_cells),
             "completed_cells": sorted(actual_cells),
+            "decompiler_cells": {
+                decompiler: sorted(cells)
+                for decompiler, cells in sorted(decompiler_cells.items())
+            },
             "input_results": len(payloads),
         },
     }

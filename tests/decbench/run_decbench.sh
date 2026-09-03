@@ -216,22 +216,33 @@ print("\n".join((d.get("selection") or {}).get("cells") or []))
 PY
 )
 
-include_reference=$refresh_reference
+refresh_all_reference=$refresh_reference
 reference_reason="explicit refresh"
 if [[ $angr_version != "$baseline_version" ]]; then
-    include_reference=1
+    refresh_all_reference=1
     reference_reason="angr version changed (${baseline_version:-uncached} -> $angr_version)"
 fi
+declare -a project_reference_flags=()
+declare -a reference_projects=()
 for project in "${projects[@]}"; do
-    for opt in "${requested_opts[@]}"; do
-        if ! grep -Fqx "$project/$opt" <<<"$baseline_cells"; then
-            include_reference=1
-            reference_reason="baseline lacks part of this selection"
-        fi
-    done
+    include_project_reference=$refresh_all_reference
+    if (( ! include_project_reference )); then
+        for opt in "${requested_opts[@]}"; do
+            if ! grep -Fqx "$project/$opt" <<<"$baseline_cells"; then
+                include_project_reference=1
+                break
+            fi
+        done
+    fi
+    project_reference_flags+=("$include_project_reference")
+    if (( include_project_reference )); then
+        reference_projects+=("$project")
+    fi
 done
-if (( ! include_reference )); then
+if (( ${#reference_projects[@]} == 0 )); then
     reference_reason="angr $angr_version is cached for every selected cell"
+elif (( ! refresh_all_reference )); then
+    reference_reason="baseline lacks selected cells for: ${reference_projects[*]}"
 fi
 
 echo "population ${#projects[@]}/${#all_projects[@]} sailr projects, ${#requested_opts[@]} opt levels"
@@ -247,6 +258,9 @@ if (( plan_only )); then
     exit 0
 fi
 
+run_started=$(date -u +%s)
+disk_available_before=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
 tree_commit=$(git -C "$root" rev-parse HEAD)
 tree_fingerprint=$(
     { git -C "$root" rev-parse HEAD; git -C "$root" diff --no-ext-diff --binary HEAD; } \
@@ -267,6 +281,7 @@ artifact_root="$root/tests/decbench/artifacts/$run_id"
 
 selection_projects=$(IFS=,; echo "${projects[*]}")
 selection_opts=$(IFS=,; echo "${requested_opts[*]}")
+selection_reference_projects=$(IFS=,; echo "${reference_projects[*]}")
 if [[ -n $resume_id ]]; then
     resume_metadata=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$remote/run.meta' 2>/dev/null" || true)
     if [[ -z $resume_metadata ]]; then
@@ -277,7 +292,9 @@ if [[ -n $resume_id ]]; then
         "tree_fingerprint=$tree_fingerprint" \
         "projects=$selection_projects" \
         "opts=$selection_opts" \
-        "decbench_commit=$decbench_commit"; do
+        "decbench_commit=$decbench_commit" \
+        "angr_version=$angr_version" \
+        "reference_projects=$selection_reference_projects"; do
         if ! grep -Fqx "$expected" <<<"$resume_metadata"; then
             echo "resume metadata mismatch: $expected" >&2
             exit 70
@@ -295,7 +312,7 @@ projects=$selection_projects
 opts=$selection_opts
 decbench_commit=$decbench_commit
 angr_version=$angr_version
-include_reference=$include_reference
+reference_projects=$selection_reference_projects
 vj_ged_source=$vj_ged_source
 EOF
     ssh "${ssh_keepalive[@]}" "$host" "printf '%s\n' '$witness' > '$remote/witness'"
@@ -381,9 +398,9 @@ else
     echo "resumed plugin install, witness present"
 fi
 
-run_started=$(date -u +%s)
-disk_available_before=$(ssh "${ssh_keepalive[@]}" "$host" "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
-for project in "${projects[@]}"; do
+for ((project_index = 0; project_index < ${#projects[@]}; project_index++)); do
+    project=${projects[$project_index]}
+    include_reference=${project_reference_flags[$project_index]}
     if ssh "${ssh_keepalive[@]}" "$host" "test -f '$remote/completed/$project'"; then
         echo "resume: $project already complete"
         continue
@@ -500,15 +517,20 @@ run_finished=$(date -u +%s)
 wall_seconds=$((run_finished - run_started))
 disk_available_after=$(ssh "${ssh_keepalive[@]}" "$host" "df -B1 --output=avail '$run_root' | tail -1 | tr -d ' '")
 peak_run_bytes=$(awk 'BEGIN { m=0 } { if ($2 > m) m=$2 } END { print m }' "$artifact_root"/*.disk.tsv)
-max_disk_delta=$((disk_available_before - disk_available_after))
-if (( max_disk_delta < 0 )); then max_disk_delta=0; fi
+min_disk_available=$(awk 'BEGIN { m=0 } { if (m == 0 || $3 < m) m=$3 } END { print m }' \
+    "$artifact_root"/*.disk.tsv)
+peak_host_disk_bytes=$((disk_available_before - min_disk_available))
+retained_host_disk_bytes=$((disk_available_before - disk_available_after))
+if (( peak_host_disk_bytes < 0 )); then peak_host_disk_bytes=0; fi
+if (( retained_host_disk_bytes < 0 )); then retained_host_disk_bytes=0; fi
 selected_cells=$(( ${#projects[@]} * ${#requested_opts[@]} ))
 full_cells=$(( expected_project_count * 3 ))
 full_wall_seconds=$(( wall_seconds * full_cells / selected_cells ))
-printf 'cost: wall %ss; peak run directory %.2f GiB; host disk delta %.2f GiB\n' \
+printf 'cost: end-to-end wall %ss; peak run directory %.2f GiB; peak host disk %.2f GiB; retained host disk %.2f GiB\n' \
     "$wall_seconds" \
     "$(awk -v n="$peak_run_bytes" 'BEGIN { print n / 1073741824 }')" \
-    "$(awk -v n="$max_disk_delta" 'BEGIN { print n / 1073741824 }')"
+    "$(awk -v n="$peak_host_disk_bytes" 'BEGIN { print n / 1073741824 }')" \
+    "$(awk -v n="$retained_host_disk_bytes" 'BEGIN { print n / 1073741824 }')"
 printf 'full 26x3 extrapolation: %.2f hours serial; %.2f GiB peak with per-project GC\n' \
     "$(awk -v n="$full_wall_seconds" 'BEGIN { print n / 3600 }')" \
     "$(awk -v n="$peak_run_bytes" 'BEGIN { print n / 1073741824 }')"

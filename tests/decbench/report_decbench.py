@@ -59,6 +59,7 @@ class Collected:
     projects: set[str]
     opt_levels: set[str]
     reference_version: str | None
+    reference_cells: set[str]
 
 
 def collect(results: dict) -> Collected:
@@ -102,7 +103,16 @@ def collect(results: dict) -> Collected:
         projects.add(project)
         opt_levels.add(opt_level)
     version = (results.get("decompiler_versions") or {}).get(REFERENCE)
-    return Collected(rows, groups, cells, projects, opt_levels, version)
+    decompiler_cells = sweep.get("decompiler_cells") or {}
+    reference_cells = set(
+        decompiler_cells.get(
+            REFERENCE,
+            observed_cells if version is not None else [],
+        )
+    )
+    return Collected(
+        rows, groups, cells, projects, opt_levels, version, reference_cells
+    )
 
 
 def quality(metric: str, value: float) -> float:
@@ -200,11 +210,8 @@ def reference_universe(
     """Fill absent current rows from the cached reference population as refusals."""
     rows = {key: dict(row) for key, row in current.rows.items()}
     before = (baseline or {}).get("functions") or {}
-    expected = rows_for_cells(before, current.cells)
-    if current.reference_version is not None:
-        # A freshly run reference defines its own complete universe. Pulling old-only
-        # rows into it would hide a population loss and could mix angr versions.
-        return rows, {"expected": len(expected), "absent": []}
+    cached_cells = current.cells - current.reference_cells
+    expected = rows_for_cells(before, cached_cells)
     absent = sorted(set(expected) - set(rows))
     for key in absent:
         old = expected[key]
@@ -215,6 +222,8 @@ def reference_universe(
             "reference": dict(old.get("reference") or {}),
         }
     for key, row in rows.items():
+        if key_cell(key) not in cached_cells:
+            continue
         old = before.get(key) or {}
         if not row["reference"]:
             row["reference"] = dict(old.get("reference") or {})

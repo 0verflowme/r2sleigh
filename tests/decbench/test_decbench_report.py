@@ -114,6 +114,7 @@ class ReportTests(unittest.TestCase):
     def test_fresh_reference_does_not_import_old_only_functions(self) -> None:
         current = report.collect(payload("one", 0.5))
         current.reference_version = "new"
+        current.reference_cells = {"one/O0"}
         baseline = {
             "functions": {
                 "one/same-name/O0::old_only": {
@@ -127,6 +128,37 @@ class ReportTests(unittest.TestCase):
         rows, fill = report.reference_universe(current, baseline)
         self.assertEqual(set(rows), {"one/same-name/O0::same_function"})
         self.assertEqual(fill["absent"], [])
+
+    def test_partial_fresh_reference_only_fills_cached_cells(self) -> None:
+        fresh = payload("fresh", 0.5)
+        fresh["decompilers"].append("angr")
+        fresh["decompiler_versions"] = {"angr": "9.3.3"}
+        cached = payload("cached", 0.5)
+        current = report.collect(merger.merge([fresh, cached]))
+        baseline = {
+            "functions": {
+                "fresh/same-name/O0::old_only": {
+                    "decompiled": False,
+                    "scores": {},
+                    "reference_decompiled": True,
+                    "reference": {"byte_match": 0.9},
+                },
+                "cached/same-name/O0::old_only": {
+                    "decompiled": False,
+                    "scores": {},
+                    "reference_decompiled": True,
+                    "reference": {"byte_match": 0.8},
+                },
+            }
+        }
+        rows, fill = report.reference_universe(current, baseline)
+        self.assertNotIn("fresh/same-name/O0::old_only", rows)
+        self.assertIn("cached/same-name/O0::old_only", rows)
+        self.assertEqual(
+            current.reference_cells,
+            {"fresh/O0"},
+        )
+        self.assertEqual(fill["absent"], ["cached/same-name/O0::old_only"])
 
     def test_merge_rejects_silent_missing_cell(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing project/opt cells: one/O1"):
