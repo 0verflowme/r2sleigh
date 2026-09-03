@@ -10188,3 +10188,17 @@ function, the same shape, one converted and one not -- the converted one had
 been converted at lowering, not by this pass. A pass that walks the rendered
 tree has to look through `Observed` and `Paren` at every branch, not only in
 the descent.
+
+## The lock split works, measured in the field
+
+`released the install lock; verification does not need it` now appears in a
+real gate run. A corpus run holds the shared install lock for its install and
+its six sweeps and hands it back before the six compiles, six oracle builds and
+six verifications, which need no plugin. That was written when six worktrees
+were queued behind a whole-binary coverage sweep.
+
+Both files were replaced atomically rather than written in place, because bash
+reads a script by byte offset as it executes and five wrappers were running at
+the time. Running instances kept their descriptor on the old inode and the next
+invocation picked up the split, which is the technique to use for every edit to
+a script this project runs concurrently.
