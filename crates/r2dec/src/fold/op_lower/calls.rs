@@ -364,19 +364,15 @@ impl<'a> FoldingContext<'a> {
             call,
             argument_index,
             value,
-        ) {
-            let names = self.inputs.binding_names?;
-            if !matches!(
-                names.require_value(value),
-                Ok(crate::binding_plan::PlannedValueSymbol::Inline(_))
-            ) {
-                self.retain_first_observation_error(
-                    crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
-                        value,
-                    ),
-                );
-                return None;
-            }
+        )
+        .filter(|_| {
+            self.inputs.binding_names.is_some_and(|names| {
+                matches!(
+                    names.require_value(value),
+                    Ok(crate::binding_plan::PlannedValueSymbol::Inline(_))
+                )
+            })
+        }) {
             let (expr, ty) = self.certified_stack_address_expr_for_object(object)?;
             let expr = self.finish_replacement_expr(PendingReplacementExpr::escaped_stack_address(
                 value,

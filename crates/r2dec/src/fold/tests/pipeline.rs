@@ -2775,6 +2775,101 @@ mod tests {
     }
 
     #[test]
+    fn bound_frame_address_call_arg_keeps_the_plans_value_spelling() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1800, 4);
+        entry.push(R2ILOp::IntSub {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(8, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0x10, 8),
+            src: Varnode::unique(0x20, 8),
+        });
+        entry.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x10, 8),
+            val: Varnode::constant(0, 8),
+        });
+        // This second, non-address use makes the value ineligible for the
+        // frame-object replacement. The call must then use the ordinary bound
+        // value path rather than treating certification alone as permission
+        // to override the binding plan.
+        entry.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x28, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::unique(1, 8),
+            src: Varnode::constant(0x401050, 8),
+        });
+        entry.push(R2ILOp::Call {
+            target: Varnode::unique(1, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks_with_call_arguments(&[entry], &arch, 1)
+            .with_name("bound_frame_address_argument");
+        let block = prepared.function().get_block(0x1800).expect("entry");
+        let call_idx = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Call { .. }))
+            .expect("call operation");
+        let call = prepared
+            .graph()
+            .inst_id_for_op_site(block.addr, call_idx)
+            .expect("call instruction");
+        let argument = prepared
+            .callsite_certificate_for_op(block.addr, call_idx)
+            .and_then(|certificate| certificate.argument_values.first())
+            .copied()
+            .expect("certified address argument");
+        assert!(crate::binding_plan::certified_frame_object_call_argument(
+            &prepared, call, 0, argument,
+        )
+        .is_some());
+
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        install_certified_function_facts(&mut ctx);
+        ctx.set_function_names(HashMap::from([(0x401050, "sym.helper".to_string())]));
+        install_callsite_resolution(
+            &mut ctx,
+            (block.addr, call_idx),
+            0x401050,
+            "sym.helper",
+            None,
+        );
+        let (_plan, names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        assert!(matches!(
+            names.require_value(argument),
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(_))
+        ));
+
+        enter_exact_test_site(&ctx, block.addr, call_idx);
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[call_idx], block.addr, call_idx)
+            .expect("supported call lowering")
+            .expect("call statement");
+        let CStmt::Expr(call_expr) = stmt.unobserved() else {
+            panic!("expected call expression: {stmt:?}");
+        };
+        let CExpr::Call { args, .. } = call_expr.unobserved() else {
+            panic!("expected call expression: {call_expr:?}");
+        };
+        let expected = ctx
+            .planned_value_expr(argument)
+            .expect("the bound value keeps its ordinary spelling");
+        let actual_value = match args[0].unobserved() {
+            CExpr::Cast { expr, .. } => expr.unobserved(),
+            expr => expr,
+        };
+        assert_eq!(actual_value, expected.unobserved());
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
     fn synthetic_normalization_sites_cannot_discharge_shifted_source_effects() {
         let arch = make_test_arch_x86_64();
         let mut entry = R2ILBlock::new(0x1900, 4);
