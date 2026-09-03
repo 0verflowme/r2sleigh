@@ -10403,6 +10403,22 @@ path does not cover a value that was dead before placement ran, or the binding
 is created before anything asks whether it has a reader. That is where to look,
 and it is a different file from the one everyone has been reading.
 
+The site is exact, so nobody need re-find it. `inlinable_values` in
+`crates/r2dec/src/binding_plan/rules.rs` counts readers at around line 570 and,
+where the count is zero, rejects the value for inlining and continues, which
+leaves it bound. Rejecting a dead value *for inlining* is the right answer to
+the question being asked and the wrong thing to do with it: a value nothing
+reads should be eliminated, not named.
+
+Note the near-miss directly above that gate, because it shows the same code has
+already been corrected once for a related reason. A call's arguments are readers
+the graph does not record, since a call takes only its callee as an operand, so
+a value staged in an argument register has no use site at all and was turned
+away at this very gate. That was fixed by consulting the callsite certificate,
+and it is what took one function from fourteen rendered statements to eight. So
+the zero-reader count is now trustworthy in a way it was not before, which is
+precisely why the remaining zero-reader values can be treated as genuinely dead.
+
 Two lessons, both of which this session has now paid for more than once. A survey
 that reads a function will tell you what the function says, and what it says can
 be true while being about a different value than the one you are holding. And
