@@ -1512,11 +1512,19 @@ impl LegacyObservationJournal {
                 // relocates ahead of its entry edges. What makes the copy say
                 // nothing is that both sides resolve to one binding, which is
                 // tested below; the loop carrier is where the case was found,
-                // not the reason it holds. A version-0 source stays excluded:
-                // it has no defining statement, and while `x = x` writes
-                // nothing, a live-in register that is not a parameter has no
-                // declaration to be rendered by either, so eliding its copy
-                // leaves the object read before it is assigned.
+                // not the reason it holds.
+                //
+                // A version-0 source has no defining statement, and the
+                // exclusion for it is exactly as wide as its reason: a
+                // live-in register that is not a parameter has no
+                // declaration to be rendered by either side, so eliding its
+                // copy leaves the object read before it is assigned. A
+                // parameter is the case the reason excepts -- the signature
+                // declares it, so the binding is written before the function
+                // body starts and the copy adds nothing. Excluding it too
+                // left `X0_0 = X0_0;` on the first two lines of every arm64
+                // function that takes arguments, which compiled only while a
+                // redundant cast hid it from `-Wself-assign`.
                 //
                 // And the program's own copies. `subs x1, x1, #1` lifts to a
                 // subtraction into a temporary and a copy of the temporary
@@ -1527,7 +1535,10 @@ impl LegacyObservationJournal {
                 // not: a write projection narrower than the object, or a read
                 // that converts, is a real operation whatever the two sides
                 // are called.
-                if !matches!(op, r2ssa::SSAOp::Copy { src, .. } if src.version != 0) {
+                let r2ssa::SSAOp::Copy { src, .. } = op else {
+                    continue;
+                };
+                if src.version == 0 && !copy_source_is_a_parameter(&plan, graph, src) {
                     continue;
                 }
                 let incoming = match origins.origin(site) {
@@ -3380,6 +3391,30 @@ fn classify_value_node(
     } else {
         Ok(LegacyValueObservation::InlineNonLiteral)
     }
+}
+
+/// Whether a copy's undefined source is a value the signature declares.
+///
+/// A live-in register with no defining instruction is either a parameter,
+/// which the function's own signature declares and therefore writes before
+/// the body runs, or a register the program read before writing, which
+/// nothing declares. The first can have its copy elided; the second cannot,
+/// because then no statement writes the object at all.
+fn copy_source_is_a_parameter(
+    plan: &BindingPlan,
+    graph: &r2ssa::SsaGraph,
+    src: &r2ssa::SSAVar,
+) -> bool {
+    let Some(value) = graph.value_id_for_var(src) else {
+        return false;
+    };
+    let Some(ValueDisposition::Bound { binding }) = plan.disposition(value) else {
+        return false;
+    };
+    matches!(
+        plan.binding_role(*binding),
+        Some(crate::binding_plan::BindingRole::Parameter { .. })
+    )
 }
 
 /// Whether this expression reads `symbol` anywhere inside it.
