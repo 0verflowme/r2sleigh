@@ -190,6 +190,8 @@ pub enum CallsiteRenderDisposition {
     SideEffectStatement,
     AssignedResult,
     NestedExpression,
+    /// The callee returns directly to this function's caller.
+    TerminalReturn,
     Suppressed,
     Residualized,
 }
@@ -3433,7 +3435,9 @@ fn prepared_call_render_facts(
             // the disposition said side effect while the owner lookup named a
             // value, so the call rendered as a bare statement *and* as its
             // definition's right-hand side, and one site was evaluated twice.
-            let disposition = if call_results.owner_for_site(callsite).is_some() {
+            let disposition = if cert.transfer == r2ssa::CallSiteTransfer::TailCall {
+                CallsiteRenderDisposition::TerminalReturn
+            } else if call_results.owner_for_site(callsite).is_some() {
                 CallsiteRenderDisposition::AssignedResult
             } else {
                 CallsiteRenderDisposition::SideEffectStatement

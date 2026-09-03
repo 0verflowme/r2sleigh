@@ -1202,17 +1202,23 @@ fn unique_call_site_identity(
             .ops
             .iter()
             .enumerate()
-            .filter_map(move |(op_index, op)| match op {
-                R2ILOp::Call { target } => {
-                    let instruction = block
-                        .op_metadata(op_index)
-                        .and_then(|metadata| metadata.instruction_addr)?;
-                    let storage = CanonicalStorageId::from_varnode(target);
-                    (instruction == call.instruction_address()
-                        && storage.offset == call.target_address())
-                    .then(|| SourceCallSiteIdentity::new(block.addr, op_index, storage))
-                }
-                _ => None,
+            .filter_map(move |(op_index, op)| {
+                let target = match (call.transfer(), op) {
+                    (r2source::AdvisoryCallTransfer::Call, R2ILOp::Call { target })
+                    | (r2source::AdvisoryCallTransfer::TailJump, R2ILOp::Branch { target })
+                        if op_index + 1 == block.ops.len() =>
+                    {
+                        target
+                    }
+                    _ => return None,
+                };
+                let instruction = block
+                    .op_metadata(op_index)
+                    .and_then(|metadata| metadata.instruction_addr)?;
+                let storage = CanonicalStorageId::from_varnode(target);
+                (instruction == call.instruction_address()
+                    && storage.offset == call.target_address())
+                .then(|| SourceCallSiteIdentity::new(block.addr, op_index, storage))
             })
     });
     match (matches.next(), matches.next()) {
@@ -1221,13 +1227,25 @@ fn unique_call_site_identity(
     }
 }
 
+struct CorrelatedCallSites {
+    tail_jumps: Vec<SourceCallSiteIdentity>,
+    interfaces: Vec<SourceCallSiteInterface>,
+}
+
 fn correlate_call_site_interfaces(
     source: &OwnedFunctionSnapshot,
     blocks: &[R2ILBlock],
     callee_interfaces: &BTreeMap<u64, SourceFunctionInterface>,
-) -> Vec<SourceCallSiteInterface> {
+) -> CorrelatedCallSites {
+    let mut tail_jumps = Vec::new();
     let mut interfaces = Vec::new();
     for call in source.advisory_calls() {
+        let Some(identity) = unique_call_site_identity(blocks, call) else {
+            continue;
+        };
+        if call.transfer() == r2source::AdvisoryCallTransfer::TailJump {
+            tail_jumps.push(identity);
+        }
         // A prototype the source recovered, or -- where it recovered none and
         // this capture carries the callee's own body -- the interface we
         // derived from that body. radare2 reports no prototype for most local
@@ -1244,9 +1262,6 @@ fn correlate_call_site_interfaces(
             let Some(callee) = recovered else {
                 continue;
             };
-            let Some(identity) = unique_call_site_identity(blocks, call) else {
-                continue;
-            };
             if let Some(interface) = crate::recover_interface::mint_recovered_call_site_interface(
                 callee,
                 identity,
@@ -1254,9 +1269,6 @@ fn correlate_call_site_interfaces(
             ) {
                 interfaces.push(interface);
             }
-            continue;
-        };
-        let Some(identity) = unique_call_site_identity(blocks, call) else {
             continue;
         };
         let Ok(interface) = SourceCallSiteInterface::new(
@@ -1273,7 +1285,10 @@ fn correlate_call_site_interfaces(
         };
         interfaces.push(interface);
     }
-    interfaces
+    CorrelatedCallSites {
+        tail_jumps,
+        interfaces,
+    }
 }
 
 impl TrustedSsaArtifact {
@@ -1310,7 +1325,7 @@ impl TrustedSsaArtifact {
         // unavailable, incoherent ABI model, and every consumer filters on
         // coherence. Refusing here instead would suppress the whole function
         // for a fact the pipeline is built to carry.
-        let call_site_interfaces =
+        let correlated_call_sites =
             correlate_call_site_interfaces(&source, &blocks, callee_interfaces);
         // Every call target the source named, whether or not a prototype was
         // recovered for it: a name and a prototype are independent facts.
@@ -1384,13 +1399,14 @@ impl TrustedSsaArtifact {
                 minted
             }
         };
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
             blocks.as_slice(),
             Some(&arch),
             function_interface,
             *source.machine_roles(),
             Some(source.convention_slots().clone()),
-            call_site_interfaces,
+            correlated_call_sites.interfaces,
+            correlated_call_sites.tail_jumps,
         );
         let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
             blocks.as_slice(),
@@ -5277,6 +5293,109 @@ impl SSABlock {
 
 #[cfg(test)]
 mod tests {
+
+    fn advisory_call_site(
+        instruction: u64,
+        target: u64,
+        transfer: u8,
+    ) -> r2source::AdvisoryCallSite {
+        let mut writer = r2source::snapshot_wire::SnapshotWireWriter::new();
+        writer.u64(instruction);
+        writer.u64(target);
+        writer.string("").expect("empty call name");
+        writer.u8(transfer);
+        writer.bool(false);
+        let bytes = writer.finish().expect("callsite wire");
+        let mut reader =
+            r2source::snapshot_wire::SnapshotWireReader::new(&bytes).expect("callsite reader");
+        r2source::snapshot_wire::read_call_site(&mut reader).expect("callsite")
+    }
+
+    #[test]
+    fn tail_jump_identity_requires_matching_terminal_branch() {
+        let mut branch = R2ILBlock::new(0x1000, 4);
+        branch.push_with_metadata(
+            R2ILOp::Branch {
+                target: make_const(0x5000, 8),
+            },
+            Some(r2il::OpMetadata {
+                instruction_addr: Some(0x1000),
+                ..r2il::OpMetadata::default()
+            }),
+        );
+        let tail = advisory_call_site(0x1000, 0x5000, 1);
+        let identity = unique_call_site_identity(&[branch.clone()], &tail)
+            .expect("exact terminal branch is the source-proven callsite");
+        assert_eq!(identity.block_addr(), 0x1000);
+        assert_eq!(identity.op_index(), 0);
+        assert_eq!(identity.target().offset, 0x5000);
+
+        let ordinary_call = advisory_call_site(0x1000, 0x5000, 0);
+        assert!(unique_call_site_identity(&[branch.clone()], &ordinary_call).is_none());
+
+        branch.ops.push(R2ILOp::Nop);
+        assert!(unique_call_site_identity(&[branch], &tail).is_none());
+    }
+
+    #[test]
+    fn tail_jump_is_a_terminal_callsite_without_call_clobbers() {
+        let target = make_const(0x5000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Branch {
+            target: target.clone(),
+        });
+        let identity =
+            SourceCallSiteIdentity::new(block.addr, 0, CanonicalStorageId::from_varnode(&target));
+        let interface = SourceCallSiteInterface::new(
+            b"tail-jump".to_vec(),
+            identity,
+            true,
+            "aapcs64",
+            [],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("tail callsite interface");
+        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+            &[block.clone()],
+            None,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            vec![interface],
+            vec![identity],
+        );
+        let function =
+            SSAFunction::from_blocks_for_decompile(&[block], None).expect("tail branch SSA");
+        let artifact =
+            SsaArtifact::new_with_context(function, FunctionPrepareMode::Decompile, context);
+
+        let prepared_block = artifact.function().get_block(0x1000).expect("tail block");
+        assert!(matches!(
+            prepared_block.ops.as_slice(),
+            [SSAOp::Branch { .. }]
+        ));
+        assert!(
+            !prepared_block
+                .ops
+                .iter()
+                .any(|op| matches!(op, SSAOp::CallDefine { .. } | SSAOp::CallRestore { .. }))
+        );
+        let call = artifact
+            .callsite_certificate_for_op(0x1000, 0)
+            .expect("tail callsite certificate");
+        assert_eq!(call.transfer, crate::semantic::CallSiteTransfer::TailCall);
+        assert_eq!(call.fallthrough, None);
+        assert_eq!(call.direct_target, Some(0x5000));
+        let obligations = artifact
+            .obligations()
+            .obligations_for_inst(call.at)
+            .map(|obligation| obligation.id.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(obligations.contains(&crate::SemanticObligationKind::Call));
+        assert!(obligations.contains(&crate::SemanticObligationKind::ControlTransfer));
+    }
 
     #[test]
     fn stack_root_follows_a_displacement_materialised_into_a_temp() {

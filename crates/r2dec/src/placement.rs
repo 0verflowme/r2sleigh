@@ -1947,12 +1947,13 @@ pub(crate) fn certified_boundary_read(
                         .argument_certificates
                         .iter()
                         .any(|argument| argument.value == value)
-                    && matches!(
+                    && (matches!(
                         payload,
                         r2ssa::InstPayload::Op(
                             r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }
                         )
-                    )
+                    ) || certificate.transfer == r2ssa::CallSiteTransfer::TailCall
+                        && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. })))
             })
 }
 

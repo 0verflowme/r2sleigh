@@ -1150,6 +1150,44 @@ impl<'a> FoldingContext<'a> {
                                 ),
                             );
                         }
+                        SSAOp::Branch { target }
+                            if frame.source_call_site.is_some_and(|(block_addr, op_idx)| {
+                                self.certified_call_render_fact_for_op(block_addr, op_idx)
+                                    .is_some_and(|fact| {
+                                        fact.disposition
+                                            == r2types::CallsiteRenderDisposition::TerminalReturn
+                                    })
+                            }) =>
+                        {
+                            let Some((source_block, source_op_idx)) = frame.source_call_site else {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
+                            };
+                            let (cert, render_fact) =
+                                self.admitted_callsite(source_block, source_op_idx)?;
+                            if render_fact.disposition
+                                != r2types::CallsiteRenderDisposition::TerminalReturn
+                            {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
+                            }
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, true)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            self.record_callee_declaration(
+                                &func_expr,
+                                source_block,
+                                source_op_idx,
+                                &certified_args,
+                            )?;
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                certified_args.args,
+                            );
+                            return self.finish_lowering_transaction(LoweredOp::FinalizedStmt(
+                                CStmt::Return(Some(call)),
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -1182,7 +1220,15 @@ impl<'a> FoldingContext<'a> {
         op_idx: usize,
     ) -> OpLoweringResult<Option<CStmt>> {
         let source_site = self.source_op_site_for_normalized_op(block_addr, op_idx);
-        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. }) && source_site.is_none() {
+        let carries_callsite = matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            || matches!(op, SSAOp::Branch { .. })
+                && source_site.is_some_and(|(block_addr, op_idx)| {
+                    self.certified_call_render_fact_for_op(block_addr, op_idx)
+                        .is_some_and(|fact| {
+                            fact.disposition == r2types::CallsiteRenderDisposition::TerminalReturn
+                        })
+                });
+        if carries_callsite && source_site.is_none() {
             return Ok(Some(self.certified_residual_comment(format!(
                 "synthetic operation cannot carry callsite facts at 0x{block_addr:x}:{op_idx}"
             ))));

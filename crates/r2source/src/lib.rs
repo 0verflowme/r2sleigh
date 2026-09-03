@@ -543,8 +543,9 @@ pub enum AdvisoryCallTransfer {
 
 /// Advisory call metadata copied from the source snapshot. This projection
 /// does not claim exact call-site identity, so it cannot create a call
-/// certificate. It is retained only for diagnostics and future comparison
-/// with machine-derived call identities.
+/// certificate by itself. SSA preparation compares it with the lifted
+/// instruction and mints an identity only when the instruction address,
+/// transfer shape, and target all agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisoryCallSite {
     instruction_address: u64,
