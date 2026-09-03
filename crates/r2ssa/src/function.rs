@@ -1204,8 +1204,8 @@ fn unique_call_site_identity(
             .enumerate()
             .filter_map(move |(op_index, op)| {
                 let target = match (call.transfer(), op) {
-                    (r2source::AdvisoryCallTransfer::Call, R2ILOp::Call { target })
-                    | (r2source::AdvisoryCallTransfer::TailJump, R2ILOp::Branch { target })
+                    (r2source::AdvisoryCallTransfer::Call, R2ILOp::Call { target }) => target,
+                    (r2source::AdvisoryCallTransfer::TailJump, R2ILOp::Branch { target })
                         if op_index + 1 == block.ops.len() =>
                     {
                         target
@@ -5362,6 +5362,23 @@ mod tests {
 
         branch.ops.push(R2ILOp::Nop);
         assert!(unique_call_site_identity(&[branch], &tail).is_none());
+
+        let mut call = R2ILBlock::new(0x2000, 4);
+        call.push_with_metadata(
+            R2ILOp::Call {
+                target: make_const(0x6000, 8),
+            },
+            Some(r2il::OpMetadata {
+                instruction_addr: Some(0x2000),
+                ..r2il::OpMetadata::default()
+            }),
+        );
+        call.push(R2ILOp::Nop);
+        let ordinary_call = advisory_call_site(0x2000, 0x6000, 0);
+        assert!(
+            unique_call_site_identity(&[call], &ordinary_call).is_some(),
+            "ordinary calls keep their original nonterminal correlation rule"
+        );
     }
 
     #[test]
