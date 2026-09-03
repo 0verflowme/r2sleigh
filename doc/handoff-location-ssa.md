@@ -11347,3 +11347,113 @@ rather than a read.
 `Use(InstId(163), 0)` and writes at `InstId(155)`. The read that refuses is the
 one on the instruction that defines it, so the binding coalesced a version it
 reads with the version it writes and no earlier assignment survives.
+
+## Eleven branches integrated, and the three collisions the merge exposed
+
+`arch/expression-engine` now contains `arch/expr-journalcells`,
+`arch/expr-tailtransfer`, `arch/expr-elfcalls`, `arch/expr-thunks`,
+`arch/expr-datatypes`, `arch/expr-cache`, `arch/expr-cellcontract`,
+`arch/expr-placement`, `arch/expr-declplacement`, `arch/expr-arrays` and
+`arch/expr-stackbuf`. Parallel development on one subsystem produced three
+collisions that a textual merge resolved silently and wrongly, and each is
+recorded here because the shape will recur.
+
+**Two answerers for a boundary read.** `certified_boundary_read` existed in both
+`placement.rs` and `binding_plan/mod.rs`. The binding-plan version already
+covers all four graphless-read kinds and expresses the singular predicate as a
+thin wrapper on the plural one, so the placement copy was deleted rather than
+kept beside it. `CertifiedValueReadSource::Boundary` routes to the survivor.
+
+**Two answerers for a return type.** The merge kept both branches' `let
+inferred_ret_type`, the second shadowing the first. The surviving definition is
+the one that consults `r2types::exact_source_return_type` before falling back to
+evidence; the shadowed one was deleted. `FoldInputs::function_return_type` had
+been dropped from the struct entirely by the same merge and was restored.
+
+**A shared Sleigh instance returns a stale decode.** `arch/expr-cache` had
+already diagnosed and withdrawn this: a `GhidraSleigh` instance caches decoded
+instructions by address, so sharing one returns the *first* decode whenever a
+later lift asks about the same address with different bytes. `mov ah, bl` at a
+reused `0x1000` lifts as `AL`. `arch/expression-engine` was carrying exactly
+that defect through `Disassembler::shared_profile_for_analysis`, whose identity
+test was `Rc::ptr_eq` on the parsed instance. The merge took the corrected side:
+`LoadedSpecification` still separates what the specification determines from what
+the caller does, so `create_disassembler_for_arch` gets its architecture and its
+disassembler from one parse instead of two, but no instance is shared. The
+plugin test `context_and_trusted_lift_share_one_profile_in_either_order`
+asserted the withdrawn behaviour and was deleted; the
+`shared_instance_address_reuse` module is the surviving gate and asserts the
+stale decode still happens, so a future attempt at sharing fails in that file
+rather than in a rendered function body. No gate could have caught this:
+single-binary analysis never repeats an address.
+
+The parse is where the time is -- 84 to 295 milliseconds against 21 to 83
+*micro*seconds to lift a block -- so the win is real and unclaimed until the
+decode cache can be flushed. `ghidra::Sleigh::clearCache` does that and the
+`libsla-sys` bridge does not expose it; `arch/expr-decodecache` owns exposing it
+through the existing forks and upstreaming both halves, in the pattern the
+`[patch.crates-io]` comment already describes.
+
+**One owner for the cells a discharged instruction owes.**
+`arch/expr-cellcontract` replaced the per-path manual marking with
+`RenderedReplacementContract`, and `arch/expr-placement` independently factored
+the same walk to add a statement twin. They were merged into one
+`discharged_instruction_targets(rendered, discharged, expr)`, with both
+`observe_rendered_replacement_expr` and `observe_discharged_stmt` on it. The
+`expr` argument is what distinguishes the two cases rather than a second copy of
+the walk: with an expression standing in for the vanished statements there is
+nothing left to answer for the operands it spells, so their value cells are
+filled there; with a statement the statement's own markers already answer, and
+filling them again would put two answers on one cell. `observe_effect_expr` was
+deleted from both the journal and the folding context, superseded by the
+contract, and its two facts -- that an obligation outside the source inventory is
+rejected, and that a recording failure refuses with its exact cause -- were
+retargeted at `observe_rendered_replacement_expr` rather than dropped. The typed
+scalar-array renderer, which had needed its own
+`observe_certified_address_replacement`, now returns a `PendingReplacementExpr`
+like every other replacement.
+
+**`arch/expr-tailcall` is superseded and is not merged.** It rewrites
+`AdvisoryCallTransfer::TailJump` into the call it performs. The merged tree
+already does that and `TailSlot` besides, through `CorrelatedCallSites` in
+`crates/r2ssa/src/function.rs`, with four tests. Merging it would have put a
+second answerer on one fact. The branch is kept; nothing on it is needed.
+
+### The gate on the merged tree
+
+`./tests/corpus/locked_matrix.sh --gate differential` at `424aec2`:
+
+| column | result |
+| --- | --- |
+| generation | 54 present |
+| raw | 54 pass |
+| **differential** | **54 pass** |
+| binding_audit | 54 pass |
+| effect_obligations | 54 pass |
+| placement_audit | 54 pass |
+| render_refusal | 54 pass |
+| diagnostic | 47 pass, 7 wrong |
+| snapshot | 25 match, 29 mismatch |
+
+`cargo test --workspace` is 2,096 passing and 0 failing over 34 binaries, up from
+the 2,068 recorded before this integration; clippy is clean over
+`--workspace --all-targets`.
+
+**The 29 snapshot mismatches are not re-blessed.** Eleven branches changed the
+rendering, so the baseline is stale by construction, and the differential column
+is what says the change is behaviour-preserving. The bless is deliberately held
+until the sessions still in flight land, because the plan's rule is once after
+the deletions and once at the end, never between.
+
+**The seven diagnostic-wrong cells are the verifier's rewrite, not the
+renderer.** They are `x64_O2/crc32_bitwise` and `murmur3_32` and `xxhash32` on
+all three arm64 configurations. Every one of the seven passes `raw` **and**
+`differential`, so the rendering is provably equivalent on the raw basis. The
+diagnostic C is the verifier's own rewrite of that rendering -- 127 semantic
+`local_retype` rewrites on the `crc32_bitwise` cell alone, plus
+`parameter_retype`, `return_retype` and `comment_removal`, all marked
+`semantic: true` -- and it is the rewrite that stops surviving. `x64_O2
+crc32_bitwise` was already recorded in this state earlier in this document with
+139 such rewrites, so this is the same known canary, not a regression from the
+merge. It remains true that a diagnostic failure is evidence about the verifier
+as much as about the renderer, which is why the corpus is not the specification.
