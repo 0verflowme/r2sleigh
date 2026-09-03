@@ -34,6 +34,7 @@ fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDispo
 /// initialize or update an object, not C objects themselves. Certified sets are
 /// filtered to the non-literal values they authorize before joining, and the
 /// same filtering is used again when the completed plan is sealed.
+#[cfg(test)]
 pub(super) fn binding_components(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &MachineProjection,
@@ -386,20 +387,11 @@ impl BindingPlan {
                 BindingPlanSourceMismatch::Authority,
             ))?;
         let unread = super::rules::unread_defined_values(source, &machine_projection);
-        let mut literal_by_value = BTreeMap::<ValueId, MachineExprId>::new();
-        for (expr_id, expr) in machine_projection.arena().iter() {
-            if let MachineExprKind::Constant { binding, .. } = expr.kind() {
-                // Arena order is dense and stable. One constant may be interned
-                // at more than one machine type; the first node is the stable
-                // canonical literal expression for value disposition purposes.
-                literal_by_value.entry(binding.value()).or_insert(expr_id);
-            }
-        }
-        let mut expr_by_value = BTreeMap::<ValueId, MachineExprId>::new();
-        for entity in machine_projection.entities() {
-            expr_by_value.insert(entity.output().value(), entity.root());
-        }
-        let inlinable = super::rules::inlinable_values(source_owned, &machine_projection);
+        let super::rules::RewriteInliningPartition {
+            canonical,
+            inlinable,
+            component_eligible,
+        } = super::rules::rewrite_inlining_partition(source_owned, &machine_projection)?;
         let mut dispositions = graph
             .values
             .iter()
@@ -501,22 +493,27 @@ impl BindingPlan {
                 };
             } else if graph_value.var.constant_bits().is_none()
                 && inlinable.contains(&graph_value.id)
-                && let Some(expr) = expr_by_value.get(&graph_value.id).copied()
+                && let Some(term) = canonical
+                    .value(graph_value.id)
+                    .map(|canonical| canonical.canonical)
             {
                 dispositions[index] = ValueDisposition::Inline {
-                    expr,
+                    term,
                     proof: InlineProof {
                         authority: source.authority().clone(),
-                        literal: expr,
+                        term,
                     },
                 };
             } else if graph_value.var.constant_bits().is_some() {
-                dispositions[index] = match literal_by_value.get(&graph_value.id).copied() {
-                    Some(expr) => ValueDisposition::Inline {
-                        expr,
+                dispositions[index] = match canonical
+                    .value(graph_value.id)
+                    .map(|canonical| canonical.canonical)
+                {
+                    Some(term) => ValueDisposition::Inline {
+                        term,
                         proof: InlineProof {
                             authority: source.authority().clone(),
-                            literal: expr,
+                            term,
                         },
                     },
                     None => {
@@ -575,7 +572,7 @@ impl BindingPlan {
             }
         }
 
-        let components = binding_components(source_owned, &machine_projection)?;
+        let components = binding_components_with(source_owned, &component_eligible)?;
         if u32::try_from(components.len()).is_err() {
             return Err(BindingPlanBuildError::TooManyBindings {
                 count: components.len(),
@@ -947,21 +944,6 @@ impl BindingPlan {
             }
         }
 
-        // The plan's own rule decides what a term absorbs, so "may this
-        // producer be expanded into its reader" and "may this value be
-        // rendered without a local" are one answer rather than two that agree
-        // today. `inlinable_values` is computed once from the same projection
-        // and `term_absorbs_producer` only tests membership.
-        let inlinable_for_expansion =
-            super::rules::inlinable_values(source_owned, &machine_projection);
-        let canonical = r2rewrite::canonicalize_with(
-            source,
-            &machine_projection,
-            &|query: &r2rewrite::ExpansionQuery<'_>| {
-                super::rules::term_absorbs_producer(&inlinable_for_expansion, query)
-            },
-        )
-        .map_err(BindingPlanBuildError::Canonicalisation)?;
         let plan = Self {
             authority: source.authority().clone(),
             machine_projection,

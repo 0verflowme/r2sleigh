@@ -155,7 +155,7 @@ pub(crate) enum LegacyObservationJournalError {
     MissingPlannedValue(ValueId),
     InvalidPlannedInline {
         value: ValueId,
-        expr: r2ssa::MachineExprId,
+        term: r2rewrite::TermId,
     },
     ExactUseRequiresRenderedOccurrence(UseSite),
     ExactWriteRequiresRenderedOccurrence(InstId),
@@ -529,10 +529,10 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             LegacyObservationJournalError::MissingPlannedValue(value) => {
                 Self::MissingPlannedValue { value: *value }
             }
-            LegacyObservationJournalError::InvalidPlannedInline { value, expr } => {
+            LegacyObservationJournalError::InvalidPlannedInline { value, term } => {
                 Self::InvalidPlannedInline {
                     value: *value,
-                    expr_index: expr.index(),
+                    term_index: term.index(),
                 }
             }
             LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site) => {
@@ -3771,20 +3771,21 @@ impl LegacyObservationJournal {
     /// The obligations of every value the plan spells as a literal wherever it
     /// is read.
     ///
-    /// Asked of `r2rewrite::machine_expr_is_literal`, which is the one place
-    /// that says what a literal expression is; the binding plan asked the same
-    /// function when it decided to inline the value, so the two cannot
-    /// disagree about which values these are.
+    /// Asked of the plan's canonical term, which is the same identity the
+    /// inline disposition renders, so planning and accounting cannot disagree
+    /// about which values are literals.
     fn repeated_literal_effects(&self) -> BTreeSet<SemanticObligationId> {
-        let projection = self.plan.machine_projection();
         let graph = self.source.graph();
         let mut ids = BTreeSet::new();
         for graph_value in &graph.values {
-            let Some(ValueDisposition::Inline { expr, .. }) = self.plan.disposition(graph_value.id)
+            let Some(ValueDisposition::Inline { term, .. }) = self.plan.disposition(graph_value.id)
             else {
                 continue;
             };
-            if !r2rewrite::machine_expr_is_literal(projection, *expr) {
+            if !matches!(
+                self.plan.canonical().arena().term(*term).kind,
+                r2rewrite::TermKind::Literal(_)
+            ) {
                 continue;
             }
             let Some(definition) = graph.def_inst(graph_value.id) else {
@@ -5615,7 +5616,7 @@ mod tests {
                 .values
                 .iter()
                 .find_map(|value| match plan.disposition(value.id) {
-                    Some(ValueDisposition::Inline { expr, .. }) => Some(*expr),
+                    Some(ValueDisposition::Inline { term, .. }) => Some(*term),
                     _ => None,
                 })
                 .expect("fixture inline expression")
@@ -5737,11 +5738,11 @@ mod tests {
             (
                 LegacyObservationJournalError::InvalidPlannedInline {
                     value: ValueId(35),
-                    expr: inline_expr,
+                    term: inline_expr,
                 },
                 BindingObservationJournalFailure::InvalidPlannedInline {
                     value: ValueId(35),
-                    expr_index: inline_expr.index(),
+                    term_index: inline_expr.index(),
                 },
             ),
             (

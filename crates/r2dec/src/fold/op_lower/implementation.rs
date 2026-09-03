@@ -916,15 +916,8 @@ impl<'a> FoldingContext<'a> {
     /// The conversion to the declared object is not made here. The write
     /// projection is applied to the statement after it is built, and the
     /// declared type is met once, outside it, from the type the projection
-    /// produced; this records what the projection starts from. An inlined
-    /// definition is the bare expression, and the reader converts it from
-    /// the same type.
+    /// produced; this records what the projection starts from.
     fn assign_typed(&self, lhs: CExpr, rhs: CExpr, rhs_type: Option<CValue>) -> Option<CStmt> {
-        if self.inlined_definition.get() {
-            // The result is read where it is computed, so there is nothing to
-            // assign it to; the expression is the whole of the answer.
-            return Some(CStmt::Expr(rhs));
-        }
         self.pending_assignment_type.set(rhs_type);
         // Both sides are exact occurrence projections. Identity-looking text
         // is not an elision proof: distinct SSA values may intentionally share
@@ -953,11 +946,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assignment_lhs_expr(&self, _dst: &SSAVar) -> OpLoweringResult<CExpr> {
-        if self.inlined_definition.get() {
-            // Discarded by `assign_stmt` under the same flag. Asking the plan
-            // for a symbol it deliberately withheld would refuse the lowering.
-            return Ok(CExpr::IntLit(0));
-        }
         match self.planned_current_output_expr() {
             Ok(Some(planned)) => Ok(planned),
             Ok(None) => Err(OpLoweringRefusal::missing_program_variable()),

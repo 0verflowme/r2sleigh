@@ -12,14 +12,23 @@ fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
 /// contains them, and certificate identities point back to their resolved member
 /// sets. A sorted BFS computes each transitive component without depending on the
 /// construction representative, union schedule, or component accumulator.
+#[cfg(test)]
 pub(super) fn seal_binding_components(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &MachineProjection,
 ) -> Result<Vec<SealBindingComponent>, BindingPlanBuildError> {
+    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
+    seal_binding_components_with(source_owned, projection, &eligible)
+}
+
+fn seal_binding_components_with(
+    source_owned: &SourceOwnedFunctionFacts,
+    _projection: &MachineProjection,
+    eligible: &[bool],
+) -> Result<Vec<SealBindingComponent>, BindingPlanBuildError> {
     let source = source_owned.source();
     let graph = source.graph();
     let value_count = graph.values.len();
-    let eligible = super::rules::component_eligible_values(source_owned, projection)?;
     let mut members_by_source = BTreeMap::<BindingCertificateSource, BTreeSet<ValueId>>::new();
 
     let mut values_by_span = BTreeMap::<SpanId, BTreeSet<ValueId>>::new();
@@ -295,7 +304,12 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
             BindingPlanSourceMismatch::Authority,
         ))?;
     let unread = super::rules::unread_defined_values(source, machine_projection);
-    let resolved = seal_binding_components(source_owned, machine_projection)?;
+    let partition = super::rules::rewrite_inlining_partition(source_owned, machine_projection)?;
+    let resolved = seal_binding_components_with(
+        source_owned,
+        machine_projection,
+        &partition.component_eligible,
+    )?;
     if u32::try_from(resolved.len()).is_err() {
         return Err(BindingPlanBuildError::TooManyBindings {
             count: resolved.len(),
@@ -314,7 +328,7 @@ pub(crate) fn build_upstream_shadow_oracle<'a>(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let inlinable = super::rules::inlinable_values(source_owned, machine_projection);
+    let inlinable = partition.inlinable;
     let mut values = vec![None; graph.values.len()];
     for graph_value in &graph.values {
         if return_controls.contains(&graph_value.id) {
@@ -484,20 +498,12 @@ impl BindingPlan {
         self.validate_source(source)
             .map_err(BindingPlanBuildError::Seal)?;
         let graph = source.graph();
-        // The rewriter must be a function of the projection, so the seal
-        // derives the canonical terms again and requires the same answer.
-        // Sharing the plan's would prove nothing: a rewriter that varied with
-        // hash order or with a stale budget would agree with itself.
-        let sealed_inlinable =
-            super::rules::inlinable_values(source_owned, &self.machine_projection);
-        let sealed_canonical = r2rewrite::canonicalize_with(
-            source,
-            &self.machine_projection,
-            &|query: &r2rewrite::ExpansionQuery<'_>| {
-                super::rules::term_absorbs_producer(&sealed_inlinable, query)
-            },
-        )
-        .map_err(BindingPlanBuildError::Canonicalisation)?;
+        // The rewriter and partition must be a function of the projection, so
+        // the seal derives their fixed point again without consulting the
+        // candidate plan.
+        let sealed_partition =
+            super::rules::rewrite_inlining_partition(source_owned, &self.machine_projection)?;
+        let sealed_canonical = &sealed_partition.canonical;
         for graph_value in &graph.values {
             let planned = self.canonical.value(graph_value.id);
             let sealed = sealed_canonical.value(graph_value.id);
@@ -518,7 +524,7 @@ impl BindingPlan {
         }
         // Once per seal, not once per inlined value: this walks the whole
         // machine arena.
-        let inlinable = super::rules::inlinable_values(source_owned, &self.machine_projection);
+        let inlinable = &sealed_partition.inlinable;
         let ptr_bits = source
             .machine_context()
             .memory_model()
@@ -532,7 +538,11 @@ impl BindingPlan {
             ));
         }
 
-        let expected = seal_binding_components(source_owned, &self.machine_projection)?;
+        let expected = seal_binding_components_with(
+            source_owned,
+            &self.machine_projection,
+            &sealed_partition.component_eligible,
+        )?;
         let unobserved_merges = source.unobserved_merges();
         let unobserved_values = source.unobserved_values();
         let return_controls = certified_return_control_values(source);
@@ -583,19 +593,20 @@ impl BindingPlan {
                     };
                     members.insert(value);
                 }
-                ValueDisposition::Inline { expr, proof } => {
-                    let owned = proof.authority == *source.authority() && proof.literal == *expr;
+                ValueDisposition::Inline { term, proof } => {
+                    let owned = proof.authority == *source.authority() && proof.term == *term;
+                    let exact_canonical = self
+                        .canonical
+                        .value(value)
+                        .is_some_and(|canonical| canonical.canonical == *term);
                     let exact_expression = graph_value.var.constant_bits().is_none()
                         && inlinable.contains(&value)
-                        && self
-                            .machine_projection
-                            .entity_for_output(value)
-                            .is_some_and(|entity| entity.root() == *expr);
+                        && exact_canonical;
                     let exact_literal = graph_value.var.constant_bits().is_some()
+                        && exact_canonical
                         && matches!(
-                            &self.machine_projection.expr(*expr).map(|expr| expr.kind()),
-                            Some(MachineExprKind::Constant { binding, .. })
-                                if binding.value() == value
+                            self.canonical.arena().term(*term).kind,
+                            r2rewrite::TermKind::Literal(_)
                         );
                     if !owned || !(exact_literal || exact_expression) {
                         return Err(BindingPlanBuildError::Seal(

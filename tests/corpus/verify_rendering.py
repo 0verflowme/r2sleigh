@@ -217,7 +217,7 @@ BINDING_AUDIT_JOURNAL_CAUSE_FIELDS = {
     "planned_elided_value_rendered": frozenset({"value_id"}),
     "planned_refused_value_rendered": frozenset({"value_id"}),
     "missing_planned_value": frozenset({"value_id"}),
-    "invalid_planned_inline": frozenset({"value_id", "expression_index"}),
+    "invalid_planned_inline": frozenset({"value_id", "term_index"}),
     "exact_use_requires_rendered_occurrence": frozenset(
         {"instruction_id", "input_index"}
     ),

@@ -2589,7 +2589,7 @@ pub enum BindingObservationJournalFailure {
     },
     InvalidPlannedInline {
         value: r2ssa::ValueId,
-        expr_index: usize,
+        term_index: usize,
     },
     ExactUseRequiresRenderedOccurrence {
         site: r2ssa::UseSite,
@@ -7891,8 +7891,8 @@ mod tests {
                         crate::binding_plan::ValueDisposition::Bound { binding } => {
                             format!("bound:{}", binding.index())
                         }
-                        crate::binding_plan::ValueDisposition::Inline { expr, .. } => {
-                            format!("inline:{}", expr.index())
+                        crate::binding_plan::ValueDisposition::Inline { term, .. } => {
+                            format!("inline:{}", term.index())
                         }
                         crate::binding_plan::ValueDisposition::Elided { reason, .. } => {
                             format!("elided:{reason:?}")
