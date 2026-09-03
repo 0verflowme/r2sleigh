@@ -1591,7 +1591,7 @@ impl LegacyObservationJournal {
                 let src = match op {
                     r2ssa::SSAOp::Copy { src, .. } => src,
                     r2ssa::SSAOp::CallRestore { src, dst }
-                        if boundary_restores_carrier(source.source(), dst) =>
+                        if boundary_restores_carrier(source.source(), src, dst) =>
                     {
                         src
                     }
@@ -1924,13 +1924,19 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>();
 
         // Definitions whose values the plan proves nobody reads have no
-        // statement to carry their cells. The structural case owns no operands
-        // or semantic obligation; an unused call clobber is the example. A
-        // pre-placement dead computation also loses the operand reads and the
-        // LiveValueProducer obligation its statement would have carried. Only
-        // that dependency obligation is authorized here: any observable effect
-        // on the same instruction remains at zero occurrences and the effect
-        // ledger refuses it instead of relabelling it dead.
+        // statement to carry their cells. An unused call clobber is structural
+        // and owns no operands or semantic obligation. A restored carrier is
+        // structural too, but it has one operand: the exact pre-call carrier.
+        // Its convention certificate says the restore is an identity, so that
+        // operand disappears with a dead restore output for the same reason it
+        // disappears when both ends are one live binding. Without that exact
+        // certificate the use stays open and the journal refuses.
+        //
+        // A pre-placement dead computation also loses the operand reads and
+        // the LiveValueProducer obligation its statement would have carried.
+        // Only that dependency obligation is authorized here: any observable
+        // effect on the same instruction remains at zero occurrences and the
+        // effect ledger refuses it instead of relabelling it dead.
         //
         // This is deliberately not done for every elided value. Most elisions
         // mean some other rendering answers for the value, and claiming its
@@ -1951,31 +1957,50 @@ impl LegacyObservationJournal {
             let Some(inst) = graph.def_inst(*value) else {
                 continue;
             };
-            if graph.inst(inst).and_then(|inst| inst.output) != Some(*value) {
+            let Some(instruction) = graph.inst(inst).filter(|inst| inst.output == Some(*value))
+            else {
                 continue;
-            }
+            };
             elided_writes.entry(inst).or_insert(*reason);
-            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
+            let certified_dead_restore = *reason
+                == r2ssa::ledger::ElisionReason::UnusedStructuralValue
+                && matches!(
+                    &instruction.payload,
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::CallRestore { src, dst })
+                        if boundary_restores_carrier(source.source(), src, dst)
+                );
+            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary
+                && !certified_dead_restore
+            {
                 continue;
             }
-            let instruction = graph
-                .inst(inst)
-                .expect("the exact definition was validated above");
             for input_idx in 0..instruction.inputs.len() {
-                elided_uses
-                    .entry(UseSite { inst, input_idx })
-                    .or_insert(*reason);
+                let site = UseSite { inst, input_idx };
+                let input_reason = if certified_dead_restore {
+                    self.coalesced_carrier_uses.insert(site);
+                    r2ssa::ledger::ElisionReason::CoalescedCopy
+                } else {
+                    *reason
+                };
+                match elided_uses.insert(site, input_reason) {
+                    Some(existing) if existing != input_reason => {
+                        return Err(LegacyObservationJournalError::ConflictingUse(site));
+                    }
+                    _ => {}
+                }
             }
-            self.dead_unused_value_effects.extend(
-                source
-                    .source()
-                    .obligations()
-                    .obligations_for_inst(inst)
-                    .filter(|obligation| {
-                        obligation.id.kind == r2ssa::SemanticObligationKind::LiveValueProducer
-                    })
-                    .map(|obligation| obligation.id),
-            );
+            if *reason == r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
+                self.dead_unused_value_effects.extend(
+                    source
+                        .source()
+                        .obligations()
+                        .obligations_for_inst(inst)
+                        .filter(|obligation| {
+                            obligation.id.kind == r2ssa::SemanticObligationKind::LiveValueProducer
+                        })
+                        .map(|obligation| obligation.id),
+                );
+            }
         }
 
         // An inline value is normally accounted where its expression is
@@ -3733,7 +3758,11 @@ fn nothing_wrote_the_object_between(
 /// a function for which the source made no such statement, is declined and
 /// keeps its own object. Reaching for the operation kind instead would be the
 /// exemption this exists to avoid.
-fn boundary_restores_carrier(source: &r2ssa::SsaArtifact, dst: &r2ssa::SSAVar) -> bool {
+fn boundary_restores_carrier(
+    source: &r2ssa::SsaArtifact,
+    src: &r2ssa::SSAVar,
+    dst: &r2ssa::SSAVar,
+) -> bool {
     let context = source.machine_context();
     let Some(carrier) = context.stack_pointer_carrier() else {
         return false;
@@ -3749,7 +3778,9 @@ fn boundary_restores_carrier(source: &r2ssa::SsaArtifact, dst: &r2ssa::SSAVar) -
             },
             |carriers| carriers.stack_pointer(),
         );
-    restored && source.graph().canonical_storage_for_var(dst) == Some(carrier)
+    restored
+        && source.graph().canonical_storage_for_var(src) == Some(carrier)
+        && source.graph().canonical_storage_for_var(dst) == Some(carrier)
 }
 
 /// Whether a copy's undefined source is a value the signature declares.
@@ -3888,7 +3919,7 @@ mod tests {
 
     use r2il::{
         AddressSpace, ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef,
-        RegisterProjection, RegisterProjectionDisposition, RegisterStorage, Varnode,
+        RegisterProjection, RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
     };
     use r2ssa::{
         CanonicalStorageId, CanonicalStorageSpace, SourceAbiParameterSpec, SourceFunctionInterface,
@@ -3937,9 +3968,23 @@ mod tests {
         source_owned_from_blocks_with_parameter(blocks, false)
     }
 
+    fn source_owned_from_blocks_with_preserved_calls(
+        blocks: &[R2ILBlock],
+    ) -> SourceOwnedFunctionFacts {
+        source_owned_from_blocks_with_interface(blocks, false, true)
+    }
+
     fn source_owned_from_blocks_with_parameter(
         blocks: &[R2ILBlock],
         with_parameter: bool,
+    ) -> SourceOwnedFunctionFacts {
+        source_owned_from_blocks_with_interface(blocks, with_parameter, false)
+    }
+
+    fn source_owned_from_blocks_with_interface(
+        blocks: &[R2ILBlock],
+        with_parameter: bool,
+        preserved_calls: bool,
     ) -> SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_space(AddressSpace::ram(8));
@@ -3969,9 +4014,7 @@ mod tests {
         let interface = SourceFunctionInterface::new_exact(
             b"observation-journal-test".to_vec(),
             "sysv64",
-            with_parameter
-                .then_some(SourceAbiParameterSpec::new(0, storage(0x38)))
-                .into_iter(),
+            with_parameter.then_some(SourceAbiParameterSpec::new(0, storage(0x38))),
             SourceFunctionReturn::Register {
                 storage: storage(0),
             },
@@ -3980,6 +4023,11 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
         .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
         .expect("exact test source interface");
+        let interface = if preserved_calls {
+            interface.with_preserved_call_carriers(true, true)
+        } else {
+            interface
+        };
         let source = Arc::new(
             SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
                 .expect("test SSA artifact"),
@@ -4042,6 +4090,95 @@ mod tests {
         )
         .expect("authority-bound journal");
         (source, plan, function, journal)
+    }
+
+    #[test]
+    fn a_dead_restore_closes_its_read_only_with_the_boundary_certificate() {
+        let rsp = Varnode::register(0x28, 8);
+        let ops = vec![
+            R2ILOp::IntSub {
+                dst: rsp.clone(),
+                a: rsp.clone(),
+                b: Varnode::constant(8, 8),
+            },
+            R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: rsp,
+                val: Varnode::constant(0x1005, 8),
+            },
+            R2ILOp::Call {
+                target: Varnode::constant(0x2000, 8),
+            },
+        ];
+        let op_metadata = (0..ops.len())
+            .map(|index| {
+                (
+                    index,
+                    r2il::OpMetadata {
+                        instruction_addr: Some(0x1000),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let block = R2ILBlock {
+            addr: 0x1000,
+            size: 5,
+            ops,
+            switch_info: None,
+            op_metadata,
+        };
+        let source = source_owned_from_blocks_with_preserved_calls(std::slice::from_ref(&block));
+        let graph = source.source().graph();
+        let (restore, output, src, dst) = graph
+            .insts
+            .iter()
+            .find_map(|inst| match &inst.payload {
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallRestore { src, dst }) => {
+                    Some((inst.id, inst.output?, src, dst))
+                }
+                _ => None,
+            })
+            .expect("the preserved call restores its stack carrier");
+        assert!(graph.use_sites(output).is_empty(), "restore output is dead");
+        assert!(boundary_restores_carrier(source.source(), src, dst));
+
+        let (_source, plan, _function, journal) = journal_fixture_for_source(source);
+        assert!(matches!(
+            plan.disposition(output),
+            Some(ValueDisposition::Elided {
+                reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                ..
+            })
+        ));
+        let use_site = UseSite {
+            inst: restore,
+            input_idx: 0,
+        };
+        assert_eq!(
+            journal.uses[restore.0 as usize][0],
+            Some(LegacyUseObservation::Elided(
+                r2ssa::ledger::ElisionReason::CoalescedCopy
+            ))
+        );
+        assert!(journal.coalesced_carrier_uses.contains(&use_site));
+
+        let uncertified = source_owned_from_blocks(&[block]);
+        let r2ssa::InstPayload::Op(r2ssa::SSAOp::IntSub { a, dst, .. }) =
+            &uncertified.source().graph().insts[0].payload
+        else {
+            panic!("call instruction starts by spending the stack carrier")
+        };
+        assert!(
+            !boundary_restores_carrier(uncertified.source(), a, dst),
+            "matching storage cannot replace the absent convention certificate"
+        );
+        assert!(uncertified.source().graph().insts.iter().all(|inst| {
+            !matches!(
+                inst.payload,
+                r2ssa::InstPayload::Op(r2ssa::SSAOp::CallRestore { .. })
+            )
+        }));
     }
 
     #[test]
