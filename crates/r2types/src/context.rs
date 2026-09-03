@@ -25,7 +25,6 @@ pub struct ExternalRegisterParamSpec {
 pub struct ExternalStackSlotSpec {
     pub name: String,
     pub ty: Option<CTypeLike>,
-    pub base: ExternalStackBase,
     pub role: ExternalStackSlotRole,
     pub param_index: Option<usize>,
     pub param_name: Option<String>,
@@ -45,8 +44,6 @@ pub struct ParsedExternalContext {
     pub known_function_signatures: HashMap<String, FunctionType>,
     pub register_params: Vec<ExternalRegisterParamSpec>,
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    // Legacy compatibility view derived from canonical stack_slots.
-    pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
     pub assumptions: r2ssa::AssumptionSet,
@@ -55,47 +52,7 @@ pub struct ParsedExternalContext {
     pub noreturn: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalStackBase {
-    FramePointer,
-    StackPointer,
-    Named(String),
-}
-
-impl Default for ExternalStackBase {
-    fn default() -> Self {
-        Self::Named("stack".to_string())
-    }
-}
-
-impl ExternalStackBase {
-    pub fn assumption_base(&self) -> Option<r2ssa::StackAddressBase> {
-        match self {
-            Self::FramePointer => Some(r2ssa::StackAddressBase::FramePointer),
-            Self::StackPointer => Some(r2ssa::StackAddressBase::StackPointer),
-            Self::Named(_) => None,
-        }
-    }
-
-    pub fn legacy_name(&self) -> Option<String> {
-        match self {
-            Self::FramePointer => Some("rbp".to_string()),
-            Self::StackPointer => Some("rsp".to_string()),
-            Self::Named(name) if !name.is_empty() => Some(name.clone()),
-            Self::Named(_) => None,
-        }
-    }
-}
-
-impl From<r2ssa::StackAddressBase> for ExternalStackBase {
-    fn from(base: r2ssa::StackAddressBase) -> Self {
-        match base {
-            r2ssa::StackAddressBase::FramePointer => Self::FramePointer,
-            r2ssa::StackAddressBase::StackPointer => Self::StackPointer,
-        }
-    }
-}
+pub use r2ssa::StackAddressBase as ExternalStackBase;
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -111,11 +68,7 @@ pub enum ExternalStackSlotRole {
     Unknown,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StackSlotKey {
-    pub base: ExternalStackBase,
-    pub offset: i64,
-}
+pub type StackSlotKey = r2ssa::StackAddressRoot;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -516,7 +469,6 @@ pub fn function_type_facts_from_parsed_context(
         known_function_signatures: parsed_context.known_function_signatures.clone(),
         register_params: parsed_context.register_params.clone(),
         stack_slots: parsed_context.stack_slots.clone(),
-        external_stack_vars: parsed_context.external_stack_vars.clone(),
         external_type_db: parsed_context.external_type_db.clone(),
         callee_facts: parsed_context.callee_facts.clone(),
         diagnostics: parsed_context.diagnostics.clone(),
@@ -608,19 +560,22 @@ pub fn parse_external_context(raw: ExternalContextJson, ptr_bits: u32) -> Parsed
         .as_ref()
         .filter(|signature| signature_param_count_is_authoritative(signature))
         .map(|signature| signature.params.len());
-    let (register_params, stack_slots) = parse_external_vars(
+    let (register_params, refused_stack_slots) = parse_external_vars(
         &raw.vars,
         ptr_bits,
         max_register_params,
         parsed.current_signature.as_ref(),
     );
     parsed.register_params = register_params;
-    parsed.stack_slots = stack_slots;
+    if refused_stack_slots > 0 {
+        parsed.diagnostics.push(format!(
+            "refused {refused_stack_slots} external stack slot(s) without a structural address root"
+        ));
+    }
     resolve_register_param_aliases_from_type_db(
         &mut parsed.register_params,
         &parsed.external_type_db,
     );
-    resolve_stack_slot_aliases_from_type_db(&mut parsed.stack_slots, &parsed.external_type_db);
     parsed.merged_signature = merge_signature_with_register_params(
         parsed.current_signature.clone(),
         &parsed.register_params,
@@ -773,17 +728,6 @@ fn resolve_register_param_aliases_from_type_db(
     }
 }
 
-fn resolve_stack_slot_aliases_from_type_db(
-    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    type_db: &ExternalTypeDb,
-) {
-    for slot in stack_slots.values_mut() {
-        if let Some(ty) = slot.ty.as_mut() {
-            resolve_type_alias_from_type_db(ty, type_db);
-        }
-    }
-}
-
 fn resolve_type_alias_from_type_db(ty: &mut CTypeLike, type_db: &ExternalTypeDb) {
     match ty {
         CTypeLike::Pointer(inner) | CTypeLike::Array(inner, _) => {
@@ -854,15 +798,13 @@ fn imported_assumptions_from_context(
         if let Some(ty) = slot.ty.as_ref()
             && context_binding_type_is_meaningful(&slot.name, ty, ptr_bits)
         {
-            if let Some(base) = slot_key.base.assumption_base() {
-                maybe_push_type_hints(
-                    r2ssa::AssumptionSubject::StackSlot {
-                        base,
-                        offset: slot_key.offset,
-                    },
-                    ty,
-                );
-            }
+            maybe_push_type_hints(
+                r2ssa::AssumptionSubject::StackSlot {
+                    base: slot_key.base,
+                    offset: slot_key.offset,
+                },
+                ty,
+            );
             if let Some(index) = slot.param_index {
                 maybe_push_type_hints(r2ssa::AssumptionSubject::Parameter { index }, ty);
             }
@@ -1011,16 +953,17 @@ fn parse_external_vars(
     ptr_bits: u32,
     max_register_params: Option<usize>,
     signature: Option<&FunctionSignatureSpec>,
-) -> (
-    Vec<ExternalRegisterParamSpec>,
-    BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-) {
+) -> (Vec<ExternalRegisterParamSpec>, usize) {
     let mut register_params_by_index = BTreeMap::<usize, (i32, ExternalRegisterParamSpec)>::new();
     let mut inferred_register_index = 0usize;
-    let mut stack_slots = BTreeMap::new();
+    let mut refused_stack_slots = 0usize;
     let mut used_names = HashSet::new();
 
     for (idx, var) in vars.iter().enumerate() {
+        if matches!(&var.kind, ExternalVarKind::Stack) {
+            refused_stack_slots = refused_stack_slots.saturating_add(1);
+            continue;
+        }
         let sanitized_name =
             sanitize_c_identifier(&var.name).unwrap_or_else(|| format!("arg{}", idx + 1));
         let name = if is_generic_arg_name(&sanitized_name) {
@@ -1033,92 +976,40 @@ fn parse_external_vars(
             .as_deref()
             .and_then(|raw| parse_context_type_spec(raw, ptr_bits));
 
-        match var.kind {
-            ExternalVarKind::Register => {
-                let param_index = var.param_index.unwrap_or(inferred_register_index);
-                let matches_expected_param_reg = expected_sysv64_param_reg(param_index)
-                    .is_some_and(|expected| {
-                        register_name_matches(var.reg.as_deref().unwrap_or_default(), expected)
-                    });
-                if max_register_params.is_some()
-                    && !var.is_arg
-                    && var.param_index.is_none()
-                    && !matches_expected_param_reg
-                {
-                    continue;
-                }
-                inferred_register_index = inferred_register_index.max(param_index + 1);
-                if max_register_params.is_some_and(|limit| param_index >= limit) {
-                    continue;
-                }
-                let candidate = ExternalRegisterParamSpec {
-                    name,
-                    ty,
-                    reg: var.reg.clone().unwrap_or_default(),
-                };
-                let score = register_param_candidate_score(
-                    var,
-                    &candidate,
-                    signature,
-                    param_index,
-                    ptr_bits,
-                );
-                register_params_by_index
-                    .entry(param_index)
-                    .and_modify(|(existing_score, existing)| {
-                        if score > *existing_score
-                            || (score == *existing_score && candidate.reg < existing.reg)
-                        {
-                            *existing_score = score;
-                            *existing = candidate.clone();
-                        }
-                    })
-                    .or_insert((score, candidate));
-            }
-            ExternalVarKind::Stack => {
-                let Some(offset) = var.offset else {
-                    continue;
-                };
-                let base = parse_external_stack_base(var.base.as_deref());
-                let role = var.role.unwrap_or({
-                    if var.is_arg {
-                        ExternalStackSlotRole::StackArg
-                    } else {
-                        ExternalStackSlotRole::Unknown
-                    }
-                });
-                let param_index = var.param_index.or_else(|| {
-                    matches!(role, ExternalStackSlotRole::StackArg)
-                        .then(|| sysv64_stack_arg_index(&base, offset, ptr_bits))
-                        .flatten()
-                });
-                let param_name = var.param_name.clone().or_else(|| {
-                    if !matches!(role, ExternalStackSlotRole::StackArg) {
-                        return None;
-                    }
-                    let param_index = param_index?;
-                    signature
-                        .and_then(|signature| signature.params.get(param_index))
-                        .filter(|param| !is_generic_arg_name(&param.name))
-                        .map(|param| param.name.clone())
-                        .or_else(|| {
-                            is_low_quality_stack_name(&name)
-                                .then(|| format!("arg{}", param_index + 1))
-                        })
-                });
-                let candidate = ExternalStackSlotSpec {
-                    name,
-                    ty,
-                    base: base.clone(),
-                    role,
-                    param_index,
-                    param_name,
-                    source_reg: var.source_reg.clone(),
-                };
-                let key = StackSlotKey { base, offset };
-                merge_stack_slot_candidate(&mut stack_slots, key, candidate.clone());
-            }
+        let param_index = var.param_index.unwrap_or(inferred_register_index);
+        let matches_expected_param_reg =
+            expected_sysv64_param_reg(param_index).is_some_and(|expected| {
+                register_name_matches(var.reg.as_deref().unwrap_or_default(), expected)
+            });
+        if max_register_params.is_some()
+            && !var.is_arg
+            && var.param_index.is_none()
+            && !matches_expected_param_reg
+        {
+            continue;
         }
+        inferred_register_index = inferred_register_index.max(param_index + 1);
+        if max_register_params.is_some_and(|limit| param_index >= limit) {
+            continue;
+        }
+        let candidate = ExternalRegisterParamSpec {
+            name,
+            ty,
+            reg: var.reg.clone().unwrap_or_default(),
+        };
+        let score =
+            register_param_candidate_score(var, &candidate, signature, param_index, ptr_bits);
+        register_params_by_index
+            .entry(param_index)
+            .and_modify(|(existing_score, existing)| {
+                if score > *existing_score
+                    || (score == *existing_score && candidate.reg < existing.reg)
+                {
+                    *existing_score = score;
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert((score, candidate));
     }
 
     let register_params = register_params_by_index
@@ -1128,7 +1019,7 @@ fn parse_external_vars(
             param
         })
         .collect();
-    (register_params, stack_slots)
+    (register_params, refused_stack_slots)
 }
 
 fn apply_signature_param_to_register_param(
@@ -1208,45 +1099,6 @@ fn register_name_matches(actual: &str, expected: &str) -> bool {
     )
 }
 
-fn sysv64_stack_arg_index(base: &ExternalStackBase, offset: i64, ptr_bits: u32) -> Option<usize> {
-    if !matches!(base, ExternalStackBase::StackPointer) || ptr_bits != 64 {
-        return None;
-    }
-    let ptr_bytes = i64::from(ptr_bits / 8);
-    if offset < ptr_bytes || (offset - ptr_bytes) % ptr_bytes != 0 {
-        return None;
-    }
-    Some(6 + ((offset - ptr_bytes) / ptr_bytes) as usize)
-}
-
-fn parse_external_stack_base(raw: Option<&str>) -> ExternalStackBase {
-    let lower = raw.unwrap_or_default().trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "" => ExternalStackBase::default(),
-        "bp" | "ebp" | "rbp" | "fp" => ExternalStackBase::FramePointer,
-        "sp" | "esp" | "rsp" => ExternalStackBase::StackPointer,
-        _ => ExternalStackBase::Named(raw.unwrap_or_default().to_string()),
-    }
-}
-
-fn stack_slot_role_rank(role: ExternalStackSlotRole) -> u8 {
-    match role {
-        ExternalStackSlotRole::ParamHome => 5,
-        ExternalStackSlotRole::StackArg => 4,
-        ExternalStackSlotRole::Local => 3,
-        ExternalStackSlotRole::SavedReg | ExternalStackSlotRole::SavedFp => 2,
-        ExternalStackSlotRole::Unknown => 1,
-    }
-}
-
-fn base_rank(base: &ExternalStackBase) -> u8 {
-    match base {
-        ExternalStackBase::FramePointer => 3,
-        ExternalStackBase::StackPointer => 2,
-        ExternalStackBase::Named(_) => 1,
-    }
-}
-
 fn is_low_quality_stack_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     lower.starts_with("var_")
@@ -1255,82 +1107,6 @@ fn is_low_quality_stack_name(name: &str) -> bool {
         || lower.starts_with("arg_")
         || lower == "saved_fp"
         || is_generic_arg_name(&lower)
-}
-
-fn prefer_stack_slot_candidate(
-    existing: &ExternalStackSlotSpec,
-    candidate: &ExternalStackSlotSpec,
-) -> bool {
-    let existing_rank = stack_slot_role_rank(existing.role);
-    let candidate_rank = stack_slot_role_rank(candidate.role);
-    if candidate_rank != existing_rank {
-        return candidate_rank > existing_rank;
-    }
-    let existing_name_quality = !is_low_quality_stack_name(&existing.name);
-    let candidate_name_quality = !is_low_quality_stack_name(&candidate.name);
-    if existing_name_quality != candidate_name_quality {
-        return candidate_name_quality;
-    }
-    base_rank(&candidate.base) > base_rank(&existing.base)
-}
-
-fn merge_stack_slot_candidate(
-    slots: &mut BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    key: StackSlotKey,
-    candidate: ExternalStackSlotSpec,
-) {
-    match slots.get(&key) {
-        None => {
-            slots.insert(key, candidate);
-        }
-        Some(existing) if prefer_stack_slot_candidate(existing, &candidate) => {
-            slots.insert(key, candidate);
-        }
-        _ => {}
-    }
-}
-
-fn merge_legacy_stack_slot(
-    slots: &mut HashMap<i64, ExternalStackVarSpec>,
-    offset: i64,
-    candidate: ExternalStackVarSpec,
-) {
-    match slots.get(&offset) {
-        None => {
-            slots.insert(offset, candidate);
-        }
-        Some(existing) if prefer_stack_slot_candidate(existing, &candidate) => {
-            slots.insert(offset, candidate);
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn legacy_external_stack_vars_from_slots(
-    stack_slots: &BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-) -> HashMap<i64, ExternalStackVarSpec> {
-    let mut legacy = HashMap::new();
-    for (slot_key, slot_spec) in stack_slots {
-        merge_legacy_stack_slot(&mut legacy, slot_key.offset, slot_spec.clone());
-    }
-    legacy
-}
-
-pub(crate) fn stack_slots_from_legacy_external_stack_vars(
-    legacy_stack_vars: &HashMap<i64, ExternalStackVarSpec>,
-) -> BTreeMap<StackSlotKey, ExternalStackSlotSpec> {
-    let mut stack_slots = BTreeMap::new();
-    for (offset, slot_spec) in legacy_stack_vars {
-        merge_stack_slot_candidate(
-            &mut stack_slots,
-            StackSlotKey {
-                base: slot_spec.base.clone(),
-                offset: *offset,
-            },
-            slot_spec.clone(),
-        );
-    }
-    stack_slots
 }
 
 fn parse_known_signatures(
@@ -1610,14 +1386,10 @@ mod tests {
                 signedness: crate::Signedness::Signed,
             })
         );
+        assert!(ctx.stack_slots.is_empty());
         assert_eq!(
-            ctx.stack_slots
-                .get(&StackSlotKey {
-                    base: ExternalStackBase::FramePointer,
-                    offset: -16,
-                })
-                .map(|var| var.name.as_str()),
-            Some("local_10h")
+            ctx.diagnostics,
+            ["refused 1 external stack slot(s) without a structural address root"]
         );
     }
 
@@ -2204,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_external_context_preserves_stack_slot_identity_and_role_metadata() {
+    fn parse_external_context_refuses_stack_slots_without_structural_roots() {
         let ctx = parse_external_context_json(
             r#"{
                 "vars":[
@@ -2226,64 +1998,37 @@ mod tests {
                         "base":"rsp",
                         "offset":16,
                         "role":"local"
+                    },
+                    {
+                        "kind":"register",
+                        "name":"spill_arr",
+                        "reg":"x0",
+                        "is_arg":true,
+                        "param_index":0
                     }
                 ]
             }"#,
             64,
         );
 
-        let home = ctx
-            .stack_slots
-            .get(&StackSlotKey {
-                base: ExternalStackBase::FramePointer,
-                offset: 16,
-            })
-            .expect("frame-based param home slot");
-        assert_eq!(home.role, ExternalStackSlotRole::ParamHome);
-        assert_eq!(home.param_index, Some(0));
-        assert_eq!(home.param_name.as_deref(), Some("arr"));
-        assert_eq!(home.source_reg.as_deref(), Some("rdi"));
-
-        let sp_local = ctx
-            .stack_slots
-            .get(&StackSlotKey {
-                base: ExternalStackBase::StackPointer,
-                offset: 16,
-            })
-            .expect("stack-pointer local slot");
-        assert_eq!(sp_local.role, ExternalStackSlotRole::Local);
-        assert_eq!(sp_local.name, "sp_local");
-
-        assert!(ctx.external_stack_vars.is_empty());
-        assert!(ctx.assumptions.items.iter().any(|assumption| {
-            matches!(
-                &assumption.subject,
-                r2ssa::AssumptionSubject::StackSlot {
-                    base: r2ssa::StackAddressBase::FramePointer,
-                    offset: 16,
-                }
-            )
-        }));
-        assert!(ctx.assumptions.items.iter().any(|assumption| {
-            matches!(
-                &assumption.subject,
-                r2ssa::AssumptionSubject::StackSlot {
-                    base: r2ssa::StackAddressBase::StackPointer,
-                    offset: 16,
-                }
-            )
-        }));
+        assert!(ctx.stack_slots.is_empty());
+        assert!(ctx.assumptions.is_empty());
+        assert_eq!(ctx.register_params[0].name, "spill_arr");
+        assert_eq!(
+            ctx.diagnostics,
+            ["refused 2 external stack slot(s) without a structural address root"]
+        );
     }
 
     #[test]
-    fn named_external_stack_base_does_not_become_a_semantic_assumption() {
+    fn aarch64_frame_pointer_spelling_is_not_a_stack_slot_identity() {
         let ctx = parse_external_context_json(
             r#"{
                 "vars":[{
                     "kind":"stack",
                     "name":"local_value",
                     "type":"int32_t",
-                    "base":"custom_stack_base",
+                    "base":"x29",
                     "offset":-8,
                     "role":"local"
                 }]
@@ -2291,15 +2036,16 @@ mod tests {
             64,
         );
 
-        assert!(ctx.stack_slots.keys().any(|slot| {
-            slot.base == ExternalStackBase::Named("custom_stack_base".to_string())
-                && slot.offset == -8
-        }));
+        assert!(ctx.stack_slots.is_empty());
         assert!(ctx.assumptions.is_empty());
+        assert_eq!(
+            ctx.diagnostics,
+            ["refused 1 external stack slot(s) without a structural address root"]
+        );
     }
 
     #[test]
-    fn parse_external_context_derives_sysv_stack_arg_index() {
+    fn parser_does_not_invent_a_sysv_stack_argument_root() {
         let ctx = parse_external_context_json(
             r#"{
                 "vars":[
@@ -2317,18 +2063,11 @@ mod tests {
             64,
         );
 
-        let stack_arg = ctx
-            .stack_slots
-            .get(&StackSlotKey {
-                base: ExternalStackBase::StackPointer,
-                offset: 8,
-            })
-            .expect("stack-pointer argument slot");
-
-        assert_eq!(stack_arg.role, ExternalStackSlotRole::StackArg);
-        assert_eq!(stack_arg.param_index, Some(6));
-        assert_eq!(stack_arg.param_name.as_deref(), Some("arg7"));
-        assert_eq!(stack_arg.name, "arg_8h");
+        assert!(ctx.stack_slots.is_empty());
+        assert_eq!(
+            ctx.diagnostics,
+            ["refused 1 external stack slot(s) without a structural address root"]
+        );
     }
 
     #[test]

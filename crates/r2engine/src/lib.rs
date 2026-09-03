@@ -2668,10 +2668,6 @@ fn trusted_stack_slot_names(
         else {
             continue;
         };
-        let base = match slot_name.base() {
-            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
-            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
-        };
         // A home is the parameter it spills and is named through the parameter
         // list, so only a slot that stands for itself is named here.
         let role = match slot.role() {
@@ -2683,7 +2679,7 @@ fn trusted_stack_slot_names(
         };
         slots.insert(
             r2types::StackSlotKey {
-                base: base.clone(),
+                base: slot_name.base(),
                 offset: slot_name.offset(),
             },
             r2types::ExternalStackSlotSpec {
@@ -2691,7 +2687,6 @@ fn trusted_stack_slot_names(
                 ty: slot_name
                     .type_spelling()
                     .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
-                base,
                 role,
                 ..r2types::ExternalStackSlotSpec::default()
             },
@@ -6865,7 +6860,6 @@ mod tests {
                         signedness: r2types::Signedness::Signed,
                     },
                 ))),
-                base: r2types::ExternalStackBase::FramePointer,
                 role: r2types::ExternalStackSlotRole::Local,
                 ..r2types::ExternalStackSlotSpec::default()
             },

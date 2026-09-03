@@ -237,8 +237,8 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         reg_meta.insert(alias_lower.clone(), (bits, offset, alias_lower));
     };
 
-    let arch_name = arch.name.to_ascii_lowercase();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(Some(arch));
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
     if is_arm64 {
         // AArch64 Sleigh specs often expose CY/ZR/NG/OV instead of cf/zf/nf/vf.
         add_gpr_alias("cf", "cy");
@@ -264,7 +264,10 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         })
     };
 
-    let is_x86 = matches!(arch_name.as_str(), "x86" | "x86-64");
+    let is_x86 = matches!(
+        architecture,
+        r2ssa::MachineArchitectureFamily::X86 | r2ssa::MachineArchitectureFamily::X86_64
+    );
     let address_bits = arch.addr_size.checked_mul(8);
     // The program counter is stated by the processor specification --
     // `<programcounter register="pc"/>` -- so it is read, not guessed. Every
@@ -2185,7 +2188,6 @@ struct AfcfjFunction {
 #[serde(untagged)]
 #[allow(dead_code)]
 enum AfvjRef {
-    Stack { base: String, offset: i64 },
     Register(String),
     Other(serde_json::Value),
 }
@@ -2206,10 +2208,6 @@ struct AfvjVar {
 struct AfvjPayload {
     #[serde(default)]
     reg: Vec<AfvjVar>,
-    #[serde(default)]
-    bp: Vec<AfvjVar>,
-    #[serde(default)]
-    sp: Vec<AfvjVar>,
 }
 
 #[cfg(test)]
@@ -2341,16 +2339,6 @@ fn is_generic_arg_name(name: &str) -> bool {
         .strip_prefix("arg")
         .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-fn is_low_quality_stack_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("var_")
-        || lower.starts_with("local_")
-        || lower.starts_with("stack_")
-        || lower == "saved_fp"
-        || is_generic_arg_name(&lower)
 }
 
 #[cfg(test)]
@@ -2554,65 +2542,6 @@ fn parse_signature_context(json_str: &str, ptr_bits: u32) -> ParsedSignatureCont
     }
 
     parsed
-}
-
-#[cfg(test)]
-fn parse_external_stack_vars(
-    json_str: &str,
-    ptr_bits: u32,
-) -> std::collections::HashMap<i64, r2types::ExternalStackVarSpec> {
-    let payload = match serde_json::from_str::<AfvjPayload>(json_str) {
-        Ok(v) => v,
-        Err(_) => return std::collections::HashMap::new(),
-    };
-
-    let mut vars = std::collections::HashMap::new();
-    let mut used_names = std::collections::HashSet::new();
-
-    for entry in payload.bp.into_iter().chain(payload.sp.into_iter()) {
-        let Some(AfvjRef::Stack { base, offset }) = entry.reference else {
-            continue;
-        };
-
-        let raw_name = entry
-            .name
-            .unwrap_or_else(|| format!("stack_{:x}", offset.unsigned_abs()));
-        let Some(clean_name) = sanitize_c_identifier(&raw_name) else {
-            continue;
-        };
-        let var_name = uniquify_name(clean_name, &mut used_names);
-        let candidate = r2types::ExternalStackVarSpec {
-            name: var_name,
-            ty: entry
-                .ty
-                .as_deref()
-                .and_then(|raw| parse_external_type(raw, ptr_bits)),
-            base: match base.trim().to_ascii_lowercase().as_str() {
-                "bp" | "ebp" | "rbp" | "fp" => r2types::ExternalStackBase::FramePointer,
-                "sp" | "esp" | "rsp" => r2types::ExternalStackBase::StackPointer,
-                _ => r2types::ExternalStackBase::Named(base),
-            },
-            role: r2types::ExternalStackSlotRole::Unknown,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-
-        match vars.get(&offset) {
-            None => {
-                vars.insert(offset, candidate);
-            }
-            Some(existing) => {
-                if is_low_quality_stack_name(&existing.name)
-                    && !is_low_quality_stack_name(&candidate.name)
-                {
-                    vars.insert(offset, candidate);
-                }
-            }
-        }
-    }
-
-    vars
 }
 
 #[derive(Debug)]
@@ -3265,16 +3194,11 @@ fn collect_pointer_arg_slot_map(
     arch: Option<&ArchSpec>,
     ptr_bits: u32,
 ) -> std::collections::HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch.map(|spec| spec.name.as_str()));
-    let arch_name = arch
-        .map(|a| a.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
-    let is_x86_64 = arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || arch_name.contains("x64");
-    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(arch);
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
+    let is_x86_64 = matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64);
+    let is_riscv64 = matches!(architecture, r2ssa::MachineArchitectureFamily::RiscV64);
 
     let mut out = std::collections::HashMap::new();
     for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
@@ -3474,24 +3398,11 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
 }
 
 #[cfg(test)]
-fn test_stack_register_names(arch: Option<&ArchSpec>, ptr_bits: u32) -> (String, String) {
-    let arch_name = arch
-        .map(|arch| arch.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    match arch_name.as_str() {
-        name if name.contains("x86-64") || name.contains("amd64") => {
-            ("rsp".to_string(), "rbp".to_string())
-        }
-        name if name.contains("x86") || name.contains("i386") => {
-            if ptr_bits >= 64 {
-                ("rsp".to_string(), "rbp".to_string())
-            } else {
-                ("esp".to_string(), "ebp".to_string())
-            }
-        }
-        name if name.contains("aarch64") || name.contains("arm64") => {
-            ("sp".to_string(), "fp".to_string())
-        }
+fn test_stack_register_names(arch: Option<&ArchSpec>) -> (String, String) {
+    match r2ssa::MachineArchitectureFamily::from_arch_spec(arch) {
+        r2ssa::MachineArchitectureFamily::X86_64 => ("rsp".to_string(), "rbp".to_string()),
+        r2ssa::MachineArchitectureFamily::X86 => ("esp".to_string(), "ebp".to_string()),
+        r2ssa::MachineArchitectureFamily::AArch64 => ("sp".to_string(), "fp".to_string()),
         _ => ("sp".to_string(), "fp".to_string()),
     }
 }
@@ -3506,7 +3417,7 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
-    let (sp_name, fp_name) = test_stack_register_names(arch, ptr_bits);
+    let (sp_name, fp_name) = test_stack_register_names(arch);
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), ArgAddrExpr> = HashMap::new();
@@ -6062,15 +5973,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_external_stack_vars_bp_sp() {
-        let json = r#"{"sp":[{"name":"var_8h","kind":"var","type":"int64_t","ref":{"base":"RSP","offset":80}}],"bp":[{"name":"buf","kind":"var","type":"char[64]","ref":{"base":"RBP","offset":-64}},{"name":"user_input","kind":"var","type":"char *","ref":{"base":"RBP","offset":-72}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        assert_eq!(vars.get(&-64).map(|v| v.name.as_str()), Some("buf"));
-        assert_eq!(vars.get(&-72).map(|v| v.name.as_str()), Some("user_input"));
-        assert_eq!(
-            vars.get(&80).and_then(|v| v.base.legacy_name()),
-            Some("rsp".to_string())
-        );
+    fn x86_32_pointer_slots_do_not_inherit_sysv64_argument_registers() {
+        let mut arch = ArchSpec::new("x86");
+        arch.addr_size = 4;
+
+        let slots = collect_pointer_arg_slot_map(Some(&arch), 32);
+
+        assert!(slots.is_empty());
+        assert!(!slots.contains_key("ecx"));
     }
 
     #[test]
@@ -6103,16 +6013,6 @@ mod tests {
         assert_eq!(merged.params.len(), 2);
         assert_eq!(merged.params[0].ty, Some(signed_type(32)));
         assert_eq!(merged.params[1].ty, Some(signed_type(32)));
-    }
-
-    #[test]
-    fn test_name_sanitization_and_collisions() {
-        let json = r#"{"bp":[{"name":"bad-name","type":"int","ref":{"base":"RBP","offset":-8}},{"name":"bad name","type":"int","ref":{"base":"RBP","offset":-16}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        let first = vars.get(&-8).expect("first var");
-        let second = vars.get(&-16).expect("second var");
-        assert_eq!(first.name, "bad_name");
-        assert_ne!(first.name, second.name);
     }
 
     #[test]

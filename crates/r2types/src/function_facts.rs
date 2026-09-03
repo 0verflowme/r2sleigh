@@ -7469,7 +7469,6 @@ mod tests {
                             bits: 64,
                             signedness: crate::Signedness::Signed,
                         }),
-                        base: ExternalStackBase::StackPointer,
                         role: ExternalStackSlotRole::StackArg,
                         param_index: Some(6),
                         param_name: Some("arg7".to_string()),
@@ -7512,7 +7511,6 @@ mod tests {
                     crate::ExternalStackSlotSpec {
                         name: "node_home".to_string(),
                         ty: None,
-                        base: ExternalStackBase::FramePointer,
                         role: ExternalStackSlotRole::ParamHome,
                         param_index: Some(0),
                         param_name: Some("node".to_string()),
@@ -7565,7 +7563,6 @@ mod tests {
                     crate::ExternalStackSlotSpec {
                         name: "arg1_home".to_string(),
                         ty: None,
-                        base: ExternalStackBase::FramePointer,
                         role: ExternalStackSlotRole::ParamHome,
                         param_index: Some(0),
                         param_name: Some("arg1".to_string()),
@@ -7652,7 +7649,7 @@ mod tests {
         let unknown_role = FunctionFacts::new(
             FunctionTypeFacts {
                 stack_slots: BTreeMap::from([(
-                    typed_slot.0.clone(),
+                    typed_slot.0,
                     crate::ExternalStackSlotSpec {
                         role: ExternalStackSlotRole::Unknown,
                         ..typed_slot.1.clone()

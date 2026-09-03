@@ -7,8 +7,9 @@ use crate::facts::{FunctionSignatureSpec, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
 use crate::prepare::{
-    SignatureTypeEvidenceContext, prepared_arch_name, recover_signature_params_from_prepared_ssa,
-    scalar_register_family_key, ssa_var_is_register_like,
+    SignatureTypeEvidenceContext, prepared_arch_display_name,
+    recover_signature_params_from_prepared_ssa, scalar_register_family_key,
+    ssa_var_is_register_like,
 };
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 use crate::writeback::{InferredSignature, InferredSignatureParam};
@@ -75,7 +76,7 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
         .memory_model()
         .default_address_bits();
     let recovered_params = recover_signature_params_from_prepared_ssa(prepared, ptr_bits);
-    let arch_name = prepared_arch_name(prepared).unwrap_or("");
+    let arch_name = prepared_arch_display_name(prepared).unwrap_or("");
     let evidence_types = crate::solve_evidence_types(prepared, &BTreeMap::new(), ptr_bits);
     let certified_parameter_widths = certified_parameter_memory_widths(prepared);
 

@@ -7,14 +7,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    CTypeLike, Constraint, ConstraintSource, ExternalStackBase, ExternalStackVarSpec,
-    ExternalStruct, ExternalTypeDb, FunctionSignatureSpec, FunctionType, MemoryCapability,
-    ResolvedFieldLayout, ResolvedSignature, SignatureRegistry, Signedness, SolvedTypes,
-    SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
+    CTypeLike, Constraint, ConstraintSource, ExternalStackVarSpec, ExternalStruct, ExternalTypeDb,
+    FunctionSignatureSpec, FunctionType, MemoryCapability, ResolvedFieldLayout, ResolvedSignature,
+    SignatureRegistry, Signedness, SolvedTypes, SolverConfig, StackSlotKey, Type, TypeArena,
+    TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
 use r2ssa::{
     CallBoundarySlot, DecompilePrepFacts, ObjectKind, SSAFunction, SSAOp, SSAVar,
-    SourceCallArgumentValue, SsaArtifact, StackAddressBase, StackAddressRoot,
+    SourceCallArgumentValue, SsaArtifact, StackAddressRoot,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -125,18 +125,6 @@ impl TypeInference {
         self.external_signature = signature;
     }
 
-    /// Set externally recovered stack variables.
-    pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVarSpec>) {
-        for (offset, spec) in stack_vars {
-            self.external_stack_slots
-                .entry(StackSlotKey {
-                    base: spec.base.clone(),
-                    offset,
-                })
-                .or_insert(spec);
-        }
-    }
-
     /// Set canonical externally recovered stack-slot facts.
     pub fn set_external_stack_slots(
         &mut self,
@@ -152,8 +140,7 @@ impl TypeInference {
             return;
         };
         for (var, root) in &facts.stack_address_roots {
-            self.ssa_stack_slots
-                .insert(var.clone(), stack_slot_key_from_root(*root));
+            self.ssa_stack_slots.insert(var.clone(), *root);
         }
     }
 
@@ -186,8 +173,7 @@ impl TypeInference {
                 } => StackAddressRoot { base, offset },
                 _ => continue,
             };
-            self.ssa_stack_slots
-                .insert(var.clone(), stack_slot_key_from_root(root));
+            self.ssa_stack_slots.insert(var.clone(), root);
         }
 
         for boundary in prepared.facts().boundaries.calls.values() {
@@ -1333,16 +1319,6 @@ impl TypeInference {
     }
 }
 
-fn stack_slot_key_from_root(root: StackAddressRoot) -> StackSlotKey {
-    StackSlotKey {
-        base: match root.base {
-            StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
-            StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
-        },
-        offset: root.offset,
-    }
-}
-
 impl<'a> CombinedTypeOracle<'a> {
     fn external_struct_for_type(&self, ty: TypeId) -> Option<&ExternalStruct> {
         let named = match self.solved.arena.get(ty) {
@@ -2158,18 +2134,20 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_external_stack_vars_are_canonicalized_without_name_fallback() {
+    fn external_stack_slot_metadata_requires_the_exact_structural_root() {
         let mut ti = TypeInference::new(64);
         let slot_var = SSAVar::new("tmp:stack", 1, 8);
-        ti.set_external_stack_vars(HashMap::from([(
-            -8,
+        ti.set_external_stack_slots(BTreeMap::from([(
+            StackSlotKey {
+                base: r2ssa::StackAddressBase::FramePointer,
+                offset: -8,
+            },
             ExternalStackVarSpec {
                 name: "count".to_string(),
                 ty: Some(CTypeLike::Int {
                     bits: 32,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -2179,7 +2157,7 @@ mod tests {
         ti.ssa_stack_slots.insert(
             slot_var.clone(),
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -8,
             },
         );
@@ -2192,7 +2170,7 @@ mod tests {
         assert!(
             ti.stack_slot_spec_for_var(&SSAVar::new("count", 1, 8))
                 .is_none(),
-            "legacy offset-only metadata must not bind unrelated SSA vars by name"
+            "structural stack metadata must not bind unrelated SSA vars by name"
         );
     }
 
@@ -2256,7 +2234,7 @@ mod tests {
         let mut ti = TypeInference::new(64);
         ti.set_external_stack_slots(BTreeMap::from([(
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -16,
             },
             ExternalStackVarSpec {
@@ -2265,7 +2243,6 @@ mod tests {
                     bits: 32,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -2320,13 +2297,12 @@ mod tests {
         let mut ti = TypeInference::new(64);
         ti.set_external_stack_slots(BTreeMap::from([(
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -16,
             },
             ExternalStackVarSpec {
                 name: "slot".to_string(),
                 ty: None,
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
