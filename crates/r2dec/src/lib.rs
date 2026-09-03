@@ -6355,6 +6355,157 @@ mod tests {
         DecompilerInput::new(source_owned_facts)
     }
 
+    /// A call whose stack pointer the convention restores, rendered end to end.
+    #[test]
+    fn a_restored_stack_pointer_renders() {
+        let arch = test_arch_for_decompile();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let rsp = Varnode::register(0x28, 8);
+        let rip = Varnode::register(0x30, 8);
+
+        // One arm calls and one does not, so their restored stack pointers
+        // meet in a phi that is also the same machine object.
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::unique(0x80, 1),
+        });
+        let mut no_call = R2ILBlock::new(0x1004, 4);
+        no_call.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut call_ops = vec![R2ILOp::IntSub {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        }];
+        call_ops.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: rsp.clone(),
+            val: Varnode::constant(0x100d, 8),
+        });
+        call_ops.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        let mut call_meta = std::collections::BTreeMap::new();
+        for i in 0..call_ops.len() {
+            call_meta.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1008),
+                    ..Default::default()
+                },
+            );
+        }
+        call_ops.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let called = R2ILBlock {
+            addr: 0x1008,
+            size: 8,
+            ops: call_ops,
+            switch_info: None,
+            op_metadata: call_meta,
+        };
+
+        let mut exit_ops = vec![R2ILOp::Load {
+            dst: rip.clone(),
+            space: SpaceId::Ram,
+            addr: rsp.clone(),
+        }];
+        exit_ops.push(R2ILOp::IntAdd {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        exit_ops.push(R2ILOp::Return {
+            target: rip.clone(),
+        });
+        let mut exit_meta = std::collections::BTreeMap::new();
+        for i in 0..exit_ops.len() {
+            exit_meta.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1010),
+                    ..Default::default()
+                },
+            );
+        }
+        let exit = R2ILBlock {
+            addr: 0x1010,
+            size: 4,
+            ops: exit_ops,
+            switch_info: None,
+            op_metadata: exit_meta,
+        };
+        let blocks = [entry, no_call, called, exit];
+
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"restore-fixture".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|i| i.with_return_address_storage(storage(0x30)))
+        .and_then(|i| i.with_stack_pointer_storage(storage(0x28)))
+        .expect("interface")
+        .with_preserved_call_carriers(true, true);
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+                .expect("prepared")
+                .with_name("restore_demo");
+        let restores = prepared
+            .function()
+            .get_block(0x1008)
+            .expect("call arm")
+            .ops
+            .iter()
+            .filter(|op| matches!(op, r2ssa::SSAOp::CallRestore { .. }))
+            .count();
+        assert_eq!(restores, 1, "the call moved the carrier, so it is restored");
+        assert!(
+            prepared
+                .function()
+                .get_block(0x1010)
+                .expect("join")
+                .phis
+                .iter()
+                .any(|phi| phi.canonical_storage == Some(storage(0x28))),
+            "the called and uncalled paths must merge their stack carriers"
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (r2types::DecompileRouteKind::Standard, "restore route", None),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+        // The restore performs nothing and says so: its two sides are one
+        // object, licensed by the convention, so both its read and its write
+        // are accounted as a coalesced copy rather than left for the seal to
+        // find. Before that licence existed this refused outright, first for
+        // an unaccounted read of the entry carrier and then for a write with
+        // no rendered occurrence.
+        assert!(
+            !output.contains("native render refusal"),
+            "a restored carrier must not refuse the function: {output}"
+        );
+        assert!(
+            output.contains("0 unaccounted"),
+            "the restore accounts for both of its sides: {output}"
+        );
+    }
+
     fn test_arch_for_decompile() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         let registers = [

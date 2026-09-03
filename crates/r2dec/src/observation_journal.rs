@@ -1566,10 +1566,37 @@ impl LegacyObservationJournal {
                 // not: a write projection narrower than the object, or a read
                 // that converts, is a real operation whatever the two sides
                 // are called.
-                let r2ssa::SSAOp::Copy { src, .. } = op else {
-                    continue;
+                // And the restore a call boundary makes. It is admitted here
+                // for exactly the reason an edge copy is -- both sides resolve
+                // to one binding, which is tested below -- and it is licensed
+                // by the convention fact it was built from rather than by its
+                // operation kind. The interference rule above declines a save
+                // and restore around a clobber *for want of proof* that
+                // nothing touched the object in between; here the source
+                // states that the callee leaves this carrier where it found
+                // it, and names the carrier it means, which is that proof. A
+                // restore the convention does not speak for is declined
+                // exactly as an unproven program copy is.
+                let src = match op {
+                    r2ssa::SSAOp::Copy { src, .. } => src,
+                    r2ssa::SSAOp::CallRestore { src, dst }
+                        if boundary_restores_carrier(source.source(), dst) =>
+                    {
+                        src
+                    }
+                    _ => continue,
                 };
-                if src.version == 0 && !copy_source_is_a_parameter(&plan, graph, src) {
+                // A restore's source is the carrier as the function was
+                // entered with it whenever the call is the first one, and that
+                // version-0 exclusion does not reach it: the reason for the
+                // exclusion is that a live-in register with no declaration is
+                // read before it is assigned, and the stack pointer has no
+                // declaration on either side of this copy, because the frame
+                // it addresses is not a C object at all.
+                if !matches!(op, r2ssa::SSAOp::CallRestore { .. })
+                    && src.version == 0
+                    && !copy_source_is_a_parameter(&plan, graph, src)
+                {
                     continue;
                 }
                 let mut program_copy = None;
@@ -1616,7 +1643,14 @@ impl LegacyObservationJournal {
                 let Some(input) = input else {
                     continue;
                 };
+                // A restore states the convention rather than performing a
+                // copy the program wrote, so the question this asks of a
+                // program copy -- did anything write the object between the
+                // value and the copy -- is the one the certificate already
+                // answered. The call is the only thing between the two sides,
+                // and the certificate is about exactly that call.
                 if let Some(inst) = program_copy
+                    && !matches!(op, r2ssa::SSAOp::CallRestore { .. })
                     && !nothing_wrote_the_object_between(&plan, graph, inst, input.value)
                 {
                     continue;
@@ -2273,10 +2307,10 @@ impl LegacyObservationJournal {
     ///
     /// A merge whose every edge is an identity has no statement: the edge
     /// copies are suppressed, so `observe_normalized_output_stmt` never runs
-    /// and never marks the value. The value is nonetheless rendered -- under
-    /// the binding's name, by whatever wrote that binding -- so the honest
-    /// cell is the one a rendered marker would have produced, and it is
-    /// spelled the same way `classify_symbol` spells it.
+    /// and never marks the value. Where the binding has a declaration, the
+    /// value is rendered under that binding's name by whatever wrote it. A
+    /// carrier whose complete use domain is independently elided has no C
+    /// occurrence instead, just as the coalesced copy case below does not.
     ///
     /// This is the sibling of `observe_discharged_expr`, which accepts that a
     /// discharged instruction's cells are filled at the site rendering its
@@ -2308,17 +2342,76 @@ impl LegacyObservationJournal {
             let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
                 continue;
             };
-            // The name the binding is declared under in the emitted function.
-            // Absent means the binding reached no declaration, which is a
-            // placement failure the seal reports for itself rather than
-            // something to paper over here.
-            let Some(symbol) = self.names.symbol_for_binding(*binding) else {
+            if let Some(legacy) = self
+                .names
+                .symbol_for_binding(*binding)
+                .and_then(|symbol| symbol_bindings.get(&symbol).copied())
+            {
+                self.values[value.0 as usize] =
+                    Some(LegacyValueObservation::Bound { binding: legacy });
+                continue;
+            }
+            let every_use_is_elided = graph.use_sites(value).iter().all(|site| {
+                matches!(
+                    self.uses
+                        .get(site.inst.0 as usize)
+                        .and_then(|row| row.get(site.input_idx)),
+                    Some(Some(LegacyUseObservation::Elided(_)))
+                )
+            });
+            if every_use_is_elided {
+                self.values[value.0 as usize] = Some(LegacyValueObservation::Elided(
+                    r2ssa::ledger::ElisionReason::CoalescedImmutablePhi,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Account a value whose defining program copy was elided as an identity.
+    ///
+    /// The copy itself has no occurrence. Usually its binding is declared
+    /// elsewhere, and that declaration answers for the value -- exactly as
+    /// for a merge coalesced to one binding. A carrier used only by certified
+    /// machine plumbing is the other case: no C object is declared, and every
+    /// use has its own justified elision, so the copy's coalescing proof also
+    /// answers that its output has no rendered occurrence.
+    ///
+    /// These are the only two answers. An undeclared binding with any use that
+    /// is not already proved elided still refuses; otherwise this would turn a
+    /// missing occurrence into an accounting exemption.
+    fn account_coalesced_copy_outputs(
+        &mut self,
+        symbol_bindings: &BTreeMap<SymbolId, LegacyBindingId>,
+    ) -> Result<(), LegacyObservationJournalError> {
+        let graph = self.source.graph();
+        for value in self.coalesced_copy_outputs.iter().copied() {
+            let slot = value.0 as usize;
+            if self.values.get(slot).is_none_or(Option::is_some) {
+                continue;
+            }
+            let Some(symbol) = self.names.symbol_for_value(value) else {
                 continue;
             };
-            let Some(legacy) = symbol_bindings.get(&symbol).copied() else {
+            if let Some(binding) = symbol_bindings.get(&symbol).copied() {
+                self.values[slot] = Some(LegacyValueObservation::Bound { binding });
                 continue;
-            };
-            self.values[value.0 as usize] = Some(LegacyValueObservation::Bound { binding: legacy });
+            }
+            let every_use_is_elided = graph.use_sites(value).iter().all(|site| {
+                matches!(
+                    self.uses
+                        .get(site.inst.0 as usize)
+                        .and_then(|row| row.get(site.input_idx)),
+                    Some(Some(LegacyUseObservation::Elided(_)))
+                )
+            });
+            if every_use_is_elided {
+                self.values[slot] = Some(LegacyValueObservation::Elided(
+                    r2ssa::ledger::ElisionReason::CoalescedCopy,
+                ));
+                continue;
+            }
+            return Err(LegacyObservationJournalError::UnownedBindingSymbol { value, symbol });
         }
         Ok(())
     }
@@ -3011,43 +3104,34 @@ impl LegacyObservationJournal {
             RenderObservationInspectError::Observer(error) => error,
         })?;
 
-        // A value defined by an elided program copy is rendered by its
-        // binding. The copy said nothing because both sides are one object,
-        // and the statement that produced the source is what writes that
-        // object, so the value's cell is the binding's -- exactly the answer
-        // the symmetric merge case gives, where a merge coalesced to one
-        // binding is rendered by that binding rather than by a write of its
-        // own. Looking for an occurrence on the statement that no longer
-        // exists would ask the rendering to carry a mark for a statement it
-        // was right not to emit.
-        for value in &self.coalesced_copy_outputs {
-            let slot = value.0 as usize;
-            if values.get(slot).is_some_and(Option::is_none)
-                && let Some(symbol) = names.symbol_for_value(*value)
-            {
-                match classify_symbol(*value, symbol, &symbol_bindings) {
-                    Ok(observation) => values[slot] = Some(observation),
-                    Err(error) => return Ok(LegacyObservationSeal::BindingFailure(error)),
-                }
-            }
-        }
-
         if let Some(error) = binding_failure {
             return Ok(LegacyObservationSeal::BindingFailure(error));
         }
 
-        let mut seal_authority = ObservationSealAuthority::new();
-        ready.discard_observation_markers(&mut seal_authority);
         self.values = values;
         self.uses = uses;
         self.writes = writes;
         self.effect_occurrences = effect_occurrences;
+        self.effect_occurrence_regions = effect_occurrence_regions;
+        // Placement has the final word on which statements survive. Apply its
+        // exact removals before deciding whether a coalesced output has any
+        // rendered consumer; doing this in the opposite order mistakes a
+        // consumer placement removed for an undeclared C object.
+        self.account_materialized_phi_occurrences();
+        self.account_values_rendered_by_binding(&symbol_bindings)?;
+        if let Err(error) = self.account_coalesced_copy_outputs(&symbol_bindings) {
+            return Ok(LegacyObservationSeal::BindingFailure(error));
+        }
+        if let Some(error) = self.first_unaccounted_render_observation() {
+            return Ok(LegacyObservationSeal::BindingFailure(error));
+        }
         // An obligation rendered more than once is a duplicate unless the
         // region tree proves the copies exclude one another. Deciding it here,
         // where the tree that produced the occurrences is still in hand, keeps
         // the ledger's question a lookup rather than a second analysis.
         if let Some(regions) = regions {
-            self.exclusive_duplicate_effects = effect_occurrence_regions
+            self.exclusive_duplicate_effects = self
+                .effect_occurrence_regions
                 .iter()
                 .filter(|(effect, occupied)| {
                     self.effect_occurrences
@@ -3063,12 +3147,10 @@ impl LegacyObservationJournal {
                 .map(|(effect, _)| *effect)
                 .collect();
         }
-        self.effect_occurrence_regions = effect_occurrence_regions;
-        self.account_materialized_phi_occurrences();
-        self.account_values_rendered_by_binding(&symbol_bindings)?;
-        if let Some(error) = self.first_unaccounted_render_observation() {
-            return Ok(LegacyObservationSeal::BindingFailure(error));
-        }
+        // Strip the proof markers only after every classification and coverage
+        // check succeeds. A binding failure leaves the marked draft intact.
+        let mut seal_authority = ObservationSealAuthority::new();
+        ready.discard_observation_markers(&mut seal_authority);
         Ok(LegacyObservationSeal::Complete(
             self.into_sealed_observations(source),
         ))
@@ -3532,6 +3614,40 @@ fn nothing_wrote_the_object_between(
                 )
             })
     })
+}
+
+/// Whether the convention proves that a call leaves this carrier untouched.
+///
+/// This is the third thing that may license a coalescing here, beside a
+/// storage span and a certified entity, and it is a proof rather than an
+/// exemption. The two rules above decline to fold a save and restore around a
+/// clobber because nothing shows the object survived the clobber; the source
+/// shows exactly that for this one carrier, in the same statement the restore
+/// was built from -- radare2 reads it off the calling convention and publishes
+/// it even for a function whose signature it never linked.
+///
+/// It asks the certificate rather than the operation, and the difference is
+/// the point: a restore whose carrier the convention does not name, or one in
+/// a function for which the source made no such statement, is declined and
+/// keeps its own object. Reaching for the operation kind instead would be the
+/// exemption this exists to avoid.
+fn boundary_restores_carrier(source: &r2ssa::SsaArtifact, dst: &r2ssa::SSAVar) -> bool {
+    let context = source.machine_context();
+    let Some(carrier) = context.stack_pointer_carrier() else {
+        return false;
+    };
+    let restored = context
+        .machine_roles()
+        .call_preserved_carriers()
+        .map_or_else(
+            || {
+                context.function_interface().is_some_and(
+                    r2ssa::SourceFunctionInterface::stack_pointer_preserved_across_calls,
+                )
+            },
+            |carriers| carriers.stack_pointer(),
+        );
+    restored && source.graph().canonical_storage_for_var(dst) == Some(carrier)
 }
 
 /// Whether a copy's undefined source is a value the signature declares.

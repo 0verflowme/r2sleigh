@@ -240,6 +240,17 @@ impl<'ctx> SymExecutor<'ctx> {
                 Ok(vec![])
             }
 
+            // The callee handed this carrier back unchanged, so the value is
+            // the one the caller had. That is a copy, and it carries the
+            // provenance with it: the whole point of the operation is that the
+            // stack pointer after a call still addresses the caller's frame.
+            CallRestore { dst, src } => {
+                let carrier = self.read_var_carrier(state, src);
+                self.write_var(state, dst, carrier.value);
+                self.propagate_var_provenance(state, dst, carrier.provenance);
+                Ok(vec![])
+            }
+
             Load { dst, addr, space } => {
                 if !require_ram_memory_space(state, *space) {
                     return Ok(vec![]);
@@ -1540,6 +1551,7 @@ fn op_def(op: &SSAOp) -> Option<&SSAVar> {
         | SSAOp::PopCount { dst, .. }
         | SSAOp::Lzcount { dst, .. }
         | SSAOp::CallDefine { dst }
+        | SSAOp::CallRestore { dst, .. }
         | SSAOp::FloatAdd { dst, .. }
         | SSAOp::FloatSub { dst, .. }
         | SSAOp::FloatMult { dst, .. }
