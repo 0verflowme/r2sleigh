@@ -116,9 +116,13 @@ ssh "$host" bash -s <<EOF
 set -euo pipefail
 export HOME='$private_home'
 cd /root/decbench
+# Output streams rather than going to a remote log. A silent run is
+# indistinguishable from a hung one, and this measurement has hung twice while
+# the host was loaded by other work.
 ./venv/bin/decbench run '$project' -O '$opt' -d r2sleigh -d angr \
     -m ged -m byte_match -m type_match -j 4 --binary-limit 1 \
-    -o '$remote/out' >'$remote/decbench.log' 2>&1 || { tail -30 '$remote/decbench.log'; exit 71; }
+    -o '$remote/out' 2>&1 | tee '$remote/decbench.log' | sed 's/^/  decbench: /'
+test -f '$remote/out/function_results.json'
 EOF
 
 mkdir -p "$root/tests/decbench/artifacts"
