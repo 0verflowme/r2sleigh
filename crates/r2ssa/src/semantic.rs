@@ -542,6 +542,13 @@ pub struct SourceCallBoundaryFact {
     pub noreturn: Option<bool>,
     pub result_kind: Option<SourceCallResult>,
     pub arguments: Vec<SourceCallArgumentFact>,
+    /// How many leading entries of `arguments` the callee's prototype names.
+    ///
+    /// The rest are the tail a variadic call passes and no prototype can
+    /// describe, so they are what makes two call sites of one callee differ.
+    /// The split has to travel, because the declaration a rendering owes the
+    /// callee can only spell the named ones.
+    pub fixed_argument_count: Option<usize>,
     pub results: Vec<CallBoundaryValueFact>,
     /// False until an ABI-aware boundary pass proves that every slot is known.
     pub complete: bool,
@@ -1271,6 +1278,16 @@ pub struct CallsiteCertificate {
     pub direct_target: Option<u64>,
     pub fallthrough: Option<u64>,
     pub argument_values: Vec<ValueId>,
+    /// Whether the callee takes a variadic tail, as radare2's prototype for it
+    /// says. Not a machine fact: nothing in the call instruction distinguishes
+    /// a variadic callee from any other, and a rendering that spells a
+    /// declaration for the callee needs to know which it is.
+    pub variadic: bool,
+    /// How many leading `argument_values` the callee's prototype names.
+    ///
+    /// Absent where no prototype described the call, which is not the same as
+    /// zero: zero says the callee is declared to take nothing.
+    pub fixed_argument_count: Option<usize>,
     pub stack_argument_values: Vec<StackCallArgumentCertificate>,
     pub argument_certificates: Vec<CallArgumentCertificate>,
 }
@@ -2932,6 +2949,97 @@ fn collect_structured_dataflow_facts(
     }
 }
 
+/// The arguments a variadic call passes past the ones its prototype names.
+///
+/// A prototype describes the callee, and a variadic callee's prototype
+/// deliberately stops before the interesting part: `fprintf` declares two
+/// parameters and every call to it passes as many as its format asks for. The
+/// count therefore belongs to the call site and cannot be read off the callee
+/// at all -- which is why taking it from the prototype rendered all three
+/// `fprintf` calls in `bzip2recover`'s `tooManyBlocks` with the same two
+/// arguments, silently dropping what the machine plainly loaded for the first.
+///
+/// What proves a tail argument is the same evidence the fixed ones rest on:
+/// the convention says which register carries argument `n`, and the reaching
+/// scan says whether this function defined that register on the way to the
+/// call. That scan treats a call as a barrier, so a value left in a register
+/// by an earlier call's argument setup cannot be mistaken for this call's --
+/// only a definition this function made since the last barrier counts.
+///
+/// A slot the function never defines ends the tail. `PreservedEntry` is
+/// evidence for a *named* parameter, where the callee's prototype says the
+/// argument exists and the value is simply the one this function was entered
+/// with; for a tail slot there is no such statement, and an untouched register
+/// is no evidence at all. Neither is a merge of two different definitions: it
+/// says the register holds something, which every register does. The tail
+/// stops at the first slot without one definition reaching the call rather
+/// than skipping it, because arguments fill the convention's registers in
+/// order and a gap cannot be resolved.
+///
+/// Where the evidence over-reaches it does so in the harmless direction: an
+/// extra argument to a variadic function is well-defined C that the callee
+/// ignores, while a dropped one destroys information the machine code carries.
+///
+/// The convention's slots are radare2's fact about the convention, captured
+/// for this function and named with the convention they belong to. They may be
+/// continued past the prototype's arguments only when both name the same
+/// convention and the prototype's arguments are exactly that convention's
+/// leading slots; anything else leaves no ground for saying where argument
+/// `n + 1` would go, and the tail is refused rather than guessed.
+fn variadic_call_tail_arguments(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    interface: &r2source::SourceCallSiteInterface,
+    block_addr: u64,
+    op_index: usize,
+) -> Vec<SourceCallArgumentFact> {
+    if !interface.is_variadic() {
+        return Vec::new();
+    }
+    let Some(convention) = machine_context.convention_slots() else {
+        return Vec::new();
+    };
+    if convention.calling_convention() != interface.calling_convention() {
+        return Vec::new();
+    }
+    let named = interface.arguments();
+    let slots = convention.argument_slots();
+    if named.len() > slots.len()
+        || named
+            .iter()
+            .zip(slots.iter())
+            .any(|(argument, slot)| argument.storage() != *slot)
+    {
+        return Vec::new();
+    }
+
+    let mut tail = Vec::new();
+    for (position, slot) in slots.iter().enumerate().skip(named.len()) {
+        let Ok(index) = u32::try_from(position) else {
+            break;
+        };
+        let Some(value) = reaching_variadic_tail_argument_in_block(
+            function,
+            graph,
+            machine_context,
+            block_addr,
+            op_index,
+            *slot,
+        ) else {
+            break;
+        };
+        tail.push(SourceCallArgumentFact {
+            slot: CallBoundarySlot::Register {
+                index,
+                storage: *slot,
+            },
+            value: SourceCallArgumentValue::Value(value),
+        });
+    }
+    tail
+}
+
 fn collect_source_boundary_facts(
     function: &SSAFunction,
     graph: &SsaGraph,
@@ -2954,6 +3062,7 @@ fn collect_source_boundary_facts(
             noreturn: None,
             result_kind: None,
             arguments: Vec::new(),
+            fixed_argument_count: None,
             results: Vec::new(),
             // Calls carry implicit machine state. Only an exact source-owned
             // callsite interface may change this state to complete.
@@ -3020,6 +3129,16 @@ fn collect_source_boundary_facts(
                 if arguments.len() == interface.arguments().len()
                     && let Some(results) = results
                 {
+                    let mut arguments = arguments;
+                    boundary.fixed_argument_count = Some(arguments.len());
+                    arguments.extend(variadic_call_tail_arguments(
+                        function,
+                        graph,
+                        machine_context,
+                        interface,
+                        block_addr,
+                        op_index,
+                    ));
                     boundary.arguments = arguments;
                     boundary.results = results;
                     boundary.complete = true;
@@ -3424,6 +3543,39 @@ fn reaching_abi_value_in_block(
         boundary_op_index,
         storage,
         true,
+    )
+    .and_then(|state| match state {
+        ReachingAbiState::PreservedEntry => None,
+        ReachingAbiState::Value(value) => Some(value),
+    })
+}
+
+/// Resolve one variadic tail carrier, which must be the same on every path.
+///
+/// A named parameter may be answered by a merge of two definitions: the
+/// prototype says the argument exists, so which of them reaches the call is a
+/// question about the value and not about whether there is one. A tail slot
+/// has no prototype behind it, and a merge whose inputs differ says only that
+/// the register holds something -- which every register does. Admitting one
+/// claimed an argument the machine had not set for this call, and the
+/// placement audit then refused two `/bin/ls` functions for reading a value no
+/// path had assigned.
+fn reaching_variadic_tail_argument_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    storage: CanonicalStorageId,
+) -> Option<ValueId> {
+    reaching_abi_value_in_block_with_policy(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        storage,
+        false,
     )
     .and_then(|state| match state {
         ReachingAbiState::PreservedEntry => None,
@@ -5336,12 +5488,26 @@ fn collect_prepared_function_certificates(
             let (block_addr, op_index) = graph.op_site_for_inst(fact.at).unwrap_or_default();
             let stack_argument_values =
                 collect_stack_call_argument_values(function, graph, objects, structured, fact);
-            let (argument_values, mut argument_certificates) = boundaries
+            let boundary = boundaries
                 .calls
                 .get(id)
-                .filter(|boundary| boundary.complete && boundary.at == fact.at)
+                .filter(|boundary| boundary.complete && boundary.at == fact.at);
+            let (argument_values, mut argument_certificates) = boundary
                 .map(|boundary| exact_register_call_arguments(boundary, graph))
                 .unwrap_or_default();
+            // The split describes the arguments this certificate carries, so
+            // it travels only when they are the boundary's own. Argument
+            // recovery reports nothing at all when any one slot fails, and a
+            // fixed count over arguments nothing recovered would claim the
+            // call passes fewer than its prototype names.
+            let (variadic, fixed_argument_count) = boundary
+                .filter(|boundary| argument_values.len() == boundary.arguments.len())
+                .map_or((false, None), |boundary| {
+                    (
+                        boundary.variadic.unwrap_or(false),
+                        boundary.fixed_argument_count,
+                    )
+                });
             argument_certificates.extend(collect_stack_call_argument_certificates(
                 &stack_argument_values,
                 structured,
@@ -5358,6 +5524,8 @@ fn collect_prepared_function_certificates(
                     direct_target: fact.direct_target,
                     fallthrough: fact.fallthrough,
                     argument_values,
+                    variadic,
+                    fixed_argument_count,
                     stack_argument_values,
                     argument_certificates,
                 },

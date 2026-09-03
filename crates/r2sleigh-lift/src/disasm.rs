@@ -16,8 +16,10 @@ use r2source::{
     AdvisorySuccessorKind, CanonicalStorageId, CanonicalStorageSpace, MachineProfile,
     OwnedFunctionSnapshot, SourceFunctionInterface,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::translate::{self, PcodeSource};
@@ -1375,11 +1377,51 @@ impl Disassembler {
         Self::from_sla_parts(sla_bytes, pspec, arch_name, Some(profile))
     }
 
+    /// The one loaded instance of an embedded profile, loaded on first ask.
+    ///
+    /// Building a disassembler parses the whole compiled `.sla` and rebuilds
+    /// the register and address-space tables from it. Measured on the x86-64
+    /// profile: 58 to 91 milliseconds to load, against 21 to 83 *micro*seconds
+    /// to lift a three-byte block. Every capture used to pay that once for the
+    /// function asked for and once for each callee beside it, so a request with
+    /// three callees spent about a quarter of a second loading four identical
+    /// copies of one specification, and a twelve-byte import thunk -- which is
+    /// most of what an analysis sweep proves -- cost a profile load and almost
+    /// nothing else. That is where the per-function cost was.
+    ///
+    /// Reuse across functions is the same reuse that already happens across
+    /// blocks: `lift_genuine_block` takes `&self` and every block of a function
+    /// already goes through one instance, at arbitrary addresses and in
+    /// arbitrary order. Nothing is reset between them now and nothing was
+    /// before.
+    ///
+    /// Thread-local rather than global, because the instance owns a C++ Sleigh
+    /// object that declares neither `Send` nor `Sync`; a thread that lifts gets
+    /// its own, which is one per embedded profile per lifting thread. The bound
+    /// is the number of profiles the build embeds, at most eleven and in
+    /// practice one.
+    fn shared_trusted_profile(profile: TrustedSleighProfile) -> Result<Rc<Self>> {
+        thread_local! {
+            static LOADED: RefCell<HashMap<TrustedSleighProfile, Rc<Disassembler>>> =
+                RefCell::new(HashMap::new());
+        }
+        if let Some(loaded) = LOADED.with(|cache| cache.borrow().get(&profile).map(Rc::clone)) {
+            return Ok(loaded);
+        }
+        // Built outside the borrow: loading is fallible and can itself reach
+        // this function for another profile.
+        let loaded = Rc::new(Self::from_trusted_profile(profile)?);
+        LOADED.with(|cache| {
+            cache.borrow_mut().insert(profile, Rc::clone(&loaded));
+        });
+        Ok(loaded)
+    }
+
     /// Lift every byte of one opaque source capture with the one exact embedded
     /// profile selected by its owned machine tuple.
     pub fn lift_owned_function(source: OwnedFunctionSnapshot) -> Result<TrustedLiftedFunction> {
         let profile = TrustedSleighProfile::from_machine(source.machine())?;
-        let disassembler = Self::from_trusted_profile(profile)?;
+        let disassembler = Self::shared_trusted_profile(profile)?;
         if disassembler.trusted_profile != Some(profile) {
             return Err(LiftError::Unsupported(
                 "trusted profile identity was lost while loading Sleigh".to_string(),
@@ -4436,5 +4478,59 @@ mod tests {
             block.op_metadata.is_empty(),
             "op metadata should stay disabled"
         );
+    }
+}
+
+#[cfg(all(test, feature = "x86"))]
+mod sleigh_profile_load_cost {
+    use super::*;
+
+    /// What loading a profile costs against what lifting costs, which is the
+    /// measurement that moved the profile load out of the per-function path.
+    ///
+    /// Not a gate: it prints rather than asserts, because a wall-clock bound
+    /// checked in CI is a flake and the ratio is the finding. Run it with
+    /// `cargo test --release -p r2sleigh-lift --features x86
+    /// sleigh_profile_load_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn loading_a_profile_costs_a_thousand_lifts() {
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let cold = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("x86-64 profile");
+            eprintln!(
+                "round {round}: cold load = {}us",
+                started.elapsed().as_micros()
+            );
+            let started = std::time::Instant::now();
+            let _ = cold.lift_genuine_block(&[0x48, 0x89, 0xe5], 0x1000, 3);
+            eprintln!(
+                "round {round}: one three-byte block = {}us",
+                started.elapsed().as_micros()
+            );
+            let started = std::time::Instant::now();
+            let shared = Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("shared x86-64 profile");
+            eprintln!(
+                "round {round}: shared load = {}us",
+                started.elapsed().as_micros()
+            );
+            assert_eq!(shared.trusted_profile, Some(TrustedSleighProfile::X86_64));
+        }
+    }
+
+    #[test]
+    fn one_profile_is_loaded_once_and_handed_out_again() {
+        let first =
+            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("first ask");
+        let second =
+            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("second ask");
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the second ask must be the same loaded profile, not another copy"
+        );
+        assert_eq!(first.trusted_profile, Some(TrustedSleighProfile::X86_64));
+        assert!(first.genuine_authority.is_some());
     }
 }

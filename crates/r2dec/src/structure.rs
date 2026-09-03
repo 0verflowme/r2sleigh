@@ -3168,7 +3168,17 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         match stmt {
             CStmt::StructuredRegion { marker, stmt } => {
                 let cleaned = Self::cleanup_recurse(symbols, *stmt);
-                if matches!(cleaned.unobserved(), CStmt::Empty) {
+                // An empty region renders nothing and its marker goes with
+                // it -- except the function body's. That marker is what
+                // sealing looks for at the root, so collapsing it turned a
+                // function whose body rendered no statement, a forwarder
+                // that is one jump out of the function, into a structurer
+                // refusal reading "unrepresentable control flow", when the
+                // control flow was fine and the honest report is the one the
+                // proof line already makes: rendering produced no statements.
+                if matches!(cleaned.unobserved(), CStmt::Empty)
+                    && marker.kind() != StructuredRegionKind::FunctionBody
+                {
                     CStmt::Empty
                 } else {
                     CStmt::structured_region(marker, cleaned)
@@ -4957,7 +4967,7 @@ mod tests {
     };
     use crate::fold::FoldingContext;
     use crate::region::Region;
-    use crate::structured_region::StructuredRegionKind;
+    use crate::structured_region::{StructuredRegionKind, StructuredRegionMarker};
     use r2il::{
         ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
         RegisterProjectionDisposition, RegisterStorage, Varnode,
@@ -5369,6 +5379,43 @@ mod tests {
             marked.clone_without_render_observations(),
             plain.clone_without_render_observations(),
             "region metadata must not alter the cleaned semantic AST"
+        );
+    }
+
+    /// A function whose body renders no statement keeps its body marker.
+    ///
+    /// The marker is what sealing looks for at the root. Collapsing it with
+    /// the empty body turned a forwarder -- one jump out of the function,
+    /// which renders nothing until that jump has a form -- into a structurer
+    /// refusal reading "unrepresentable control flow", when the control flow
+    /// was fine and the honest report is the proof line's own: rendering
+    /// produced no statements. A nested region that is empty still goes,
+    /// because nothing looks for it.
+    #[test]
+    fn empty_function_body_keeps_its_marker_through_cleanup() {
+        let symbols = test_table();
+        let nested = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::Sequence),
+            CStmt::Block(Vec::new()),
+        );
+        let input = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Block(vec![nested]),
+        );
+
+        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
+
+        let CStmt::StructuredRegion { marker, stmt } = &cleaned else {
+            panic!("the function body marker must survive an empty body: {cleaned:?}");
+        };
+        assert_eq!(marker.kind(), StructuredRegionKind::FunctionBody);
+        assert!(
+            matches!(stmt.unobserved(), CStmt::Empty),
+            "the empty nested region must collapse with its marker: {stmt:?}"
+        );
+        assert!(
+            crate::structured_region::seal_structured_body_for_test(cleaned).is_ok(),
+            "an empty body must still seal as a function body"
         );
     }
 

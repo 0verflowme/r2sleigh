@@ -1,0 +1,1781 @@
+{
+  "schema_version": 2,
+  "decompilers": [
+    "angr",
+    "r2sleigh"
+  ],
+  "decompiler_versions": {
+    "angr": "9.3.3",
+    "r2sleigh": "r2sleigh via radare2 6.2.1 +37750 abi:141 @ linux-x86_64"
+  },
+  "metrics": [
+    "byte_match",
+    "ged",
+    "type_match"
+  ],
+  "perfect_values": {
+    "ged": 0.0,
+    "byte_match": 1.0,
+    "type_match": 1.0
+  },
+  "groups": [
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "arch": "x86-64",
+      "functions": [
+        {
+          "function": "readError",
+          "values": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 0.9130434782608695
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 0.21428571428571427
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": true,
+              "byte_match": false
+            },
+            "r2sleigh": {
+              "ged": true,
+              "byte_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 2.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 44.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 15,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "writeError",
+          "values": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 0.9130434782608695
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 0.21428571428571427
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": true,
+              "byte_match": false
+            },
+            "r2sleigh": {
+              "ged": true,
+              "byte_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 2.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 44.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 15,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "mallocFail",
+          "values": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 0.9090909090909091,
+              "type_match": 1.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 0.16071428571428573,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": true,
+              "byte_match": false,
+              "type_match": true
+            },
+            "r2sleigh": {
+              "ged": true,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 2.0,
+              "type_match": 0.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 47.0,
+              "type_match": 1.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 13,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "tooManyBlocks",
+          "values": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 0.9333333333333333,
+              "type_match": 1.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 0.15584415584415584,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": true,
+              "byte_match": false,
+              "type_match": true
+            },
+            "r2sleigh": {
+              "ged": true,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 0.0,
+              "byte_match": 2.0,
+              "type_match": 0.0
+            },
+            "r2sleigh": {
+              "ged": 0.0,
+              "byte_match": 65.0,
+              "type_match": 1.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 15,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsOpenReadStream",
+          "values": {
+            "angr": {
+              "ged": 6.0,
+              "byte_match": 0.75,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 6.0,
+              "byte_match": 7.0,
+              "type_match": 2.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 23,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsOpenWriteStream",
+          "values": {
+            "angr": {
+              "ged": 6.0,
+              "byte_match": 0.75,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 6.0,
+              "byte_match": 7.0,
+              "type_match": 2.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 23,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsPutBit",
+          "values": {
+            "angr": {
+              "ged": 2.0,
+              "byte_match": 0.45588235294117646,
+              "type_match": 0.6666666666666666
+            },
+            "r2sleigh": {
+              "ged": 5.0,
+              "byte_match": 0.052884615384615384,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            },
+            "r2sleigh": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 2.0,
+              "byte_match": 37.0,
+              "type_match": 1.0
+            },
+            "r2sleigh": {
+              "ged": 5.0,
+              "byte_match": 197.0,
+              "type_match": 3.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 32,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsGetBit",
+          "values": {
+            "angr": {
+              "ged": 2.0,
+              "byte_match": 0.375,
+              "type_match": 0.5
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 2.0,
+              "byte_match": 50.0,
+              "type_match": 1.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 26,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsClose",
+          "values": {
+            "angr": {
+              "ged": 8.0,
+              "byte_match": 0.8472222222222222,
+              "type_match": 0.5
+            },
+            "r2sleigh": {
+              "ged": 8.0,
+              "byte_match": 0.0,
+              "type_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            },
+            "r2sleigh": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 8.0,
+              "byte_match": 11.0,
+              "type_match": 1.0
+            },
+            "r2sleigh": {
+              "ged": 8.0,
+              "type_match": 2.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 46,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsPutUChar",
+          "values": {
+            "angr": {
+              "ged": 3.0,
+              "byte_match": 0.35135135135135137,
+              "type_match": 0.3333333333333333
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 3.0,
+              "byte_match": 24.0,
+              "type_match": 2.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 23,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "bsPutUInt32",
+          "values": {
+            "angr": {
+              "ged": 3.0,
+              "byte_match": 0.5161290322580645,
+              "type_match": 0.6666666666666666
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 3.0,
+              "byte_match": 15.0,
+              "type_match": 1.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 21,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "endsInBz2",
+          "values": {
+            "angr": {
+              "ged": 7.0,
+              "byte_match": 0.7777777777777778,
+              "type_match": 1.0
+            },
+            "r2sleigh": {
+              "ged": 25.0,
+              "byte_match": 0.08780487804878048,
+              "type_match": 0.5
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": true
+            },
+            "r2sleigh": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 7.0,
+              "byte_match": 12.0,
+              "type_match": 0.0
+            },
+            "r2sleigh": {
+              "ged": 25.0,
+              "byte_match": 187.0,
+              "type_match": 1.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 13,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "main",
+          "values": {
+            "angr": {
+              "ged": 35.0,
+              "byte_match": 0.533515731874145,
+              "type_match": 0.8333333333333334
+            }
+          },
+          "perfects": {
+            "angr": {
+              "ged": false,
+              "byte_match": false,
+              "type_match": false
+            }
+          },
+          "distances": {
+            "angr": {
+              "ged": 35.0,
+              "byte_match": 341.0,
+              "type_match": 3.0
+            }
+          },
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression",
+            "large"
+          ],
+          "size": 207,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "sub_401285",
+          "values": {
+            "angr": {
+              "byte_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "byte_match": false
+            }
+          },
+          "distances": {},
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 5,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "sub_4017ef",
+          "values": {
+            "angr": {
+              "byte_match": 0.0
+            }
+          },
+          "perfects": {
+            "angr": {
+              "byte_match": false
+            }
+          },
+          "distances": {},
+          "decompiled": {
+            "angr": true,
+            "r2sleigh": false
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 4,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        },
+        {
+          "function": "entry.fini0",
+          "values": {
+            "r2sleigh": {
+              "byte_match": 0.0
+            }
+          },
+          "perfects": {
+            "r2sleigh": {
+              "byte_match": false
+            }
+          },
+          "distances": {},
+          "decompiled": {
+            "angr": false,
+            "r2sleigh": true
+          },
+          "compiles": {},
+          "labels": [
+            "O0",
+            "unoptimized",
+            "sailr",
+            "cli-tool",
+            "compression"
+          ],
+          "size": 29,
+          "datasets": [
+            "unoptimized",
+            "sample-set"
+          ]
+        }
+      ]
+    }
+  ],
+  "dataset_presets": [
+    {
+      "name": "unoptimized",
+      "label": "",
+      "description": ""
+    },
+    {
+      "name": "optimized",
+      "label": "",
+      "description": ""
+    },
+    {
+      "name": "inlined",
+      "label": "",
+      "description": ""
+    },
+    {
+      "name": "large",
+      "label": "",
+      "description": ""
+    },
+    {
+      "name": "sample-set",
+      "label": "",
+      "description": ""
+    }
+  ],
+  "hardest": [
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "main",
+      "value": 35.0,
+      "perfect_value": 0.0,
+      "size": 207,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char outFileName;\nextern char progName;\nextern char g_4067cf;\nextern unsigned long long bStart[4];\nextern unsigned long long bEnd[4];\nextern unsigned long long rbStart[4];\nextern unsigned long long rbEnd[4];\n\nunsigned int main(unsigned int a0, char **a1)\n{\n    unsigned int v17;  // eax\n    int v0;  // [bp-0x64]\n    int node;  // [bp-0x60]\n    int v2;  // [bp-0x5c]\n    unsigned int v3;  // [bp-0x58]\n    unsigned int v4;  // [bp-0x54]\n    unsigned int v5;  // [bp-0x50]\n    int j;  // [bp-0x4c]\n    unsigned int v7;  // [bp-0x48]\n    unsigned int v8;  // [bp-0x44]\n    FILE *fp1;  // [bp-0x40]\n    struct_0 *count1;  // [bp-0x38]\n    unsigned long long *iter;  // [bp-0x30]\n    char *iter1;  // [bp-0x28]\n    char *ptr;  // [bp-0x20]\n    FILE *fp;  // [bp-0x18]\n    void* count;  // [bp-0x10], Other Possible Types: struct_0 *\n\n    strncpy(&progName, *(a1), 1999);\n    g_4067cf = 0;\n    outFileName = 0;\n    inFileName = outFileName;\n    fprintf(GLIBC_2.2.5::stderr, \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\");\n    if (a0 != 2)\n    {\n        fprintf(GLIBC_2.2.5::stderr, \"%s: usage is `%s damaged_file_name'.\\n\", &progName, &progName);\n        fprintf(GLIBC_2.2.5::stderr, \"\\trestrictions on size of recovered file: None\\n\");\n        exit(1); /* do not return */\n    }\n    else if (strlen(a1[1]) > 1979)\n    {\n        v17 = strlen(a1[1]);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\", &progName, v17);\n        exit(1); /* do not return */\n    }\n    else\n    {\n        strcpy(&inFileName, a1[1]);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't read `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: searching for block boundaries ...\\n\", &progName);\n        iter = NULL;\n        v4 = 0;\n        v3 = v4;\n        node = 0;\n        bStart[node] = 0;\n        v2 = 0;\n        while (1)\n        {\n            v7 = bsGetBit(count);\n            iter = (char *)iter + 1;\n            if (v7 == 2)\n                break;\n            v3 = v4 >> 31 | v3 * 2;\n            v4 = v7 & 1 | v4 * 2;\n            if ((unsigned short)v3 == 12609 && v4 == 1495683929 || (unsigned short)v3 == 6002 && v4 == 1161318544)\n            {\n                if (iter > 0x31)\n                    bEnd[node] = (char *)iter - 49;\n                else\n                    bEnd[node] = 0;\n                if (node > 0 && bEnd[node] - bStart[node] > 129)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu\\n\", v2 + 1);\n                    rbStart[v2] = bStart[node];\n                    rbEnd[v2] = bEnd[node];\n                    v2 += 1;\n                }\n                if (node > 49999)\n                    tooManyBlocks(50000); /* do not return */\n                node += 1;\n                bStart[node] = iter;\n            }\n        }\n        if (iter >= bStart[node] && (char *)iter - bStart[node] > 39)\n        {\n            bEnd[node] = (char *)iter - 1;\n            if (node > 0)\n                fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu (incomplete)\\n\", node);\n        }\n        else\n        {\n            node -= 1;\n        }\n        bsClose(count);\n        if (v2 <= 0)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: sorry, I couldn't find any block boundaries.\\n\", &progName);\n            exit(1); /* do not return */\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: splitting into blocks\\n\", &progName);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't open `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        v5 = 0;\n        count1 = NULL;\n        iter = NULL;\n        fp1 = NULL;\n        v0 = 0;\n        while (1)\n        {\n            do\n            {\n                v7 = bsGetBit(count);\n                if (v7 == 2)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                    return 0;\n                }\n                v3 = v4 >> 31 | v3 * 2;\n                v4 = v7 & 1 | v4 * 2;\n                if (iter == rbStart[v0] + 47)\n                    v5 = v4 >> 16 | v3 * 0x10000;\n                if (fp1 && iter >= rbStart[v0] && rbEnd[v0] >= iter)\n                    bsPutBit(count1, v7);\n                iter = (char *)iter + 1;\n                if (iter == rbEnd[v0] + 1)\n                {\n                    if (fp1)\n                    {\n                        bsPutUChar(count1, 23);\n                        bsPutUChar(count1, 114);\n                        bsPutUChar(count1, 69);\n                        bsPutUChar(count1, 56);\n                        bsPutUChar(count1, 80);\n                        bsPutUChar(count1, 144);\n                        bsPutUInt32(count1, v5);\n                        bsClose(count1);\n                        fp1 = NULL;\n                    }\n                    if (v0 >= v2)\n                    {\n                        fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                        return 0;\n                    }\n                    v0 += 1;\n                }\n            } while (iter != rbStart[v0]);\n            for (j = 0; j <= 1999; j += 1)\n            {\n                *(&(&outFileName)[j]) = 0;\n            }\n            strcpy(&outFileName, &inFileName);\n            ptr = strrchr(&outFileName, 47);\n            ptr = (!ptr ? &outFileName : ptr + 1);\n            v8 = ptr - &outFileName;\n            sprintf(ptr, \"rec%5d\", v0 + 1);\n            for (iter1 = ptr; *(iter1); iter1 += 1)\n            {\n                if (*(iter1) == 32)\n                    *(iter1) = 48;\n            }\n            strcat(&outFileName, &(&inFileName)[v8]);\n            if (!(char)endsInBz2(&outFileName))\n                strcat(&outFileName, \".bz2\");\n            fprintf(GLIBC_2.2.5::stderr, \"   writing block %d to `%s' ...\\n\", v0 + 1, &outFileName);\n            fp1 = fopen(&outFileName, \"wb\");\n            if (!fp1)\n                break;\n            count1 = bsOpenWriteStream(fp1);\n            bsPutUChar(count1, 66);\n            bsPutUChar(count1, 90);\n            bsPutUChar(count1, 104);\n            bsPutUChar(count1, 57);\n            bsPutUChar(count1, 49);\n            bsPutUChar(count1, 65);\n            bsPutUChar(count1, 89);\n            bsPutUChar(count1, 38);\n            bsPutUChar(count1, 83);\n            bsPutUChar(count1, 89);\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: can't write `%s'\\n\", &progName, &outFileName);\n        exit(1); /* do not return */\n    }\n}\n",
+      "source_code": "Int32 main ( Int32 argc, Char** argv )\n{\n   FILE*       inFile;\n   FILE*       outFile;\n   BitStream*  bsIn, *bsWr;\n   Int32       b, wrBlock, currBlock, rbCtr;\n   MaybeUInt64 bitsRead;\n\n   UInt32      buffHi, buffLo, blockCRC;\n   Char*       p;\n\n   strncpy ( progName, argv[0], BZ_MAX_FILENAME-1);\n   progName[BZ_MAX_FILENAME-1]='\\0';\n   inFileName[0] = outFileName[0] = 0;\n\n   fprintf ( stderr, \n             \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\" );\n\n   if (argc != 2) {\n      fprintf ( stderr, \"%s: usage is `%s damaged_file_name'.\\n\",\n                        progName, progName );\n      switch (sizeof(MaybeUInt64)) {\n         case 8:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: None\\n\");\n            break;\n         case 4:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: 512 MB\\n\");\n            fprintf(stderr, \n                    \"\\tto circumvent, recompile with MaybeUInt64 as an\\n\"\n                    \"\\tunsigned 64-bit int.\\n\");\n            break;\n         default:\n            fprintf(stderr, \n                    \"\\tsizeof(MaybeUInt64) is not 4 or 8 -- \"\n                    \"configuration error.\\n\");\n            break;\n      }\n      exit(1);\n   }\n\n   if (strlen(argv[1]) >= BZ_MAX_FILENAME-20) {\n      fprintf ( stderr, \n                \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\",\n                progName, (int)strlen(argv[1]) );\n      exit(1);\n   }\n\n   strcpy ( inFileName, argv[1] );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't read `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n\n   bsIn = bsOpenReadStream ( inFile );\n   fprintf ( stderr, \"%s: searching for block boundaries ...\\n\", progName );\n\n   bitsRead = 0;\n   buffHi = buffLo = 0;\n   currBlock = 0;\n   bStart[currBlock] = 0;\n\n   rbCtr = 0;\n\n   while (True) {\n      b = bsGetBit ( bsIn );\n      bitsRead++;\n      if (b == 2) {\n         if (bitsRead >= bStart[currBlock] &&\n            (bitsRead - bStart[currBlock]) >= 40) {\n            bEnd[currBlock] = bitsRead-1;\n            if (currBlock > 0)\n               fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                                 \" to \" MaybeUInt64_FMT \" (incomplete)\\n\",\n                         currBlock,  bStart[currBlock], bEnd[currBlock] );\n         } else\n            currBlock--;\n         break;\n      }\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if ( ( (buffHi & 0x0000ffff) == BLOCK_HEADER_HI \n             && buffLo == BLOCK_HEADER_LO)\n           || \n           ( (buffHi & 0x0000ffff) == BLOCK_ENDMARK_HI \n             && buffLo == BLOCK_ENDMARK_LO)\n         ) {\n         if (bitsRead > 49) {\n            bEnd[currBlock] = bitsRead-49;\n         } else {\n            bEnd[currBlock] = 0;\n         }\n         if (currBlock > 0 &&\n\t     (bEnd[currBlock] - bStart[currBlock]) >= 130) {\n            fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                              \" to \" MaybeUInt64_FMT \"\\n\",\n                      rbCtr+1,  bStart[currBlock], bEnd[currBlock] );\n            rbStart[rbCtr] = bStart[currBlock];\n            rbEnd[rbCtr] = bEnd[currBlock];\n            rbCtr++;\n         }\n         if (currBlock >= BZ_MAX_HANDLED_BLOCKS)\n            tooManyBlocks(BZ_MAX_HANDLED_BLOCKS);\n         currBlock++;\n\n         bStart[currBlock] = bitsRead;\n      }\n   }\n\n   bsClose ( bsIn );\n\n   /*-- identified blocks run from 1 to rbCtr inclusive. --*/\n\n   if (rbCtr < 1) {\n      fprintf ( stderr,\n                \"%s: sorry, I couldn't find any block boundaries.\\n\",\n                progName );\n      exit(1);\n   };\n\n   fprintf ( stderr, \"%s: splitting into blocks\\n\", progName );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't open `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n   bsIn = bsOpenReadStream ( inFile );\n\n   /*-- placate gcc's dataflow analyser --*/\n   blockCRC = 0; bsWr = 0;\n\n   bitsRead = 0;\n   outFile = NULL;\n   wrBlock = 0;\n   while (True) {\n      b = bsGetBit(bsIn);\n      if (b == 2) break;\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if (bitsRead == 47+rbStart[wrBlock]) \n         blockCRC = (buffHi << 16) | (buffLo >> 16);\n\n      if (outFile != NULL && bitsRead >= rbStart[wrBlock]\n                          && bitsRead <= rbEnd[wrBlock]) {\n         bsPutBit ( bsWr, b );\n      }\n\n      bitsRead++;\n\n      if (bitsRead == rbEnd[wrBlock]+1) {\n         if (outFile != NULL) {\n            bsPutUChar ( bsWr, 0x17 ); bsPutUChar ( bsWr, 0x72 );\n            bsPutUChar ( bsWr, 0x45 ); bsPutUChar ( bsWr, 0x38 );\n            bsPutUChar ( bsWr, 0x50 ); bsPutUChar ( bsWr, 0x90 );\n            bsPutUInt32 ( bsWr, blockCRC );\n            bsClose ( bsWr );\n            outFile = NULL;\n         }\n         if (wrBlock >= rbCtr) break;\n         wrBlock++;\n      } else\n      if (bitsRead == rbStart[wrBlock]) {\n         /* Create the output file name, correctly handling leading paths. \n            (31.10.2001 by Sergey E. Kusikov) */\n         Char* split;\n         Int32 ofs, k;\n         for (k = 0; k < BZ_MAX_FILENAME; k++) \n            outFileName[k] = 0;\n         strcpy (outFileName, inFileName);\n         split = strrchr (outFileName, BZ_SPLIT_SYM);\n         if (split == NULL) {\n            split = outFileName;\n         } else {\n            ++split;\n\t }\n\t /* Now split points to the start of the basename. */\n         ofs  = split - outFileName;\n         sprintf (split, \"rec%5d\", wrBlock+1);\n         for (p = split; *p != 0; p++) if (*p == ' ') *p = '0';\n         strcat (outFileName, inFileName + ofs);\n\n         if ( !endsInBz2(outFileName)) strcat ( outFileName, \".bz2\" );\n\n         fprintf ( stderr, \"   writing block %d to `%s' ...\\n\",\n                           wrBlock+1, outFileName );\n\n         outFile = fopen ( outFileName, \"wb\" );\n         if (outFile == NULL) {\n            fprintf ( stderr, \"%s: can't write `%s'\\n\",\n                      progName, outFileName );\n            exit(1);\n         }\n         bsWr = bsOpenWriteStream ( outFile );\n         bsPutUChar ( bsWr, BZ_HDR_B );    \n         bsPutUChar ( bsWr, BZ_HDR_Z );    \n         bsPutUChar ( bsWr, BZ_HDR_h );    \n         bsPutUChar ( bsWr, BZ_HDR_0 + 9 );\n         bsPutUChar ( bsWr, 0x31 ); bsPutUChar ( bsWr, 0x41 );\n         bsPutUChar ( bsWr, 0x59 ); bsPutUChar ( bsWr, 0x26 );\n         bsPutUChar ( bsWr, 0x53 ); bsPutUChar ( bsWr, 0x59 );\n      }\n   }\n\n   fprintf ( stderr, \"%s: finished\\n\", progName );\n   return 0;\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 8.0,
+      "perfect_value": 0.0,
+      "size": 46,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    int field_c;\n    char field_10;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nvoid bsClose(struct_0 *ptr)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (ptr->field_10 == 0x77)\n    {\n        for (; ptr->field_c <= 7; ptr->field_8 = ptr->field_8 * 2)\n        {\n            ptr->field_c = ptr->field_c + 1;\n        }\n        v0 = putc((char)ptr->field_8, ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n        bytesOut = bytesOut + 1;\n        v0 = fflush(ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n    }\n    v0 = fclose(ptr->field_0);\n    if (v0 != 0xffffffff)\n    {\n        free(ptr);\n        return;\n    }\n    else if (ptr->field_10 == 0x77)\n    {\n        writeError(); /* do not return */\n    }\n    else\n    {\n        readError(); /* do not return */\n    }\n}\n",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "value": 7.0,
+      "perfect_value": 0.0,
+      "size": 13,
+      "labels": [],
+      "decompiled_code": "unsigned int endsInBz2(char *a0)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    v0 = strlen(a0);\n    if (v0 <= 4)\n        return 0;\n    if (*(&a0[v0] - 4) != 46 || *(&a0[v0] - 3) != 98 || *(&a0[v0] - 2) != 122 || *(&a0[v0] - 1) != 50)\n        return 0;\n    return 1;\n    return 0;\n}\n",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenReadStream",
+      "value": 6.0,
+      "perfect_value": 0.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenReadStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 114;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenReadStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'r';\n   return bs;\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenWriteStream",
+      "value": 6.0,
+      "perfect_value": 0.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenWriteStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 0x77;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenWriteStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'w';\n   return bs;\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUChar",
+      "value": 3.0,
+      "perfect_value": 0.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nlong long bsPutUChar(struct_0 *a0, unsigned int a1)\n{\n    unsigned long v3;  // rax\n    char v0;  // [bp-0x24]\n    unsigned int i;  // [bp-0xc]\n\n    v0 = a1;\n    for (i = 7; i >= 0; i -= 1)\n    {\n        v3 = bsPutBit(a0, v0 >> ((char)i & 31) & 1);\n    }\n    return v3;\n}\n",
+      "source_code": "static void bsPutUChar ( BitStream* bs, UChar c )\n{\n   Int32 i;\n   for (i = 7; i >= 0; i--)\n      bsPutBit ( bs, (((UInt32) c) >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUInt32",
+      "value": 3.0,
+      "perfect_value": 0.0,
+      "size": 21,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nstruct_0 * bsPutUInt32(struct_0 *a0, unsigned int a1)\n{\n    struct_0 *v2;  // rax\n    unsigned int i;  // [bp-0xc]\n\n    for (i = 31; i >= 0; i -= 1)\n    {\n        v2 = bsPutBit(a0, a1 >> ((char)i & 31) & 1);\n    }\n    return v2;\n}\n",
+      "source_code": "static void bsPutUInt32 ( BitStream* bs, UInt32 c )\n{\n   Int32 i;\n\n   for (i = 31; i >= 0; i--)\n      bsPutBit ( bs, (c >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 2.0,
+      "perfect_value": 0.0,
+      "size": 32,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nstruct_0 * bsPutBit(struct_0 *idx, unsigned int a1)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (idx->field_c != 8)\n    {\n        idx->field_8 = idx->field_8 * 2 | a1 & 1;\n        idx->field_c = idx->field_c + 1;\n        return idx;\n    }\n    v0 = putc((char)idx->field_8, idx->field_0);\n    if (v0 != 0xffffffff)\n    {\n        bytesOut = bytesOut + 1;\n        idx->field_c = 1;\n        idx->field_8 = a1 & 1;\n        return idx;\n    }\n    writeError(); /* do not return */\n}\n",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsGetBit",
+      "value": 2.0,
+      "perfect_value": 0.0,
+      "size": 26,
+      "labels": [],
+      "decompiled_code": "unsigned int bsGetBit(void* idx)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if ((int)idx[12] > 0)\n    {\n        *((unsigned int *)&idx[12]) = (int)idx[12] - 1;\n        return (int)idx[8] >> ((char)(int)idx[12] & 31) & 1;\n    }\n    v0 = getc(*((long long *)idx));\n    if (v0 != 0xffffffff)\n    {\n        *((unsigned int *)&idx[12]) = 7;\n        *((unsigned int *)&idx[8]) = v0;\n        return (int)idx[8] >> 7 & 1;\n    }\n    else if (*(__errno_location()))\n    {\n        readError(); /* do not return */\n    }\n    else\n    {\n        return 2;\n    }\n}\n",
+      "source_code": "static Int32 bsGetBit ( BitStream* bs )\n{\n   if (bs->buffLive > 0) {\n      bs->buffLive --;\n      return ( ((bs->buffer) >> (bs->buffLive)) & 0x1 );\n   } else {\n      Int32 retVal = getc ( bs->handle );\n      if ( retVal == EOF ) {\n         if (errno != 0) readError();\n         return 2;\n      }\n      bs->buffLive = 7;\n      bs->buffer = retVal;\n      return ( ((bs->buffer) >> 7) & 0x1 );\n   }\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "sub_401285",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 5,
+      "labels": [],
+      "decompiled_code": "void sub_401285(void)\n{\n    __debugbreak();\n}\n",
+      "source_code": null
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "sub_4017ef",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 4,
+      "labels": [],
+      "decompiled_code": "void sub_4017ef(void)\n{\n}\n",
+      "source_code": null
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUChar",
+      "value": 0.35135135135135137,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nlong long bsPutUChar(struct_0 *a0, unsigned int a1)\n{\n    unsigned long v3;  // rax\n    char v0;  // [bp-0x24]\n    unsigned int i;  // [bp-0xc]\n\n    v0 = a1;\n    for (i = 7; i >= 0; i -= 1)\n    {\n        v3 = bsPutBit(a0, v0 >> ((char)i & 31) & 1);\n    }\n    return v3;\n}\n",
+      "source_code": "static void bsPutUChar ( BitStream* bs, UChar c )\n{\n   Int32 i;\n   for (i = 7; i >= 0; i--)\n      bsPutBit ( bs, (((UInt32) c) >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsGetBit",
+      "value": 0.375,
+      "perfect_value": 1.0,
+      "size": 26,
+      "labels": [],
+      "decompiled_code": "unsigned int bsGetBit(void* idx)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if ((int)idx[12] > 0)\n    {\n        *((unsigned int *)&idx[12]) = (int)idx[12] - 1;\n        return (int)idx[8] >> ((char)(int)idx[12] & 31) & 1;\n    }\n    v0 = getc(*((long long *)idx));\n    if (v0 != 0xffffffff)\n    {\n        *((unsigned int *)&idx[12]) = 7;\n        *((unsigned int *)&idx[8]) = v0;\n        return (int)idx[8] >> 7 & 1;\n    }\n    else if (*(__errno_location()))\n    {\n        readError(); /* do not return */\n    }\n    else\n    {\n        return 2;\n    }\n}\n",
+      "source_code": "static Int32 bsGetBit ( BitStream* bs )\n{\n   if (bs->buffLive > 0) {\n      bs->buffLive --;\n      return ( ((bs->buffer) >> (bs->buffLive)) & 0x1 );\n   } else {\n      Int32 retVal = getc ( bs->handle );\n      if ( retVal == EOF ) {\n         if (errno != 0) readError();\n         return 2;\n      }\n      bs->buffLive = 7;\n      bs->buffer = retVal;\n      return ( ((bs->buffer) >> 7) & 0x1 );\n   }\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 0.45588235294117646,
+      "perfect_value": 1.0,
+      "size": 32,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nstruct_0 * bsPutBit(struct_0 *idx, unsigned int a1)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (idx->field_c != 8)\n    {\n        idx->field_8 = idx->field_8 * 2 | a1 & 1;\n        idx->field_c = idx->field_c + 1;\n        return idx;\n    }\n    v0 = putc((char)idx->field_8, idx->field_0);\n    if (v0 != 0xffffffff)\n    {\n        bytesOut = bytesOut + 1;\n        idx->field_c = 1;\n        idx->field_8 = a1 & 1;\n        return idx;\n    }\n    writeError(); /* do not return */\n}\n",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUInt32",
+      "value": 0.5161290322580645,
+      "perfect_value": 1.0,
+      "size": 21,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nstruct_0 * bsPutUInt32(struct_0 *a0, unsigned int a1)\n{\n    struct_0 *v2;  // rax\n    unsigned int i;  // [bp-0xc]\n\n    for (i = 31; i >= 0; i -= 1)\n    {\n        v2 = bsPutBit(a0, a1 >> ((char)i & 31) & 1);\n    }\n    return v2;\n}\n",
+      "source_code": "static void bsPutUInt32 ( BitStream* bs, UInt32 c )\n{\n   Int32 i;\n\n   for (i = 31; i >= 0; i--)\n      bsPutBit ( bs, (c >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "main",
+      "value": 0.533515731874145,
+      "perfect_value": 1.0,
+      "size": 207,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char outFileName;\nextern char progName;\nextern char g_4067cf;\nextern unsigned long long bStart[4];\nextern unsigned long long bEnd[4];\nextern unsigned long long rbStart[4];\nextern unsigned long long rbEnd[4];\n\nunsigned int main(unsigned int a0, char **a1)\n{\n    unsigned int v17;  // eax\n    int v0;  // [bp-0x64]\n    int node;  // [bp-0x60]\n    int v2;  // [bp-0x5c]\n    unsigned int v3;  // [bp-0x58]\n    unsigned int v4;  // [bp-0x54]\n    unsigned int v5;  // [bp-0x50]\n    int j;  // [bp-0x4c]\n    unsigned int v7;  // [bp-0x48]\n    unsigned int v8;  // [bp-0x44]\n    FILE *fp1;  // [bp-0x40]\n    struct_0 *count1;  // [bp-0x38]\n    unsigned long long *iter;  // [bp-0x30]\n    char *iter1;  // [bp-0x28]\n    char *ptr;  // [bp-0x20]\n    FILE *fp;  // [bp-0x18]\n    void* count;  // [bp-0x10], Other Possible Types: struct_0 *\n\n    strncpy(&progName, *(a1), 1999);\n    g_4067cf = 0;\n    outFileName = 0;\n    inFileName = outFileName;\n    fprintf(GLIBC_2.2.5::stderr, \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\");\n    if (a0 != 2)\n    {\n        fprintf(GLIBC_2.2.5::stderr, \"%s: usage is `%s damaged_file_name'.\\n\", &progName, &progName);\n        fprintf(GLIBC_2.2.5::stderr, \"\\trestrictions on size of recovered file: None\\n\");\n        exit(1); /* do not return */\n    }\n    else if (strlen(a1[1]) > 1979)\n    {\n        v17 = strlen(a1[1]);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\", &progName, v17);\n        exit(1); /* do not return */\n    }\n    else\n    {\n        strcpy(&inFileName, a1[1]);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't read `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: searching for block boundaries ...\\n\", &progName);\n        iter = NULL;\n        v4 = 0;\n        v3 = v4;\n        node = 0;\n        bStart[node] = 0;\n        v2 = 0;\n        while (1)\n        {\n            v7 = bsGetBit(count);\n            iter = (char *)iter + 1;\n            if (v7 == 2)\n                break;\n            v3 = v4 >> 31 | v3 * 2;\n            v4 = v7 & 1 | v4 * 2;\n            if ((unsigned short)v3 == 12609 && v4 == 1495683929 || (unsigned short)v3 == 6002 && v4 == 1161318544)\n            {\n                if (iter > 0x31)\n                    bEnd[node] = (char *)iter - 49;\n                else\n                    bEnd[node] = 0;\n                if (node > 0 && bEnd[node] - bStart[node] > 129)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu\\n\", v2 + 1);\n                    rbStart[v2] = bStart[node];\n                    rbEnd[v2] = bEnd[node];\n                    v2 += 1;\n                }\n                if (node > 49999)\n                    tooManyBlocks(50000); /* do not return */\n                node += 1;\n                bStart[node] = iter;\n            }\n        }\n        if (iter >= bStart[node] && (char *)iter - bStart[node] > 39)\n        {\n            bEnd[node] = (char *)iter - 1;\n            if (node > 0)\n                fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu (incomplete)\\n\", node);\n        }\n        else\n        {\n            node -= 1;\n        }\n        bsClose(count);\n        if (v2 <= 0)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: sorry, I couldn't find any block boundaries.\\n\", &progName);\n            exit(1); /* do not return */\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: splitting into blocks\\n\", &progName);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't open `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        v5 = 0;\n        count1 = NULL;\n        iter = NULL;\n        fp1 = NULL;\n        v0 = 0;\n        while (1)\n        {\n            do\n            {\n                v7 = bsGetBit(count);\n                if (v7 == 2)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                    return 0;\n                }\n                v3 = v4 >> 31 | v3 * 2;\n                v4 = v7 & 1 | v4 * 2;\n                if (iter == rbStart[v0] + 47)\n                    v5 = v4 >> 16 | v3 * 0x10000;\n                if (fp1 && iter >= rbStart[v0] && rbEnd[v0] >= iter)\n                    bsPutBit(count1, v7);\n                iter = (char *)iter + 1;\n                if (iter == rbEnd[v0] + 1)\n                {\n                    if (fp1)\n                    {\n                        bsPutUChar(count1, 23);\n                        bsPutUChar(count1, 114);\n                        bsPutUChar(count1, 69);\n                        bsPutUChar(count1, 56);\n                        bsPutUChar(count1, 80);\n                        bsPutUChar(count1, 144);\n                        bsPutUInt32(count1, v5);\n                        bsClose(count1);\n                        fp1 = NULL;\n                    }\n                    if (v0 >= v2)\n                    {\n                        fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                        return 0;\n                    }\n                    v0 += 1;\n                }\n            } while (iter != rbStart[v0]);\n            for (j = 0; j <= 1999; j += 1)\n            {\n                *(&(&outFileName)[j]) = 0;\n            }\n            strcpy(&outFileName, &inFileName);\n            ptr = strrchr(&outFileName, 47);\n            ptr = (!ptr ? &outFileName : ptr + 1);\n            v8 = ptr - &outFileName;\n            sprintf(ptr, \"rec%5d\", v0 + 1);\n            for (iter1 = ptr; *(iter1); iter1 += 1)\n            {\n                if (*(iter1) == 32)\n                    *(iter1) = 48;\n            }\n            strcat(&outFileName, &(&inFileName)[v8]);\n            if (!(char)endsInBz2(&outFileName))\n                strcat(&outFileName, \".bz2\");\n            fprintf(GLIBC_2.2.5::stderr, \"   writing block %d to `%s' ...\\n\", v0 + 1, &outFileName);\n            fp1 = fopen(&outFileName, \"wb\");\n            if (!fp1)\n                break;\n            count1 = bsOpenWriteStream(fp1);\n            bsPutUChar(count1, 66);\n            bsPutUChar(count1, 90);\n            bsPutUChar(count1, 104);\n            bsPutUChar(count1, 57);\n            bsPutUChar(count1, 49);\n            bsPutUChar(count1, 65);\n            bsPutUChar(count1, 89);\n            bsPutUChar(count1, 38);\n            bsPutUChar(count1, 83);\n            bsPutUChar(count1, 89);\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: can't write `%s'\\n\", &progName, &outFileName);\n        exit(1); /* do not return */\n    }\n}\n",
+      "source_code": "Int32 main ( Int32 argc, Char** argv )\n{\n   FILE*       inFile;\n   FILE*       outFile;\n   BitStream*  bsIn, *bsWr;\n   Int32       b, wrBlock, currBlock, rbCtr;\n   MaybeUInt64 bitsRead;\n\n   UInt32      buffHi, buffLo, blockCRC;\n   Char*       p;\n\n   strncpy ( progName, argv[0], BZ_MAX_FILENAME-1);\n   progName[BZ_MAX_FILENAME-1]='\\0';\n   inFileName[0] = outFileName[0] = 0;\n\n   fprintf ( stderr, \n             \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\" );\n\n   if (argc != 2) {\n      fprintf ( stderr, \"%s: usage is `%s damaged_file_name'.\\n\",\n                        progName, progName );\n      switch (sizeof(MaybeUInt64)) {\n         case 8:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: None\\n\");\n            break;\n         case 4:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: 512 MB\\n\");\n            fprintf(stderr, \n                    \"\\tto circumvent, recompile with MaybeUInt64 as an\\n\"\n                    \"\\tunsigned 64-bit int.\\n\");\n            break;\n         default:\n            fprintf(stderr, \n                    \"\\tsizeof(MaybeUInt64) is not 4 or 8 -- \"\n                    \"configuration error.\\n\");\n            break;\n      }\n      exit(1);\n   }\n\n   if (strlen(argv[1]) >= BZ_MAX_FILENAME-20) {\n      fprintf ( stderr, \n                \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\",\n                progName, (int)strlen(argv[1]) );\n      exit(1);\n   }\n\n   strcpy ( inFileName, argv[1] );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't read `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n\n   bsIn = bsOpenReadStream ( inFile );\n   fprintf ( stderr, \"%s: searching for block boundaries ...\\n\", progName );\n\n   bitsRead = 0;\n   buffHi = buffLo = 0;\n   currBlock = 0;\n   bStart[currBlock] = 0;\n\n   rbCtr = 0;\n\n   while (True) {\n      b = bsGetBit ( bsIn );\n      bitsRead++;\n      if (b == 2) {\n         if (bitsRead >= bStart[currBlock] &&\n            (bitsRead - bStart[currBlock]) >= 40) {\n            bEnd[currBlock] = bitsRead-1;\n            if (currBlock > 0)\n               fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                                 \" to \" MaybeUInt64_FMT \" (incomplete)\\n\",\n                         currBlock,  bStart[currBlock], bEnd[currBlock] );\n         } else\n            currBlock--;\n         break;\n      }\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if ( ( (buffHi & 0x0000ffff) == BLOCK_HEADER_HI \n             && buffLo == BLOCK_HEADER_LO)\n           || \n           ( (buffHi & 0x0000ffff) == BLOCK_ENDMARK_HI \n             && buffLo == BLOCK_ENDMARK_LO)\n         ) {\n         if (bitsRead > 49) {\n            bEnd[currBlock] = bitsRead-49;\n         } else {\n            bEnd[currBlock] = 0;\n         }\n         if (currBlock > 0 &&\n\t     (bEnd[currBlock] - bStart[currBlock]) >= 130) {\n            fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                              \" to \" MaybeUInt64_FMT \"\\n\",\n                      rbCtr+1,  bStart[currBlock], bEnd[currBlock] );\n            rbStart[rbCtr] = bStart[currBlock];\n            rbEnd[rbCtr] = bEnd[currBlock];\n            rbCtr++;\n         }\n         if (currBlock >= BZ_MAX_HANDLED_BLOCKS)\n            tooManyBlocks(BZ_MAX_HANDLED_BLOCKS);\n         currBlock++;\n\n         bStart[currBlock] = bitsRead;\n      }\n   }\n\n   bsClose ( bsIn );\n\n   /*-- identified blocks run from 1 to rbCtr inclusive. --*/\n\n   if (rbCtr < 1) {\n      fprintf ( stderr,\n                \"%s: sorry, I couldn't find any block boundaries.\\n\",\n                progName );\n      exit(1);\n   };\n\n   fprintf ( stderr, \"%s: splitting into blocks\\n\", progName );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't open `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n   bsIn = bsOpenReadStream ( inFile );\n\n   /*-- placate gcc's dataflow analyser --*/\n   blockCRC = 0; bsWr = 0;\n\n   bitsRead = 0;\n   outFile = NULL;\n   wrBlock = 0;\n   while (True) {\n      b = bsGetBit(bsIn);\n      if (b == 2) break;\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if (bitsRead == 47+rbStart[wrBlock]) \n         blockCRC = (buffHi << 16) | (buffLo >> 16);\n\n      if (outFile != NULL && bitsRead >= rbStart[wrBlock]\n                          && bitsRead <= rbEnd[wrBlock]) {\n         bsPutBit ( bsWr, b );\n      }\n\n      bitsRead++;\n\n      if (bitsRead == rbEnd[wrBlock]+1) {\n         if (outFile != NULL) {\n            bsPutUChar ( bsWr, 0x17 ); bsPutUChar ( bsWr, 0x72 );\n            bsPutUChar ( bsWr, 0x45 ); bsPutUChar ( bsWr, 0x38 );\n            bsPutUChar ( bsWr, 0x50 ); bsPutUChar ( bsWr, 0x90 );\n            bsPutUInt32 ( bsWr, blockCRC );\n            bsClose ( bsWr );\n            outFile = NULL;\n         }\n         if (wrBlock >= rbCtr) break;\n         wrBlock++;\n      } else\n      if (bitsRead == rbStart[wrBlock]) {\n         /* Create the output file name, correctly handling leading paths. \n            (31.10.2001 by Sergey E. Kusikov) */\n         Char* split;\n         Int32 ofs, k;\n         for (k = 0; k < BZ_MAX_FILENAME; k++) \n            outFileName[k] = 0;\n         strcpy (outFileName, inFileName);\n         split = strrchr (outFileName, BZ_SPLIT_SYM);\n         if (split == NULL) {\n            split = outFileName;\n         } else {\n            ++split;\n\t }\n\t /* Now split points to the start of the basename. */\n         ofs  = split - outFileName;\n         sprintf (split, \"rec%5d\", wrBlock+1);\n         for (p = split; *p != 0; p++) if (*p == ' ') *p = '0';\n         strcat (outFileName, inFileName + ofs);\n\n         if ( !endsInBz2(outFileName)) strcat ( outFileName, \".bz2\" );\n\n         fprintf ( stderr, \"   writing block %d to `%s' ...\\n\",\n                           wrBlock+1, outFileName );\n\n         outFile = fopen ( outFileName, \"wb\" );\n         if (outFile == NULL) {\n            fprintf ( stderr, \"%s: can't write `%s'\\n\",\n                      progName, outFileName );\n            exit(1);\n         }\n         bsWr = bsOpenWriteStream ( outFile );\n         bsPutUChar ( bsWr, BZ_HDR_B );    \n         bsPutUChar ( bsWr, BZ_HDR_Z );    \n         bsPutUChar ( bsWr, BZ_HDR_h );    \n         bsPutUChar ( bsWr, BZ_HDR_0 + 9 );\n         bsPutUChar ( bsWr, 0x31 ); bsPutUChar ( bsWr, 0x41 );\n         bsPutUChar ( bsWr, 0x59 ); bsPutUChar ( bsWr, 0x26 );\n         bsPutUChar ( bsWr, 0x53 ); bsPutUChar ( bsWr, 0x59 );\n      }\n   }\n\n   fprintf ( stderr, \"%s: finished\\n\", progName );\n   return 0;\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenReadStream",
+      "value": 0.75,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenReadStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 114;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenReadStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'r';\n   return bs;\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenWriteStream",
+      "value": 0.75,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenWriteStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 0x77;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenWriteStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'w';\n   return bs;\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "value": 0.7777777777777778,
+      "perfect_value": 1.0,
+      "size": 13,
+      "labels": [],
+      "decompiled_code": "unsigned int endsInBz2(char *a0)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    v0 = strlen(a0);\n    if (v0 <= 4)\n        return 0;\n    if (*(&a0[v0] - 4) != 46 || *(&a0[v0] - 3) != 98 || *(&a0[v0] - 2) != 122 || *(&a0[v0] - 1) != 50)\n        return 0;\n    return 1;\n    return 0;\n}\n",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 0.8472222222222222,
+      "perfect_value": 1.0,
+      "size": 46,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    int field_c;\n    char field_10;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nvoid bsClose(struct_0 *ptr)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (ptr->field_10 == 0x77)\n    {\n        for (; ptr->field_c <= 7; ptr->field_8 = ptr->field_8 * 2)\n        {\n            ptr->field_c = ptr->field_c + 1;\n        }\n        v0 = putc((char)ptr->field_8, ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n        bytesOut = bytesOut + 1;\n        v0 = fflush(ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n    }\n    v0 = fclose(ptr->field_0);\n    if (v0 != 0xffffffff)\n    {\n        free(ptr);\n        return;\n    }\n    else if (ptr->field_10 == 0x77)\n    {\n        writeError(); /* do not return */\n    }\n    else\n    {\n        readError(); /* do not return */\n    }\n}\n",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "mallocFail",
+      "value": 0.9090909090909091,
+      "perfect_value": 1.0,
+      "size": 13,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char progName;\n\nvoid mallocFail(int a0)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: malloc failed on request for %d bytes.\\n\", &progName, a0);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+      "source_code": "static void mallocFail ( Int32 n )\n{\n   fprintf ( stderr,\n             \"%s: malloc failed on request for %d bytes.\\n\",\n            progName, n );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "readError",
+      "value": 0.9130434782608695,
+      "perfect_value": 1.0,
+      "size": 15,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid readError(void)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: I/O error reading `%s', possible reason follows.\\n\", &progName, &inFileName);\n    perror(&progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+      "source_code": "static void readError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "writeError",
+      "value": 0.9130434782608695,
+      "perfect_value": 1.0,
+      "size": 15,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid writeError(void)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: I/O error reading `%s', possible reason follows.\\n\", &progName, &inFileName);\n    perror(&progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+      "source_code": "static void writeError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "tooManyBlocks",
+      "value": 0.9333333333333333,
+      "perfect_value": 1.0,
+      "size": 15,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid tooManyBlocks(int a0)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: `%s' appears to contain more than %d blocks\\n\", &progName, &inFileName, a0);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: and cannot be handled.  To fix, increase\\n\", &progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+      "source_code": "static void tooManyBlocks ( Int32 max_handled_blocks )\n{\n   fprintf ( stderr,\n             \"%s: `%s' appears to contain more than %d blocks\\n\",\n            progName, inFileName, max_handled_blocks );\n   fprintf ( stderr,\n             \"%s: and cannot be handled.  To fix, increase\\n\",\n             progName );\n   fprintf ( stderr, \n             \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenReadStream",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenReadStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 114;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenReadStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'r';\n   return bs;\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsOpenWriteStream",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nstruct_0 * bsOpenWriteStream(unsigned long a0)\n{\n    struct_0 *ptr;  // [bp-0x10]\n\n    ptr = malloc(24);\n    if (ptr)\n    {\n        ptr->field_0 = a0;\n        ptr->field_8 = 0;\n        ptr->field_c = 0;\n        ptr->field_10 = 0x77;\n        return ptr;\n    }\n    mallocFail(24); /* do not return */\n}\n",
+      "source_code": "static BitStream* bsOpenWriteStream ( FILE* stream )\n{\n   BitStream *bs = malloc ( sizeof(BitStream) );\n   if (bs == NULL) mallocFail ( sizeof(BitStream) );\n   bs->handle = stream;\n   bs->buffer = 0;\n   bs->buffLive = 0;\n   bs->mode = 'w';\n   return bs;\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUChar",
+      "value": 0.3333333333333333,
+      "perfect_value": 1.0,
+      "size": 23,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nlong long bsPutUChar(struct_0 *a0, unsigned int a1)\n{\n    unsigned long v3;  // rax\n    char v0;  // [bp-0x24]\n    unsigned int i;  // [bp-0xc]\n\n    v0 = a1;\n    for (i = 7; i >= 0; i -= 1)\n    {\n        v3 = bsPutBit(a0, v0 >> ((char)i & 31) & 1);\n    }\n    return v3;\n}\n",
+      "source_code": "static void bsPutUChar ( BitStream* bs, UChar c )\n{\n   Int32 i;\n   for (i = 7; i >= 0; i--)\n      bsPutBit ( bs, (((UInt32) c) >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsGetBit",
+      "value": 0.5,
+      "perfect_value": 1.0,
+      "size": 26,
+      "labels": [],
+      "decompiled_code": "unsigned int bsGetBit(void* idx)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if ((int)idx[12] > 0)\n    {\n        *((unsigned int *)&idx[12]) = (int)idx[12] - 1;\n        return (int)idx[8] >> ((char)(int)idx[12] & 31) & 1;\n    }\n    v0 = getc(*((long long *)idx));\n    if (v0 != 0xffffffff)\n    {\n        *((unsigned int *)&idx[12]) = 7;\n        *((unsigned int *)&idx[8]) = v0;\n        return (int)idx[8] >> 7 & 1;\n    }\n    else if (*(__errno_location()))\n    {\n        readError(); /* do not return */\n    }\n    else\n    {\n        return 2;\n    }\n}\n",
+      "source_code": "static Int32 bsGetBit ( BitStream* bs )\n{\n   if (bs->buffLive > 0) {\n      bs->buffLive --;\n      return ( ((bs->buffer) >> (bs->buffLive)) & 0x1 );\n   } else {\n      Int32 retVal = getc ( bs->handle );\n      if ( retVal == EOF ) {\n         if (errno != 0) readError();\n         return 2;\n      }\n      bs->buffLive = 7;\n      bs->buffer = retVal;\n      return ( ((bs->buffer) >> 7) & 0x1 );\n   }\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 0.5,
+      "perfect_value": 1.0,
+      "size": 46,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    int field_c;\n    char field_10;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nvoid bsClose(struct_0 *ptr)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (ptr->field_10 == 0x77)\n    {\n        for (; ptr->field_c <= 7; ptr->field_8 = ptr->field_8 * 2)\n        {\n            ptr->field_c = ptr->field_c + 1;\n        }\n        v0 = putc((char)ptr->field_8, ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n        bytesOut = bytesOut + 1;\n        v0 = fflush(ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n    }\n    v0 = fclose(ptr->field_0);\n    if (v0 != 0xffffffff)\n    {\n        free(ptr);\n        return;\n    }\n    else if (ptr->field_10 == 0x77)\n    {\n        writeError(); /* do not return */\n    }\n    else\n    {\n        readError(); /* do not return */\n    }\n}\n",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 0.6666666666666666,
+      "perfect_value": 1.0,
+      "size": 32,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nstruct_0 * bsPutBit(struct_0 *idx, unsigned int a1)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (idx->field_c != 8)\n    {\n        idx->field_8 = idx->field_8 * 2 | a1 & 1;\n        idx->field_c = idx->field_c + 1;\n        return idx;\n    }\n    v0 = putc((char)idx->field_8, idx->field_0);\n    if (v0 != 0xffffffff)\n    {\n        bytesOut = bytesOut + 1;\n        idx->field_c = 1;\n        idx->field_8 = a1 & 1;\n        return idx;\n    }\n    writeError(); /* do not return */\n}\n",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutUInt32",
+      "value": 0.6666666666666666,
+      "perfect_value": 1.0,
+      "size": 21,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nstruct_0 * bsPutUInt32(struct_0 *a0, unsigned int a1)\n{\n    struct_0 *v2;  // rax\n    unsigned int i;  // [bp-0xc]\n\n    for (i = 31; i >= 0; i -= 1)\n    {\n        v2 = bsPutBit(a0, a1 >> ((char)i & 31) & 1);\n    }\n    return v2;\n}\n",
+      "source_code": "static void bsPutUInt32 ( BitStream* bs, UInt32 c )\n{\n   Int32 i;\n\n   for (i = 31; i >= 0; i--)\n      bsPutBit ( bs, (c >> i) & 0x1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "angr",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "main",
+      "value": 0.8333333333333334,
+      "perfect_value": 1.0,
+      "size": 207,
+      "labels": [],
+      "decompiled_code": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    unsigned long long field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n    char field_10;\n} struct_0;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char outFileName;\nextern char progName;\nextern char g_4067cf;\nextern unsigned long long bStart[4];\nextern unsigned long long bEnd[4];\nextern unsigned long long rbStart[4];\nextern unsigned long long rbEnd[4];\n\nunsigned int main(unsigned int a0, char **a1)\n{\n    unsigned int v17;  // eax\n    int v0;  // [bp-0x64]\n    int node;  // [bp-0x60]\n    int v2;  // [bp-0x5c]\n    unsigned int v3;  // [bp-0x58]\n    unsigned int v4;  // [bp-0x54]\n    unsigned int v5;  // [bp-0x50]\n    int j;  // [bp-0x4c]\n    unsigned int v7;  // [bp-0x48]\n    unsigned int v8;  // [bp-0x44]\n    FILE *fp1;  // [bp-0x40]\n    struct_0 *count1;  // [bp-0x38]\n    unsigned long long *iter;  // [bp-0x30]\n    char *iter1;  // [bp-0x28]\n    char *ptr;  // [bp-0x20]\n    FILE *fp;  // [bp-0x18]\n    void* count;  // [bp-0x10], Other Possible Types: struct_0 *\n\n    strncpy(&progName, *(a1), 1999);\n    g_4067cf = 0;\n    outFileName = 0;\n    inFileName = outFileName;\n    fprintf(GLIBC_2.2.5::stderr, \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\");\n    if (a0 != 2)\n    {\n        fprintf(GLIBC_2.2.5::stderr, \"%s: usage is `%s damaged_file_name'.\\n\", &progName, &progName);\n        fprintf(GLIBC_2.2.5::stderr, \"\\trestrictions on size of recovered file: None\\n\");\n        exit(1); /* do not return */\n    }\n    else if (strlen(a1[1]) > 1979)\n    {\n        v17 = strlen(a1[1]);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\", &progName, v17);\n        exit(1); /* do not return */\n    }\n    else\n    {\n        strcpy(&inFileName, a1[1]);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't read `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        fprintf(GLIBC_2.2.5::stderr, \"%s: searching for block boundaries ...\\n\", &progName);\n        iter = NULL;\n        v4 = 0;\n        v3 = v4;\n        node = 0;\n        bStart[node] = 0;\n        v2 = 0;\n        while (1)\n        {\n            v7 = bsGetBit(count);\n            iter = (char *)iter + 1;\n            if (v7 == 2)\n                break;\n            v3 = v4 >> 31 | v3 * 2;\n            v4 = v7 & 1 | v4 * 2;\n            if ((unsigned short)v3 == 12609 && v4 == 1495683929 || (unsigned short)v3 == 6002 && v4 == 1161318544)\n            {\n                if (iter > 0x31)\n                    bEnd[node] = (char *)iter - 49;\n                else\n                    bEnd[node] = 0;\n                if (node > 0 && bEnd[node] - bStart[node] > 129)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu\\n\", v2 + 1);\n                    rbStart[v2] = bStart[node];\n                    rbEnd[v2] = bEnd[node];\n                    v2 += 1;\n                }\n                if (node > 49999)\n                    tooManyBlocks(50000); /* do not return */\n                node += 1;\n                bStart[node] = iter;\n            }\n        }\n        if (iter >= bStart[node] && (char *)iter - bStart[node] > 39)\n        {\n            bEnd[node] = (char *)iter - 1;\n            if (node > 0)\n                fprintf(GLIBC_2.2.5::stderr, \"   block %d runs from %Lu to %Lu (incomplete)\\n\", node);\n        }\n        else\n        {\n            node -= 1;\n        }\n        bsClose(count);\n        if (v2 <= 0)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: sorry, I couldn't find any block boundaries.\\n\", &progName);\n            exit(1); /* do not return */\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: splitting into blocks\\n\", &progName);\n        fp = fopen(&inFileName, \"rb\");\n        if (!fp)\n        {\n            fprintf(GLIBC_2.2.5::stderr, \"%s: can't open `%s'\\n\", &progName, &inFileName);\n            exit(1); /* do not return */\n        }\n        count = bsOpenReadStream(fp);\n        v5 = 0;\n        count1 = NULL;\n        iter = NULL;\n        fp1 = NULL;\n        v0 = 0;\n        while (1)\n        {\n            do\n            {\n                v7 = bsGetBit(count);\n                if (v7 == 2)\n                {\n                    fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                    return 0;\n                }\n                v3 = v4 >> 31 | v3 * 2;\n                v4 = v7 & 1 | v4 * 2;\n                if (iter == rbStart[v0] + 47)\n                    v5 = v4 >> 16 | v3 * 0x10000;\n                if (fp1 && iter >= rbStart[v0] && rbEnd[v0] >= iter)\n                    bsPutBit(count1, v7);\n                iter = (char *)iter + 1;\n                if (iter == rbEnd[v0] + 1)\n                {\n                    if (fp1)\n                    {\n                        bsPutUChar(count1, 23);\n                        bsPutUChar(count1, 114);\n                        bsPutUChar(count1, 69);\n                        bsPutUChar(count1, 56);\n                        bsPutUChar(count1, 80);\n                        bsPutUChar(count1, 144);\n                        bsPutUInt32(count1, v5);\n                        bsClose(count1);\n                        fp1 = NULL;\n                    }\n                    if (v0 >= v2)\n                    {\n                        fprintf(GLIBC_2.2.5::stderr, \"%s: finished\\n\", &progName);\n                        return 0;\n                    }\n                    v0 += 1;\n                }\n            } while (iter != rbStart[v0]);\n            for (j = 0; j <= 1999; j += 1)\n            {\n                *(&(&outFileName)[j]) = 0;\n            }\n            strcpy(&outFileName, &inFileName);\n            ptr = strrchr(&outFileName, 47);\n            ptr = (!ptr ? &outFileName : ptr + 1);\n            v8 = ptr - &outFileName;\n            sprintf(ptr, \"rec%5d\", v0 + 1);\n            for (iter1 = ptr; *(iter1); iter1 += 1)\n            {\n                if (*(iter1) == 32)\n                    *(iter1) = 48;\n            }\n            strcat(&outFileName, &(&inFileName)[v8]);\n            if (!(char)endsInBz2(&outFileName))\n                strcat(&outFileName, \".bz2\");\n            fprintf(GLIBC_2.2.5::stderr, \"   writing block %d to `%s' ...\\n\", v0 + 1, &outFileName);\n            fp1 = fopen(&outFileName, \"wb\");\n            if (!fp1)\n                break;\n            count1 = bsOpenWriteStream(fp1);\n            bsPutUChar(count1, 66);\n            bsPutUChar(count1, 90);\n            bsPutUChar(count1, 104);\n            bsPutUChar(count1, 57);\n            bsPutUChar(count1, 49);\n            bsPutUChar(count1, 65);\n            bsPutUChar(count1, 89);\n            bsPutUChar(count1, 38);\n            bsPutUChar(count1, 83);\n            bsPutUChar(count1, 89);\n        }\n        fprintf(GLIBC_2.2.5::stderr, \"%s: can't write `%s'\\n\", &progName, &outFileName);\n        exit(1); /* do not return */\n    }\n}\n",
+      "source_code": "Int32 main ( Int32 argc, Char** argv )\n{\n   FILE*       inFile;\n   FILE*       outFile;\n   BitStream*  bsIn, *bsWr;\n   Int32       b, wrBlock, currBlock, rbCtr;\n   MaybeUInt64 bitsRead;\n\n   UInt32      buffHi, buffLo, blockCRC;\n   Char*       p;\n\n   strncpy ( progName, argv[0], BZ_MAX_FILENAME-1);\n   progName[BZ_MAX_FILENAME-1]='\\0';\n   inFileName[0] = outFileName[0] = 0;\n\n   fprintf ( stderr, \n             \"bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\\n\" );\n\n   if (argc != 2) {\n      fprintf ( stderr, \"%s: usage is `%s damaged_file_name'.\\n\",\n                        progName, progName );\n      switch (sizeof(MaybeUInt64)) {\n         case 8:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: None\\n\");\n            break;\n         case 4:\n            fprintf(stderr, \n                    \"\\trestrictions on size of recovered file: 512 MB\\n\");\n            fprintf(stderr, \n                    \"\\tto circumvent, recompile with MaybeUInt64 as an\\n\"\n                    \"\\tunsigned 64-bit int.\\n\");\n            break;\n         default:\n            fprintf(stderr, \n                    \"\\tsizeof(MaybeUInt64) is not 4 or 8 -- \"\n                    \"configuration error.\\n\");\n            break;\n      }\n      exit(1);\n   }\n\n   if (strlen(argv[1]) >= BZ_MAX_FILENAME-20) {\n      fprintf ( stderr, \n                \"%s: supplied filename is suspiciously (>= %d chars) long.  Bye!\\n\",\n                progName, (int)strlen(argv[1]) );\n      exit(1);\n   }\n\n   strcpy ( inFileName, argv[1] );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't read `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n\n   bsIn = bsOpenReadStream ( inFile );\n   fprintf ( stderr, \"%s: searching for block boundaries ...\\n\", progName );\n\n   bitsRead = 0;\n   buffHi = buffLo = 0;\n   currBlock = 0;\n   bStart[currBlock] = 0;\n\n   rbCtr = 0;\n\n   while (True) {\n      b = bsGetBit ( bsIn );\n      bitsRead++;\n      if (b == 2) {\n         if (bitsRead >= bStart[currBlock] &&\n            (bitsRead - bStart[currBlock]) >= 40) {\n            bEnd[currBlock] = bitsRead-1;\n            if (currBlock > 0)\n               fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                                 \" to \" MaybeUInt64_FMT \" (incomplete)\\n\",\n                         currBlock,  bStart[currBlock], bEnd[currBlock] );\n         } else\n            currBlock--;\n         break;\n      }\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if ( ( (buffHi & 0x0000ffff) == BLOCK_HEADER_HI \n             && buffLo == BLOCK_HEADER_LO)\n           || \n           ( (buffHi & 0x0000ffff) == BLOCK_ENDMARK_HI \n             && buffLo == BLOCK_ENDMARK_LO)\n         ) {\n         if (bitsRead > 49) {\n            bEnd[currBlock] = bitsRead-49;\n         } else {\n            bEnd[currBlock] = 0;\n         }\n         if (currBlock > 0 &&\n\t     (bEnd[currBlock] - bStart[currBlock]) >= 130) {\n            fprintf ( stderr, \"   block %d runs from \" MaybeUInt64_FMT \n                              \" to \" MaybeUInt64_FMT \"\\n\",\n                      rbCtr+1,  bStart[currBlock], bEnd[currBlock] );\n            rbStart[rbCtr] = bStart[currBlock];\n            rbEnd[rbCtr] = bEnd[currBlock];\n            rbCtr++;\n         }\n         if (currBlock >= BZ_MAX_HANDLED_BLOCKS)\n            tooManyBlocks(BZ_MAX_HANDLED_BLOCKS);\n         currBlock++;\n\n         bStart[currBlock] = bitsRead;\n      }\n   }\n\n   bsClose ( bsIn );\n\n   /*-- identified blocks run from 1 to rbCtr inclusive. --*/\n\n   if (rbCtr < 1) {\n      fprintf ( stderr,\n                \"%s: sorry, I couldn't find any block boundaries.\\n\",\n                progName );\n      exit(1);\n   };\n\n   fprintf ( stderr, \"%s: splitting into blocks\\n\", progName );\n\n   inFile = fopen ( inFileName, \"rb\" );\n   if (inFile == NULL) {\n      fprintf ( stderr, \"%s: can't open `%s'\\n\", progName, inFileName );\n      exit(1);\n   }\n   bsIn = bsOpenReadStream ( inFile );\n\n   /*-- placate gcc's dataflow analyser --*/\n   blockCRC = 0; bsWr = 0;\n\n   bitsRead = 0;\n   outFile = NULL;\n   wrBlock = 0;\n   while (True) {\n      b = bsGetBit(bsIn);\n      if (b == 2) break;\n      buffHi = (buffHi << 1) | (buffLo >> 31);\n      buffLo = (buffLo << 1) | (b & 1);\n      if (bitsRead == 47+rbStart[wrBlock]) \n         blockCRC = (buffHi << 16) | (buffLo >> 16);\n\n      if (outFile != NULL && bitsRead >= rbStart[wrBlock]\n                          && bitsRead <= rbEnd[wrBlock]) {\n         bsPutBit ( bsWr, b );\n      }\n\n      bitsRead++;\n\n      if (bitsRead == rbEnd[wrBlock]+1) {\n         if (outFile != NULL) {\n            bsPutUChar ( bsWr, 0x17 ); bsPutUChar ( bsWr, 0x72 );\n            bsPutUChar ( bsWr, 0x45 ); bsPutUChar ( bsWr, 0x38 );\n            bsPutUChar ( bsWr, 0x50 ); bsPutUChar ( bsWr, 0x90 );\n            bsPutUInt32 ( bsWr, blockCRC );\n            bsClose ( bsWr );\n            outFile = NULL;\n         }\n         if (wrBlock >= rbCtr) break;\n         wrBlock++;\n      } else\n      if (bitsRead == rbStart[wrBlock]) {\n         /* Create the output file name, correctly handling leading paths. \n            (31.10.2001 by Sergey E. Kusikov) */\n         Char* split;\n         Int32 ofs, k;\n         for (k = 0; k < BZ_MAX_FILENAME; k++) \n            outFileName[k] = 0;\n         strcpy (outFileName, inFileName);\n         split = strrchr (outFileName, BZ_SPLIT_SYM);\n         if (split == NULL) {\n            split = outFileName;\n         } else {\n            ++split;\n\t }\n\t /* Now split points to the start of the basename. */\n         ofs  = split - outFileName;\n         sprintf (split, \"rec%5d\", wrBlock+1);\n         for (p = split; *p != 0; p++) if (*p == ' ') *p = '0';\n         strcat (outFileName, inFileName + ofs);\n\n         if ( !endsInBz2(outFileName)) strcat ( outFileName, \".bz2\" );\n\n         fprintf ( stderr, \"   writing block %d to `%s' ...\\n\",\n                           wrBlock+1, outFileName );\n\n         outFile = fopen ( outFileName, \"wb\" );\n         if (outFile == NULL) {\n            fprintf ( stderr, \"%s: can't write `%s'\\n\",\n                      progName, outFileName );\n            exit(1);\n         }\n         bsWr = bsOpenWriteStream ( outFile );\n         bsPutUChar ( bsWr, BZ_HDR_B );    \n         bsPutUChar ( bsWr, BZ_HDR_Z );    \n         bsPutUChar ( bsWr, BZ_HDR_h );    \n         bsPutUChar ( bsWr, BZ_HDR_0 + 9 );\n         bsPutUChar ( bsWr, 0x31 ); bsPutUChar ( bsWr, 0x41 );\n         bsPutUChar ( bsWr, 0x59 ); bsPutUChar ( bsWr, 0x26 );\n         bsPutUChar ( bsWr, 0x53 ); bsPutUChar ( bsWr, 0x59 );\n      }\n   }\n\n   fprintf ( stderr, \"%s: finished\\n\", progName );\n   return 0;\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "value": 25.0,
+      "perfect_value": 0.0,
+      "size": 90,
+      "labels": [],
+      "decompiled_code": "uint64_t endsInBz2(char* name)\n{\n    uint64_t sym_imp_strlen(uint64_t);\n\n    /* r2dec proof: no individual construct is marked; 123 source obligations: 94 rendered, 29 elided, 0 refused; 71 statements rendered */\n    {\n        uint64_t RAX_3;\n        char* stack_m32;\n        uint32_t stack_m12;\n        stack_m32 = (char*)name;\n        char* tmp_11f80_1 = (char*)stack_m32;\n        char* RDI_1 = (char*)tmp_11f80_1;\n        uint64_t RAX_2 = sym_imp_strlen(RDI_1);\n        uint32_t EAX_1 = (uint32_t)RAX_2;\n        stack_m12 = (uint32_t)EAX_1;\n        uint32_t tmp_11f00_1 = stack_m12;\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint8_t OF_2 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_1, (uint32_t)4);\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)4;\n        uint8_t SF_2 = (uint8_t)((int32_t)tmp_3ea00_1 < (int32_t)0);\n        uint8_t ZF_2 = (uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)((uint8_t)!(uint8_t)ZF_2 && (uint8_t)((uint8_t)OF_2 == (uint8_t)SF_2))) {\n            uint64_t RAX_6;\n            uint32_t tmp_11f00_2 = stack_m12;\n            uint64_t RAX_5 = (uint64_t)(int32_t)tmp_11f00_2;\n            uint64_t RDX_2 = (uint64_t)((uint64_t)RAX_5 + (uint64_t)-0x4);\n            char* tmp_11f80_2 = (char*)stack_m32;\n            RAX_6 = (uint64_t)(char*)tmp_11f80_2;\n            RAX_6 = (uint64_t)RAX_6 + (uint64_t)RDX_2;\n            uint8_t tmp_11e00_1 = *(uint8_t*)RAX_6;\n            uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)46;\n            uint8_t ZF_4 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n            uint8_t tmp_12800_1 = !(uint8_t)ZF_4;\n            if ((uint8_t)tmp_12800_1) {\n                RAX_3 = (uint64_t)0;\n            } else {\n                uint64_t RAX_11;\n                uint32_t tmp_11f00_3 = stack_m12;\n                uint64_t RAX_10 = (uint64_t)(int32_t)tmp_11f00_3;\n                uint64_t RDX_3 = (uint64_t)((uint64_t)RAX_10 + (uint64_t)-0x3);\n                char* tmp_11f80_3 = (char*)stack_m32;\n                RAX_11 = (uint64_t)(char*)tmp_11f80_3;\n                RAX_11 = (uint64_t)RAX_11 + (uint64_t)RDX_3;\n                uint8_t tmp_11e00_2 = *(uint8_t*)RAX_11;\n                uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)98;\n                uint8_t ZF_6 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n                uint8_t tmp_12800_2 = !(uint8_t)ZF_6;\n                if ((uint8_t)tmp_12800_2) {\n                    RAX_3 = (uint64_t)0;\n                } else {\n                    uint64_t RAX_16;\n                    uint32_t tmp_11f00_4 = stack_m12;\n                    uint64_t RAX_15 = (uint64_t)(int32_t)tmp_11f00_4;\n                    uint64_t RDX_4 = (uint64_t)((uint64_t)RAX_15 + (uint64_t)-0x2);\n                    char* tmp_11f80_4 = (char*)stack_m32;\n                    RAX_16 = (uint64_t)(char*)tmp_11f80_4;\n                    RAX_16 = (uint64_t)RAX_16 + (uint64_t)RDX_4;\n                    uint8_t tmp_11e00_3 = *(uint8_t*)RAX_16;\n                    uint8_t tmp_3de00_3 = (uint8_t)tmp_11e00_3 - (uint8_t)122;\n                    uint8_t ZF_8 = (uint8_t)((uint8_t)tmp_3de00_3 == (uint8_t)0);\n                    uint8_t tmp_12800_3 = !(uint8_t)ZF_8;\n                    if ((uint8_t)tmp_12800_3) {\n                        RAX_3 = (uint64_t)0;\n                    } else {\n                        uint64_t RAX_21;\n                        uint32_t tmp_11f00_5 = stack_m12;\n                        uint64_t RAX_20 = (uint64_t)(int32_t)tmp_11f00_5;\n                        uint64_t RDX_5 = (uint64_t)((uint64_t)RAX_20 + (uint64_t)-0x1);\n                        char* tmp_11f80_5 = (char*)stack_m32;\n                        RAX_21 = (uint64_t)(char*)tmp_11f80_5;\n                        RAX_21 = (uint64_t)RAX_21 + (uint64_t)RDX_5;\n                        uint8_t tmp_11e00_4 = *(uint8_t*)RAX_21;\n                        uint8_t tmp_3de00_4 = (uint8_t)tmp_11e00_4 - (uint8_t)50;\n                        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_4 == (uint8_t)0);\n                        uint8_t tmp_12800_4 = !(uint8_t)ZF_10;\n                        if ((uint8_t)tmp_12800_4) {\n                            RAX_3 = (uint64_t)0;\n                        } else {\n                            RAX_3 = (uint64_t)1;\n                        }\n                    }\n                }\n            }\n        } else {\n            RAX_3 = (uint64_t)0;\n        }\n        return RAX_3;\n    }\n    /* summary return unresolved; value intentionally not reconstructed */\n}",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 8.0,
+      "perfect_value": 0.0,
+      "size": 162,
+      "labels": [],
+      "decompiled_code": "void bsClose(uint64_t bs)\n{\n    void dbg_readError(void);\n    void dbg_writeError(void);\n    uint64_t sym_imp_fclose(uint64_t);\n    uint64_t sym_imp_fflush(uint64_t);\n    void sym_imp_free(uint64_t);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: 1 construct is marked below; 214 source obligations: 173 rendered, 41 elided, 0 refused; 134 statements rendered */\n    {\n        uint64_t tmp_11f80_3;\n        uint64_t tmp_11f80_8;\n        uint64_t RAX_18;\n        uint64_t tmp_11f80_4;\n        uint64_t tmp_11f80_14;\n        uint64_t tmp_11f80_16;\n        uint64_t tmp_11f80_18;\n        uint64_t stack_m32;\n        uint32_t stack_m12;\n        /* r2dec residual: rendered control-domain occurrences do not exactly cover block 0x17f6; body rendered without structure */\n        stack_m32 = (uint64_t)bs;\n        uint64_t tmp_11f80_1 = stack_m32;\n        uint8_t* tmp_4700_3 = (uint8_t*)(uint64_t)((uint64_t)tmp_11f80_1 + (uint64_t)16);\n        uint8_t tmp_11e00_1 = *tmp_4700_3;\n        uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)119;\n        uint8_t ZF_2 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n        uint8_t tmp_12800_1 = !(uint8_t)ZF_2;\n        if ((uint8_t)tmp_12800_1) {\n            goto loc_17c6;\n        } else {\n            goto loc_173e;\n        }\nloc_173e: ;\n        goto loc_1762;\nloc_1762: ;\n        tmp_11f80_3 = stack_m32;\n        uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)tmp_11f80_3 + (uint64_t)12);\n        uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_2;\n        uint8_t OF_4 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_2, (uint32_t)7);\n        uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)7;\n        uint8_t SF_4 = (uint8_t)((int32_t)tmp_3ea00_2 < (int32_t)0);\n        uint8_t ZF_4 = (uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n        uint8_t tmp_12f00_2 = (uint8_t)((uint8_t)OF_4 != (uint8_t)SF_4);\n        uint8_t tmp_13000_2 = (uint8_t)ZF_4 || (uint8_t)tmp_12f00_2;\n        if ((uint8_t)tmp_13000_2) {\n            goto loc_1740;\n        } else {\n            goto loc_176e;\n        }\nloc_176e: ;\n        tmp_11f80_8 = stack_m32;\n        FILE* tmp_11f80_9 = (FILE*)*(uint64_t*)(uint64_t)tmp_11f80_8;\n        FILE* RDX_4 = (FILE*)tmp_11f80_9;\n        uint64_t tmp_11f80_10 = stack_m32;\n        uint32_t tmp_11f00_5 = *(uint32_t*)((uint64_t)tmp_11f80_10 + (uint64_t)8);\n        uint64_t RAX_14 = (uint64_t)(uint32_t)tmp_11f00_5;\n        uint8_t tmp_regalias_176e_c_0_1 = (uint8_t)RAX_14;\n        uint64_t EAX_7 = (uint64_t)(uint8_t)tmp_regalias_176e_c_0_1;\n        FILE* RSI_1 = (FILE*)RDX_4;\n        uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_7;\n        uint64_t RAX_16 = sym_imp_putc(RDI_1, RSI_1);\n        uint32_t EAX_8 = (uint32_t)RAX_16;\n        stack_m12 = (uint32_t)EAX_8;\n        uint32_t tmp_11f00_6 = stack_m12;\n        uint32_t tmp_3e900_3 = (uint32_t)tmp_11f00_6;\n        uint32_t tmp_3ea00_3 = (uint32_t)tmp_3e900_3 - (uint32_t)0xffffffff;\n        if ((uint8_t)!(uint8_t)((uint32_t)tmp_3ea00_3 == (uint32_t)0)) {\n            goto loc_1797;\n        } else {\n            goto loc_1792;\n        }\nloc_1792: ;\n        dbg_writeError();\n        goto loc_1797;\nloc_1797: ;\n        RAX_18 = *(uint64_t*)&bytesOut;\n        RAX_18 = (uint64_t)RAX_18 + (uint64_t)1;\n        *(int64_t*)&bytesOut = (uint64_t)RAX_18;\n        uint64_t tmp_11f80_11 = stack_m32;\n        uint64_t tmp_11f80_12 = *(uint64_t*)(uint64_t)tmp_11f80_11;\n        uint64_t RDI_4 = (uint64_t)tmp_11f80_12;\n        uint64_t RAX_22 = sym_imp_fflush(RDI_4);\n        uint32_t EAX_10 = (uint32_t)RAX_22;\n        uint32_t tmp_6a80_5 = (uint32_t)EAX_10;\n        stack_m12 = (uint32_t)tmp_6a80_5;\n        uint32_t tmp_11f00_7 = stack_m12;\n        uint32_t tmp_3e900_4 = (uint32_t)tmp_11f00_7;\n        uint32_t tmp_3ea00_4 = (uint32_t)tmp_3e900_4 - (uint32_t)0xffffffff;\n        uint8_t ZF_7 = (uint8_t)((uint32_t)tmp_3ea00_4 == (uint32_t)0);\n        uint8_t tmp_12800_3 = !(uint8_t)ZF_7;\n        if ((uint8_t)tmp_12800_3) {\n            goto loc_17c6;\n        } else {\n            goto loc_17c1;\n        }\nloc_17c1: ;\n        dbg_writeError();\n        goto loc_17c6;\nloc_1740: ;\n        tmp_11f80_4 = stack_m32;\n        uint32_t tmp_11f00_3 = *(uint32_t*)((uint64_t)tmp_11f80_4 + (uint64_t)12);\n        uint64_t RAX_7 = (uint64_t)(uint32_t)tmp_11f00_3;\n        uint64_t EDX_2 = (uint64_t)(uint32_t)((uint64_t)RAX_7 + (uint64_t)1);\n        uint64_t tmp_11f80_5 = stack_m32;\n        *(int32_t*)((uint64_t)tmp_11f80_5 + (uint64_t)12) = (uint32_t)EDX_2;\n        uint64_t tmp_11f80_6 = stack_m32;\n        uint32_t tmp_11f00_4 = *(uint32_t*)((uint64_t)tmp_11f80_6 + (uint64_t)8);\n        uint64_t RAX_10 = (uint64_t)(uint32_t)tmp_11f00_4;\n        uint64_t tmp_4900_2 = (uint64_t)RAX_10;\n        uint64_t tmp_4a00_2 = (uint64_t)RAX_10 + (uint64_t)tmp_4900_2;\n        uint64_t EDX_3 = (uint64_t)(uint32_t)tmp_4a00_2;\n        uint64_t tmp_11f80_7 = stack_m32;\n        uint64_t RAX_11 = (uint64_t)tmp_11f80_7;\n        uint8_t* tmp_4700_15 = (uint8_t*)((uint64_t)RAX_11 + (uint64_t)8);\n        uint32_t tmp_6a80_3 = (uint32_t)EDX_3;\n        *(int32_t*)tmp_4700_15 = (uint32_t)tmp_6a80_3;\n        goto loc_1762;\nloc_17c6: ;\n        tmp_11f80_14 = stack_m32;\n        uint64_t tmp_11f80_15 = *(uint64_t*)(uint64_t)tmp_11f80_14;\n        uint64_t RDI_8 = (uint64_t)tmp_11f80_15;\n        uint64_t RAX_27 = sym_imp_fclose(RDI_8);\n        uint32_t EAX_13 = (uint32_t)RAX_27;\n        stack_m12 = (uint32_t)EAX_13;\n        uint32_t tmp_11f00_9 = stack_m12;\n        uint32_t tmp_3e900_6 = (uint32_t)tmp_11f00_9;\n        uint32_t tmp_3ea00_6 = (uint32_t)tmp_3e900_6 - (uint32_t)0xffffffff;\n        uint8_t ZF_9 = (uint8_t)((uint32_t)tmp_3ea00_6 == (uint32_t)0);\n        uint8_t tmp_12800_5 = !(uint8_t)ZF_9;\n        if ((uint8_t)tmp_12800_5) {\n            goto loc_17f6;\n        } else {\n            goto loc_17de;\n        }\nloc_17de: ;\n        tmp_11f80_16 = stack_m32;\n        uint8_t* tmp_4700_29 = (uint8_t*)((uint64_t)tmp_11f80_16 + (uint64_t)16);\n        uint8_t tmp_11e00_2 = *tmp_4700_29;\n        uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)119;\n        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n        uint8_t tmp_12800_6 = !(uint8_t)ZF_10;\n        if ((uint8_t)tmp_12800_6) {\n            goto loc_17f1;\n        } else {\n            goto loc_17ea;\n        }\nloc_17ea: ;\n        dbg_writeError();\n        goto loc_17ef;\nloc_17f1: ;\n        dbg_readError();\n        goto loc_17f6;\nloc_17f6: ;\n        tmp_11f80_18 = stack_m32;\n        uint64_t RDI_12 = (uint64_t)tmp_11f80_18;\n        sym_imp_free(RDI_12);\n        return;\n    }\n}",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "ged",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 5.0,
+      "perfect_value": 0.0,
+      "size": 83,
+      "labels": [],
+      "decompiled_code": "uint64_t bsPutBit(int64_t* bs, uint64_t bit)\n{\n    void dbg_writeError(void);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: no individual construct is marked; 141 source obligations: 107 rendered, 34 elided, 0 refused; 69 statements rendered */\n    {\n        int64_t* RAX_23;\n        uint32_t stack_m36;\n        int64_t* stack_m32;\n        stack_m32 = (int64_t*)bs;\n        uint32_t tmp_regalias_15e3_11_0_1 = (uint32_t)bit;\n        stack_m36 = (uint32_t)tmp_regalias_15e3_11_0_1;\n        int64_t* tmp_11f80_1 = (int64_t*)stack_m32;\n        uint32_t tmp_11f00_1 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_1 + (uint64_t)12);\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)8;\n        uint8_t tmp_12800_1 = !(uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)tmp_12800_1) {\n            uint64_t EDX_2;\n            int64_t* tmp_11f80_7 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_5 = *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_7 + (uint64_t)8);\n            uint64_t RAX_16 = (uint64_t)(uint32_t)tmp_11f00_5;\n            uint64_t tmp_4900_1 = (uint64_t)RAX_16;\n            uint64_t tmp_4a00_1 = (uint64_t)RAX_16 + (uint64_t)tmp_4900_1;\n            EDX_2 = (uint64_t)(uint32_t)tmp_4a00_1;\n            uint32_t tmp_11f00_6 = stack_m36;\n            uint64_t EAX_10 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_6 & (uint32_t)1);\n            EDX_2 = (uint64_t)(uint32_t)((uint32_t)EDX_2 | (uint32_t)EAX_10);\n            int64_t* tmp_11f80_8 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_8 + (uint64_t)8) = (uint32_t)EDX_2;\n            int64_t* tmp_11f80_9 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_7 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_9 + (uint64_t)12);\n            uint64_t RAX_21 = (uint64_t)(uint32_t)tmp_11f00_7;\n            uint64_t EDX_4 = (uint64_t)(uint32_t)((uint64_t)RAX_21 + (uint64_t)1);\n            int64_t* tmp_11f80_10 = (int64_t*)stack_m32;\n            int64_t* RAX_22 = (int64_t*)tmp_11f80_10;\n            int32_t* tmp_4700_24 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_22 + (uint64_t)12);\n            uint32_t tmp_6a80_6 = (uint32_t)EDX_4;\n            *(int32_t*)tmp_4700_24 = (uint32_t)tmp_6a80_6;\n            RAX_23 = (int64_t*)RAX_22;\n        } else {\n            uint64_t RAX_9;\n            uint32_t stack_m12;\n            int64_t* tmp_11f80_2 = (int64_t*)stack_m32;\n            FILE* tmp_11f80_3 = (FILE*)*(uint64_t*)(int64_t*)tmp_11f80_2;\n            FILE* RDX_1 = (FILE*)tmp_11f80_3;\n            int64_t* tmp_11f80_4 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_4 + (uint64_t)8);\n            uint64_t RAX_5 = (uint64_t)(uint32_t)tmp_11f00_2;\n            uint8_t tmp_regalias_1602_c_0_1 = (uint8_t)RAX_5;\n            uint64_t EAX_3 = (uint64_t)(uint8_t)tmp_regalias_1602_c_0_1;\n            FILE* RSI_1 = (FILE*)RDX_1;\n            uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_3;\n            uint64_t RAX_7 = sym_imp_putc(RDI_1, RSI_1);\n            uint32_t EAX_4 = (uint32_t)RAX_7;\n            stack_m12 = (uint32_t)EAX_4;\n            uint32_t tmp_11f00_3 = stack_m12;\n            uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_3;\n            uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)0xffffffff;\n            uint8_t tmp_12800_2 = !(uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n            if (!(uint8_t)tmp_12800_2) {\n                dbg_writeError();\n            }\n            RAX_9 = *(uint64_t*)&bytesOut;\n            RAX_9 = (uint64_t)RAX_9 + (uint64_t)1;\n            *(int64_t*)&bytesOut = (uint64_t)RAX_9;\n            int64_t* tmp_11f80_5 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_5 + (uint64_t)12) = (uint32_t)1;\n            uint32_t tmp_11f00_4 = stack_m36;\n            uint64_t EAX_7 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_4 & (uint32_t)1);\n            int64_t* tmp_11f80_6 = (int64_t*)stack_m32;\n            int64_t* RAX_14 = (int64_t*)tmp_11f80_6;\n            int32_t* tmp_4700_14 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_14 + (uint64_t)8);\n            uint32_t tmp_6a80_4 = (uint32_t)EAX_7;\n            *(int32_t*)tmp_4700_14 = (uint32_t)tmp_6a80_4;\n            RAX_23 = (int64_t*)RAX_14;\n        }\n        return RAX_23;\n    }\n}",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "entry.fini0",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 29,
+      "labels": [],
+      "decompiled_code": "void entry.fini0(void)\n{\n    void fcn_00001140(void);\n    uint64_t sym_deregister_tm_clones(void);\n#define __cxa_finalize__r2sleigh_addr 0x4ff8ULL\n    extern char __cxa_finalize[];\n#define __dso_handle__r2sleigh_addr 0x5008ULL\n    extern char __dso_handle[];\n#define completed_0__r2sleigh_addr 0x5028ULL\n    extern char completed_0[];\n\n    /* r2dec proof: no individual construct is marked; 38 source obligations: 28 rendered, 10 elided, 0 refused; 11 statements rendered */\n    {\n        uint8_t tmp_3e180_1 = *(uint8_t*)&completed_0;\n        uint8_t tmp_3e280_1 = (uint8_t)tmp_3e180_1;\n        if ((uint8_t)!(uint8_t)((uint8_t)tmp_3e280_1 == (uint8_t)0)) {\n            return;\n        } else {\n            uint64_t tmp_3ea80_1 = *(uint64_t*)&__cxa_finalize;\n            uint64_t tmp_3eb80_1 = (uint64_t)tmp_3ea80_1;\n            if (!(uint8_t)((uint64_t)tmp_3eb80_1 == (uint64_t)0)) {\n                fcn_00001140();\n            }\n            uint64_t RAX_2 = sym_deregister_tm_clones();\n            *(int8_t*)&completed_0 = (uint8_t)1;\n            return;\n        }\n    }\n}",
+      "source_code": null
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 162,
+      "labels": [],
+      "decompiled_code": "void bsClose(uint64_t bs)\n{\n    void dbg_readError(void);\n    void dbg_writeError(void);\n    uint64_t sym_imp_fclose(uint64_t);\n    uint64_t sym_imp_fflush(uint64_t);\n    void sym_imp_free(uint64_t);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: 1 construct is marked below; 214 source obligations: 173 rendered, 41 elided, 0 refused; 134 statements rendered */\n    {\n        uint64_t tmp_11f80_3;\n        uint64_t tmp_11f80_8;\n        uint64_t RAX_18;\n        uint64_t tmp_11f80_4;\n        uint64_t tmp_11f80_14;\n        uint64_t tmp_11f80_16;\n        uint64_t tmp_11f80_18;\n        uint64_t stack_m32;\n        uint32_t stack_m12;\n        /* r2dec residual: rendered control-domain occurrences do not exactly cover block 0x17f6; body rendered without structure */\n        stack_m32 = (uint64_t)bs;\n        uint64_t tmp_11f80_1 = stack_m32;\n        uint8_t* tmp_4700_3 = (uint8_t*)(uint64_t)((uint64_t)tmp_11f80_1 + (uint64_t)16);\n        uint8_t tmp_11e00_1 = *tmp_4700_3;\n        uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)119;\n        uint8_t ZF_2 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n        uint8_t tmp_12800_1 = !(uint8_t)ZF_2;\n        if ((uint8_t)tmp_12800_1) {\n            goto loc_17c6;\n        } else {\n            goto loc_173e;\n        }\nloc_173e: ;\n        goto loc_1762;\nloc_1762: ;\n        tmp_11f80_3 = stack_m32;\n        uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)tmp_11f80_3 + (uint64_t)12);\n        uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_2;\n        uint8_t OF_4 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_2, (uint32_t)7);\n        uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)7;\n        uint8_t SF_4 = (uint8_t)((int32_t)tmp_3ea00_2 < (int32_t)0);\n        uint8_t ZF_4 = (uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n        uint8_t tmp_12f00_2 = (uint8_t)((uint8_t)OF_4 != (uint8_t)SF_4);\n        uint8_t tmp_13000_2 = (uint8_t)ZF_4 || (uint8_t)tmp_12f00_2;\n        if ((uint8_t)tmp_13000_2) {\n            goto loc_1740;\n        } else {\n            goto loc_176e;\n        }\nloc_176e: ;\n        tmp_11f80_8 = stack_m32;\n        FILE* tmp_11f80_9 = (FILE*)*(uint64_t*)(uint64_t)tmp_11f80_8;\n        FILE* RDX_4 = (FILE*)tmp_11f80_9;\n        uint64_t tmp_11f80_10 = stack_m32;\n        uint32_t tmp_11f00_5 = *(uint32_t*)((uint64_t)tmp_11f80_10 + (uint64_t)8);\n        uint64_t RAX_14 = (uint64_t)(uint32_t)tmp_11f00_5;\n        uint8_t tmp_regalias_176e_c_0_1 = (uint8_t)RAX_14;\n        uint64_t EAX_7 = (uint64_t)(uint8_t)tmp_regalias_176e_c_0_1;\n        FILE* RSI_1 = (FILE*)RDX_4;\n        uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_7;\n        uint64_t RAX_16 = sym_imp_putc(RDI_1, RSI_1);\n        uint32_t EAX_8 = (uint32_t)RAX_16;\n        stack_m12 = (uint32_t)EAX_8;\n        uint32_t tmp_11f00_6 = stack_m12;\n        uint32_t tmp_3e900_3 = (uint32_t)tmp_11f00_6;\n        uint32_t tmp_3ea00_3 = (uint32_t)tmp_3e900_3 - (uint32_t)0xffffffff;\n        if ((uint8_t)!(uint8_t)((uint32_t)tmp_3ea00_3 == (uint32_t)0)) {\n            goto loc_1797;\n        } else {\n            goto loc_1792;\n        }\nloc_1792: ;\n        dbg_writeError();\n        goto loc_1797;\nloc_1797: ;\n        RAX_18 = *(uint64_t*)&bytesOut;\n        RAX_18 = (uint64_t)RAX_18 + (uint64_t)1;\n        *(int64_t*)&bytesOut = (uint64_t)RAX_18;\n        uint64_t tmp_11f80_11 = stack_m32;\n        uint64_t tmp_11f80_12 = *(uint64_t*)(uint64_t)tmp_11f80_11;\n        uint64_t RDI_4 = (uint64_t)tmp_11f80_12;\n        uint64_t RAX_22 = sym_imp_fflush(RDI_4);\n        uint32_t EAX_10 = (uint32_t)RAX_22;\n        uint32_t tmp_6a80_5 = (uint32_t)EAX_10;\n        stack_m12 = (uint32_t)tmp_6a80_5;\n        uint32_t tmp_11f00_7 = stack_m12;\n        uint32_t tmp_3e900_4 = (uint32_t)tmp_11f00_7;\n        uint32_t tmp_3ea00_4 = (uint32_t)tmp_3e900_4 - (uint32_t)0xffffffff;\n        uint8_t ZF_7 = (uint8_t)((uint32_t)tmp_3ea00_4 == (uint32_t)0);\n        uint8_t tmp_12800_3 = !(uint8_t)ZF_7;\n        if ((uint8_t)tmp_12800_3) {\n            goto loc_17c6;\n        } else {\n            goto loc_17c1;\n        }\nloc_17c1: ;\n        dbg_writeError();\n        goto loc_17c6;\nloc_1740: ;\n        tmp_11f80_4 = stack_m32;\n        uint32_t tmp_11f00_3 = *(uint32_t*)((uint64_t)tmp_11f80_4 + (uint64_t)12);\n        uint64_t RAX_7 = (uint64_t)(uint32_t)tmp_11f00_3;\n        uint64_t EDX_2 = (uint64_t)(uint32_t)((uint64_t)RAX_7 + (uint64_t)1);\n        uint64_t tmp_11f80_5 = stack_m32;\n        *(int32_t*)((uint64_t)tmp_11f80_5 + (uint64_t)12) = (uint32_t)EDX_2;\n        uint64_t tmp_11f80_6 = stack_m32;\n        uint32_t tmp_11f00_4 = *(uint32_t*)((uint64_t)tmp_11f80_6 + (uint64_t)8);\n        uint64_t RAX_10 = (uint64_t)(uint32_t)tmp_11f00_4;\n        uint64_t tmp_4900_2 = (uint64_t)RAX_10;\n        uint64_t tmp_4a00_2 = (uint64_t)RAX_10 + (uint64_t)tmp_4900_2;\n        uint64_t EDX_3 = (uint64_t)(uint32_t)tmp_4a00_2;\n        uint64_t tmp_11f80_7 = stack_m32;\n        uint64_t RAX_11 = (uint64_t)tmp_11f80_7;\n        uint8_t* tmp_4700_15 = (uint8_t*)((uint64_t)RAX_11 + (uint64_t)8);\n        uint32_t tmp_6a80_3 = (uint32_t)EDX_3;\n        *(int32_t*)tmp_4700_15 = (uint32_t)tmp_6a80_3;\n        goto loc_1762;\nloc_17c6: ;\n        tmp_11f80_14 = stack_m32;\n        uint64_t tmp_11f80_15 = *(uint64_t*)(uint64_t)tmp_11f80_14;\n        uint64_t RDI_8 = (uint64_t)tmp_11f80_15;\n        uint64_t RAX_27 = sym_imp_fclose(RDI_8);\n        uint32_t EAX_13 = (uint32_t)RAX_27;\n        stack_m12 = (uint32_t)EAX_13;\n        uint32_t tmp_11f00_9 = stack_m12;\n        uint32_t tmp_3e900_6 = (uint32_t)tmp_11f00_9;\n        uint32_t tmp_3ea00_6 = (uint32_t)tmp_3e900_6 - (uint32_t)0xffffffff;\n        uint8_t ZF_9 = (uint8_t)((uint32_t)tmp_3ea00_6 == (uint32_t)0);\n        uint8_t tmp_12800_5 = !(uint8_t)ZF_9;\n        if ((uint8_t)tmp_12800_5) {\n            goto loc_17f6;\n        } else {\n            goto loc_17de;\n        }\nloc_17de: ;\n        tmp_11f80_16 = stack_m32;\n        uint8_t* tmp_4700_29 = (uint8_t*)((uint64_t)tmp_11f80_16 + (uint64_t)16);\n        uint8_t tmp_11e00_2 = *tmp_4700_29;\n        uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)119;\n        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n        uint8_t tmp_12800_6 = !(uint8_t)ZF_10;\n        if ((uint8_t)tmp_12800_6) {\n            goto loc_17f1;\n        } else {\n            goto loc_17ea;\n        }\nloc_17ea: ;\n        dbg_writeError();\n        goto loc_17ef;\nloc_17f1: ;\n        dbg_readError();\n        goto loc_17f6;\nloc_17f6: ;\n        tmp_11f80_18 = stack_m32;\n        uint64_t RDI_12 = (uint64_t)tmp_11f80_18;\n        sym_imp_free(RDI_12);\n        return;\n    }\n}",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 0.052884615384615384,
+      "perfect_value": 1.0,
+      "size": 83,
+      "labels": [],
+      "decompiled_code": "uint64_t bsPutBit(int64_t* bs, uint64_t bit)\n{\n    void dbg_writeError(void);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: no individual construct is marked; 141 source obligations: 107 rendered, 34 elided, 0 refused; 69 statements rendered */\n    {\n        int64_t* RAX_23;\n        uint32_t stack_m36;\n        int64_t* stack_m32;\n        stack_m32 = (int64_t*)bs;\n        uint32_t tmp_regalias_15e3_11_0_1 = (uint32_t)bit;\n        stack_m36 = (uint32_t)tmp_regalias_15e3_11_0_1;\n        int64_t* tmp_11f80_1 = (int64_t*)stack_m32;\n        uint32_t tmp_11f00_1 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_1 + (uint64_t)12);\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)8;\n        uint8_t tmp_12800_1 = !(uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)tmp_12800_1) {\n            uint64_t EDX_2;\n            int64_t* tmp_11f80_7 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_5 = *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_7 + (uint64_t)8);\n            uint64_t RAX_16 = (uint64_t)(uint32_t)tmp_11f00_5;\n            uint64_t tmp_4900_1 = (uint64_t)RAX_16;\n            uint64_t tmp_4a00_1 = (uint64_t)RAX_16 + (uint64_t)tmp_4900_1;\n            EDX_2 = (uint64_t)(uint32_t)tmp_4a00_1;\n            uint32_t tmp_11f00_6 = stack_m36;\n            uint64_t EAX_10 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_6 & (uint32_t)1);\n            EDX_2 = (uint64_t)(uint32_t)((uint32_t)EDX_2 | (uint32_t)EAX_10);\n            int64_t* tmp_11f80_8 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_8 + (uint64_t)8) = (uint32_t)EDX_2;\n            int64_t* tmp_11f80_9 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_7 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_9 + (uint64_t)12);\n            uint64_t RAX_21 = (uint64_t)(uint32_t)tmp_11f00_7;\n            uint64_t EDX_4 = (uint64_t)(uint32_t)((uint64_t)RAX_21 + (uint64_t)1);\n            int64_t* tmp_11f80_10 = (int64_t*)stack_m32;\n            int64_t* RAX_22 = (int64_t*)tmp_11f80_10;\n            int32_t* tmp_4700_24 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_22 + (uint64_t)12);\n            uint32_t tmp_6a80_6 = (uint32_t)EDX_4;\n            *(int32_t*)tmp_4700_24 = (uint32_t)tmp_6a80_6;\n            RAX_23 = (int64_t*)RAX_22;\n        } else {\n            uint64_t RAX_9;\n            uint32_t stack_m12;\n            int64_t* tmp_11f80_2 = (int64_t*)stack_m32;\n            FILE* tmp_11f80_3 = (FILE*)*(uint64_t*)(int64_t*)tmp_11f80_2;\n            FILE* RDX_1 = (FILE*)tmp_11f80_3;\n            int64_t* tmp_11f80_4 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_4 + (uint64_t)8);\n            uint64_t RAX_5 = (uint64_t)(uint32_t)tmp_11f00_2;\n            uint8_t tmp_regalias_1602_c_0_1 = (uint8_t)RAX_5;\n            uint64_t EAX_3 = (uint64_t)(uint8_t)tmp_regalias_1602_c_0_1;\n            FILE* RSI_1 = (FILE*)RDX_1;\n            uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_3;\n            uint64_t RAX_7 = sym_imp_putc(RDI_1, RSI_1);\n            uint32_t EAX_4 = (uint32_t)RAX_7;\n            stack_m12 = (uint32_t)EAX_4;\n            uint32_t tmp_11f00_3 = stack_m12;\n            uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_3;\n            uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)0xffffffff;\n            uint8_t tmp_12800_2 = !(uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n            if (!(uint8_t)tmp_12800_2) {\n                dbg_writeError();\n            }\n            RAX_9 = *(uint64_t*)&bytesOut;\n            RAX_9 = (uint64_t)RAX_9 + (uint64_t)1;\n            *(int64_t*)&bytesOut = (uint64_t)RAX_9;\n            int64_t* tmp_11f80_5 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_5 + (uint64_t)12) = (uint32_t)1;\n            uint32_t tmp_11f00_4 = stack_m36;\n            uint64_t EAX_7 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_4 & (uint32_t)1);\n            int64_t* tmp_11f80_6 = (int64_t*)stack_m32;\n            int64_t* RAX_14 = (int64_t*)tmp_11f80_6;\n            int32_t* tmp_4700_14 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_14 + (uint64_t)8);\n            uint32_t tmp_6a80_4 = (uint32_t)EAX_7;\n            *(int32_t*)tmp_4700_14 = (uint32_t)tmp_6a80_4;\n            RAX_23 = (int64_t*)RAX_14;\n        }\n        return RAX_23;\n    }\n}",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "value": 0.08780487804878048,
+      "perfect_value": 1.0,
+      "size": 90,
+      "labels": [],
+      "decompiled_code": "uint64_t endsInBz2(char* name)\n{\n    uint64_t sym_imp_strlen(uint64_t);\n\n    /* r2dec proof: no individual construct is marked; 123 source obligations: 94 rendered, 29 elided, 0 refused; 71 statements rendered */\n    {\n        uint64_t RAX_3;\n        char* stack_m32;\n        uint32_t stack_m12;\n        stack_m32 = (char*)name;\n        char* tmp_11f80_1 = (char*)stack_m32;\n        char* RDI_1 = (char*)tmp_11f80_1;\n        uint64_t RAX_2 = sym_imp_strlen(RDI_1);\n        uint32_t EAX_1 = (uint32_t)RAX_2;\n        stack_m12 = (uint32_t)EAX_1;\n        uint32_t tmp_11f00_1 = stack_m12;\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint8_t OF_2 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_1, (uint32_t)4);\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)4;\n        uint8_t SF_2 = (uint8_t)((int32_t)tmp_3ea00_1 < (int32_t)0);\n        uint8_t ZF_2 = (uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)((uint8_t)!(uint8_t)ZF_2 && (uint8_t)((uint8_t)OF_2 == (uint8_t)SF_2))) {\n            uint64_t RAX_6;\n            uint32_t tmp_11f00_2 = stack_m12;\n            uint64_t RAX_5 = (uint64_t)(int32_t)tmp_11f00_2;\n            uint64_t RDX_2 = (uint64_t)((uint64_t)RAX_5 + (uint64_t)-0x4);\n            char* tmp_11f80_2 = (char*)stack_m32;\n            RAX_6 = (uint64_t)(char*)tmp_11f80_2;\n            RAX_6 = (uint64_t)RAX_6 + (uint64_t)RDX_2;\n            uint8_t tmp_11e00_1 = *(uint8_t*)RAX_6;\n            uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)46;\n            uint8_t ZF_4 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n            uint8_t tmp_12800_1 = !(uint8_t)ZF_4;\n            if ((uint8_t)tmp_12800_1) {\n                RAX_3 = (uint64_t)0;\n            } else {\n                uint64_t RAX_11;\n                uint32_t tmp_11f00_3 = stack_m12;\n                uint64_t RAX_10 = (uint64_t)(int32_t)tmp_11f00_3;\n                uint64_t RDX_3 = (uint64_t)((uint64_t)RAX_10 + (uint64_t)-0x3);\n                char* tmp_11f80_3 = (char*)stack_m32;\n                RAX_11 = (uint64_t)(char*)tmp_11f80_3;\n                RAX_11 = (uint64_t)RAX_11 + (uint64_t)RDX_3;\n                uint8_t tmp_11e00_2 = *(uint8_t*)RAX_11;\n                uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)98;\n                uint8_t ZF_6 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n                uint8_t tmp_12800_2 = !(uint8_t)ZF_6;\n                if ((uint8_t)tmp_12800_2) {\n                    RAX_3 = (uint64_t)0;\n                } else {\n                    uint64_t RAX_16;\n                    uint32_t tmp_11f00_4 = stack_m12;\n                    uint64_t RAX_15 = (uint64_t)(int32_t)tmp_11f00_4;\n                    uint64_t RDX_4 = (uint64_t)((uint64_t)RAX_15 + (uint64_t)-0x2);\n                    char* tmp_11f80_4 = (char*)stack_m32;\n                    RAX_16 = (uint64_t)(char*)tmp_11f80_4;\n                    RAX_16 = (uint64_t)RAX_16 + (uint64_t)RDX_4;\n                    uint8_t tmp_11e00_3 = *(uint8_t*)RAX_16;\n                    uint8_t tmp_3de00_3 = (uint8_t)tmp_11e00_3 - (uint8_t)122;\n                    uint8_t ZF_8 = (uint8_t)((uint8_t)tmp_3de00_3 == (uint8_t)0);\n                    uint8_t tmp_12800_3 = !(uint8_t)ZF_8;\n                    if ((uint8_t)tmp_12800_3) {\n                        RAX_3 = (uint64_t)0;\n                    } else {\n                        uint64_t RAX_21;\n                        uint32_t tmp_11f00_5 = stack_m12;\n                        uint64_t RAX_20 = (uint64_t)(int32_t)tmp_11f00_5;\n                        uint64_t RDX_5 = (uint64_t)((uint64_t)RAX_20 + (uint64_t)-0x1);\n                        char* tmp_11f80_5 = (char*)stack_m32;\n                        RAX_21 = (uint64_t)(char*)tmp_11f80_5;\n                        RAX_21 = (uint64_t)RAX_21 + (uint64_t)RDX_5;\n                        uint8_t tmp_11e00_4 = *(uint8_t*)RAX_21;\n                        uint8_t tmp_3de00_4 = (uint8_t)tmp_11e00_4 - (uint8_t)50;\n                        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_4 == (uint8_t)0);\n                        uint8_t tmp_12800_4 = !(uint8_t)ZF_10;\n                        if ((uint8_t)tmp_12800_4) {\n                            RAX_3 = (uint64_t)0;\n                        } else {\n                            RAX_3 = (uint64_t)1;\n                        }\n                    }\n                }\n            }\n        } else {\n            RAX_3 = (uint64_t)0;\n        }\n        return RAX_3;\n    }\n    /* summary return unresolved; value intentionally not reconstructed */\n}",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "tooManyBlocks",
+      "value": 0.15584415584415584,
+      "perfect_value": 1.0,
+      "size": 32,
+      "labels": [],
+      "decompiled_code": "void tooManyBlocks(uint64_t max_handled_blocks)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 57 source obligations: 42 rendered, 15 elided, 0 refused; 19 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)max_handled_blocks;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_3 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: `%s' appears to contain more than %d blocks\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_3);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: and cannot be handled.  To fix, increase\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_5);\n        FILE* RAX_7 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_7 = (uint64_t)&progName;\n        char* RSI_5 = (char*)(uint64_t)\"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_7;\n        uint64_t RAX_9 = sym_imp_fprintf(RDI_5, RSI_5, RDX_7);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}",
+      "source_code": "static void tooManyBlocks ( Int32 max_handled_blocks )\n{\n   fprintf ( stderr,\n             \"%s: `%s' appears to contain more than %d blocks\\n\",\n            progName, inFileName, max_handled_blocks );\n   fprintf ( stderr,\n             \"%s: and cannot be handled.  To fix, increase\\n\",\n             progName );\n   fprintf ( stderr, \n             \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "mallocFail",
+      "value": 0.16071428571428573,
+      "perfect_value": 1.0,
+      "size": 27,
+      "labels": [],
+      "decompiled_code": "void mallocFail(uint64_t n)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 43 source obligations: 30 rendered, 13 elided, 0 refused; 14 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)n;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: malloc failed on request for %d bytes.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_4 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_4);\n        uint64_t RDI_5 = (uint64_t)1;\n        sym_imp_exit(RDI_5);\n    }\n}",
+      "source_code": "static void mallocFail ( Int32 n )\n{\n   fprintf ( stderr,\n             \"%s: malloc failed on request for %d bytes.\\n\",\n            progName, n );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "readError",
+      "value": 0.21428571428571427,
+      "perfect_value": 1.0,
+      "size": 28,
+      "labels": [],
+      "decompiled_code": "void readError(void)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n    void sym_imp_perror(uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 42 source obligations: 31 rendered, 11 elided, 0 refused; 14 statements rendered */\n    {\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: I/O error reading `%s', possible reason follows.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        char* RDI_3 = (char*)(uint64_t)&progName;\n        sym_imp_perror(RDI_3);\n        FILE* RAX_6 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_4 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_6;\n        uint64_t RAX_8 = sym_imp_fprintf(RDI_5, RSI_4, RDX_5);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}",
+      "source_code": "static void readError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "byte_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "writeError",
+      "value": 0.21428571428571427,
+      "perfect_value": 1.0,
+      "size": 28,
+      "labels": [],
+      "decompiled_code": "void writeError(void)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n    void sym_imp_perror(uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 42 source obligations: 31 rendered, 11 elided, 0 refused; 14 statements rendered */\n    {\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: I/O error reading `%s', possible reason follows.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        char* RDI_3 = (char*)(uint64_t)&progName;\n        sym_imp_perror(RDI_3);\n        FILE* RAX_6 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_4 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_6;\n        uint64_t RAX_8 = sym_imp_fprintf(RDI_5, RSI_4, RDX_5);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}",
+      "source_code": "static void writeError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "mallocFail",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 27,
+      "labels": [],
+      "decompiled_code": "void mallocFail(uint64_t n)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 43 source obligations: 30 rendered, 13 elided, 0 refused; 14 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)n;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: malloc failed on request for %d bytes.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_4 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_4);\n        uint64_t RDI_5 = (uint64_t)1;\n        sym_imp_exit(RDI_5);\n    }\n}",
+      "source_code": "static void mallocFail ( Int32 n )\n{\n   fprintf ( stderr,\n             \"%s: malloc failed on request for %d bytes.\\n\",\n            progName, n );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "tooManyBlocks",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 32,
+      "labels": [],
+      "decompiled_code": "void tooManyBlocks(uint64_t max_handled_blocks)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 57 source obligations: 42 rendered, 15 elided, 0 refused; 19 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)max_handled_blocks;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_3 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: `%s' appears to contain more than %d blocks\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_3);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: and cannot be handled.  To fix, increase\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_5);\n        FILE* RAX_7 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_7 = (uint64_t)&progName;\n        char* RSI_5 = (char*)(uint64_t)\"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_7;\n        uint64_t RAX_9 = sym_imp_fprintf(RDI_5, RSI_5, RDX_7);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}",
+      "source_code": "static void tooManyBlocks ( Int32 max_handled_blocks )\n{\n   fprintf ( stderr,\n             \"%s: `%s' appears to contain more than %d blocks\\n\",\n            progName, inFileName, max_handled_blocks );\n   fprintf ( stderr,\n             \"%s: and cannot be handled.  To fix, increase\\n\",\n             progName );\n   fprintf ( stderr, \n             \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\",\n             progName );\n   exit ( 1 );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 83,
+      "labels": [],
+      "decompiled_code": "uint64_t bsPutBit(int64_t* bs, uint64_t bit)\n{\n    void dbg_writeError(void);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: no individual construct is marked; 141 source obligations: 107 rendered, 34 elided, 0 refused; 69 statements rendered */\n    {\n        int64_t* RAX_23;\n        uint32_t stack_m36;\n        int64_t* stack_m32;\n        stack_m32 = (int64_t*)bs;\n        uint32_t tmp_regalias_15e3_11_0_1 = (uint32_t)bit;\n        stack_m36 = (uint32_t)tmp_regalias_15e3_11_0_1;\n        int64_t* tmp_11f80_1 = (int64_t*)stack_m32;\n        uint32_t tmp_11f00_1 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_1 + (uint64_t)12);\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)8;\n        uint8_t tmp_12800_1 = !(uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)tmp_12800_1) {\n            uint64_t EDX_2;\n            int64_t* tmp_11f80_7 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_5 = *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_7 + (uint64_t)8);\n            uint64_t RAX_16 = (uint64_t)(uint32_t)tmp_11f00_5;\n            uint64_t tmp_4900_1 = (uint64_t)RAX_16;\n            uint64_t tmp_4a00_1 = (uint64_t)RAX_16 + (uint64_t)tmp_4900_1;\n            EDX_2 = (uint64_t)(uint32_t)tmp_4a00_1;\n            uint32_t tmp_11f00_6 = stack_m36;\n            uint64_t EAX_10 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_6 & (uint32_t)1);\n            EDX_2 = (uint64_t)(uint32_t)((uint32_t)EDX_2 | (uint32_t)EAX_10);\n            int64_t* tmp_11f80_8 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_8 + (uint64_t)8) = (uint32_t)EDX_2;\n            int64_t* tmp_11f80_9 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_7 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_9 + (uint64_t)12);\n            uint64_t RAX_21 = (uint64_t)(uint32_t)tmp_11f00_7;\n            uint64_t EDX_4 = (uint64_t)(uint32_t)((uint64_t)RAX_21 + (uint64_t)1);\n            int64_t* tmp_11f80_10 = (int64_t*)stack_m32;\n            int64_t* RAX_22 = (int64_t*)tmp_11f80_10;\n            int32_t* tmp_4700_24 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_22 + (uint64_t)12);\n            uint32_t tmp_6a80_6 = (uint32_t)EDX_4;\n            *(int32_t*)tmp_4700_24 = (uint32_t)tmp_6a80_6;\n            RAX_23 = (int64_t*)RAX_22;\n        } else {\n            uint64_t RAX_9;\n            uint32_t stack_m12;\n            int64_t* tmp_11f80_2 = (int64_t*)stack_m32;\n            FILE* tmp_11f80_3 = (FILE*)*(uint64_t*)(int64_t*)tmp_11f80_2;\n            FILE* RDX_1 = (FILE*)tmp_11f80_3;\n            int64_t* tmp_11f80_4 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_4 + (uint64_t)8);\n            uint64_t RAX_5 = (uint64_t)(uint32_t)tmp_11f00_2;\n            uint8_t tmp_regalias_1602_c_0_1 = (uint8_t)RAX_5;\n            uint64_t EAX_3 = (uint64_t)(uint8_t)tmp_regalias_1602_c_0_1;\n            FILE* RSI_1 = (FILE*)RDX_1;\n            uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_3;\n            uint64_t RAX_7 = sym_imp_putc(RDI_1, RSI_1);\n            uint32_t EAX_4 = (uint32_t)RAX_7;\n            stack_m12 = (uint32_t)EAX_4;\n            uint32_t tmp_11f00_3 = stack_m12;\n            uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_3;\n            uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)0xffffffff;\n            uint8_t tmp_12800_2 = !(uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n            if (!(uint8_t)tmp_12800_2) {\n                dbg_writeError();\n            }\n            RAX_9 = *(uint64_t*)&bytesOut;\n            RAX_9 = (uint64_t)RAX_9 + (uint64_t)1;\n            *(int64_t*)&bytesOut = (uint64_t)RAX_9;\n            int64_t* tmp_11f80_5 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_5 + (uint64_t)12) = (uint32_t)1;\n            uint32_t tmp_11f00_4 = stack_m36;\n            uint64_t EAX_7 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_4 & (uint32_t)1);\n            int64_t* tmp_11f80_6 = (int64_t*)stack_m32;\n            int64_t* RAX_14 = (int64_t*)tmp_11f80_6;\n            int32_t* tmp_4700_14 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_14 + (uint64_t)8);\n            uint32_t tmp_6a80_4 = (uint32_t)EAX_7;\n            *(int32_t*)tmp_4700_14 = (uint32_t)tmp_6a80_4;\n            RAX_23 = (int64_t*)RAX_14;\n        }\n        return RAX_23;\n    }\n}",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "value": 0.0,
+      "perfect_value": 1.0,
+      "size": 162,
+      "labels": [],
+      "decompiled_code": "void bsClose(uint64_t bs)\n{\n    void dbg_readError(void);\n    void dbg_writeError(void);\n    uint64_t sym_imp_fclose(uint64_t);\n    uint64_t sym_imp_fflush(uint64_t);\n    void sym_imp_free(uint64_t);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: 1 construct is marked below; 214 source obligations: 173 rendered, 41 elided, 0 refused; 134 statements rendered */\n    {\n        uint64_t tmp_11f80_3;\n        uint64_t tmp_11f80_8;\n        uint64_t RAX_18;\n        uint64_t tmp_11f80_4;\n        uint64_t tmp_11f80_14;\n        uint64_t tmp_11f80_16;\n        uint64_t tmp_11f80_18;\n        uint64_t stack_m32;\n        uint32_t stack_m12;\n        /* r2dec residual: rendered control-domain occurrences do not exactly cover block 0x17f6; body rendered without structure */\n        stack_m32 = (uint64_t)bs;\n        uint64_t tmp_11f80_1 = stack_m32;\n        uint8_t* tmp_4700_3 = (uint8_t*)(uint64_t)((uint64_t)tmp_11f80_1 + (uint64_t)16);\n        uint8_t tmp_11e00_1 = *tmp_4700_3;\n        uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)119;\n        uint8_t ZF_2 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n        uint8_t tmp_12800_1 = !(uint8_t)ZF_2;\n        if ((uint8_t)tmp_12800_1) {\n            goto loc_17c6;\n        } else {\n            goto loc_173e;\n        }\nloc_173e: ;\n        goto loc_1762;\nloc_1762: ;\n        tmp_11f80_3 = stack_m32;\n        uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)tmp_11f80_3 + (uint64_t)12);\n        uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_2;\n        uint8_t OF_4 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_2, (uint32_t)7);\n        uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)7;\n        uint8_t SF_4 = (uint8_t)((int32_t)tmp_3ea00_2 < (int32_t)0);\n        uint8_t ZF_4 = (uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n        uint8_t tmp_12f00_2 = (uint8_t)((uint8_t)OF_4 != (uint8_t)SF_4);\n        uint8_t tmp_13000_2 = (uint8_t)ZF_4 || (uint8_t)tmp_12f00_2;\n        if ((uint8_t)tmp_13000_2) {\n            goto loc_1740;\n        } else {\n            goto loc_176e;\n        }\nloc_176e: ;\n        tmp_11f80_8 = stack_m32;\n        FILE* tmp_11f80_9 = (FILE*)*(uint64_t*)(uint64_t)tmp_11f80_8;\n        FILE* RDX_4 = (FILE*)tmp_11f80_9;\n        uint64_t tmp_11f80_10 = stack_m32;\n        uint32_t tmp_11f00_5 = *(uint32_t*)((uint64_t)tmp_11f80_10 + (uint64_t)8);\n        uint64_t RAX_14 = (uint64_t)(uint32_t)tmp_11f00_5;\n        uint8_t tmp_regalias_176e_c_0_1 = (uint8_t)RAX_14;\n        uint64_t EAX_7 = (uint64_t)(uint8_t)tmp_regalias_176e_c_0_1;\n        FILE* RSI_1 = (FILE*)RDX_4;\n        uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_7;\n        uint64_t RAX_16 = sym_imp_putc(RDI_1, RSI_1);\n        uint32_t EAX_8 = (uint32_t)RAX_16;\n        stack_m12 = (uint32_t)EAX_8;\n        uint32_t tmp_11f00_6 = stack_m12;\n        uint32_t tmp_3e900_3 = (uint32_t)tmp_11f00_6;\n        uint32_t tmp_3ea00_3 = (uint32_t)tmp_3e900_3 - (uint32_t)0xffffffff;\n        if ((uint8_t)!(uint8_t)((uint32_t)tmp_3ea00_3 == (uint32_t)0)) {\n            goto loc_1797;\n        } else {\n            goto loc_1792;\n        }\nloc_1792: ;\n        dbg_writeError();\n        goto loc_1797;\nloc_1797: ;\n        RAX_18 = *(uint64_t*)&bytesOut;\n        RAX_18 = (uint64_t)RAX_18 + (uint64_t)1;\n        *(int64_t*)&bytesOut = (uint64_t)RAX_18;\n        uint64_t tmp_11f80_11 = stack_m32;\n        uint64_t tmp_11f80_12 = *(uint64_t*)(uint64_t)tmp_11f80_11;\n        uint64_t RDI_4 = (uint64_t)tmp_11f80_12;\n        uint64_t RAX_22 = sym_imp_fflush(RDI_4);\n        uint32_t EAX_10 = (uint32_t)RAX_22;\n        uint32_t tmp_6a80_5 = (uint32_t)EAX_10;\n        stack_m12 = (uint32_t)tmp_6a80_5;\n        uint32_t tmp_11f00_7 = stack_m12;\n        uint32_t tmp_3e900_4 = (uint32_t)tmp_11f00_7;\n        uint32_t tmp_3ea00_4 = (uint32_t)tmp_3e900_4 - (uint32_t)0xffffffff;\n        uint8_t ZF_7 = (uint8_t)((uint32_t)tmp_3ea00_4 == (uint32_t)0);\n        uint8_t tmp_12800_3 = !(uint8_t)ZF_7;\n        if ((uint8_t)tmp_12800_3) {\n            goto loc_17c6;\n        } else {\n            goto loc_17c1;\n        }\nloc_17c1: ;\n        dbg_writeError();\n        goto loc_17c6;\nloc_1740: ;\n        tmp_11f80_4 = stack_m32;\n        uint32_t tmp_11f00_3 = *(uint32_t*)((uint64_t)tmp_11f80_4 + (uint64_t)12);\n        uint64_t RAX_7 = (uint64_t)(uint32_t)tmp_11f00_3;\n        uint64_t EDX_2 = (uint64_t)(uint32_t)((uint64_t)RAX_7 + (uint64_t)1);\n        uint64_t tmp_11f80_5 = stack_m32;\n        *(int32_t*)((uint64_t)tmp_11f80_5 + (uint64_t)12) = (uint32_t)EDX_2;\n        uint64_t tmp_11f80_6 = stack_m32;\n        uint32_t tmp_11f00_4 = *(uint32_t*)((uint64_t)tmp_11f80_6 + (uint64_t)8);\n        uint64_t RAX_10 = (uint64_t)(uint32_t)tmp_11f00_4;\n        uint64_t tmp_4900_2 = (uint64_t)RAX_10;\n        uint64_t tmp_4a00_2 = (uint64_t)RAX_10 + (uint64_t)tmp_4900_2;\n        uint64_t EDX_3 = (uint64_t)(uint32_t)tmp_4a00_2;\n        uint64_t tmp_11f80_7 = stack_m32;\n        uint64_t RAX_11 = (uint64_t)tmp_11f80_7;\n        uint8_t* tmp_4700_15 = (uint8_t*)((uint64_t)RAX_11 + (uint64_t)8);\n        uint32_t tmp_6a80_3 = (uint32_t)EDX_3;\n        *(int32_t*)tmp_4700_15 = (uint32_t)tmp_6a80_3;\n        goto loc_1762;\nloc_17c6: ;\n        tmp_11f80_14 = stack_m32;\n        uint64_t tmp_11f80_15 = *(uint64_t*)(uint64_t)tmp_11f80_14;\n        uint64_t RDI_8 = (uint64_t)tmp_11f80_15;\n        uint64_t RAX_27 = sym_imp_fclose(RDI_8);\n        uint32_t EAX_13 = (uint32_t)RAX_27;\n        stack_m12 = (uint32_t)EAX_13;\n        uint32_t tmp_11f00_9 = stack_m12;\n        uint32_t tmp_3e900_6 = (uint32_t)tmp_11f00_9;\n        uint32_t tmp_3ea00_6 = (uint32_t)tmp_3e900_6 - (uint32_t)0xffffffff;\n        uint8_t ZF_9 = (uint8_t)((uint32_t)tmp_3ea00_6 == (uint32_t)0);\n        uint8_t tmp_12800_5 = !(uint8_t)ZF_9;\n        if ((uint8_t)tmp_12800_5) {\n            goto loc_17f6;\n        } else {\n            goto loc_17de;\n        }\nloc_17de: ;\n        tmp_11f80_16 = stack_m32;\n        uint8_t* tmp_4700_29 = (uint8_t*)((uint64_t)tmp_11f80_16 + (uint64_t)16);\n        uint8_t tmp_11e00_2 = *tmp_4700_29;\n        uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)119;\n        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n        uint8_t tmp_12800_6 = !(uint8_t)ZF_10;\n        if ((uint8_t)tmp_12800_6) {\n            goto loc_17f1;\n        } else {\n            goto loc_17ea;\n        }\nloc_17ea: ;\n        dbg_writeError();\n        goto loc_17ef;\nloc_17f1: ;\n        dbg_readError();\n        goto loc_17f6;\nloc_17f6: ;\n        tmp_11f80_18 = stack_m32;\n        uint64_t RDI_12 = (uint64_t)tmp_11f80_18;\n        sym_imp_free(RDI_12);\n        return;\n    }\n}",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}"
+    },
+    {
+      "metric": "type_match",
+      "decompiler": "r2sleigh",
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "value": 0.5,
+      "perfect_value": 1.0,
+      "size": 90,
+      "labels": [],
+      "decompiled_code": "uint64_t endsInBz2(char* name)\n{\n    uint64_t sym_imp_strlen(uint64_t);\n\n    /* r2dec proof: no individual construct is marked; 123 source obligations: 94 rendered, 29 elided, 0 refused; 71 statements rendered */\n    {\n        uint64_t RAX_3;\n        char* stack_m32;\n        uint32_t stack_m12;\n        stack_m32 = (char*)name;\n        char* tmp_11f80_1 = (char*)stack_m32;\n        char* RDI_1 = (char*)tmp_11f80_1;\n        uint64_t RAX_2 = sym_imp_strlen(RDI_1);\n        uint32_t EAX_1 = (uint32_t)RAX_2;\n        stack_m12 = (uint32_t)EAX_1;\n        uint32_t tmp_11f00_1 = stack_m12;\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint8_t OF_2 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_1, (uint32_t)4);\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)4;\n        uint8_t SF_2 = (uint8_t)((int32_t)tmp_3ea00_1 < (int32_t)0);\n        uint8_t ZF_2 = (uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)((uint8_t)!(uint8_t)ZF_2 && (uint8_t)((uint8_t)OF_2 == (uint8_t)SF_2))) {\n            uint64_t RAX_6;\n            uint32_t tmp_11f00_2 = stack_m12;\n            uint64_t RAX_5 = (uint64_t)(int32_t)tmp_11f00_2;\n            uint64_t RDX_2 = (uint64_t)((uint64_t)RAX_5 + (uint64_t)-0x4);\n            char* tmp_11f80_2 = (char*)stack_m32;\n            RAX_6 = (uint64_t)(char*)tmp_11f80_2;\n            RAX_6 = (uint64_t)RAX_6 + (uint64_t)RDX_2;\n            uint8_t tmp_11e00_1 = *(uint8_t*)RAX_6;\n            uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)46;\n            uint8_t ZF_4 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n            uint8_t tmp_12800_1 = !(uint8_t)ZF_4;\n            if ((uint8_t)tmp_12800_1) {\n                RAX_3 = (uint64_t)0;\n            } else {\n                uint64_t RAX_11;\n                uint32_t tmp_11f00_3 = stack_m12;\n                uint64_t RAX_10 = (uint64_t)(int32_t)tmp_11f00_3;\n                uint64_t RDX_3 = (uint64_t)((uint64_t)RAX_10 + (uint64_t)-0x3);\n                char* tmp_11f80_3 = (char*)stack_m32;\n                RAX_11 = (uint64_t)(char*)tmp_11f80_3;\n                RAX_11 = (uint64_t)RAX_11 + (uint64_t)RDX_3;\n                uint8_t tmp_11e00_2 = *(uint8_t*)RAX_11;\n                uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)98;\n                uint8_t ZF_6 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n                uint8_t tmp_12800_2 = !(uint8_t)ZF_6;\n                if ((uint8_t)tmp_12800_2) {\n                    RAX_3 = (uint64_t)0;\n                } else {\n                    uint64_t RAX_16;\n                    uint32_t tmp_11f00_4 = stack_m12;\n                    uint64_t RAX_15 = (uint64_t)(int32_t)tmp_11f00_4;\n                    uint64_t RDX_4 = (uint64_t)((uint64_t)RAX_15 + (uint64_t)-0x2);\n                    char* tmp_11f80_4 = (char*)stack_m32;\n                    RAX_16 = (uint64_t)(char*)tmp_11f80_4;\n                    RAX_16 = (uint64_t)RAX_16 + (uint64_t)RDX_4;\n                    uint8_t tmp_11e00_3 = *(uint8_t*)RAX_16;\n                    uint8_t tmp_3de00_3 = (uint8_t)tmp_11e00_3 - (uint8_t)122;\n                    uint8_t ZF_8 = (uint8_t)((uint8_t)tmp_3de00_3 == (uint8_t)0);\n                    uint8_t tmp_12800_3 = !(uint8_t)ZF_8;\n                    if ((uint8_t)tmp_12800_3) {\n                        RAX_3 = (uint64_t)0;\n                    } else {\n                        uint64_t RAX_21;\n                        uint32_t tmp_11f00_5 = stack_m12;\n                        uint64_t RAX_20 = (uint64_t)(int32_t)tmp_11f00_5;\n                        uint64_t RDX_5 = (uint64_t)((uint64_t)RAX_20 + (uint64_t)-0x1);\n                        char* tmp_11f80_5 = (char*)stack_m32;\n                        RAX_21 = (uint64_t)(char*)tmp_11f80_5;\n                        RAX_21 = (uint64_t)RAX_21 + (uint64_t)RDX_5;\n                        uint8_t tmp_11e00_4 = *(uint8_t*)RAX_21;\n                        uint8_t tmp_3de00_4 = (uint8_t)tmp_11e00_4 - (uint8_t)50;\n                        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_4 == (uint8_t)0);\n                        uint8_t tmp_12800_4 = !(uint8_t)ZF_10;\n                        if ((uint8_t)tmp_12800_4) {\n                            RAX_3 = (uint64_t)0;\n                        } else {\n                            RAX_3 = (uint64_t)1;\n                        }\n                    }\n                }\n            }\n        } else {\n            RAX_3 = (uint64_t)0;\n        }\n        return RAX_3;\n    }\n    /* summary return unresolved; value intentionally not reconstructed */\n}",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}"
+    }
+  ],
+  "samples": [
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "readError",
+      "size": 15,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "easy",
+      "source_code": "static void readError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid readError(void)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: I/O error reading `%s', possible reason follows.\\n\", &progName, &inFileName);\n    perror(&progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+        "r2sleigh": "void readError(void)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n    void sym_imp_perror(uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 42 source obligations: 31 rendered, 11 elided, 0 refused; 14 statements rendered */\n    {\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: I/O error reading `%s', possible reason follows.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        char* RDI_3 = (char*)(uint64_t)&progName;\n        sym_imp_perror(RDI_3);\n        FILE* RAX_6 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_4 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_6;\n        uint64_t RAX_8 = sym_imp_fprintf(RDI_5, RSI_4, RDX_5);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 0.0,
+          "byte_match": 0.9130434782608695
+        },
+        "r2sleigh": {
+          "ged": 0.0,
+          "byte_match": 0.21428571428571427
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": true,
+          "byte_match": false
+        },
+        "r2sleigh": {
+          "ged": true,
+          "byte_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "mallocFail",
+      "size": 13,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "easy",
+      "source_code": "static void mallocFail ( Int32 n )\n{\n   fprintf ( stderr,\n             \"%s: malloc failed on request for %d bytes.\\n\",\n            progName, n );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char progName;\n\nvoid mallocFail(int a0)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: malloc failed on request for %d bytes.\\n\", &progName, a0);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+        "r2sleigh": "void mallocFail(uint64_t n)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 43 source obligations: 30 rendered, 13 elided, 0 refused; 14 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)n;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: malloc failed on request for %d bytes.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_4 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_4);\n        uint64_t RDI_5 = (uint64_t)1;\n        sym_imp_exit(RDI_5);\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 0.0,
+          "byte_match": 0.9090909090909091,
+          "type_match": 1.0
+        },
+        "r2sleigh": {
+          "ged": 0.0,
+          "byte_match": 0.16071428571428573,
+          "type_match": 0.0
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": true,
+          "byte_match": false,
+          "type_match": true
+        },
+        "r2sleigh": {
+          "ged": true,
+          "byte_match": false,
+          "type_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "writeError",
+      "size": 15,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "easy",
+      "source_code": "static void writeError ( void )\n{\n   fprintf ( stderr,\n             \"%s: I/O error reading `%s', possible reason follows.\\n\",\n            progName, inFileName );\n   perror ( progName );\n   fprintf ( stderr, \"%s: warning: output file(s) may be incomplete.\\n\",\n             progName );\n   exit ( 1 );\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid writeError(void)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: I/O error reading `%s', possible reason follows.\\n\", &progName, &inFileName);\n    perror(&progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: warning: output file(s) may be incomplete.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+        "r2sleigh": "void writeError(void)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n    void sym_imp_perror(uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 42 source obligations: 31 rendered, 11 elided, 0 refused; 14 statements rendered */\n    {\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_2 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: I/O error reading `%s', possible reason follows.\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);\n        char* RDI_3 = (char*)(uint64_t)&progName;\n        sym_imp_perror(RDI_3);\n        FILE* RAX_6 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_4 = (char*)(uint64_t)\"%s: warning: output file(s) may be incomplete.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_6;\n        uint64_t RAX_8 = sym_imp_fprintf(RDI_5, RSI_4, RDX_5);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 0.0,
+          "byte_match": 0.9130434782608695
+        },
+        "r2sleigh": {
+          "ged": 0.0,
+          "byte_match": 0.21428571428571427
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": true,
+          "byte_match": false
+        },
+        "r2sleigh": {
+          "ged": true,
+          "byte_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "tooManyBlocks",
+      "size": 15,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "easy",
+      "source_code": "static void tooManyBlocks ( Int32 max_handled_blocks )\n{\n   fprintf ( stderr,\n             \"%s: `%s' appears to contain more than %d blocks\\n\",\n            progName, inFileName, max_handled_blocks );\n   fprintf ( stderr,\n             \"%s: and cannot be handled.  To fix, increase\\n\",\n             progName );\n   fprintf ( stderr, \n             \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\",\n             progName );\n   exit ( 1 );\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\nextern FILE *GLIBC_2.2.5::stderr;\nextern char inFileName;\nextern char progName;\n\nvoid tooManyBlocks(int a0)\n{\n    fprintf(GLIBC_2.2.5::stderr, \"%s: `%s' appears to contain more than %d blocks\\n\", &progName, &inFileName, a0);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: and cannot be handled.  To fix, increase\\n\", &progName);\n    fprintf(GLIBC_2.2.5::stderr, \"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\n\", &progName);\n    exit(1); /* do not return */\n}\n",
+        "r2sleigh": "void tooManyBlocks(uint64_t max_handled_blocks)\n{\n    void sym_imp_exit(uint64_t);\n    uint64_t sym_imp_fprintf(uint64_t, uint64_t, uint64_t);\n#define progName__r2sleigh_addr 0x6000ULL\n    extern char progName[];\n#define stderr__r2sleigh_addr 0x5020ULL\n    extern char stderr[];\n\n    /* r2dec proof: no individual construct is marked; 57 source obligations: 42 rendered, 15 elided, 0 refused; 19 statements rendered */\n    {\n        uint32_t stack_m12;\n        stack_m12 = (uint32_t)max_handled_blocks;\n        FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_3 = (uint64_t)&progName;\n        char* RSI_1 = (char*)(uint64_t)\"%s: `%s' appears to contain more than %d blocks\\\\n\";\n        FILE* RDI_1 = (FILE*)RAX_1;\n        uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_3);\n        FILE* RAX_4 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_5 = (uint64_t)&progName;\n        char* RSI_3 = (char*)(uint64_t)\"%s: and cannot be handled.  To fix, increase\\\\n\";\n        FILE* RDI_3 = (FILE*)RAX_4;\n        uint64_t RAX_6 = sym_imp_fprintf(RDI_3, RSI_3, RDX_5);\n        FILE* RAX_7 = (FILE*)*(uint64_t*)&stderr;\n        uint64_t RDX_7 = (uint64_t)&progName;\n        char* RSI_5 = (char*)(uint64_t)\"%s: BZ_MAX_HANDLED_BLOCKS in bzip2recover.c, and recompile.\\\\n\";\n        FILE* RDI_5 = (FILE*)RAX_7;\n        uint64_t RAX_9 = sym_imp_fprintf(RDI_5, RSI_5, RDX_7);\n        uint64_t RDI_7 = (uint64_t)1;\n        sym_imp_exit(RDI_7);\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 0.0,
+          "byte_match": 0.9333333333333333,
+          "type_match": 1.0
+        },
+        "r2sleigh": {
+          "ged": 0.0,
+          "byte_match": 0.15584415584415584,
+          "type_match": 0.0
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": true,
+          "byte_match": false,
+          "type_match": true
+        },
+        "r2sleigh": {
+          "ged": true,
+          "byte_match": false,
+          "type_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "endsInBz2",
+      "size": 13,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "hard",
+      "source_code": "static Bool endsInBz2 ( Char* name )\n{\n   Int32 n = strlen ( name );\n   if (n <= 4) return False;\n   return\n      (name[n-4] == '.' &&\n       name[n-3] == 'b' &&\n       name[n-2] == 'z' &&\n       name[n-1] == '2');\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "unsigned int endsInBz2(char *a0)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    v0 = strlen(a0);\n    if (v0 <= 4)\n        return 0;\n    if (*(&a0[v0] - 4) != 46 || *(&a0[v0] - 3) != 98 || *(&a0[v0] - 2) != 122 || *(&a0[v0] - 1) != 50)\n        return 0;\n    return 1;\n    return 0;\n}\n",
+        "r2sleigh": "uint64_t endsInBz2(char* name)\n{\n    uint64_t sym_imp_strlen(uint64_t);\n\n    /* r2dec proof: no individual construct is marked; 123 source obligations: 94 rendered, 29 elided, 0 refused; 71 statements rendered */\n    {\n        uint64_t RAX_3;\n        char* stack_m32;\n        uint32_t stack_m12;\n        stack_m32 = (char*)name;\n        char* tmp_11f80_1 = (char*)stack_m32;\n        char* RDI_1 = (char*)tmp_11f80_1;\n        uint64_t RAX_2 = sym_imp_strlen(RDI_1);\n        uint32_t EAX_1 = (uint32_t)RAX_2;\n        stack_m12 = (uint32_t)EAX_1;\n        uint32_t tmp_11f00_1 = stack_m12;\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint8_t OF_2 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_1, (uint32_t)4);\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)4;\n        uint8_t SF_2 = (uint8_t)((int32_t)tmp_3ea00_1 < (int32_t)0);\n        uint8_t ZF_2 = (uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)((uint8_t)!(uint8_t)ZF_2 && (uint8_t)((uint8_t)OF_2 == (uint8_t)SF_2))) {\n            uint64_t RAX_6;\n            uint32_t tmp_11f00_2 = stack_m12;\n            uint64_t RAX_5 = (uint64_t)(int32_t)tmp_11f00_2;\n            uint64_t RDX_2 = (uint64_t)((uint64_t)RAX_5 + (uint64_t)-0x4);\n            char* tmp_11f80_2 = (char*)stack_m32;\n            RAX_6 = (uint64_t)(char*)tmp_11f80_2;\n            RAX_6 = (uint64_t)RAX_6 + (uint64_t)RDX_2;\n            uint8_t tmp_11e00_1 = *(uint8_t*)RAX_6;\n            uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)46;\n            uint8_t ZF_4 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n            uint8_t tmp_12800_1 = !(uint8_t)ZF_4;\n            if ((uint8_t)tmp_12800_1) {\n                RAX_3 = (uint64_t)0;\n            } else {\n                uint64_t RAX_11;\n                uint32_t tmp_11f00_3 = stack_m12;\n                uint64_t RAX_10 = (uint64_t)(int32_t)tmp_11f00_3;\n                uint64_t RDX_3 = (uint64_t)((uint64_t)RAX_10 + (uint64_t)-0x3);\n                char* tmp_11f80_3 = (char*)stack_m32;\n                RAX_11 = (uint64_t)(char*)tmp_11f80_3;\n                RAX_11 = (uint64_t)RAX_11 + (uint64_t)RDX_3;\n                uint8_t tmp_11e00_2 = *(uint8_t*)RAX_11;\n                uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)98;\n                uint8_t ZF_6 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n                uint8_t tmp_12800_2 = !(uint8_t)ZF_6;\n                if ((uint8_t)tmp_12800_2) {\n                    RAX_3 = (uint64_t)0;\n                } else {\n                    uint64_t RAX_16;\n                    uint32_t tmp_11f00_4 = stack_m12;\n                    uint64_t RAX_15 = (uint64_t)(int32_t)tmp_11f00_4;\n                    uint64_t RDX_4 = (uint64_t)((uint64_t)RAX_15 + (uint64_t)-0x2);\n                    char* tmp_11f80_4 = (char*)stack_m32;\n                    RAX_16 = (uint64_t)(char*)tmp_11f80_4;\n                    RAX_16 = (uint64_t)RAX_16 + (uint64_t)RDX_4;\n                    uint8_t tmp_11e00_3 = *(uint8_t*)RAX_16;\n                    uint8_t tmp_3de00_3 = (uint8_t)tmp_11e00_3 - (uint8_t)122;\n                    uint8_t ZF_8 = (uint8_t)((uint8_t)tmp_3de00_3 == (uint8_t)0);\n                    uint8_t tmp_12800_3 = !(uint8_t)ZF_8;\n                    if ((uint8_t)tmp_12800_3) {\n                        RAX_3 = (uint64_t)0;\n                    } else {\n                        uint64_t RAX_21;\n                        uint32_t tmp_11f00_5 = stack_m12;\n                        uint64_t RAX_20 = (uint64_t)(int32_t)tmp_11f00_5;\n                        uint64_t RDX_5 = (uint64_t)((uint64_t)RAX_20 + (uint64_t)-0x1);\n                        char* tmp_11f80_5 = (char*)stack_m32;\n                        RAX_21 = (uint64_t)(char*)tmp_11f80_5;\n                        RAX_21 = (uint64_t)RAX_21 + (uint64_t)RDX_5;\n                        uint8_t tmp_11e00_4 = *(uint8_t*)RAX_21;\n                        uint8_t tmp_3de00_4 = (uint8_t)tmp_11e00_4 - (uint8_t)50;\n                        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_4 == (uint8_t)0);\n                        uint8_t tmp_12800_4 = !(uint8_t)ZF_10;\n                        if ((uint8_t)tmp_12800_4) {\n                            RAX_3 = (uint64_t)0;\n                        } else {\n                            RAX_3 = (uint64_t)1;\n                        }\n                    }\n                }\n            }\n        } else {\n            RAX_3 = (uint64_t)0;\n        }\n        return RAX_3;\n    }\n    /* summary return unresolved; value intentionally not reconstructed */\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 7.0,
+          "byte_match": 0.7777777777777778,
+          "type_match": 1.0
+        },
+        "r2sleigh": {
+          "ged": 25.0,
+          "byte_match": 0.08780487804878048,
+          "type_match": 0.5
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": true
+        },
+        "r2sleigh": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsClose",
+      "size": 46,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "hard",
+      "source_code": "static void bsClose ( BitStream* bs )\n{\n   Int32 retVal;\n\n   if ( bs->mode == 'w' ) {\n      while ( bs->buffLive < 8 ) {\n         bs->buffLive++;\n         bs->buffer <<= 1;\n      };\n      retVal = putc ( (UChar) (bs->buffer), bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      retVal = fflush ( bs->handle );\n      if (retVal == EOF) writeError();\n   }\n   retVal = fclose ( bs->handle );\n   if (retVal == EOF) {\n      if (bs->mode == 'w') writeError(); else readError();\n   }\n   free ( bs );\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    int field_c;\n    char field_10;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nvoid bsClose(struct_0 *ptr)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (ptr->field_10 == 0x77)\n    {\n        for (; ptr->field_c <= 7; ptr->field_8 = ptr->field_8 * 2)\n        {\n            ptr->field_c = ptr->field_c + 1;\n        }\n        v0 = putc((char)ptr->field_8, ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n        bytesOut = bytesOut + 1;\n        v0 = fflush(ptr->field_0);\n        if (v0 == 0xffffffff)\n            writeError(); /* do not return */\n    }\n    v0 = fclose(ptr->field_0);\n    if (v0 != 0xffffffff)\n    {\n        free(ptr);\n        return;\n    }\n    else if (ptr->field_10 == 0x77)\n    {\n        writeError(); /* do not return */\n    }\n    else\n    {\n        readError(); /* do not return */\n    }\n}\n",
+        "r2sleigh": "void bsClose(uint64_t bs)\n{\n    void dbg_readError(void);\n    void dbg_writeError(void);\n    uint64_t sym_imp_fclose(uint64_t);\n    uint64_t sym_imp_fflush(uint64_t);\n    void sym_imp_free(uint64_t);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: 1 construct is marked below; 214 source obligations: 173 rendered, 41 elided, 0 refused; 134 statements rendered */\n    {\n        uint64_t tmp_11f80_3;\n        uint64_t tmp_11f80_8;\n        uint64_t RAX_18;\n        uint64_t tmp_11f80_4;\n        uint64_t tmp_11f80_14;\n        uint64_t tmp_11f80_16;\n        uint64_t tmp_11f80_18;\n        uint64_t stack_m32;\n        uint32_t stack_m12;\n        /* r2dec residual: rendered control-domain occurrences do not exactly cover block 0x17f6; body rendered without structure */\n        stack_m32 = (uint64_t)bs;\n        uint64_t tmp_11f80_1 = stack_m32;\n        uint8_t* tmp_4700_3 = (uint8_t*)(uint64_t)((uint64_t)tmp_11f80_1 + (uint64_t)16);\n        uint8_t tmp_11e00_1 = *tmp_4700_3;\n        uint8_t tmp_3de00_1 = (uint8_t)tmp_11e00_1 - (uint8_t)119;\n        uint8_t ZF_2 = (uint8_t)((uint8_t)tmp_3de00_1 == (uint8_t)0);\n        uint8_t tmp_12800_1 = !(uint8_t)ZF_2;\n        if ((uint8_t)tmp_12800_1) {\n            goto loc_17c6;\n        } else {\n            goto loc_173e;\n        }\nloc_173e: ;\n        goto loc_1762;\nloc_1762: ;\n        tmp_11f80_3 = stack_m32;\n        uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)tmp_11f80_3 + (uint64_t)12);\n        uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_2;\n        uint8_t OF_4 = (uint8_t)r2sleigh_int_sborrow_32((uint32_t)tmp_3e900_2, (uint32_t)7);\n        uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)7;\n        uint8_t SF_4 = (uint8_t)((int32_t)tmp_3ea00_2 < (int32_t)0);\n        uint8_t ZF_4 = (uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n        uint8_t tmp_12f00_2 = (uint8_t)((uint8_t)OF_4 != (uint8_t)SF_4);\n        uint8_t tmp_13000_2 = (uint8_t)ZF_4 || (uint8_t)tmp_12f00_2;\n        if ((uint8_t)tmp_13000_2) {\n            goto loc_1740;\n        } else {\n            goto loc_176e;\n        }\nloc_176e: ;\n        tmp_11f80_8 = stack_m32;\n        FILE* tmp_11f80_9 = (FILE*)*(uint64_t*)(uint64_t)tmp_11f80_8;\n        FILE* RDX_4 = (FILE*)tmp_11f80_9;\n        uint64_t tmp_11f80_10 = stack_m32;\n        uint32_t tmp_11f00_5 = *(uint32_t*)((uint64_t)tmp_11f80_10 + (uint64_t)8);\n        uint64_t RAX_14 = (uint64_t)(uint32_t)tmp_11f00_5;\n        uint8_t tmp_regalias_176e_c_0_1 = (uint8_t)RAX_14;\n        uint64_t EAX_7 = (uint64_t)(uint8_t)tmp_regalias_176e_c_0_1;\n        FILE* RSI_1 = (FILE*)RDX_4;\n        uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_7;\n        uint64_t RAX_16 = sym_imp_putc(RDI_1, RSI_1);\n        uint32_t EAX_8 = (uint32_t)RAX_16;\n        stack_m12 = (uint32_t)EAX_8;\n        uint32_t tmp_11f00_6 = stack_m12;\n        uint32_t tmp_3e900_3 = (uint32_t)tmp_11f00_6;\n        uint32_t tmp_3ea00_3 = (uint32_t)tmp_3e900_3 - (uint32_t)0xffffffff;\n        if ((uint8_t)!(uint8_t)((uint32_t)tmp_3ea00_3 == (uint32_t)0)) {\n            goto loc_1797;\n        } else {\n            goto loc_1792;\n        }\nloc_1792: ;\n        dbg_writeError();\n        goto loc_1797;\nloc_1797: ;\n        RAX_18 = *(uint64_t*)&bytesOut;\n        RAX_18 = (uint64_t)RAX_18 + (uint64_t)1;\n        *(int64_t*)&bytesOut = (uint64_t)RAX_18;\n        uint64_t tmp_11f80_11 = stack_m32;\n        uint64_t tmp_11f80_12 = *(uint64_t*)(uint64_t)tmp_11f80_11;\n        uint64_t RDI_4 = (uint64_t)tmp_11f80_12;\n        uint64_t RAX_22 = sym_imp_fflush(RDI_4);\n        uint32_t EAX_10 = (uint32_t)RAX_22;\n        uint32_t tmp_6a80_5 = (uint32_t)EAX_10;\n        stack_m12 = (uint32_t)tmp_6a80_5;\n        uint32_t tmp_11f00_7 = stack_m12;\n        uint32_t tmp_3e900_4 = (uint32_t)tmp_11f00_7;\n        uint32_t tmp_3ea00_4 = (uint32_t)tmp_3e900_4 - (uint32_t)0xffffffff;\n        uint8_t ZF_7 = (uint8_t)((uint32_t)tmp_3ea00_4 == (uint32_t)0);\n        uint8_t tmp_12800_3 = !(uint8_t)ZF_7;\n        if ((uint8_t)tmp_12800_3) {\n            goto loc_17c6;\n        } else {\n            goto loc_17c1;\n        }\nloc_17c1: ;\n        dbg_writeError();\n        goto loc_17c6;\nloc_1740: ;\n        tmp_11f80_4 = stack_m32;\n        uint32_t tmp_11f00_3 = *(uint32_t*)((uint64_t)tmp_11f80_4 + (uint64_t)12);\n        uint64_t RAX_7 = (uint64_t)(uint32_t)tmp_11f00_3;\n        uint64_t EDX_2 = (uint64_t)(uint32_t)((uint64_t)RAX_7 + (uint64_t)1);\n        uint64_t tmp_11f80_5 = stack_m32;\n        *(int32_t*)((uint64_t)tmp_11f80_5 + (uint64_t)12) = (uint32_t)EDX_2;\n        uint64_t tmp_11f80_6 = stack_m32;\n        uint32_t tmp_11f00_4 = *(uint32_t*)((uint64_t)tmp_11f80_6 + (uint64_t)8);\n        uint64_t RAX_10 = (uint64_t)(uint32_t)tmp_11f00_4;\n        uint64_t tmp_4900_2 = (uint64_t)RAX_10;\n        uint64_t tmp_4a00_2 = (uint64_t)RAX_10 + (uint64_t)tmp_4900_2;\n        uint64_t EDX_3 = (uint64_t)(uint32_t)tmp_4a00_2;\n        uint64_t tmp_11f80_7 = stack_m32;\n        uint64_t RAX_11 = (uint64_t)tmp_11f80_7;\n        uint8_t* tmp_4700_15 = (uint8_t*)((uint64_t)RAX_11 + (uint64_t)8);\n        uint32_t tmp_6a80_3 = (uint32_t)EDX_3;\n        *(int32_t*)tmp_4700_15 = (uint32_t)tmp_6a80_3;\n        goto loc_1762;\nloc_17c6: ;\n        tmp_11f80_14 = stack_m32;\n        uint64_t tmp_11f80_15 = *(uint64_t*)(uint64_t)tmp_11f80_14;\n        uint64_t RDI_8 = (uint64_t)tmp_11f80_15;\n        uint64_t RAX_27 = sym_imp_fclose(RDI_8);\n        uint32_t EAX_13 = (uint32_t)RAX_27;\n        stack_m12 = (uint32_t)EAX_13;\n        uint32_t tmp_11f00_9 = stack_m12;\n        uint32_t tmp_3e900_6 = (uint32_t)tmp_11f00_9;\n        uint32_t tmp_3ea00_6 = (uint32_t)tmp_3e900_6 - (uint32_t)0xffffffff;\n        uint8_t ZF_9 = (uint8_t)((uint32_t)tmp_3ea00_6 == (uint32_t)0);\n        uint8_t tmp_12800_5 = !(uint8_t)ZF_9;\n        if ((uint8_t)tmp_12800_5) {\n            goto loc_17f6;\n        } else {\n            goto loc_17de;\n        }\nloc_17de: ;\n        tmp_11f80_16 = stack_m32;\n        uint8_t* tmp_4700_29 = (uint8_t*)((uint64_t)tmp_11f80_16 + (uint64_t)16);\n        uint8_t tmp_11e00_2 = *tmp_4700_29;\n        uint8_t tmp_3de00_2 = (uint8_t)tmp_11e00_2 - (uint8_t)119;\n        uint8_t ZF_10 = (uint8_t)((uint8_t)tmp_3de00_2 == (uint8_t)0);\n        uint8_t tmp_12800_6 = !(uint8_t)ZF_10;\n        if ((uint8_t)tmp_12800_6) {\n            goto loc_17f1;\n        } else {\n            goto loc_17ea;\n        }\nloc_17ea: ;\n        dbg_writeError();\n        goto loc_17ef;\nloc_17f1: ;\n        dbg_readError();\n        goto loc_17f6;\nloc_17f6: ;\n        tmp_11f80_18 = stack_m32;\n        uint64_t RDI_12 = (uint64_t)tmp_11f80_18;\n        sym_imp_free(RDI_12);\n        return;\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 8.0,
+          "byte_match": 0.8472222222222222,
+          "type_match": 0.5
+        },
+        "r2sleigh": {
+          "ged": 8.0,
+          "byte_match": 0.0,
+          "type_match": 0.0
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": false
+        },
+        "r2sleigh": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": false
+        }
+      }
+    },
+    {
+      "project": "bzip2",
+      "opt_level": "O0",
+      "binary": "bzip2recover",
+      "function": "bsPutBit",
+      "size": 32,
+      "labels": [
+        "O0",
+        "unoptimized",
+        "sailr",
+        "cli-tool",
+        "compression"
+      ],
+      "difficulty": "hard",
+      "source_code": "static void bsPutBit ( BitStream* bs, Int32 bit )\n{\n   if (bs->buffLive == 8) {\n      Int32 retVal = putc ( (UChar) bs->buffer, bs->handle );\n      if (retVal == EOF) writeError();\n      bytesOut++;\n      bs->buffLive = 1;\n      bs->buffer = bit & 0x1;\n   } else {\n      bs->buffer = ( (bs->buffer << 1) | (bit & 0x1) );\n      bs->buffLive++;\n   };\n}",
+      "source_status": "",
+      "decompiled": {
+        "angr": "typedef struct FILE {\n} FILE;\n\ntypedef struct struct_0 {\n    struct FILE *field_0;\n    unsigned int field_8;\n    unsigned int field_c;\n} struct_0;\n\nextern unsigned long long bytesOut;\n\nstruct_0 * bsPutBit(struct_0 *idx, unsigned int a1)\n{\n    unsigned int v0;  // [bp-0xc]\n\n    if (idx->field_c != 8)\n    {\n        idx->field_8 = idx->field_8 * 2 | a1 & 1;\n        idx->field_c = idx->field_c + 1;\n        return idx;\n    }\n    v0 = putc((char)idx->field_8, idx->field_0);\n    if (v0 != 0xffffffff)\n    {\n        bytesOut = bytesOut + 1;\n        idx->field_c = 1;\n        idx->field_8 = a1 & 1;\n        return idx;\n    }\n    writeError(); /* do not return */\n}\n",
+        "r2sleigh": "uint64_t bsPutBit(int64_t* bs, uint64_t bit)\n{\n    void dbg_writeError(void);\n    uint64_t sym_imp_putc(uint64_t, uint64_t);\n#define bytesOut__r2sleigh_addr 0x67d0ULL\n    extern char bytesOut[];\n\n    /* r2dec proof: no individual construct is marked; 141 source obligations: 107 rendered, 34 elided, 0 refused; 69 statements rendered */\n    {\n        int64_t* RAX_23;\n        uint32_t stack_m36;\n        int64_t* stack_m32;\n        stack_m32 = (int64_t*)bs;\n        uint32_t tmp_regalias_15e3_11_0_1 = (uint32_t)bit;\n        stack_m36 = (uint32_t)tmp_regalias_15e3_11_0_1;\n        int64_t* tmp_11f80_1 = (int64_t*)stack_m32;\n        uint32_t tmp_11f00_1 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_1 + (uint64_t)12);\n        uint32_t tmp_3e900_1 = (uint32_t)tmp_11f00_1;\n        uint32_t tmp_3ea00_1 = (uint32_t)tmp_3e900_1 - (uint32_t)8;\n        uint8_t tmp_12800_1 = !(uint8_t)((uint32_t)tmp_3ea00_1 == (uint32_t)0);\n        if ((uint8_t)tmp_12800_1) {\n            uint64_t EDX_2;\n            int64_t* tmp_11f80_7 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_5 = *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_7 + (uint64_t)8);\n            uint64_t RAX_16 = (uint64_t)(uint32_t)tmp_11f00_5;\n            uint64_t tmp_4900_1 = (uint64_t)RAX_16;\n            uint64_t tmp_4a00_1 = (uint64_t)RAX_16 + (uint64_t)tmp_4900_1;\n            EDX_2 = (uint64_t)(uint32_t)tmp_4a00_1;\n            uint32_t tmp_11f00_6 = stack_m36;\n            uint64_t EAX_10 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_6 & (uint32_t)1);\n            EDX_2 = (uint64_t)(uint32_t)((uint32_t)EDX_2 | (uint32_t)EAX_10);\n            int64_t* tmp_11f80_8 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_8 + (uint64_t)8) = (uint32_t)EDX_2;\n            int64_t* tmp_11f80_9 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_7 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_9 + (uint64_t)12);\n            uint64_t RAX_21 = (uint64_t)(uint32_t)tmp_11f00_7;\n            uint64_t EDX_4 = (uint64_t)(uint32_t)((uint64_t)RAX_21 + (uint64_t)1);\n            int64_t* tmp_11f80_10 = (int64_t*)stack_m32;\n            int64_t* RAX_22 = (int64_t*)tmp_11f80_10;\n            int32_t* tmp_4700_24 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_22 + (uint64_t)12);\n            uint32_t tmp_6a80_6 = (uint32_t)EDX_4;\n            *(int32_t*)tmp_4700_24 = (uint32_t)tmp_6a80_6;\n            RAX_23 = (int64_t*)RAX_22;\n        } else {\n            uint64_t RAX_9;\n            uint32_t stack_m12;\n            int64_t* tmp_11f80_2 = (int64_t*)stack_m32;\n            FILE* tmp_11f80_3 = (FILE*)*(uint64_t*)(int64_t*)tmp_11f80_2;\n            FILE* RDX_1 = (FILE*)tmp_11f80_3;\n            int64_t* tmp_11f80_4 = (int64_t*)stack_m32;\n            uint32_t tmp_11f00_2 = *(uint32_t*)((uint64_t)(int64_t*)tmp_11f80_4 + (uint64_t)8);\n            uint64_t RAX_5 = (uint64_t)(uint32_t)tmp_11f00_2;\n            uint8_t tmp_regalias_1602_c_0_1 = (uint8_t)RAX_5;\n            uint64_t EAX_3 = (uint64_t)(uint8_t)tmp_regalias_1602_c_0_1;\n            FILE* RSI_1 = (FILE*)RDX_1;\n            uint64_t RDI_1 = (uint64_t)(uint32_t)EAX_3;\n            uint64_t RAX_7 = sym_imp_putc(RDI_1, RSI_1);\n            uint32_t EAX_4 = (uint32_t)RAX_7;\n            stack_m12 = (uint32_t)EAX_4;\n            uint32_t tmp_11f00_3 = stack_m12;\n            uint32_t tmp_3e900_2 = (uint32_t)tmp_11f00_3;\n            uint32_t tmp_3ea00_2 = (uint32_t)tmp_3e900_2 - (uint32_t)0xffffffff;\n            uint8_t tmp_12800_2 = !(uint8_t)((uint32_t)tmp_3ea00_2 == (uint32_t)0);\n            if (!(uint8_t)tmp_12800_2) {\n                dbg_writeError();\n            }\n            RAX_9 = *(uint64_t*)&bytesOut;\n            RAX_9 = (uint64_t)RAX_9 + (uint64_t)1;\n            *(int64_t*)&bytesOut = (uint64_t)RAX_9;\n            int64_t* tmp_11f80_5 = (int64_t*)stack_m32;\n            *(int32_t*)((uint64_t)(int64_t*)tmp_11f80_5 + (uint64_t)12) = (uint32_t)1;\n            uint32_t tmp_11f00_4 = stack_m36;\n            uint64_t EAX_7 = (uint64_t)(uint32_t)((uint32_t)tmp_11f00_4 & (uint32_t)1);\n            int64_t* tmp_11f80_6 = (int64_t*)stack_m32;\n            int64_t* RAX_14 = (int64_t*)tmp_11f80_6;\n            int32_t* tmp_4700_14 = (int32_t*)(uint64_t)((uint64_t)(int64_t*)RAX_14 + (uint64_t)8);\n            uint32_t tmp_6a80_4 = (uint32_t)EAX_7;\n            *(int32_t*)tmp_4700_14 = (uint32_t)tmp_6a80_4;\n            RAX_23 = (int64_t*)RAX_14;\n        }\n        return RAX_23;\n    }\n}"
+      },
+      "private": [],
+      "values": {
+        "angr": {
+          "ged": 2.0,
+          "byte_match": 0.45588235294117646,
+          "type_match": 0.6666666666666666
+        },
+        "r2sleigh": {
+          "ged": 5.0,
+          "byte_match": 0.052884615384615384,
+          "type_match": 0.0
+        }
+      },
+      "perfects": {
+        "angr": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": false
+        },
+        "r2sleigh": {
+          "ged": false,
+          "byte_match": false,
+          "type_match": false
+        }
+      }
+    }
+  ],
+  "compile_rates": {
+    "angr": 1.0,
+    "r2sleigh": 0.8571428571428571
+  },
+  "dataset_info": {},
+  "cost_info": {},
+  "history": []
+}

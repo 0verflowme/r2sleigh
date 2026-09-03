@@ -88,14 +88,25 @@ pub enum ElisionReason {
     /// binding has no runtime C operation. Its graph cells remain accounted,
     /// but no assignment or read is fabricated for the SSA merge itself.
     CoalescedImmutablePhi,
-    /// A materialised merge edge whose incoming value and the merge's output
-    /// are one renderer binding. Whatever wrote that binding has already
-    /// written it, so the synthetic edge copy would only spell `x = x`.
+    /// A copy whose source and destination are one renderer binding, whole.
+    /// Whatever wrote that binding has already written it, so the copy would
+    /// only spell `x = x`.
     ///
-    /// This was once restricted to a certified loop carrier, which is where
-    /// the case was found rather than the reason it holds: what makes the copy
-    /// say nothing is that both sides are one binding.
-    CoalescedEdgeCopy,
+    /// The copies normalization makes for a merge are the common case -- one
+    /// on each materialised edge, and the initializer relocated ahead of a
+    /// certified carrier's entry edges -- and the program's own copies are
+    /// the other: `subs x1, x1, #1` lifts to a subtraction into a temporary
+    /// and a copy of the temporary into `x1`, and once a carrier certificate
+    /// puts the two in one object the copy says nothing. A program copy
+    /// keeps its statement where it does something the name does not, a
+    /// narrowing write or a converting read.
+    ///
+    /// This was once restricted to a certified loop carrier's edges with a
+    /// defined source, which is where the case was found rather than the
+    /// reason it holds: what makes the copy say nothing is that both sides
+    /// are one binding. A source nothing defines -- a parameter -- is
+    /// rendered by the binding's declaration, not by the copy.
+    CoalescedCopy,
     /// Every incoming edge of a merge is either an SSA identity or coalesced
     /// to the merge's own binding, so the merge needs no standalone C write.
     ///
@@ -168,7 +179,7 @@ impl std::fmt::Display for ElisionReason {
             Self::CallReturnAddress => "call-return-address",
             Self::DeadFrameSlotStore => "dead-frame-slot-store",
             Self::CoalescedImmutablePhi => "coalesced-immutable-phi",
-            Self::CoalescedEdgeCopy => "coalesced-edge-copy",
+            Self::CoalescedCopy => "coalesced-copy",
             Self::CoalescedIdentityPhi => "coalesced-identity-phi",
             Self::DeadCpuFlag => "dead-cpu-flag",
             Self::DeadFlagOnly => "dead-flag-only",

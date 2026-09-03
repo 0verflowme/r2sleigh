@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 6;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 7;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -354,11 +354,11 @@ use crate::contracts::{
     SourceType, SourceTypeGraph, SourceTypeKind, StackAddressBase,
 };
 use crate::{
-    AdvisoryCallPrototype, AdvisoryCallSite, AdvisorySuccessor, AdvisorySuccessorKind,
-    CapturedSourceFields, DiagnosticIdentity, FunctionIdentity, FunctionPresentation,
-    MachineProfile, OwnedFunctionBlock, OwnedFunctionImage, OwnedFunctionSnapshot,
-    SnapshotValidationError, SourceCodePointerTable, SourceEndianness, SourceSignatureParameter,
-    SourceSignaturePresentation, SourceStackSlotName,
+    AdvisoryCallPrototype, AdvisoryCallSite, AdvisoryCallTransfer, AdvisorySuccessor,
+    AdvisorySuccessorKind, CapturedSourceFields, DiagnosticIdentity, FunctionIdentity,
+    FunctionPresentation, MachineProfile, OwnedFunctionBlock, OwnedFunctionImage,
+    OwnedFunctionSnapshot, SnapshotValidationError, SourceCodePointerTable, SourceEndianness,
+    SourceSignatureParameter, SourceSignaturePresentation, SourceStackSlotName,
 };
 
 const ENDIAN_LITTLE: u8 = 0;
@@ -1243,6 +1243,10 @@ pub fn read_call_prototype(
     })
 }
 
+const CALL_TRANSFER_CALL: u8 = 0;
+const CALL_TRANSFER_TAIL_JUMP: u8 = 1;
+const CALL_TRANSFER_TAIL_SLOT: u8 = 2;
+
 pub fn write_call_site(
     writer: &mut SnapshotWireWriter,
     site: &AdvisoryCallSite,
@@ -1250,6 +1254,11 @@ pub fn write_call_site(
     writer.u64(site.instruction_address());
     writer.u64(site.target_address());
     writer.string(site.target_name().unwrap_or(""))?;
+    writer.u8(match site.transfer() {
+        AdvisoryCallTransfer::Call => CALL_TRANSFER_CALL,
+        AdvisoryCallTransfer::TailJump => CALL_TRANSFER_TAIL_JUMP,
+        AdvisoryCallTransfer::TailSlot => CALL_TRANSFER_TAIL_SLOT,
+    });
     // Absence is meaningful here: radare2 described the call but not what it
     // takes or returns, which is not the same as an empty prototype.
     match site.prototype() {
@@ -1268,6 +1277,23 @@ pub fn read_call_site(
     let instruction_address = reader.u64()?;
     let target_address = reader.u64()?;
     let target_name = reader.string()?;
+    // Before version 7 every site radare2 reported was a call instruction, so
+    // an older buffer says so without carrying the byte.
+    let transfer = if reader.format_version() >= 7 {
+        match reader.u8()? {
+            CALL_TRANSFER_CALL => AdvisoryCallTransfer::Call,
+            CALL_TRANSFER_TAIL_JUMP => AdvisoryCallTransfer::TailJump,
+            CALL_TRANSFER_TAIL_SLOT => AdvisoryCallTransfer::TailSlot,
+            tag => {
+                return Err(SnapshotWireError::UnknownDiscriminant {
+                    record: "call transfer",
+                    tag: u64::from(tag),
+                });
+            }
+        }
+    } else {
+        AdvisoryCallTransfer::Call
+    };
     let prototype = if reader.bool()? {
         Some(read_call_prototype(reader)?)
     } else {
@@ -1276,6 +1302,7 @@ pub fn read_call_site(
     Ok(AdvisoryCallSite {
         instruction_address,
         target_address,
+        transfer,
         target_name: (!target_name.is_empty()).then(|| target_name.to_string()),
         prototype,
     })
@@ -1973,6 +2000,37 @@ pub fn encode_snapshot_set(
     snapshot: &OwnedFunctionSnapshot,
     callees: &[OwnedFunctionSnapshot],
 ) -> Result<Vec<u8>, SnapshotWireError> {
+    encode_snapshot_parts(snapshot, callees, snapshot.source_revision_identity())
+}
+
+/// Encode one body as a cache key: every field it carries, with the capture
+/// tag replaced by this function's own content identity.
+///
+/// The tag is the reason a plain re-encoding cannot key a callee. A callee
+/// collected beside a root inherits the *root's* revision identity, so the
+/// same body reached from two callers serializes to two different buffers and
+/// a byte-exact key never matches the one case a callee cache exists to serve.
+/// Radare2 records what the body's own tag would have been as its content
+/// identity, and this writes that in the tag's place.
+///
+/// Substituting is safe in the direction that matters. Every other field is
+/// still written and still compared byte for byte, so two different bodies are
+/// still told apart by the bytes that describe them; the substituted field is
+/// a hash *of those same bytes*, so it adds no claim the rest of the buffer
+/// does not already make. On a radare2 that predates the content identity the
+/// two are equal and this degrades to the plain encoding, which is a key that
+/// misses rather than one that is wrong.
+pub fn encode_snapshot_cache_key(
+    snapshot: &OwnedFunctionSnapshot,
+) -> Result<Vec<u8>, SnapshotWireError> {
+    encode_snapshot_parts(snapshot, &[], snapshot.source_content_identity())
+}
+
+fn encode_snapshot_parts(
+    snapshot: &OwnedFunctionSnapshot,
+    callees: &[OwnedFunctionSnapshot],
+    revision_identity: &[u8],
+) -> Result<Vec<u8>, SnapshotWireError> {
     let mut writer = SnapshotWireWriter::new();
     write_machine_profile(&mut writer, snapshot.machine())?;
     write_function_identity(&mut writer, snapshot.function());
@@ -1984,7 +2042,7 @@ pub fn encode_snapshot_set(
     for site in snapshot.advisory_calls() {
         write_call_site(&mut writer, site)?;
     }
-    writer.bytes(snapshot.source_revision_identity())?;
+    writer.bytes(revision_identity)?;
     writer.bytes(snapshot.source_content_identity())?;
     match snapshot.function_interface() {
         Some(interface) => {
@@ -2704,6 +2762,7 @@ mod tests {
         let with_prototype = AdvisoryCallSite {
             instruction_address: 0x1000_0741,
             target_address: 0x1000_1980,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: Some("sym.imp.strcmp".to_string()),
             prototype: Some(AdvisoryCallPrototype {
                 calling_convention: "amd64".to_string(),
@@ -2722,16 +2781,35 @@ mod tests {
         let without = AdvisoryCallSite {
             instruction_address: 0x1000_0757,
             target_address: 0x1000_1986,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: Some("sym.imp.malloc".to_string()),
             prototype: None,
         };
         let unnamed = AdvisoryCallSite {
             instruction_address: 0x1000_0763,
             target_address: 0x1000_1992,
+            transfer: AdvisoryCallTransfer::Call,
             target_name: None,
             prototype: None,
         };
-        for site in [with_prototype, without, unnamed] {
+        // A tail transfer is the same record with a different way in: a jump
+        // to the callee's entry, or a jump through a relocated slot, in which
+        // case the target address is the slot.
+        let tail_jump = AdvisoryCallSite {
+            instruction_address: 0x1000_0770,
+            target_address: 0x1000_1a00,
+            transfer: AdvisoryCallTransfer::TailJump,
+            target_name: Some("sym.func.10001a00".to_string()),
+            prototype: None,
+        };
+        let tail_slot = AdvisoryCallSite {
+            instruction_address: 0x1000_42b0,
+            target_address: 0x1000_8010,
+            transfer: AdvisoryCallTransfer::TailSlot,
+            target_name: Some("strcoll".to_string()),
+            prototype: None,
+        };
+        for site in [with_prototype, without, unnamed, tail_jump, tail_slot] {
             let mut writer = SnapshotWireWriter::new();
             write_call_site(&mut writer, &site).expect("write");
             let buffer = writer.finish().expect("finish");
@@ -3479,6 +3557,32 @@ mod tests {
         assert_eq!(reader.string().expect("rbp"), "rbp");
         assert_eq!(reader.optional_string().expect("absent"), None);
         reader.finish().expect("consumed exactly");
+    }
+
+    #[test]
+    fn a_cache_key_keys_a_body_by_itself_rather_than_by_its_caller() {
+        // Two captures of one body differ in exactly one field: the capture
+        // tag, which is the caller's. A key that carried it would make the
+        // same callee under two callers two different keys, which is the one
+        // case a callee cache exists to serve.
+        let body = sample_snapshot(None).with_source_content_identity(Box::from(&b"own-body"[..]));
+        let key = encode_snapshot_cache_key(&body).expect("encode a cache key");
+        let decoded = decode_snapshot(&key).expect("decode the cache key");
+        assert_eq!(decoded.source_revision_identity(), b"own-body");
+        assert_eq!(decoded.source_content_identity(), b"own-body");
+        // Everything else the lift reads is still there and still compared.
+        assert_eq!(decoded.function().address(), body.function().address());
+        assert_eq!(
+            decoded.image().entry_address(),
+            body.image().entry_address()
+        );
+        assert_eq!(decoded.machine().arch_id(), body.machine().arch_id());
+        // And it is not simply the plain encoding under another name.
+        assert_ne!(
+            encode_snapshot(&body).expect("plain encoding"),
+            key,
+            "the fixture must make the tag and the content differ"
+        );
     }
 
     #[test]

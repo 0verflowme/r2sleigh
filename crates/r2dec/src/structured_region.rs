@@ -127,6 +127,10 @@ impl StructuredRegionMarker {
         self.anchor
     }
 
+    pub(crate) const fn kind(&self) -> StructuredRegionKind {
+        self.kind
+    }
+
     fn authority(&self) -> Option<&StructuredRegionArtifactAuthority> {
         self.authority.as_ref()
     }

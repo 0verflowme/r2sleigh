@@ -8113,3 +8113,796 @@ script builds this tree without the lock, then holds the lock across the
 install and the command together, which is the only window in which the answer
 is about this tree. Releasing between the two is what makes a stale answer
 possible.
+
+## The plan after the first benchmark run and the architecture survey
+
+Two things happened on the same day and between them they reorder the work.
+
+### The engine ran on the benchmark's own platform for the first time
+
+The plugin now builds and runs on Linux x86-64 against the radare2 fork, and
+DecBench is installed there with joern. The first head-to-head, on
+`bzip2recover` compiled by GCC at `-O0`, thirteen functions scored by graph edit
+distance against the source control-flow graph:
+
+| decompiler | decompiled | perfect | mean GED |
+| --- | --- | --- | --- |
+| angr 9.3.3 | 13 of 14 | 4 | 5.54 |
+| r2sleigh | 8 of 14 | 4 | 5.43 |
+
+The reading is unambiguous and it is not the reading this branch has been
+working from. **Accuracy is already competitive.** Where r2sleigh renders, it
+matches the source structure slightly better than angr does, on the same
+functions, with the same number of exact matches. **Coverage is the entire
+gap.** Every point of the difference is a function that refused.
+
+The six it missed refused for three causes, none of which is a tail call:
+`unobserved_binding_write` from placement, `missing_definition` from placement,
+and `RenderedValueRequired` from the observation journal, the last twice. Those
+are accounting failures in the binding plan and the journal, and the survey
+below independently traced two of them to duplicated predicates that have
+diverged. So the noise work and the accounting work are the same work as the
+coverage work on real code, which is not how this branch had them ordered.
+
+### The eager sweep was making analysis seventeen times slower
+
+Measured by moving the plugin's directory aside and back, on the same binary:
+radare2 analyses `bzip2recover` in 0.68 seconds alone, and 11.98 seconds with
+r2sleigh installed. The plugin's post-analysis reported spending 10.16 of those
+seconds and then refusing the rest of the program against its own budget.
+
+The cause was `sleigh_function_may_prove`, whose comment says it looks for a
+transfer radare2 could not resolve and whose test was that a block has no
+successor -- which is also true of every `ret`. Every function was admitted.
+Asking the block's last instruction instead takes `bzip2recover` to 6.94 seconds
+with sixteen of thirty-eight functions skipped and the same two unreachable
+blocks proven. What remains is the per-function cost, about 286 ms per proved
+function and about 1.05 s for one `pdd`, against an agreed bar of 100 ms for a
+500-obligation function. That is the per-binary program cache, and it is now the
+performance item rather than the sweep.
+
+### What the survey found that the plan did not have
+
+A seventy-agent read of the tree, with every finding put to independent
+refutation, left fifty standing. The ones that change the ordering:
+
+- **A transfer through a value has no renderer form at all**, at
+  `crates/r2dec/src/fold/op_lower/implementation.rs:3233`. It costs **105 of the
+  449 matrix cells and 84 of the 136 `/bin/ls` entries**, which makes it the
+  largest single coverage item in the tree, far larger than the direct tail
+  call it was grouped with. It is one machine shape with two SSA shapes: on x64
+  the operand is a `Bound` value with no definition whose canonical storage is a
+  RAM address, and on arm64 it is an `Inline` value defined by a copy from a
+  register. A fix keyed to either alone gets half the cells.
+- **The direct tail call is smaller than reported.** Ten of the forty-one
+  refusing real `/bin/ls` functions are on the exact path, sixteen counting the
+  short forwarders. The earlier figure of twenty-two was co-occurrence. The six
+  functions mislabelled "unrepresentable control flow" are the same forwarders,
+  so the counts do not add.
+- **The exiting branch must not be rewritten into a call in `CFG::from_blocks`.**
+  That was written, measured and reverted: `/bin/ls` went from 123 to 125
+  refusals and from one to eighty-one refused obligations. The capability
+  belongs in the source-facts layer, as a callsite interface offered for a
+  branch whose target lies outside the function's bounds.
+- **`same_type_casts` was measuring the rarer of two shapes.** It compared only
+  directly adjacent casts, so a lone cast to a value's own declared type was
+  never examined. The corrected predicate counts 3,395 across the fifty-four
+  cells where the column had read zero. Every noise fix before this landed was
+  scored against a blind gate.
+- **The identity-merge predicate is stated twice and the copies have diverged**,
+  and the divergence is a whole-function refusal rather than a style problem:
+  the phi output's value cell stays empty and the journal refuses with
+  `RenderedValueRequired`. The obvious repair is backwards; the term has to move
+  to the rule, not be copied into the journal.
+- **The parameter-slot conflict rule and the width rule are each written four
+  times**, and the certified-entities pair has diverged into a whole-function
+  refusal with `UnexpectedParameterDisposition`. The root cause is that the two
+  candidate enums differ.
+- **Fifteen register-alias tables, and the name-keyed ones give wrong answers
+  today**: `rdx` and `dh` are reported as the same family, so an external type
+  assumption for `dh` is applied to the `rdx` parameter; `ah` and `al` get the
+  same key, so an alias pair is emitted between disjoint storages and
+  pointer-ness propagates across it; and the AArch64 frame pointer is spelled
+  two ways that can never meet, so those slots are structurally un-rebasable.
+- **Thirty-two-bit x86 is given the SysV-64 argument registers**, because the
+  prepared arch name is re-spelled from a substring match rather than passed as
+  the typed family.
+- **Import evidence never crosses into r2sym**, so an eighteen-model libc seed
+  table, a role source and a name hint are all permanently inert, and the
+  twenty-one summaries the registry builds are discarded per function.
+
+### Decisions the owner settled
+
+| question | answer |
+| --- | --- |
+| a value with one rendered and one elided reader | inline it; the guard counts only rendered readers |
+| the unreachable r2sym subsystems | delete, keeping what they proved as tests |
+| interprocedural helper inlining | delete; out of scope, and a working owner already computes those summaries |
+| import thunks in the coverage denominator | render them and keep them; report against 136 |
+| a type spelling the parser cannot place | refuse, rather than inventing a typedef |
+| radare2 type ingestion | the trusted snapshot is canonical, not the JSON schema |
+| what CI sweeps | a pinned binary the repository ships gates; the runner's own binary is reported |
+
+### The ordering now
+
+1. The accounting refusals, because they are what the benchmark measures:
+   the identity-merge predicate, the parameter-slot rules, and the two
+   placement refusals behind `unobserved_binding_write` and
+   `missing_definition`.
+2. The transfer through a value, at 105 matrix cells and 84 `/bin/ls` entries.
+3. The per-binary program cache, for the 286 ms per function.
+4. Cast policy, now that 3,395 redundant casts are visible to the gate.
+5. The direct tail call and the empty-body mislabel, together.
+6. Array indexing, stack buffers and `for`, which is the largest information
+   recovery win and is unblocked.
+7. The register-identity collapse, which removes four live wrong-answer paths.
+8. The deletions.
+
+## What is actually blocking us, measured
+
+The GED-only reading in the previous section was too kind, and this section
+corrects it. DecBench now runs all three of its metrics on `bzip2recover`,
+built by GCC at `-O0`, sixteen functions:
+
+| metric | what it measures | angr | r2sleigh |
+| --- | --- | --- | --- |
+| ged | control-flow graph edit distance from source | 5.54 mean, 4 of 13 perfect | 5.43 mean, 4 of 13 perfect |
+| byte_match | assembly of the recompiled output against the original | 0.60 mean, 0.75 median | 0.11 mean, 0.12 median |
+| type_match | recovered types against DWARF | 0.59 mean, 3 of 11 perfect | 0.10 mean, 0 of 11 perfect |
+
+**Control-flow shape is competitive and nothing else is.** `byte_match` is the
+closest thing to a semantic correctness score this project has ever had, and it
+is not refusals dragging the mean: on the functions r2sleigh renders it scores
+0.00 to 0.21 where angr scores 0.35 to 0.93 on the same functions.
+
+### Why, in one function
+
+`readError` in `bzip2recover` is four source statements. Its rendered
+control-flow graph is a perfect match, GED 0.0. Its `byte_match` is 0.21
+against angr's 0.91, and the rendering shows every reason:
+
+```c
+FILE* RAX_1 = (FILE*)*(uint64_t*)&stderr;
+uint64_t RDX_2 = (uint64_t)&progName;
+char* RSI_1 = (char*)(uint64_t)"%s: I/O error reading `%s'...\n";
+FILE* RDI_1 = (FILE*)RAX_1;
+uint64_t RAX_3 = sym_imp_fprintf(RDI_1, RSI_1, RDX_2);
+```
+
+Fourteen statements for four. Six of them stage arguments into register-named
+locals that are read once. Every value carries a cast it does not need.
+`stderr` is declared `extern char stderr[]` and read through a pointer cast,
+because a global has no recovered type. So the noise columns are not measuring
+cosmetics: they are measuring the score.
+
+**And the call is wrong.** The source passes four arguments; r2sleigh renders
+three, dropping `&inFileName`, which the machine plainly loads into `rcx`. In
+`tooManyBlocks` the same declaration serves three `fprintf` callsites of five,
+three and three source arguments, and all three render as three. The argument
+count is being decided once per callee rather than once per callsite, which for
+a variadic callee is wrong by construction. The proof line above the function
+says `0 refused`. This is a wrong answer rendered confidently, which is the one
+outcome this project treats as worse than refusing, and no existing gate can
+see it: the corpus is nine hash functions with no variadic calls, the coverage
+sweep only asks whether a function rendered, and graph edit distance never
+looks at an argument list.
+
+### The refusal population, split properly
+
+The headline coverage numbers are dominated by import thunks. Across the 449
+functions in the coverage baseline:
+
+| population | rendered |
+| --- | --- |
+| import thunks | 0 of 105 |
+| real functions | 272 of 344 |
+
+Every one of the 105 thunks refuses with `RenderedValueRequired`, and they are
+the transfer-through-a-value item. Of the 117 `RenderedValueRequired` refusals
+in total, 105 are thunks and 12 are real functions, so the duplicated
+identity-merge predicate is worth twelve functions rather than a hundred.
+
+The 72 real refusals, by cause:
+
+| count | cause |
+| --- | --- |
+| 20 | effect obligations refused |
+| 12 | observation journal: RenderedValueRequired |
+| 6 | placement: missing_definition |
+| 6 | placement: unobserved_binding_write |
+| 6 | unrepresentable control flow |
+| 4 | placement: preserved_carrier_read_before_assignment |
+| 4 | projection authorization, memory renderer |
+| 4 | observation journal: ConflictingUse |
+| 3 | placement: unobserved_binding_read |
+| 7 | singletons |
+
+**Fifty-six of the seventy-two are the accounting machinery refusing its own
+output**: twenty from the effect ledger, twenty from placement, sixteen from
+the journal. Control flow accounts for seven and type recovery for none. The
+proof accounting is the coverage blocker on real code, not the decompiler's
+understanding of the program.
+
+### Performance, profiled rather than guessed
+
+Nothing is cached. Decompiling one function three times in one radare2 session
+costs the same every time, and the same three callees are lifted from scratch
+on each call. `crates/r2engine/src/lib.rs` holds no cache, and
+`crates/r2ssa/src/fingerprint.rs` exists but is not used as a cache key.
+
+| function | capture | decode | callee lift | root lift |
+| --- | --- | --- | --- | --- |
+| readError | 513 ms | 0.06 ms | 382 ms, 3 callees | 131 ms |
+| bsGetBit | 618 ms | 0.05 ms | 450 ms, 3 callees | 168 ms |
+| main | 1725 ms | 0.11 ms | 1139 ms, 4 callees | 586 ms |
+
+Instruction decoding is nothing. Callee lifting is about eighty per cent of
+capture, and it is repeated per caller. The r2dec side is small except in the
+structurer, which is superlinear: `main` spends 2.27 seconds there and then
+refuses, against a total of 2.77 seconds for every other r2dec stage combined.
+That is the BDD safety budget, computed as blocks times 128 and consumed in
+whatever order the proofs happen to run.
+
+Whole-binary, after the eligibility-filter fix, with the plugin's directory
+moved aside and back:
+
+| binary | plugin absent | plugin present |
+| --- | --- | --- |
+| bzip2recover, 38 functions | 1.12 s | 7.50 s |
+| bzip2, 154 functions | 18.38 s | 29.93 s |
+
+### What we cannot see, which is the deepest problem
+
+Every defect above was invisible to the gates until the benchmark ran.
+
+- The **differential column** is the only semantic check, and it covers nine
+  hash functions of one shape, a loop over bytes accumulating an integer, with
+  eighteen to twenty-three fixed inputs each. No struct, no array of structs,
+  no float, no recursion, no varargs, no signed division, no union, no
+  multi-word return, no pointer to pointer.
+- The **coverage sweep** asks only whether a function rendered.
+- **GED** measures graph shape and is blind to the body.
+- **byte_match** and **type_match** had never been run before today.
+
+So the project's correctness evidence covers one program shape, and its two
+quality metrics were unmeasured. Making `byte_match` a gate, and widening the
+differential corpus past hash functions, is the work that lets every other item
+be judged.
+## Where a function's cost actually went: a Sleigh load, not the program
+
+The per-function cost was the task, and the shape of the answer was agreed
+before the work: an engine-owned per-binary cache of prepared bodies, because
+the snapshot walk pulls in callee bodies and a callee is lifted again for every
+caller that mentions it. That cache is built and it works. It is not what was
+making a function expensive.
+
+**Every measurement below was taken on the Linux VM against the DecBench GCC
+-O0 builds, with each column's plugin installed under its own `HOME` so that
+neither column can be overwritten while it is being measured.** That precaution
+was not optional: the first two attempts at this measurement were void. The
+shared install lock in `tests/locked_run.sh` was held for the whole of the
+second run and another tree on the same host still installed over the plugin
+between two sections of it, so half of that run was measuring somebody else's
+build. radare2 reads its user plugins from `$HOME`, so a private `HOME` per
+column is an isolation nothing outside the script can defeat, and it needs no
+cooperation from the other agent. That is the sixth measurement this class of
+error has cost the project and the first one it cannot cost again.
+
+    bzip2recover, 38 functions        absent    before     after
+      aaa                              0.76s     6.30s     3.29s
+      aa                               0.19s     2.70s     2.29s
+      aaa minus aa                     0.57s     3.60s     1.00s
+      proof sweep, plugin's share         --     3.03s     0.43s
+      per proved function (22)            --      138ms      20ms
+      pdd capture, first                  --      599ms    58.8ms
+      pdd capture, repeated               --      586ms     114us
+      pdd wall clock over aaa             --   in noise    0.073s
+
+    bzip2, 154 functions              absent    before     after
+      aaa                             10.84s    23.90s    22.00s
+      aa                               3.00s     5.99s     5.66s
+      functions the sweep reached         --        35        97
+      of those, proved                    --        35        42
+      budget exhausted at                 --    10.35s    10.02s
+      pdd capture, first                  --     1065ms     204ms
+      pdd capture, repeated               --      880ms     135us
+
+Medians of three on bzip2recover and two on bzip2; the machine is shared and
+noisy, so the ratios are the claim and the milliseconds are approximate.
+
+### The cache works completely, and the sweep gets nothing from it
+
+Repeated work vanishes. A second `pdd` of one function costs 114 microseconds
+of capture against 586 milliseconds, five thousand times less, with
+`cached_callees=3 cached_root=1` on the line saying why.
+
+And the analysis sweep reported `cache_hits=0` across the whole of `aaa`, with
+26 entries for the 22 functions bzip2recover proves. The reason is worth
+keeping, because it invalidates the premise the cache was designed from: **the
+functions an analysis sweep proves are import thunks, and a thunk has no
+callees to share.** The sweep produced 22 entries, exactly its 22 roots, and
+not one callee entry. So the sweep's cost was never repeated work between
+functions. It was the first-time cost of one function, and no cache removes
+that.
+
+### What the first time was spent on
+
+`Disassembler::from_trusted_profile` parses the whole compiled `.sla` and
+rebuilds the register and address-space tables from it, and `lift_owned_function`
+called it once for the function asked for and once for every callee captured
+beside it.
+
+    x86-64 Sleigh profile load      58000-91000us
+    one three-byte block lift             21-83us
+
+Three orders of magnitude, and the load was on the per-function path. A request
+with three callees spent about a quarter of a second building four identical
+copies of one specification. A twelve-byte import thunk cost a profile load and
+almost nothing else, which is the whole explanation for twenty-two tiny
+functions taking three seconds to prove.
+
+`shared_trusted_profile` loads each embedded profile on first ask and hands the
+same one out afterwards -- 52588us, then 0us, then 1us. Reuse across functions
+is the reuse that already happens across blocks: `lift_genuine_block` takes
+`&self`, every block of a function already goes through one instance at
+arbitrary addresses in arbitrary order, and nothing is reset between them now
+or before. It is thread-local rather than global because the instance owns a
+C++ Sleigh object that declares neither `Send` nor `Sync`, so the bound is one
+per embedded profile per lifting thread: at most eleven, in practice one.
+
+Both changes were needed and neither substitutes for the other. The profile
+load is what makes a *first* look at a function cheap; the program cache is what
+makes every look after the first nearly free. Together the per-proved-function
+cost falls from 138ms to 20ms and a repeated decompile from 586ms to 114us.
+
+### Keying a cache when a stale hit is a wrong answer
+
+The key is the whole serialized snapshot, byte for byte, not a hash of it. A
+miss costs time and a wrong hit renders a body that is not the function's, with
+nothing downstream to say so. A hash small enough to store makes two claims at
+once -- that it covers every input, and that no two inputs collide -- and
+neither can be checked at the point of use, while the snapshot *is* the whole
+input to a lift by construction of the V2 boundary. Comparing it costs one
+`memcmp` and a few kilobytes per function against hundreds of milliseconds.
+
+`stable_ssa_semantic_fingerprint` is recorded beside each entry rather than used
+as the key, which is the only honest place for it: it is computed from the
+prepared artifact, so it cannot be known until the work the lookup exists to
+avoid has been done.
+
+Two things the design had to get right, both of which would have silently
+produced a cache that never hits:
+
+*A root and a callee body are two different artifacts for one address.* The
+function a request asks about is prepared knowing the recovered interfaces of
+everything it calls; a body captured as a callee is prepared alone. Under one
+address key each would be the other's eviction and neither would ever hit, so
+`PreparedRole` is part of the key.
+
+*A callee carries its caller's capture tag.* radare2 gives every callee the
+root's `revision_identity`, deliberately, so a consumer can tell the bodies were
+read together -- which means the same body under two callers serializes two
+ways and a byte-exact key never matches in the one case a callee cache exists
+for. `encode_snapshot_cache_key` writes the body's own `content_identity` in
+the tag's place. Every other field is still written and still compared, so two
+different bodies are still told apart by the bytes describing them, and the
+substituted field is a hash of those same bytes rather than a new claim. On a
+radare2 predating `content_identity` the two are equal and this degrades to a
+key that misses rather than one that is wrong.
+
+The entry bound is one per address per preparation, replaced when that address's
+input changes, so the count is the program's own function count at most twice
+over. Nothing is evicted while a session runs: an eviction policy would have to
+guess which function a later request wants, and a sweep asks about all of them.
+
+### The machine arena was lowered twice per render
+
+`BindingPlan::build_shadow` builds a `MachineProjection` and keeps it;
+`build_upstream_shadow_oracle` built a second from the same source. The oracle's
+comment explains that it takes no plan as input so a wrong plan disposition is
+observable rather than self-validating, and that argument is about the plan's
+*decisions*. A projection is not one: it is derived from the source alone, and
+`validate_source`, which `derive_report` already calls first, has proven the
+plan's copy is what this exact source produces. The oracle now borrows it, and
+the module documentation says which independence is load-bearing and which was
+only cost, because the next reader of the first sentence would otherwise put
+the second build back.
+
+### Two open items, and one decision that is not ours
+
+**The dominant cost is now the `aa` path, and nobody has measured it.** On
+bzip2recover the plugin adds 2.10 seconds to `aa` after this work against 0.43
+seconds to the proof sweep -- five times as much, over 38 functions, or about
+55ms each. That is `sleigh_analyze_fcn`'s semantic comments,
+`sleigh_get_data_refs`, and `sleigh_op` per instruction, none of which this
+work touched and none of which has ever been split. It is the next measurement
+to take, and it is a bigger number than the one this task was given.
+
+**The two smaller hot shapes were deliberately not taken.** `inlinable_values`
+scanning `graph.insts` per candidate sits in `binding_plan/rules.rs`, which
+another effort is editing for the inlining guard, and the load-lowering access
+filter is in `MachineProjection::from_artifact`. Both are inside the
+`binding_plan` stage, which is 10ms of a 21ms render on `bsGetBit` and 275ms
+against the structurer's 2274ms on `main`. Halving either moves nothing that
+matters while the structurer is superlinear, so the structurer comes first.
+
+**Whether the `aaa` sweep should become lazy is still open, and it is the
+owner's call rather than ours.** The measurement says the question is live:
+bzip2 still exhausts the ten-second budget, now reaching 97 of 154 functions
+instead of 35 and proving 42 instead of 35. So the sweep is 2.8 times further
+through the program and still does not finish it. Deferring proofs to first
+`pdd` would finish `aaa` in the lift alone -- but the indirect-call xrefs and
+unreachable-block comments radare2 consumes are produced by those proofs, so
+`axt` immediately after `aaa` would no longer show them. Trading a fact radare2
+can currently see for analysis time is a decision about what the plugin
+promises, not an optimisation, and it is recorded here unmade.
+
+The ten-second budget itself deserves the same scrutiny the project gives every
+other bound. It is a constant per analysis mode in `r2engine`, not derived from
+anything the sweep has to clear, and on bzip2 it is the only thing deciding how
+much of the program gets proved. Whatever replaces it should be derived from
+the work in front of it -- the function count and the measured per-function
+cost, both of which the sweep now knows -- rather than from a number that
+happens to feel like a long time.
+The tail transfer: what the source now carries, and the two forks that remain
+-----------------------------------------------------------------------------
+
+**The brief's numbers were wrong in both directions, and the corrected ones
+reorder the work.** The direct tail call was described as 22 of the 41 refusing
+real `/bin/ls` functions and as the project's largest coverage lever. Measured
+against the coverage baseline, the direct tail call is ten functions, sixteen
+counting the short forwarders, and the largest lever by a wide margin is its
+sibling: the transfer *through a value*, which is every import thunk, at
+**0 of 105 rendered** across the whole sweep -- 84 in `/bin/ls` and 21 across
+the corpus binaries. Every one of the 105 refuses identically, with
+`observation journal: RenderedValueRequired`. Of the 72 refusing real
+functions, only twelve are `RenderedValueRequired`, and those are a different
+cause.
+
+**Measured, on this tree, before and after.** 271 of 449 both before and after
+the two commits below: 261 of 313 on the corpus binaries, 10 of 136 on
+`/bin/ls`, 0 of 105 on thunks. The commits are plumbing and an honesty fix, so
+coverage is unchanged by design; what moved is which cause each refusal
+reports. The one `REGRESSION` line the harness prints against its blessed
+baseline, `sym.func.10000306c`, predates this work: it comes from the
+integration branch's new linear-body refusal, and was measured identically
+before anything here was written.
+
+**What radare2 now carries.** The function map is what knows that a jump's
+target is where another function starts, and the relocation table is what
+knows which import a loaded slot names, so the detection sits in the fork at
+`libr/anal/function.c` rather than being guessed from addresses in Rust.
+`fcn_context_collect_callees` kept only the `CALL` references leaving the
+image; it now also offers a *tail jump* -- a direct successor outside the image
+that is exactly a function entry, so a jump into the middle of another function
+stays what it was -- and a *tail slot*, a block with no successor whose last
+instruction decodes as a jump through a value. Each callee, each call site
+interface and the interface hash carry an `RAnalCallTransfer`, the snapshot
+exposes it through `r_anal_function_snapshot_call_site_transfer`, and the wire
+format is version 7: one byte after the target name, read as `Call` from any
+older buffer. `RBinBind` gained a relocation-at-address lookup, and
+`function_get_signature` split so a prototype can be built for a bare name that
+is no function of this binary, which is what an imported callee is.
+
+**An empty body was being reported as unrepresentable control flow.** A
+function whose body renders no statement had its `FunctionBody` marker
+collapsed by the structurer cleanup along with the body it wrapped; sealing
+then failed for want of a marker at the root, and that became
+`unrepresentable control flow`. Six `/bin/ls` forwarders reported a structural
+refusal for a fact about their contents. With the marker kept, that column goes
+from six to zero and all six report the cause they actually have --
+`effect obligations refused`, the refused `ControlTransfer` for the tail branch,
+which is the real subject. Worth stating plainly because it was the risk in
+the fix: they did **not** become empty-bodied renders. An empty body would have
+counted as rendered by the harness and claimed the function does nothing, which
+is the wrong-answer class; the effect ledger refuses first and no cell was
+bought with a lie.
+
+**Fork one, and it is the whole of the 105: what a thunk is allowed to claim.**
+The refusal is exact and the machine side is easier than expected. On x86-64 a
+thunk is one instruction and its whole SSA is
+`BranchInd { target: ram:0x100002010 }` -- the GOT slot *is* the target value,
+with no definition, which is why the journal has nothing to account. On arm64
+the slot is `adrp` plus a displacement and the branch reads a register loaded
+from it. So the machine can prove the exact slot, and radare2's relocation
+names it. Note in passing that radare2's own `ICOD` reference for these blocks
+is the `adrp` page base, not the slot: at `0x1000042a4` it points at
+`0x100008000`, whose relocation says `humanize_number`, while the `add #0x28`
+makes the true slot `0x100008028`, which the relocation table names
+`__assert_rtn` -- matching the thunk. Keying on that reference would have named
+every thunk in a page after the first relocation in it. The source must
+therefore describe slots and let the machine pick, never pick for it.
+
+What is *not* settled is what may then be rendered, and the arithmetic decides
+nothing on its own. A thunk forwards the arguments its caller left in
+registers; it reads none of them and writes none of them. So the standing rule
+that an unknown call takes its arity from the convention's argument registers
+provably written and live into the transfer yields **zero arguments** here, and
+would render `acl_get_entry()` for a function of three arguments -- silently
+dropping them, which is exactly the class of wrong answer the variadic
+callsite-arity defect was just raised for. Counting `/bin/ls`'s 84 thunks by
+what radare2 knows about the callee:
+
+    complete non-variadic prototype, forwardable as a call        54
+    no recovered prototype, so arity unknown                      22
+    variadic                                                       8
+
+The eight variadic ones are not a gap in the recovery: C cannot forward `...`,
+so no call expression exists for them at any level of knowledge. The options,
+with the trade-off that separates them:
+
+1. *Render the 54, refuse the 30.* Truthful, and refusing per-callee where the
+   evidence is absent is what this project already does per-value. Buys 54 of
+   105 cells and leaves the metric honest about the rest.
+2. *Render all 105 as a call through the named slot.* Requires asserting an
+   arity radare2 never recovered for 22 of them, which drops arguments
+   silently, and has no expression at all for the 8 variadic.
+3. *Render none.* The status quo, and the position the earlier survey took when
+   it recorded the value of rendering thunks as low.
+
+Option 1 is the one consistent with the rest of the system, but it decides that
+a thunk may claim a direct call to the symbol its slot's relocation names, on
+radare2's authority and marked as such, and that is a claim about what the
+decompiler asserts rather than an implementation detail. It is put here rather
+than taken.
+
+Two smaller things fall out of it either way. The thunk's parameters have to
+exist for a forwarding call to name them, and radare2 already supplies them --
+it gives the thunk function the callee's own signature -- so this does not need
+the pass-through parameter work that four other `/bin/ls` functions do. And the
+marking has no home yet: nothing in the renderer says which facts came from
+radare2, so "the callee at this site is named by the relocation at slot S"
+needs a line the proof can carry.
+
+**Fork two: what IL shape a direct tail call takes.** Independent of the above
+and needed for the ten-to-sixteen real functions. The source now offers the
+callsite; what is unsettled is the representation.
+
+*Option A -- rewrite at the lift into a call followed by the machine's own
+return sequence.* `lift_owned_function` has the external exits, the advisory
+sites and the architecture, so it can replace a terminal `Branch f` licensed by
+a `TailJump` site with `Call f` and then the ops the architecture's return
+performs. Downstream nothing changes: the block is an ordinary call-then-return
+and every certificate already applies. The costs are real: the synthesized ops
+are the *callee's* epilogue attributed to the caller's `jmp`, so the
+per-instruction ledger states a load and a stack adjust that instruction does
+not perform; the genuine lift stops being a function of bytes and Sleigh alone;
+and on AArch64 the synthesized `return [x30]` reads x30 after the call, whose
+`CallDefine` clobbers it, so either a tail call gets no `CallDefine` for the
+return-address carrier or the return-address fact learns to look through one.
+
+*Option C -- a terminal call with no fallthrough as a first-class tail return
+boundary.* The op becomes `Call f`, the terminator `Call { fallthrough: None }`,
+and `collect_source_boundary_facts` records a return boundary at the call whose
+machine state is the stack-pointer and return-address carriers reaching it
+entry-preserved -- which is the true requirement of a tail transfer, rather
+than a load of a return slot that never happens. The renderer emits
+`return f(args);`. The cost is breadth: every place that keys a return on
+`SSAOp::Return` needs a tail arm -- the boundary collector, the return-control
+and return-value certificates, the render plan, placement, the observation
+journal, and both terminators -- which is the five-places shape this document
+already records being reverted whole when attempted late in a session.
+
+*Option B, keeping the `Branch` op and giving it a form,* is dominated by C: it
+needs the result register defined at the branch, which is what calling it a
+call provides.
+
+**One caution for whoever takes either fork.** Do not build anything that
+assumes a callee has one arity. A separate confirmed defect decides argument
+count once per callee rather than per callsite, so three `fprintf` calls of
+five, three and three arguments all render as three; the thunk work touches the
+same call-boundary machinery and must not deepen that assumption.
+## Self-assignments, literal-only declarations, and the staging locals
+
+Three columns were the brief; a fourth thing turned out to matter more, and two
+of the three brief items ended as questions rather than answers. Everything
+below is measured on the fifty-four cells with `locked_matrix.sh`, and every
+number that moved is stated with the state it moved from.
+
+    predicate                    before   after   what happened
+    self_assignments               225     205    merge-copy coalescing widened; the
+                                                  carrier zero-extend is still open
+    literal_only_declarations      103      80    call arguments now spell their literal
+                                                  where it is read; the rest are open
+    flag_carriers                  192     192    untouched, and still the open question
+    cast_chains                      8       8    untouched
+    comma_conditions                17      17    untouched
+    gotos                          125     125    untouched
+    same_type_casts                  0       0    still zero
+
+54 of 54 on generation, raw, diagnostic, differential, binding audit, effect
+obligations, placement and render refusal. Whole-binary coverage 272 of 449,
+no regressions. Seventeen cells differ from the blessed snapshot and want a
+fresh blessing.
+
+**The staging locals were never a single-use question, and that is the finding
+worth carrying.** DecBench scores `byte_match` by recompiling the rendering and
+comparing assembly, and on `bzip2recover` at -O0 r2sleigh sat at 0.11 against
+angr's 0.60. `readError` is four lines of source and rendered as fourteen
+statements, six of which existed only to stage call arguments. The obvious
+reading is that the inlining guard counts elided readers, and it is wrong.
+`SSAOp::Call` takes only the callee as an operand: a value staged in `rdi` is
+consumed by the call boundary and has **no `UseSite` in the graph at all**. The
+SSA dump says so directly -- `RDI_1 ... uses=[]`. `inlinable_values` turned
+those values away at its first gate, "no readers", before any question about
+single use could be asked. The callsite certificate is the source's record that
+the read happens, the renderer already consults it and already accepts an
+argument the plan inlines; only the plan did not know the reader existed. It
+counts them now. `readError` renders as eight statements, and the literal-only
+column falls by 23.
+
+`RDI_1 = (FILE*)RAX_1` still survives, because a register-to-register copy
+roots at `Source` and `Source` is not among the shapes that render inline.
+Whether it belongs there is the next thing to try on this path, and it is
+cheap to test.
+
+Measured on the benchmark, `bzip2recover` at -O0, `byte_match`, the eight
+functions r2sleigh renders, before and after this one change:
+
+    function          before    after
+    readError         0.2143   0.4000
+    writeError        0.2143   0.4000
+    mallocFail        0.1607   0.3095
+    tooManyBlocks     0.1558   0.3158
+    endsInBz2         0.0878   0.0887
+    bsPutBit          0.0529   0.0534
+    bsClose           0.0000   0.0000
+    entry.fini0       0.0000   0.0000
+    mean              0.1107   0.1959
+
+Nothing regressed and nothing stopped rendering. angr scores 0.6017 over the
+fifteen it decompiles, so the gap is far from closed, but the four functions
+that are mostly calls roughly doubled, which is what a staging local costs when
+it is spelled as a statement instead of an argument. `bsClose` at 0.0000 and
+`bsPutBit` at 0.05 are not call-shaped and are where the next look belongs.
+
+### Three things that were tried, measured, and reverted
+
+Each looked right, each is recorded with the evidence, and none should be
+retried without reading the reason.
+
+**Counting only rendered readers is unsound as `inlinable_values` stands.**
+Discounting a reader whose instruction a certificate elides is what the brief
+asked for and it is what the staging locals appeared to need. It widens what
+may be folded without widening the window the interference test looks at: that
+test spans the definition and the one reader the guard then believes in.
+`fnv1a64` at x86-64 -O2 renders `R8_1 = byte3;` and then
+`R8_1 = (R8_1 ^ (... ^ R8_1) * k) * k`, reading the accumulator after the byte
+load overwrote it -- a wrong hash under a proof line reading `0 refused`. Three
+cells compute wrong answers and five more refuse. If this is wanted, the
+interference test has to cover every reader's window, not the surviving one's.
+
+**Discharging an absorbed carrier extension on the write that absorbed it
+refuses ten cells.** This was the plan for the 149 self-assignments of the form
+`EAX_2 = (uint64_t)(uint32_t)EAX_2`, and the machine half of it landed:
+`MachineProjection::absorbed_extensions` and `absorbing_write` now report which
+extensions a `ZeroExtend` projection consumed, with tests, including the nested
+case where a byte is widened twice. The accounting half is where it stops, and
+the cause was bisected to one cell rather than guessed: the extension reads the
+very binding the fused statement defines, so recording that operand as a
+rendered use puts a *read* of the object on the statement that first assigns
+it, and placement refuses with `read_before_assignment`. Dropping just the
+operand targets changes the refusal to `ExactUseRequiresRenderedOccurrence`,
+which is the proof that the operand cell is the one at fault.
+
+That is a question, not a bug, and it is the fork this work stopped at. What is
+the honest cell for an operand read that a write projection absorbed?
+
+- *Elide it*, with a reason of its own. Truthful -- the read does not appear in
+  the text -- and it is the mechanism the codebase already uses for the
+  analogous case, `account_materialized_phi_occurrences`. It contradicts the
+  brief's expectation that no new elision reason would be needed.
+- *Keep it exact and teach placement that a discharged operand read at the
+  statement that defines it is not an occurrence.* Preserves the "rendered by
+  equivalence" story and splits the journal's notion of an occurrence from
+  placement's, which is exactly the two-answerers-that-drift shape this
+  codebase keeps warning about.
+- *Narrow the discharge* to extensions whose operand is not in the absorbing
+  write's binding. This disables the feature: same-binding is its precondition.
+
+The first looks right and none of it was landed, because it decides what
+"rendered by equivalence" means for two ledgers at once.
+
+**Coalescing the program's own copies, merge edges whose source is version 0,
+and literals held in registers all delete an object's only definition.** A
+copy normalization made for a merge is safe to drop when both sides are one
+binding, because nothing can have touched the object between an edge's two
+ends. A program copy has a position, and the object can be written between its
+source's definition and it -- a save and restore around a clobber is that
+shape. A live-in register that is not a parameter has no declaration to be
+rendered by. And `RAX_1 = 0xcbf29ce484222325` initialises an accumulator it
+shares a binding with, so spelling the constant at each reader deletes the
+definition and the loop header reads it unassigned.
+
+The literal case is the one with a clean statement of what would be correct,
+and it is blocked on ordering rather than on evidence: the honest test is
+whether the value is coalesced with anything, and that cannot be asked where
+inlining is decided, because the partition is computed *from* the inlining
+answer. Admitting register literals needs a two-pass partition -- provisional
+components first, inlining decided against them, then the real partition -- and
+that is a structural change, not a predicate change. Until then the
+lowering-temporary restriction stands, and the comment beside it now says so
+with the reason rather than the storage class.
+
+What did survive from that direction: a copy relocated ahead of a certified
+carrier's entry edges is coalesced like any other merge copy, which is most of
+the 20 self-assignments that went.
+
+### Two defects found on the way, both fixed
+
+`expression_renders_inline` is the list of shapes the materialiser can build,
+and `Constant` was missing from it. Every literal the duplicable rule admitted
+was then asked whether a constant renders inline and told no, which is why that
+column had not moved in a previous session either. A computation *over*
+constants is still not a constant: `machine_expr_is_literal` is true of
+`popcount(0xf0f0)` because it asks only whether every leaf is constant, and the
+materialiser has no form for a population count. Two pipeline tests were
+quietly asserting exactly that distinction and caught the first attempt.
+
+The parameter-slot candidate rules were written twice, in `construction` and in
+`seal`, and they disagreed about a slot claimed three times: one overwrote the
+refusal reason, the other kept it, so the seal would reject a plan that was
+right. They are one statement in `rules` now.
+
+### Probes added
+
+`R2SLEIGH_TRACE_INLINE=<display name>` or `=all` prints, for each value,
+which gate in `inlinable_values` turned it away and why. This is what turned
+"the guard counts elided readers" into "a call argument has no `UseSite`", and
+it is the probe the previous session asked for when it recorded the flag
+carriers as needing one. `R2SLEIGH_DUMP_SSA=1` prints the prepared and
+normalized functions, every value with its storage, definition and use sites,
+and every instruction; between them the two answer most "why is this value
+bound" questions without a rebuild.
+
+### A hazard that cost two measurements here
+
+Syncing a worktree to the benchmark host with `rsync` carried macOS `.o` files
+into `r2plugin/`, the host linker rejected them, `make install` aborted *before*
+copying the library, and DecBench then scored the previously installed plugin.
+The run looked completely normal and the numbers were identical to the
+baseline, which is exactly what a real "no effect" result looks like. On a
+second run the Makefile copied a library that was not the one just built. Both
+are the shared-plugin hazard wearing a different coat, and the answer is the
+same one this document already gives for the corpus: verify the artifact you
+measured is the artifact you built. `run-placement.sh` on the host now copies
+the freshly built library itself and prints whether a string only this tree
+contains is present in the installed one.
+
+## The effect-ledger refusals, split by layer
+
+The effect ledger is the largest single cause of refusal among real functions,
+26 of them across the coverage baseline, and until now the cause line said only
+"N refused, N unaccounted, N conflicts". `R2SLEIGH_DEBUG_UNOWNED=1` writes a
+per-function ledger line to `/tmp/r2sleigh_unowned.log` naming the layer, the
+reason and the obligation ids, and it splits them cleanly. Swept over 78
+functions in three binaries, four had a refused obligation:
+
+| count | layer and reason | obligation kind |
+| --- | --- | --- |
+| 22 | `ssa/unsupported-effect` | `volatile-or-unknown` |
+| 5 | `codegen/block-not-rendered` | `live-value-producer` |
+
+The two are different problems and only one of them is about the decompiler's
+ability to read a program.
+
+**`ssa/unsupported-effect`** appears entirely in `_init` and `entry.init0` of
+the pinned GCC binaries, at a single address. Those are compiler-generated
+stubs whose effects the SSA layer declines to model. Whether they are worth
+modelling at all is a scope question rather than a defect, and their share of
+the count makes the ledger cause look larger than the part that matters.
+
+**`codegen/block-not-rendered`** is the real one. A block exists in the SSA,
+produces live values, and never reached the output, so the obligations of the
+values it produces have nowhere to be discharged. `siphash24` at x64-O1 is the
+clearest case: 435 obligations, 393 rendered, 40 elided, and exactly two
+refused, both `live-value-producer` on the same block. Anything that drops a
+block after the plan is fixed produces this, so the trace runs from the
+structurer's region handling and the linearizer through placement's statement
+removal.
+
+Note that the elision profile of that same function is healthy and worth
+keeping as a reference for what a well-accounted function looks like:
+21 coalesced identity phis, 6 coalesced copies, 3 dead stack bases,
+3 materialized phi edges, 3 stack frame, 2 return control, 1 direct control
+target and 1 with no native semantics.

@@ -28,8 +28,8 @@ use crate::integrity::{SsaIntegrityError, validate_ssa_function};
 #[cfg(test)]
 use crate::machine_context::{SourceCallArgumentSpec, SourceCallResult};
 use crate::machine_context::{
-    SourceCallSiteIdentity, SourceCallSiteInterface, SourceFunctionInterface, SourceMachineContext,
-    SourceMachineRoles,
+    SourceCallSiteIdentity, SourceCallSiteInterface, SourceConventionSlots,
+    SourceFunctionInterface, SourceMachineContext, SourceMachineRoles,
 };
 use crate::naming::{ARCH_DERIVED_CACHE_MAX_ENTRIES, ArchCacheTag, cached_register_name_map};
 use crate::op::SSAOp;
@@ -491,12 +491,36 @@ impl SsaArtifact {
         machine_roles: SourceMachineRoles,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Option<Self> {
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+        Self::for_decompile_with_interfaces_roles_and_convention(
             blocks,
             arch,
             function_interface,
             machine_roles,
             None,
+            call_site_interfaces,
+        )
+    }
+
+    /// The same, describing where the calling convention places arguments.
+    ///
+    /// The slots are a fact about the convention rather than about this
+    /// function, and a variadic call needs them: its prototype names only the
+    /// fixed arguments, so where argument `n + 1` would go is a question only
+    /// the convention answers.
+    pub fn for_decompile_with_interfaces_roles_and_convention(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+        convention_slots: Option<SourceConventionSlots>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+    ) -> Option<Self> {
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            function_interface,
+            machine_roles,
+            convention_slots,
             call_site_interfaces,
         );
         Some(Self::new_with_context(
@@ -2324,9 +2348,7 @@ impl SSAFunction {
             decompile_prep_facts: None,
             query_index: RwLock::new(None),
         };
-        if let Some(arch) = arch
-            && std::env::var_os("R2SLEIGH_NO_ALIAS_REPAIR").is_none()
-        {
+        if let Some(arch) = arch {
             function.normalize_register_alias_sources_with_control(arch, control)?;
         }
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
@@ -7076,6 +7098,122 @@ mod tests {
         assert_eq!(recursive.structured().recursive_calls.len(), 1);
         assert_eq!(call.block_addr, 0x1500);
         assert_eq!(call.target, 0x1500);
+    }
+
+    /// A machine, a convention and a call site that passes more than the
+    /// callee's prototype names.
+    ///
+    /// `defined` says how many of the convention's argument registers the
+    /// function writes before the call; the prototype names one of them.
+    fn variadic_tail_call_artifact(defined: usize, variadic: bool) -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        for (index, name) in ["rdi", "rsi", "rdx", "rcx"].iter().enumerate() {
+            arch.add_register(RegisterDef::new(*name, (index as u64) * 8, 8));
+        }
+        let slot = |index: usize| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: (index as u64) * 8,
+            size: 8,
+        };
+
+        let mut ops = (0..defined)
+            .map(|index| R2ILOp::Copy {
+                dst: make_reg((index as u64) * 8, 8),
+                src: make_const(0x10 + index as u64, 8),
+            })
+            .collect::<Vec<_>>();
+        let call_index = ops.len();
+        ops.push(R2ILOp::Call {
+            target: make_const(0x2000, 8),
+        });
+        ops.push(R2ILOp::Return {
+            target: make_const(0, 8),
+        });
+        let blocks = vec![R2ILBlock {
+            addr: 0x1600,
+            size: 4,
+            ops,
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+
+        let interface = SourceCallSiteInterface::new(
+            b"variadic-tail".to_vec(),
+            SourceCallSiteIdentity::new(
+                0x1600,
+                call_index,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x2000,
+                    size: 8,
+                },
+            ),
+            true,
+            "amd64",
+            [SourceCallArgumentSpec::new(0, slot(0))],
+            variadic,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("exact callsite interface");
+        let convention =
+            SourceConventionSlots::new("amd64", (0..4).map(slot).collect::<Vec<_>>(), None)
+                .expect("convention slots");
+        SsaArtifact::for_decompile_with_interfaces_roles_and_convention(
+            &blocks,
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(convention),
+            vec![interface],
+        )
+        .expect("prepared SSA")
+    }
+
+    fn variadic_tail_arity(defined: usize, variadic: bool) -> (usize, bool, Option<usize>) {
+        let prepared = variadic_tail_call_artifact(defined, variadic);
+        let call = prepared
+            .callsite_certificate_for_op(0x1600, defined)
+            .expect("callsite certificate");
+        (
+            call.argument_values.len(),
+            call.variadic,
+            call.fixed_argument_count,
+        )
+    }
+
+    /// How many arguments a call passes is a fact about the call.
+    ///
+    /// A variadic callee's prototype names only the fixed ones, so the count
+    /// cannot be read off the callee at all: `fprintf` declares two parameters
+    /// and its calls pass as many as their formats ask for. The tail continues
+    /// through the convention's remaining argument registers for as long as
+    /// this function defines them on the way to the call.
+    #[test]
+    fn a_variadic_call_passes_the_arguments_the_machine_writes() {
+        assert_eq!(variadic_tail_arity(1, true), (1, true, Some(1)));
+        assert_eq!(variadic_tail_arity(2, true), (2, true, Some(1)));
+        assert_eq!(variadic_tail_arity(3, true), (3, true, Some(1)));
+        assert_eq!(variadic_tail_arity(4, true), (4, true, Some(1)));
+    }
+
+    /// The same callee, called two different ways, is two different counts.
+    #[test]
+    fn two_calls_to_one_variadic_callee_may_pass_different_counts() {
+        let (few, _, few_fixed) = variadic_tail_arity(2, true);
+        let (many, _, many_fixed) = variadic_tail_arity(4, true);
+        assert_ne!(few, many);
+        assert_eq!((few_fixed, many_fixed), (Some(1), Some(1)));
+    }
+
+    /// A callee that is not variadic takes what its prototype says, however
+    /// many argument registers the caller happens to have written. Extending
+    /// past the prototype there would be a claim about the callee, not an
+    /// observation about the call.
+    #[test]
+    fn a_fixed_callee_takes_only_the_arguments_its_prototype_names() {
+        assert_eq!(variadic_tail_arity(4, false), (1, false, Some(1)));
     }
 
     #[test]

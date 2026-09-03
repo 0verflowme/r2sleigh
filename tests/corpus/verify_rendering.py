@@ -995,6 +995,57 @@ def cast_runs(source: str) -> list[list[str]]:
     ]
 
 
+DECLARATION_RE = re.compile(
+    rf"^\s*({_TYPE_WORD}(?:\s+{_TYPE_WORD})*\s*(?:\*\s*)*)\s*([A-Za-z_]\w*)\s*(?:=|;|,|\))",
+    re.MULTILINE,
+)
+PARAMETER_RE = re.compile(
+    rf"({_TYPE_WORD}(?:\s+{_TYPE_WORD})*\s*(?:\*\s*)*)\s*([A-Za-z_]\w*)\s*(?=,|\))"
+)
+CAST_OF_NAME_RE = re.compile(rf"({CAST_PATTERN})\s*([A-Za-z_]\w*)\b(?!\s*\()")
+
+
+def declared_types(source: str) -> dict[str, str]:
+    """Every name the function declares, with its normalized type.
+
+    Locals come from declarations in the body; parameters from the signature.
+    A name declared twice with two types is dropped, because a cast to either
+    is then not provably redundant.
+    """
+    types: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    signature_end = source.find("{")
+    head = source[:signature_end] if signature_end > 0 else ""
+    open_paren = head.find("(")
+    parameters = head[open_paren + 1 :] if open_paren >= 0 else ""
+    for pattern, text in ((PARAMETER_RE, parameters), (DECLARATION_RE, source)):
+        for match in pattern.finditer(text):
+            ty = normalize_cast("(" + match.group(1) + ")")
+            name = match.group(2)
+            if name in types and types[name] != ty:
+                ambiguous.add(name)
+            types.setdefault(name, ty)
+    for name in ambiguous:
+        types.pop(name, None)
+    return types
+
+
+def casts_to_declared_type(source: str) -> int:
+    """Casts that convert a name to the type that name is declared with.
+
+    A run of adjacent identical casts is one shape of redundancy; this is the
+    other, and the more common one: `(uint64_t)RAX_2` where `RAX_2` is
+    declared `uint64_t`. The pair-based count never examined a lone cast, so
+    the column read zero while thousands of these were in the rendered C.
+    """
+    types = declared_types(source)
+    return sum(
+        1
+        for match in CAST_OF_NAME_RE.finditer(source)
+        if types.get(match.group(2)) == normalize_cast(match.group(1))
+    )
+
+
 def parenthesized_conditions(source: str) -> list[str]:
     """The text inside each `if`/`while`/`switch` control parenthesis."""
     conditions: list[str] = []
@@ -1044,12 +1095,16 @@ def run_is_required(run: list[str]) -> bool:
 
 def _score_machine_noise(source: str, config: str) -> dict[str, Any]:
     runs = cast_runs(source)
+    # Two shapes of a cast that converts nothing: an identical cast directly
+    # inside another, and a cast to the type its operand is already declared
+    # with. The first count alone reported zero while the second stood at
+    # thousands, because a lone cast was never examined.
     same_type_cast = sum(
         1
         for run in runs
         for first, second in zip(run, run[1:])
         if first == second
-    )
+    ) + casts_to_declared_type(source)
     counts = {
         "flag_carriers": len(set(FLAG_CARRIER_RE.findall(source))),
         "self_assignments": len(SELF_ASSIGN_RE.findall(source)),
