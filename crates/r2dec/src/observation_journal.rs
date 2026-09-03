@@ -2765,14 +2765,19 @@ impl LegacyObservationJournal {
                             .map(|s| (s.space, s.offset, s.size))
                     );
                     for site in graph.use_sites(value) {
+                        let reader = graph.inst(site.inst);
+                        let output = reader.and_then(|inst| inst.output);
                         eprintln!(
-                            "   use {site:?} -> {:?}",
-                            graph
-                                .inst(site.inst)
-                                .map(|inst| format!("{:?}", inst.payload)
-                                    .chars()
-                                    .take(110)
-                                    .collect::<String>())
+                            "   use {site:?} answer={:?} projection={:?} output={output:?} output_disposition={:?} -> {:?}",
+                            self.uses
+                                .get(site.inst.0 as usize)
+                                .and_then(|row| row.get(site.input_idx)),
+                            self.plan.use_disposition(*site),
+                            output.and_then(|value| self.plan.disposition(value)),
+                            reader.map(|inst| format!("{:?}", inst.payload)
+                                .chars()
+                                .take(110)
+                                .collect::<String>())
                         );
                     }
                 }
