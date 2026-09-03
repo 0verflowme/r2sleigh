@@ -5759,6 +5759,21 @@ fn counted_for_loop_certificate(
     if !initializer.validate(graph) {
         return None;
     }
+    if !movable_for_clause_value(
+        function,
+        graph,
+        initializer.value,
+        initializer.predecessor,
+        loop_fact.header,
+    ) || !movable_for_clause_value(
+        function,
+        graph,
+        induction.update,
+        induction.latch,
+        loop_fact.header,
+    ) {
+        return None;
+    }
     Some(ForLoopCertificate {
         induction_phi: phi,
         induction_init: induction.init,
@@ -5766,6 +5781,41 @@ fn counted_for_loop_certificate(
         latch: induction.latch,
         initializer: *initializer,
     })
+}
+
+/// Whether moving one definition into a `for` clause preserves its block order.
+///
+/// The defining block must flow only to the loop header, and only inert or
+/// control operations may follow the definition. This walks at most the two
+/// clause-owning block suffixes per loop; it never rescans the function.
+fn movable_for_clause_value(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    value: ValueId,
+    block_addr: u64,
+    loop_header: u64,
+) -> bool {
+    if function.successors(block_addr).as_slice() != [loop_header] {
+        return false;
+    }
+    let Some((definition_block, op_index)) = graph
+        .def_inst(value)
+        .and_then(|inst| graph.op_site_for_inst(inst))
+    else {
+        return false;
+    };
+    definition_block == block_addr
+        && function.get_block(block_addr).is_some_and(|block| {
+            let Some(suffix) = op_index
+                .checked_add(1)
+                .and_then(|start| block.ops.get(start..))
+            else {
+                return false;
+            };
+            suffix
+                .iter()
+                .all(|op| matches!(op, SSAOp::Branch { .. } | SSAOp::Nop))
+        })
 }
 
 #[expect(
@@ -10019,12 +10069,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        CallBoundarySlot, ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation,
-        MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind,
-        ObjectModel, ObjectModelBuilder, ObjectSpaceId, RelativeMemoryAddress, ReturnCarrier,
+        CallBoundarySlot, ControlGuard, ForLoopCertificate, GlobalObjectKey, InductionStep,
+        LoopCertificate, MemoryDefFact, MemoryLocation, MemorySSAFacts, MemoryUseFact,
+        MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, ObjectModelBuilder,
+        ObjectSpaceId, RelativeMemoryAddress, ReturnCarrier,
         SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SourceReturnRegisterCompositionFact,
         SourceReturnRegisterDefinitionFact, StackReloadSourceCertificate, StructuredAccessId,
-        memory_locations_may_alias,
+        StructuredLoopKind, memory_locations_may_alias,
     };
     use crate::{
         AddressProvenanceFacts, AnalysisAssumption, AssumptionProvenance, AssumptionScope,
@@ -12313,6 +12364,219 @@ mod tests {
         .expect("counted loop artifact")
     }
 
+    #[derive(Clone, Copy)]
+    enum CountedTestStep {
+        Add(u64),
+        Sub(u64),
+        UnsupportedXor(u64),
+    }
+
+    /// The same pre-test loop with optional copy projections on the compared
+    /// phi and latch update. These are graph identities, not symbol aliases.
+    fn counted_loop_with_aliases(
+        condition_aliases: usize,
+        update_aliases: usize,
+        step: CountedTestStep,
+        trailing_latch_effect: bool,
+    ) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let condition = Varnode::unique(0x75f0, 1);
+
+        let mut entry = R2ILBlock::new(0x7500, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7510, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7510, 4);
+        let mut compared = counter.clone();
+        for index in 0..condition_aliases {
+            let alias = Varnode::unique(0x7600 + index as u64 * 8, 8);
+            header.push(R2ILOp::Copy {
+                dst: alias.clone(),
+                src: compared,
+            });
+            compared = alias;
+        }
+        header.push(R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: compared,
+            b: Varnode::constant(10, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7540, 8),
+            cond: condition,
+        });
+
+        let mut body = R2ILBlock::new(0x7514, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7520, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x7520, 4);
+        let mut update_input = counter.clone();
+        for index in 0..update_aliases {
+            let alias = Varnode::unique(0x7700 + index as u64 * 8, 8);
+            latch.push(R2ILOp::Copy {
+                dst: alias.clone(),
+                src: update_input,
+            });
+            update_input = alias;
+        }
+        match step {
+            CountedTestStep::Add(step) => latch.push(R2ILOp::IntAdd {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(step, 8),
+            }),
+            CountedTestStep::Sub(step) => latch.push(R2ILOp::IntSub {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(step, 8),
+            }),
+            CountedTestStep::UnsupportedXor(mask) => latch.push(R2ILOp::IntXor {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(mask, 8),
+            }),
+        }
+        if trailing_latch_effect {
+            latch.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x9010, 8),
+                val: counter.clone(),
+            });
+        }
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7510, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x7540, 4);
+        exit.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x9000, 8),
+            val: counter,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        SsaArtifact::for_decompile(
+            &[entry, header, body, latch, exit],
+            Some(&return_boundary_arch()),
+        )
+        .expect("counted loop with graph aliases")
+    }
+
+    /// A loop with two body paths converging either at the update itself or at
+    /// a common suffix immediately before it. Both shapes have one real latch.
+    fn counted_loop_with_shared_latch_artifact(common_suffix: bool) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let loop_condition = Varnode::unique(0x7800, 1);
+        let branch_condition = Varnode::register(56, 1);
+
+        let mut entry = R2ILBlock::new(0x7100, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7110, 4);
+        header.push(R2ILOp::IntLess {
+            dst: loop_condition.clone(),
+            a: counter.clone(),
+            b: Varnode::constant(10, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7140, 8),
+            cond: loop_condition,
+        });
+
+        let mut branch = R2ILBlock::new(0x7114, 4);
+        branch.push(R2ILOp::CBranch {
+            target: Varnode::ram(if common_suffix { 0x711c } else { 0x7120 }, 8),
+            cond: branch_condition,
+        });
+
+        let mut fallthrough = R2ILBlock::new(0x7118, 4);
+        fallthrough.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x7810, 8),
+            src: counter.clone(),
+        });
+        fallthrough.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7120, 8),
+        });
+
+        let mut blocks = vec![entry, header, branch, fallthrough];
+        let latch_addr = if common_suffix {
+            let mut alternate = R2ILBlock::new(0x711c, 4);
+            alternate.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x7818, 8),
+                src: counter.clone(),
+            });
+            alternate.push(R2ILOp::Branch {
+                target: Varnode::ram(0x7120, 8),
+            });
+            let mut suffix = R2ILBlock::new(0x7120, 4);
+            suffix.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x7820, 8),
+                src: counter.clone(),
+            });
+            suffix.push(R2ILOp::Branch {
+                target: Varnode::ram(0x7130, 8),
+            });
+            blocks.extend([alternate, suffix]);
+            0x7130
+        } else {
+            0x7120
+        };
+
+        let mut latch = R2ILBlock::new(latch_addr, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter.clone(),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+        blocks.push(latch);
+
+        let mut exit = R2ILBlock::new(0x7140, 4);
+        exit.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x9000, 8),
+            val: counter,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        blocks.push(exit);
+
+        SsaArtifact::for_decompile(&blocks, Some(&return_boundary_arch()))
+            .expect("counted loop with shared latch")
+    }
+
+    fn for_certificate(artifact: &SsaArtifact) -> Option<(&LoopCertificate, &ForLoopCertificate)> {
+        artifact
+            .facts()
+            .certificates
+            .loops
+            .values()
+            .find_map(|loop_fact| {
+                loop_fact
+                    .for_loop
+                    .as_ref()
+                    .map(|certificate| (loop_fact, certificate))
+            })
+    }
+
     fn recovered_induction_step(artifact: &SsaArtifact) -> Option<super::InductionStep> {
         artifact
             .facts()
@@ -12479,6 +12743,212 @@ mod tests {
                 .all(|loop_fact| loop_fact.for_loop.is_none()),
             "an induction step does not license `for` when the condition reads another value"
         );
+    }
+
+    // These seven names retain the behavior facts from the deleted
+    // presentation-level recognizer. Eligibility is now asserted at its one
+    // owner, before any C symbols or statement cleanup exist.
+    #[test]
+    fn rewrites_canonical_while_to_for() {
+        let artifact = counted_loop_artifact(true);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("canonical counted certificate");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("certificate loop fact");
+
+        assert_eq!(loop_fact.kind, StructuredLoopKind::Natural);
+        assert_eq!(loop_fact.latches.as_slice(), [certificate.latch]);
+        assert!(loop_fact.condition.is_some());
+    }
+
+    #[test]
+    fn rewrites_continue_tail_update_to_shared_for_latch() {
+        let artifact = counted_loop_with_shared_latch_artifact(false);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("shared latch certificate");
+        assert_eq!(certificate.latch, 0x7120);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("shared latch loop fact");
+        assert!(loop_fact.body.contains(&0x7114));
+        assert!(loop_fact.body.contains(&0x7118));
+    }
+
+    #[test]
+    fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
+        let artifact = counted_loop_with_shared_latch_artifact(true);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("common-suffix latch certificate");
+        assert_eq!(certificate.latch, 0x7130);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("common-suffix loop fact");
+        for block in [0x7118, 0x711c, 0x7120, 0x7130] {
+            assert!(
+                loop_fact.body.contains(&block),
+                "missing body block {block:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_guard_break_while1_to_for() {
+        let artifact = counted_loop_artifact(true);
+        let (prepared_loop, _certificate) =
+            for_certificate(&artifact).expect("guard-exit counted certificate");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("guard-exit loop fact");
+        let predicate = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("guard predicate"))
+            .expect("guard predicate fact");
+        assert!(predicate.comparison.is_some());
+        assert_eq!(loop_fact.exits.as_slice(), [0x7140]);
+    }
+
+    #[test]
+    fn accepts_self_assign_update_forms() {
+        let add = counted_loop_with_aliases(0, 0, CountedTestStep::Add(2), false);
+        let sub = counted_loop_with_aliases(0, 0, CountedTestStep::Sub(1), false);
+        assert!(for_certificate(&add).is_some());
+        assert!(for_certificate(&sub).is_some());
+
+        let unsupported =
+            counted_loop_with_aliases(0, 0, CountedTestStep::UnsupportedXor(0x55), false);
+        assert!(
+            for_certificate(&unsupported).is_none(),
+            "a self-assignment with no exact induction algebra must remain uncertified"
+        );
+    }
+
+    #[test]
+    fn rewrites_while_to_for_when_condition_uses_addrof_induction_var() {
+        let artifact = counted_loop_with_aliases(1, 0, CountedTestStep::Add(1), false);
+        let (prepared_loop, certificate) = for_certificate(&artifact)
+            .expect("an identity projection around the compared phi remains certified");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("projected-condition loop fact");
+        let comparison = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("condition"))
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("comparison");
+        assert_eq!(
+            comparison.lhs, certificate.induction_phi,
+            "identity projections are normalized before certification, so an address-style presentation wrapper cannot become a second loop identity"
+        );
+    }
+
+    #[test]
+    fn rewrites_while_to_for_with_two_step_alias_update_chain() {
+        let artifact = counted_loop_with_aliases(0, 2, CountedTestStep::Add(1), false);
+        let (_, certificate) =
+            for_certificate(&artifact).expect("two exact update projections remain certified");
+        let induction = artifact
+            .facts()
+            .structured
+            .inductions
+            .get(&certificate.induction_phi)
+            .expect("aliased induction fact");
+        assert_eq!(induction.step, InductionStep::AddConst(1));
+        assert!(induction.validate(artifact.graph()));
+    }
+
+    #[test]
+    fn loop_without_exact_induction_update_has_no_for_certificate() {
+        let artifact =
+            counted_loop_with_aliases(0, 0, CountedTestStep::UnsupportedXor(0xaa), false);
+        assert!(for_certificate(&artifact).is_none());
+    }
+
+    #[test]
+    fn unrelated_condition_value_has_no_for_certificate() {
+        let artifact = counted_loop_artifact(false);
+        assert!(
+            artifact
+                .facts()
+                .structured
+                .loops
+                .values()
+                .any(|loop_fact| loop_fact.induction_phi.is_some()),
+            "the refusal fixture must still contain an induction"
+        );
+        assert!(for_certificate(&artifact).is_none());
+    }
+
+    #[test]
+    fn update_followed_by_observable_effect_has_no_for_certificate() {
+        let artifact = counted_loop_with_aliases(0, 0, CountedTestStep::Add(1), true);
+        assert!(
+            !artifact.facts().structured.inductions.is_empty(),
+            "the loop still has an exact induction update"
+        );
+        assert!(
+            for_certificate(&artifact).is_none(),
+            "moving the update after a later store would reverse their order"
+        );
+    }
+
+    #[test]
+    fn exact_update_projection_chain_is_not_bounded_by_presentation_lookback() {
+        let artifact = counted_loop_with_aliases(0, 5, CountedTestStep::Add(1), false);
+        assert!(
+            for_certificate(&artifact).is_some(),
+            "five exact graph identities are proof, not a symbol lookback heuristic"
+        );
+    }
+
+    #[test]
+    fn distinct_value_identities_never_merge_for_certificate_by_name() {
+        let artifact = counted_loop_artifact(false);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .values()
+            .find(|loop_fact| loop_fact.induction_phi.is_some())
+            .expect("loop induction");
+        let phi = loop_fact.induction_phi.expect("induction phi");
+        let comparison = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("loop condition"))
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("loop comparison");
+        assert!(!super::value_depends_on(
+            artifact.graph(),
+            comparison.lhs,
+            phi
+        ));
+        assert!(!super::value_depends_on(
+            artifact.graph(),
+            comparison.rhs,
+            phi
+        ));
+        assert!(for_certificate(&artifact).is_none());
     }
 
     #[test]

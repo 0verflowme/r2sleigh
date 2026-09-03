@@ -3480,6 +3480,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 body,
             } => {
                 let body = Self::strip_trailing_continue(Self::cleanup_recurse(symbols, *body));
+                let body = update
+                    .as_ref()
+                    .map(|update| Self::strip_trailing_for_update(symbols, body.clone(), update))
+                    .unwrap_or(body);
                 CStmt::For {
                     init,
                     cond,
@@ -3585,6 +3589,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
 
         None
+    }
+
+    fn compound_assignment_rhs_of(target: SymbolId, rhs: &CExpr) -> Option<(BinaryOp, CExpr)> {
+        let semantic = rhs.clone_without_render_observations();
+        let (op, retained, _) = Self::compound_assignment_parts(target, &semantic)?;
+        Some((op, retained.clone()))
     }
 
     fn compound_assignment_op(op: BinaryOp) -> Option<BinaryOp> {
@@ -4295,6 +4305,67 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
         let tail_stmt = stmts.pop()?;
         Self::stmt_is_self_update(symbols, &tail_stmt).then_some((stmts, tail_stmt))
+    }
+
+    /// Drop the explicit body occurrence of the exact update a certified
+    /// `for` header now owns.
+    fn strip_trailing_for_update(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        body: CStmt,
+        update: &CExpr,
+    ) -> CStmt {
+        let mut stmts = Self::stmt_into_vec(body);
+        while stmts
+            .last()
+            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
+        {
+            stmts.pop();
+        }
+        if stmts.last().is_some_and(|stmt| {
+            matches!(stmt.unobserved(), CStmt::Expr(expr) if Self::expr_matches_for_update(symbols, expr, update))
+        }) {
+            stmts.pop();
+        }
+        Self::stmt_from_vec(stmts)
+    }
+
+    fn expr_matches_for_update(
+        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        body_expr: &CExpr,
+        for_update: &CExpr,
+    ) -> bool {
+        if body_expr.transparently_eq(for_update) {
+            return true;
+        }
+
+        Self::normalized_self_update_signature(symbols, body_expr)
+            .zip(Self::normalized_self_update_signature(symbols, for_update))
+            .is_some_and(|(body, update)| body == update)
+    }
+
+    fn normalized_self_update_signature(
+        _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
+        expr: &CExpr,
+    ) -> Option<(SymbolId, BinaryOp, CExpr)> {
+        let semantic = expr.clone_without_render_observations();
+        let CExpr::Binary { op, left, right } = &semantic else {
+            return None;
+        };
+        let CExpr::Var(name) = left.unobserved() else {
+            return None;
+        };
+
+        if Self::is_compound_assign_op(*op) {
+            return Some((*name, *op, right.as_ref().clone()));
+        }
+
+        if *op == BinaryOp::Assign
+            && let Some((compound_op, rhs)) = Self::compound_assignment_rhs_of(*name, right)
+        {
+            return Some((*name, compound_op, rhs));
+        }
+
+        None
     }
 
     fn stmt_is_self_update(
@@ -6094,6 +6165,245 @@ mod tests {
     }
 
     #[test]
+    fn removes_duplicate_body_update_owned_by_for_latch() {
+        let symbols = test_table();
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::For {
+                init: Some(Box::new(assign(&symbols, "i", CExpr::IntLit(0)))),
+                cond: Some(CExpr::binary(
+                    BinaryOp::Lt,
+                    v(&symbols, "i"),
+                    v(&symbols, "n"),
+                )),
+                update: Some(update.clone()),
+                body: Box::new(CStmt::Block(vec![
+                    assign(
+                        &symbols,
+                        "hash",
+                        CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
+                    ),
+                    CStmt::Expr(update),
+                ])),
+            },
+        );
+
+        let CStmt::For { body, .. } = cleaned else {
+            panic!("expected certified for-loop, got {cleaned:?}");
+        };
+        assert_eq!(
+            body.as_ref(),
+            &CStmt::Expr(CExpr::binary(
+                BinaryOp::BitXorAssign,
+                v(&symbols, "hash"),
+                v(&symbols, "c"),
+            )),
+            "the header owns the certified latch update exactly once"
+        );
+    }
+
+    #[test]
+    fn observed_loop_init_condition_and_update_survive_for_recognition_once() {
+        let symbols = test_table();
+        let mut owner = RenderObservationOwner::new();
+        let (init_id, init) = owner
+            .observe_stmt(assign(&symbols, "i", CExpr::IntLit(0)))
+            .expect("loop init observation");
+        let (cond_id, cond) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Lt,
+                v(&symbols, "i"),
+                v(&symbols, "n"),
+            ))
+            .expect("loop condition observation");
+        let (update_id, update) = owner
+            .observe_expr(CExpr::assign(
+                v(&symbols, "i"),
+                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+            ))
+            .expect("loop update observation");
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::For {
+                init: Some(Box::new(init)),
+                cond: Some(cond),
+                update: Some(update),
+                body: Box::new(assign(&symbols, "sum", v(&symbols, "i"))),
+            },
+        );
+
+        let (plain, reachable) = strip_test_observations(&owner, cleaned);
+        for id in [init_id, cond_id, update_id] {
+            assert!(
+                reachable.contains(id),
+                "certified header occurrence was lost"
+            );
+        }
+        assert!(matches!(plain, CStmt::For { .. }));
+    }
+
+    #[test]
+    fn for_recognition_preserves_the_replaced_loop_observation() {
+        let symbols = test_table();
+        let prefix = assign(&symbols, "sum", CExpr::IntLit(0));
+        let init = assign(&symbols, "i", CExpr::IntLit(0));
+        let cond = CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n"));
+        let work = assign(&symbols, "sum", v(&symbols, "i"));
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let plain = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![
+                prefix.clone(),
+                CStmt::For {
+                    init: Some(Box::new(init.clone())),
+                    cond: Some(cond.clone()),
+                    update: Some(update.clone()),
+                    body: Box::new(CStmt::Block(vec![
+                        work.clone(),
+                        CStmt::Expr(update.clone()),
+                    ])),
+                },
+            ]),
+        );
+
+        let mut owner = RenderObservationOwner::new();
+        let (prefix_id, prefix) = owner.observe_stmt(prefix).expect("prefix observation");
+        let (init_id, init) = owner.observe_stmt(init).expect("init observation");
+        let (cond_id, cond) = owner.observe_expr(cond).expect("condition observation");
+        let (work_id, work) = owner.observe_stmt(work).expect("body observation");
+        let (update_id, update) = owner.observe_expr(update).expect("update observation");
+        let (body_id, body) = owner
+            .observe_stmt(CStmt::Block(vec![work, CStmt::Expr(update.clone())]))
+            .expect("body block observation");
+        let (for_id, for_stmt) = owner
+            .observe_stmt(CStmt::For {
+                init: Some(Box::new(init)),
+                cond: Some(cond),
+                update: Some(update),
+                body: Box::new(body),
+            })
+            .expect("certified loop observation");
+        let marked = ControlFlowStructurer::cleanup(&symbols, CStmt::Block(vec![prefix, for_stmt]));
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
+
+        for id in [prefix_id, init_id, cond_id, work_id, update_id, for_id] {
+            assert!(
+                reachable.contains(id),
+                "exact certified-loop occurrence was lost"
+            );
+        }
+        assert!(
+            !reachable.contains(body_id),
+            "a body wrapper eliminated with the duplicate latch update cannot move"
+        );
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn for_body_observations_track_only_actual_body_splits() {
+        let symbols = test_table();
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let first_work = assign(&symbols, "sum", v(&symbols, "i"));
+        let second_work = assign(&symbols, "hash", v(&symbols, "byte"));
+        let trailing_assignment = assign(&symbols, "tmp:dead", CExpr::IntLit(9));
+        let plain = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![
+                CStmt::For {
+                    init: None,
+                    cond: Some(CExpr::binary(
+                        BinaryOp::Lt,
+                        v(&symbols, "i"),
+                        v(&symbols, "n"),
+                    )),
+                    update: Some(update.clone()),
+                    body: Box::new(CStmt::Block(vec![
+                        first_work.clone(),
+                        CStmt::Expr(update.clone()),
+                    ])),
+                },
+                CStmt::For {
+                    init: None,
+                    cond: Some(v(&symbols, "keep_going")),
+                    update: None,
+                    body: Box::new(CStmt::Block(vec![
+                        second_work.clone(),
+                        trailing_assignment.clone(),
+                    ])),
+                },
+            ]),
+        );
+
+        let mut owner = RenderObservationOwner::new();
+        let (first_work_id, first_work) = owner
+            .observe_stmt(first_work)
+            .expect("first loop work observation");
+        let (first_body_inner_id, first_body) = owner
+            .observe_stmt(CStmt::Block(vec![first_work, CStmt::Expr(update.clone())]))
+            .expect("first loop body observation");
+        let (first_body_outer_id, first_body) = owner
+            .observe_stmt(first_body)
+            .expect("outer first loop body observation");
+        let (second_work_id, second_work) = owner
+            .observe_stmt(second_work)
+            .expect("second loop work observation");
+        let (second_body_inner_id, second_body) = owner
+            .observe_stmt(CStmt::Block(vec![second_work, trailing_assignment]))
+            .expect("second loop body observation");
+        let (second_body_outer_id, second_body) = owner
+            .observe_stmt(second_body)
+            .expect("outer second loop body observation");
+        let marked = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![
+                CStmt::For {
+                    init: None,
+                    cond: Some(CExpr::binary(
+                        BinaryOp::Lt,
+                        v(&symbols, "i"),
+                        v(&symbols, "n"),
+                    )),
+                    update: Some(update),
+                    body: Box::new(first_body),
+                },
+                CStmt::For {
+                    init: None,
+                    cond: Some(v(&symbols, "keep_going")),
+                    update: None,
+                    body: Box::new(second_body),
+                },
+            ]),
+        );
+
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
+        for id in [
+            first_work_id,
+            second_work_id,
+            second_body_inner_id,
+            second_body_outer_id,
+        ] {
+            assert!(reachable.contains(id));
+        }
+        for id in [first_body_inner_id, first_body_outer_id] {
+            assert!(
+                !reachable.contains(id),
+                "the split that removes the duplicate update has no surviving wrapper"
+            );
+        }
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
     fn observed_terminators_classify_transparently_and_trailing_markers_are_deleted() {
         let symbols = test_table();
         let mut owner = RenderObservationOwner::new();
@@ -6312,102 +6622,6 @@ mod tests {
         };
         assert_eq!(cases[0].body, vec![CStmt::Return(Some(CExpr::IntLit(1)))]);
         assert_eq!(default, Some(vec![CStmt::Return(Some(CExpr::IntLit(3)))]));
-    }
-
-    #[test]
-    fn does_not_rewrite_without_tail_update() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
-                    &symbols,
-                    "sum",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected unmatched loop to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "loop without a recognized update should remain while-loop"
-        );
-    }
-
-    #[test]
-    fn does_not_rewrite_when_cond_var_mismatch() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "j"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
-                    &symbols,
-                    "i",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected unmatched condition var to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "condition must reference same induction variable as init/update"
-        );
-    }
-
-    #[test]
-    fn keeps_while_when_unproven_trailing_assignment_follows_update() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            CStmt::Block(vec![
-                assign(&symbols, "sum", CExpr::IntLit(0)),
-                assign(&symbols, "i", CExpr::IntLit(0)),
-            ]),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "len")),
-                CStmt::Block(vec![
-                    CStmt::Expr(CExpr::binary(
-                        BinaryOp::AddAssign,
-                        v(&symbols, "sum"),
-                        CExpr::Subscript {
-                            base: Box::new(v(&symbols, "arr")),
-                            index: Box::new(v(&symbols, "i")),
-                        },
-                    )),
-                    CStmt::Expr(CExpr::Unary {
-                        op: UnaryOp::PostInc,
-                        operand: Box::new(v(&symbols, "i")),
-                    }),
-                    CStmt::Decl {
-                        name: crate::symbol::declare(&symbols, "tmp:11f00_4"),
-                        ty: CType::i32(),
-                        init: Some(CExpr::Deref(Box::new(CExpr::binary(
-                            BinaryOp::Add,
-                            v(&symbols, "arr"),
-                            CExpr::binary(BinaryOp::Mul, v(&symbols, "i"), CExpr::IntLit(4)),
-                        )))),
-                    },
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected block with sum init and while-loop, got {cleaned:?}");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "an unproven trailing assignment must prevent a for-loop rewrite: {stmts:?}"
-        );
     }
 
     #[test]
@@ -6747,62 +6961,5 @@ mod tests {
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
         );
-    }
-
-    #[test]
-    fn does_not_rewrite_while_to_for_when_alias_chain_is_too_long() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                CStmt::Block(vec![
-                    assign(&symbols, "tmp1", v(&symbols, "i")),
-                    assign(&symbols, "tmp2", v(&symbols, "tmp1")),
-                    assign(&symbols, "tmp3", v(&symbols, "tmp2")),
-                    assign(
-                        &symbols,
-                        "i",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "tmp3"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected long alias-chain loop to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "Alias chain beyond bounded lookback should not rewrite to for-loop"
-        );
-    }
-
-    #[test]
-    fn distinct_suffix_and_case_var_symbols_do_not_merge_for_rewrite() {
-        for (init_name, cond_name) in [("local_4", "local"), ("Index", "index")] {
-            let symbols = test_table();
-            let input = CStmt::Block(vec![
-                assign(&symbols, init_name, CExpr::IntLit(0)),
-                CStmt::while_loop(
-                    CExpr::binary(BinaryOp::Lt, v(&symbols, cond_name), v(&symbols, "n")),
-                    CStmt::Block(vec![assign(
-                        &symbols,
-                        init_name,
-                        CExpr::binary(BinaryOp::Add, v(&symbols, init_name), CExpr::IntLit(1)),
-                    )]),
-                ),
-            ]);
-
-            let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-            let CStmt::Block(stmts) = cleaned else {
-                panic!("distinct symbols must retain the while form");
-            };
-            assert!(
-                matches!(stmts.get(1), Some(CStmt::While { .. })),
-                "{init_name:?} and {cond_name:?} are distinct SymbolIds"
-            );
-        }
     }
 }
