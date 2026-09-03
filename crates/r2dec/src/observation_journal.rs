@@ -660,6 +660,7 @@ pub(crate) struct EffectOccurrences {
 struct CoalescedCarrierEffectElisions {
     coalesced_carrier_uses: BTreeSet<UseSite>,
     coalesced_carrier_phis: BTreeSet<InstId>,
+    coalesced_copies: BTreeSet<InstId>,
 }
 
 impl SurvivingEffectObservations {
@@ -701,6 +702,11 @@ impl SurvivingEffectObservations {
         self.coalesced_carriers
             .coalesced_carrier_phis
             .contains(&inst)
+    }
+
+    /// Whether this instruction is a copy elided for saying nothing.
+    pub(crate) fn is_coalesced_copy(&self, inst: InstId) -> bool {
+        self.coalesced_carriers.coalesced_copies.contains(&inst)
     }
 
     #[cfg(test)]
@@ -2830,6 +2836,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: self.coalesced_carrier_uses,
                 coalesced_carrier_phis: self.coalesced_carrier_phi_writes,
+                coalesced_copies: self.coalesced_copy_writes,
             }),
         })
     }
@@ -3219,6 +3226,7 @@ impl LegacyObservationJournal {
             coalesced_carriers: Box::new(CoalescedCarrierEffectElisions {
                 coalesced_carrier_uses: std::mem::take(&mut self.coalesced_carrier_uses),
                 coalesced_carrier_phis: std::mem::take(&mut self.coalesced_carrier_phi_writes),
+                coalesced_copies: std::mem::take(&mut self.coalesced_copy_writes),
             }),
         };
         let snapshot = self.into_snapshot(source);
