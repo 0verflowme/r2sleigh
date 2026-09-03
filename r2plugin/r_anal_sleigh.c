@@ -2832,6 +2832,80 @@ static bool sleigh_mode_is_fast(RAnal *anal) {
 	return mode == SLEIGH_MODE_FAST;
 }
 
+/* Where the analysis callbacks spend their time.
+ *
+ * `sla.profilej` reports per function and only for the stages a decompile
+ * walks. The analysis callbacks are a different population: `op` runs per
+ * instruction and several times over for one byte, `analyze_fcn` and
+ * `get_data_refs` run per function, and none of the three had ever been
+ * separated from the others. Measured on bzip2recover, they are together
+ * about five times the proof sweep, so knowing only their sum is knowing the
+ * wrong thing.
+ *
+ * One counter and one accumulator per site, printed once at `fini` when
+ * `R2SLEIGH_TIMING` asks. Reading the clock twice per instruction is the whole
+ * cost when the switch is off, and the alternative -- deriving a per-callback
+ * figure by differencing whole-binary runs -- is the method this project has
+ * already had to withdraw a conclusion for. */
+typedef enum {
+	SLEIGH_CB_OP = 0,
+	SLEIGH_CB_OP_CONTEXT,
+	SLEIGH_CB_OP_LIFT,
+	SLEIGH_CB_OP_DISASM,
+	SLEIGH_CB_OP_ESIL,
+	SLEIGH_CB_OP_VAL,
+	SLEIGH_CB_ANALYZE_FCN,
+	SLEIGH_CB_DATA_REFS,
+	SLEIGH_CB_POST_ANALYSIS,
+	SLEIGH_CB_COUNT
+} SleighCallbackSite;
+
+static const char *const sleigh_callback_names[SLEIGH_CB_COUNT] = {
+	"op", "op.context", "op.lift", "op.disasm", "op.esil", "op.val",
+	"analyze_fcn", "get_data_refs", "post_analysis"
+};
+
+static ut64 sleigh_callback_calls[SLEIGH_CB_COUNT];
+static ut64 sleigh_callback_us[SLEIGH_CB_COUNT];
+
+static bool sleigh_callback_timing_enabled(void) {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = r_sys_getenv ("R2SLEIGH_TIMING")? 1: 0;
+	}
+	return enabled == 1;
+}
+
+static ut64 sleigh_callback_start(void) {
+	return sleigh_callback_timing_enabled ()? r_time_now_mono (): 0;
+}
+
+static void sleigh_callback_end(SleighCallbackSite site, ut64 started) {
+	if (!started) {
+		return;
+	}
+	sleigh_callback_calls[site]++;
+	sleigh_callback_us[site] += r_time_now_mono () - started;
+}
+
+static void sleigh_callback_report(void) {
+	if (!sleigh_callback_timing_enabled ()) {
+		return;
+	}
+	size_t i;
+	for (i = 0; i < SLEIGH_CB_COUNT; i++) {
+		if (!sleigh_callback_calls[i]) {
+			continue;
+		}
+		eprintf ("r2sleigh callback timing: %-14s calls=%-8"PFMT64u" total=%"PFMT64u"us mean=%"PFMT64u"ns\n",
+			sleigh_callback_names[i], sleigh_callback_calls[i],
+			sleigh_callback_us[i],
+			(sleigh_callback_us[i] * 1000) / sleigh_callback_calls[i]);
+		sleigh_callback_calls[i] = 0;
+		sleigh_callback_us[i] = 0;
+	}
+}
+
 static void sleigh_profile_clear(void) {
 	for (size_t i = 0; i < sleigh_profile_count; i++) {
 		free (sleigh_profile_entries[i].name);
@@ -3310,8 +3384,12 @@ R2ILContext *get_context(RAnal *anal) {
 int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAnalOpMask mask) {
 	R_RETURN_VAL_IF_FAIL (anal && op && data, -1);
 
+	const ut64 op_started = sleigh_callback_start ();
+	const ut64 context_started = sleigh_callback_start ();
 	R2ILContext *ctx = get_context (anal);
+	sleigh_callback_end (SLEIGH_CB_OP_CONTEXT, context_started);
 	if (!ctx) {
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
 
@@ -3328,8 +3406,12 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	}
 
 	R2ILBlock *block = NULL;
-	if (sleigh_v2_lift_instruction (sleigh_ctx, use_data, use_len, addr, &block)
-		!= R2SLEIGH_STATUS_OK_V2 || !block) {
+	const ut64 lift_started = sleigh_callback_start ();
+	const uint32_t lift_status = sleigh_v2_lift_instruction (
+		sleigh_ctx, use_data, use_len, addr, &block);
+	sleigh_callback_end (SLEIGH_CB_OP_LIFT, lift_started);
+	if (lift_status != R2SLEIGH_STATUS_OK_V2 || !block) {
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
 
@@ -3338,6 +3420,7 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	if (sleigh_v2_block_view (block, &view) != R2SLEIGH_STATUS_OK_V2
 		|| view.struct_size != sizeof (view)) {
 		(void)sleigh_v2_block_release (&block);
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
 	op->size = view.size;
@@ -3350,15 +3433,18 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	}
 
 	if (mask & R_ARCH_OP_MASK_DISASM) {
+		const ut64 disasm_started = sleigh_callback_start ();
 		char *mnem = NULL;
 		(void)sleigh_v2_block_mnemonic (ctx, use_data, use_len, addr, &mnem);
 		if (mnem) {
 			op->mnemonic = strdup (mnem);
 			free (mnem);
 		}
+		sleigh_callback_end (SLEIGH_CB_OP_DISASM, disasm_started);
 	}
 
 	if (mask & R_ARCH_OP_MASK_ESIL) {
+		const ut64 esil_started = sleigh_callback_start ();
 		char *esil = NULL;
 		const R2ILBlock *blocks[] = { block };
 		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
@@ -3367,15 +3453,19 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 			r_strbuf_set (&op->esil, esil);
 			free (esil);
 		}
+		sleigh_callback_end (SLEIGH_CB_OP_ESIL, esil_started);
 	}
 
 	if (mask & R_ARCH_OP_MASK_VAL) {
+		const ut64 val_started = sleigh_callback_start ();
 		RVecRArchValue_clear (&op->srcs);
 		RVecRArchValue_clear (&op->dsts);
 		fill_op_values_enhanced (anal, op, ctx, block);
+		sleigh_callback_end (SLEIGH_CB_OP_VAL, val_started);
 	}
 
 	(void)sleigh_v2_block_release (&block);
+	sleigh_callback_end (SLEIGH_CB_OP, op_started);
 	return op->size;
 }
 
@@ -4329,7 +4419,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
  * ============================================================================ */
 
 /* Called after function analysis completes */
-static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
+static bool sleigh_analyze_fcn_inner(RAnal *anal, RAnalFunction *fcn) {
 	if (!fcn || !anal) {
 		return false;
 	}
@@ -4440,7 +4530,23 @@ static bool collect_data_refs_from_typed(
 }
 
 /* Called during reference analysis (aar) */
+static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_analyze_fcn_inner (anal, fcn);
+	sleigh_callback_end (SLEIGH_CB_ANALYZE_FCN, started);
+	return ok;
+}
+
+static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs);
+
 static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_get_data_refs_inner (anal, fcn, refs);
+	sleigh_callback_end (SLEIGH_CB_DATA_REFS, started);
+	return ok;
+}
+
+static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs) {
 	if (!refs) {
 		return false;
 	}
@@ -5011,7 +5117,7 @@ static bool sleigh_pre_analysis(RAnal *anal) {
 }
 
 /* Called at end of aaaa for global post-analysis passes */
-static bool sleigh_post_analysis(RAnal *anal) {
+static bool sleigh_post_analysis_inner(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
 	size_t taint_comments = 0;
 	size_t taint_flags = 0;
@@ -5199,6 +5305,14 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		free (best_sink_label);
 	}
 	return true;
+}
+
+static bool sleigh_post_analysis(RAnal *anal) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_post_analysis_inner (anal);
+	sleigh_callback_end (SLEIGH_CB_POST_ANALYSIS, started);
+	sleigh_callback_report ();
+	return ok;
 }
 
 RAnalPlugin r_anal_plugin_sleigh = {
