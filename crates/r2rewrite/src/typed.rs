@@ -33,17 +33,19 @@ use r2ssa::{
 };
 use r2types::{CTypeLike, Signedness};
 
+use crate::{TermArena, TermId, TermKind};
+
 /// What the renderer's plan says about a value, as far as typing needs it.
 ///
 /// The binding plan lives in the renderer; this is the two answers of it that
 /// decide a C type. A bound value renders as a name with a declaration; an
-/// inlined value renders as the expression of the arena node that defines it.
+/// inlined value renders as its canonical term.
 pub trait RenderTypes {
     /// The declared type of the object a bound value renders as.
     fn declaration_type(&self, value: ValueId) -> Option<CTypeLike>;
 
-    /// The arena node an inlined value renders as, at each of its readers.
-    fn inline_root(&self, value: ValueId) -> Option<MachineExprId>;
+    /// The canonical term an inlined value renders as, at each of its readers.
+    fn inline_root(&self, value: ValueId) -> Option<TermId>;
 }
 
 /// The C type a rendered expression has.
@@ -137,6 +139,10 @@ pub struct TypedBoundaries {
     /// and an unsigned addition of the same value share it while requiring
     /// different things of it.
     required: BTreeMap<(MachineExprId, usize), CTypeLike>,
+    /// What the expression each canonical term renders as has.
+    term_produced: BTreeMap<TermId, CValue>,
+    /// What each canonical term requires of the operand at each position.
+    term_required: BTreeMap<(TermId, usize), CTypeLike>,
 }
 
 impl TypedBoundaries {
@@ -157,15 +163,32 @@ impl TypedBoundaries {
     pub fn required(&self, parent: MachineExprId, operand: usize) -> Option<&CTypeLike> {
         self.required.get(&(parent, operand))
     }
+
+    /// What the expression `term` renders as has.
+    pub fn term_produced(&self, term: TermId) -> Option<&CValue> {
+        self.term_produced.get(&term)
+    }
+
+    /// What `parent` requires of its canonical-term operand at `operand`, in
+    /// the order of [`TermKind::children`].
+    pub fn term_required(&self, parent: TermId, operand: usize) -> Option<&CTypeLike> {
+        self.term_required.get(&(parent, operand))
+    }
 }
 
-/// State the C type at every boundary of `projection` under `plan`.
-pub fn typed_boundaries(projection: &MachineProjection, plan: &dyn RenderTypes) -> TypedBoundaries {
+/// State the C type at every machine and canonical-term boundary under `plan`.
+pub fn typed_boundaries(
+    projection: &MachineProjection,
+    terms: &TermArena,
+    plan: &dyn RenderTypes,
+) -> TypedBoundaries {
     let mut builder = Builder {
         projection,
+        terms,
         plan,
         out: TypedBoundaries::default(),
-        in_progress: BTreeSet::new(),
+        machine_in_progress: BTreeSet::new(),
+        term_in_progress: BTreeSet::new(),
     };
     for (id, _) in projection.arena().iter() {
         builder.produced(id);
@@ -181,17 +204,22 @@ pub fn typed_boundaries(projection: &MachineProjection, plan: &dyn RenderTypes) 
             });
         builder.value_type(value, &ty);
     }
+    for index in 0..terms.len() {
+        builder.term_produced(TermId::from_index(index));
+    }
     builder.out
 }
 
 struct Builder<'a> {
     projection: &'a MachineProjection,
+    terms: &'a TermArena,
     plan: &'a dyn RenderTypes,
     out: TypedBoundaries,
     /// Nodes whose type is being derived, so a value read inside its own
     /// definition -- a call that reads the location it defines -- takes its
     /// machine type instead of recursing forever.
-    in_progress: BTreeSet<MachineExprId>,
+    machine_in_progress: BTreeSet<MachineExprId>,
+    term_in_progress: BTreeSet<TermId>,
 }
 
 impl Builder<'_> {
@@ -206,6 +234,10 @@ impl Builder<'_> {
         self.out.required.insert((parent, operand), ty);
     }
 
+    fn require_term(&mut self, parent: TermId, operand: usize, ty: CTypeLike) {
+        self.out.term_required.insert((parent, operand), ty);
+    }
+
     fn value_type(&mut self, value: ValueId, fallback: &MachineType) -> CValue {
         if let Some(known) = self.out.values.get(&value) {
             return known.clone();
@@ -213,10 +245,10 @@ impl Builder<'_> {
         let ty = if let Some(declared) = self.plan.declaration_type(value) {
             CValue::Typed(declared)
         } else if let Some(root) = self.plan.inline_root(value) {
-            if self.in_progress.contains(&root) {
+            if self.term_in_progress.contains(&root) {
                 CValue::Typed(c_type_of(fallback))
             } else {
-                self.produced(root)
+                self.term_produced(root)
             }
         } else {
             CValue::Typed(c_type_of(fallback))
@@ -232,15 +264,153 @@ impl Builder<'_> {
         let Some(expr) = self.projection.expr(id) else {
             return CValue::Typed(CTypeLike::Unknown);
         };
-        if !self.in_progress.insert(id) {
+        if !self.machine_in_progress.insert(id) {
             return CValue::Typed(c_type_of(expr.ty()));
         }
         let ty = *expr.ty();
         let kind = expr.kind().clone();
         let produced = self.boundary(id, &ty, &kind);
-        self.in_progress.remove(&id);
+        self.machine_in_progress.remove(&id);
         self.out.produced.insert(id, produced.clone());
         produced
+    }
+
+    fn term_width(&self, id: TermId) -> u32 {
+        self.terms.term(id).width_bits()
+    }
+
+    fn term_produced(&mut self, id: TermId) -> CValue {
+        if let Some(known) = self.out.term_produced.get(&id) {
+            return known.clone();
+        }
+        let term = self.terms.term(id);
+        if !self.term_in_progress.insert(id) {
+            return CValue::Typed(c_type_of(&term.ty));
+        }
+        let produced = self.term_boundary(id, &term.ty, &term.kind);
+        self.term_in_progress.remove(&id);
+        self.out.term_produced.insert(id, produced.clone());
+        produced
+    }
+
+    /// The canonical operator's operand rule and produced type.
+    fn term_boundary(&mut self, id: TermId, ty: &MachineType, kind: &TermKind) -> CValue {
+        let own = c_type_of(ty);
+        match kind {
+            TermKind::Leaf(expr) | TermKind::Opaque(expr) => self.produced(*expr),
+            TermKind::Literal(_) => CValue::Constant,
+            TermKind::Variable(_) => CValue::Typed(own),
+            TermKind::ObjectAddress(_) => CValue::Typed(CTypeLike::ptr(CTypeLike::Unknown)),
+            TermKind::Load { address, .. } => {
+                self.term_produced(*address);
+                self.require_term(id, 0, CTypeLike::ptr(own.clone()));
+                CValue::Typed(own)
+            }
+            TermKind::Subscript { base, index } => {
+                self.term_produced(*base);
+                self.term_produced(*index);
+                self.require_term(id, 0, CTypeLike::ptr(own.clone()));
+                self.require_term(id, 1, unsigned(self.term_width(*index)));
+                CValue::Typed(own)
+            }
+            TermKind::Arithmetic { left, right, .. } | TermKind::Bitwise { left, right, .. } => {
+                self.term_produced(*left);
+                self.term_produced(*right);
+                self.require_term(id, 0, own.clone());
+                self.require_term(id, 1, own.clone());
+                CValue::Typed(promoted(&own))
+            }
+            TermKind::Negate(input) | TermKind::BitwiseNot(input) => {
+                self.term_produced(*input);
+                self.require_term(id, 0, own.clone());
+                CValue::Typed(promoted(&own))
+            }
+            TermKind::Boolean { left, right, .. } => {
+                self.term_produced(*left);
+                self.term_produced(*right);
+                self.require_term(id, 0, CTypeLike::Bool);
+                self.require_term(id, 1, CTypeLike::Bool);
+                CValue::Typed(CTypeLike::Bool)
+            }
+            TermKind::BooleanNot(input) => {
+                self.term_produced(*input);
+                self.require_term(id, 0, CTypeLike::Bool);
+                CValue::Typed(CTypeLike::Bool)
+            }
+            TermKind::Shift {
+                kind, value, count, ..
+            } => {
+                self.term_produced(*value);
+                self.term_produced(*count);
+                let shifted = match kind {
+                    MachineShiftKind::ArithmeticRight => signed(ty.width_bits()),
+                    MachineShiftKind::Left | MachineShiftKind::LogicalRight => own,
+                };
+                self.require_term(id, 0, shifted.clone());
+                self.require_term(id, 1, unsigned(self.term_width(*count)));
+                CValue::Typed(promoted(&shifted))
+            }
+            TermKind::Compare {
+                interpretation,
+                left,
+                right,
+                ..
+            } => {
+                self.term_produced(*left);
+                self.term_produced(*right);
+                let operand = integer(self.term_width(*left), *interpretation);
+                self.require_term(id, 0, operand.clone());
+                self.require_term(id, 1, operand);
+                CValue::Typed(CTypeLike::Bool)
+            }
+            TermKind::Flag { left, right, .. } => {
+                self.term_produced(*left);
+                self.term_produced(*right);
+                let operand = unsigned(self.term_width(*left));
+                self.require_term(id, 0, operand.clone());
+                self.require_term(id, 1, operand);
+                CValue::Typed(CTypeLike::u8())
+            }
+            TermKind::Cast { kind, input } => {
+                self.term_produced(*input);
+                let from = self.term_width(*input);
+                let operand = match kind {
+                    MachineCastKind::SignExtend => signed(from),
+                    MachineCastKind::ZeroExtend
+                    | MachineCastKind::Truncate
+                    | MachineCastKind::BitReinterpret
+                    | MachineCastKind::IntegerToAddress
+                    | MachineCastKind::AddressToInteger => unsigned(from),
+                };
+                self.require_term(id, 0, operand);
+                CValue::Typed(own)
+            }
+            TermKind::Extract { input, .. } => {
+                self.term_produced(*input);
+                self.require_term(id, 0, unsigned(self.term_width(*input)));
+                CValue::Typed(own)
+            }
+            TermKind::Concat { high, low } => {
+                self.term_produced(*high);
+                self.term_produced(*low);
+                self.require_term(id, 0, unsigned(self.term_width(*high)));
+                self.require_term(id, 1, unsigned(self.term_width(*low)));
+                CValue::Typed(promoted(&own))
+            }
+            TermKind::Select {
+                condition,
+                if_true,
+                if_false,
+            } => {
+                self.term_produced(*condition);
+                self.term_produced(*if_true);
+                self.term_produced(*if_false);
+                self.require_term(id, 0, CTypeLike::Bool);
+                self.require_term(id, 1, own.clone());
+                self.require_term(id, 2, own.clone());
+                CValue::Typed(own)
+            }
+        }
     }
 
     /// The operator's operand rule and what it produces, in one place.

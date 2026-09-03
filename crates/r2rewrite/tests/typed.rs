@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use fixture::{RAX, RDI, artifact, konst, projection, reg, tmp, value_named};
 use r2il::R2ILOp;
-use r2rewrite::{CValue, RenderTypes, c_type_of, promoted, typed_boundaries};
+use r2rewrite::{CValue, RenderTypes, TermId, c_type_of, canonicalize, promoted, typed_boundaries};
 use r2ssa::{MachineExprId, MachineExprKind, MachineSignedness, MachineType, ValueId};
 use r2types::CTypeLike;
 
@@ -14,7 +14,7 @@ use r2types::CTypeLike;
 #[derive(Default)]
 struct Plan {
     declared: BTreeMap<ValueId, CTypeLike>,
-    inlined: BTreeMap<ValueId, MachineExprId>,
+    inlined: BTreeMap<ValueId, TermId>,
 }
 
 impl RenderTypes for Plan {
@@ -22,7 +22,7 @@ impl RenderTypes for Plan {
         self.declared.get(&value).cloned()
     }
 
-    fn inline_root(&self, value: ValueId) -> Option<MachineExprId> {
+    fn inline_root(&self, value: ValueId) -> Option<TermId> {
         self.inlined.get(&value).copied()
     }
 }
@@ -55,16 +55,24 @@ fn a_signed_comparison_requires_signed_operands_and_produces_a_truth_value() {
         ret(),
     ]);
     let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
     let rdi = value_named(&artifact, "RDI_0");
     let less = value_named(&artifact, "tmp:100_1");
     let mut plan = Plan::default();
     plan.declared.insert(rdi, CTypeLike::u64());
-    let typed = typed_boundaries(&projection, &plan);
+    let typed = typed_boundaries(&projection, roots.arena(), &plan);
 
     let root = root_of(&projection, less);
     assert_eq!(typed.required(root, 0), Some(&CTypeLike::i64()));
     assert_eq!(typed.required(root, 1), Some(&CTypeLike::i64()));
     assert_eq!(typed.produced(root), Some(&CValue::Typed(CTypeLike::Bool)));
+    let canonical = roots.value(less).expect("canonical comparison").canonical;
+    assert_eq!(typed.term_required(canonical, 0), Some(&CTypeLike::i64()));
+    assert_eq!(typed.term_required(canonical, 1), Some(&CTypeLike::i64()));
+    assert_eq!(
+        typed.term_produced(canonical),
+        Some(&CValue::Typed(CTypeLike::Bool))
+    );
     // The declaration is what a read of the value has; the comparison's
     // requirement differs from it, which is exactly where a cast belongs.
     assert_eq!(
@@ -95,6 +103,7 @@ fn narrow_arithmetic_is_computed_in_int_and_read_back_at_its_width() {
         ret(),
     ]);
     let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
     let byte = value_named(&artifact, "tmp:100_1");
     let sum = value_named(&artifact, "tmp:200_1");
     let rax = value_named(&artifact, "RAX_1");
@@ -102,8 +111,9 @@ fn narrow_arithmetic_is_computed_in_int_and_read_back_at_its_width() {
     plan.declared
         .insert(value_named(&artifact, "RDI_0"), CTypeLike::u64());
     plan.declared.insert(byte, CTypeLike::u8());
-    plan.inlined.insert(sum, root_of(&projection, sum));
-    let typed = typed_boundaries(&projection, &plan);
+    plan.inlined
+        .insert(sum, roots.value(sum).expect("canonical sum").canonical);
+    let typed = typed_boundaries(&projection, roots.arena(), &plan);
 
     let trunc = root_of(&projection, byte);
     assert_eq!(typed.required(trunc, 0), Some(&CTypeLike::u64()));
@@ -115,6 +125,13 @@ fn narrow_arithmetic_is_computed_in_int_and_read_back_at_its_width() {
     // `uint8_t + uint8_t` is an `int`, and the sum is inlined, so a read of
     // it has that type: the reader narrows it, once, where it reads it.
     assert_eq!(typed.produced(add), Some(&CValue::Typed(CTypeLike::i32())));
+    let canonical = roots.value(sum).expect("canonical sum").canonical;
+    assert_eq!(typed.term_required(canonical, 0), Some(&CTypeLike::u8()));
+    assert_eq!(typed.term_required(canonical, 1), Some(&CTypeLike::u8()));
+    assert_eq!(
+        typed.term_produced(canonical),
+        Some(&CValue::Typed(CTypeLike::i32()))
+    );
     assert_eq!(
         typed.value_type(sum),
         Some(&CValue::Typed(CTypeLike::i32()))
@@ -151,8 +168,9 @@ fn signedness_comes_from_the_node_not_the_operator() {
         ret(),
     ]);
     let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
     let plan = Plan::default();
-    let typed = typed_boundaries(&projection, &plan);
+    let typed = typed_boundaries(&projection, roots.arena(), &plan);
 
     let arithmetic = root_of(&projection, value_named(&artifact, "tmp:100_1"));
     assert_eq!(typed.required(arithmetic, 0), Some(&CTypeLike::i64()));
@@ -191,12 +209,13 @@ fn a_copy_converts_nothing() {
         ret(),
     ]);
     let projection = projection(&artifact);
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
     let rdi = value_named(&artifact, "RDI_0");
     let rax = value_named(&artifact, "RAX_1");
     let mut plan = Plan::default();
     plan.declared.insert(rdi, CTypeLike::ptr(CTypeLike::u8()));
     plan.declared.insert(rax, CTypeLike::u64());
-    let typed = typed_boundaries(&projection, &plan);
+    let typed = typed_boundaries(&projection, roots.arena(), &plan);
 
     let copy = root_of(&projection, rax);
     let kind = projection.expr(copy).expect("root").kind().clone();
