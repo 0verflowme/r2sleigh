@@ -16,7 +16,6 @@ use r2source::{
     AdvisorySuccessorKind, CanonicalStorageId, CanonicalStorageSpace, MachineProfile,
     OwnedFunctionSnapshot, SourceFunctionInterface,
 };
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -1395,72 +1394,38 @@ impl LoadedSpecification {
     }
 }
 
-/// The one loaded copy of an embedded specification.
+/// Load an embedded specification.
 ///
-/// Keyed by `stable_lift_manifest_hash`, which this crate already documents as
-/// the identity "available for diagnostics and cache partitioning" -- this is
-/// that use. The obvious key, the address of the specification bytes, is wrong:
-/// the embedded specs are `const` arrays, so each use site may materialise its
-/// own promoted copy and two callers naming the same language can hold two
-/// different addresses for identical bytes. Keying on the address made the
-/// cache silently miss between the lift path and the plugin's context, which is
-/// the whole thing it exists to join.
+/// **This deliberately does not cache, and the reason is a wrong answer rather
+/// than a slow one.** A `GhidraSleigh` instance caches decoded instructions by
+/// address, so sharing one across lifts returns the *first* decode whenever a
+/// second lift asks about the same address with different bytes. Demonstrated
+/// by `two_instructions_at_one_address_through_one_instance`: `mov al, bl` then
+/// `mov ah, bl`, both at 0x1000 through one instance, yields `AL` twice, while
+/// the same second instruction at a fresh address yields `AH`.
 ///
-/// The name alone is not a key either, and that one would be a wrong answer
-/// rather than a miss: ARM32 deliberately reports one `ArchSpec::name` across
-/// four A32/Thumb by endianness languages, so a name maps to four different
-/// grammars and the processor spec is what tells them apart. The manifest hash
-/// covers the `.sla`, the processor spec and the name together.
+/// A caching version of this function shipped briefly and was wrong. It is
+/// reachable in production whenever one process sees one address twice with
+/// different bytes: a second binary opened in the same radare2 session (two
+/// position-independent executables both based at zero), or bytes patched and
+/// re-analysed. Single-binary analysis never repeats an address, which is why
+/// every gate passed.
 ///
-/// Hashing megabytes is not cheap, so it is done at most once per distinct
-/// pointer and the pointer answers afterwards. That memo is sound where a bare
-/// pointer key is not: a colliding address that has not been hashed before
-/// simply gets hashed, and a `'static` bound means an address that has been
-/// hashed can never be reused for something else.
-///
-/// The `'static` bounds are the safety argument rather than a convenience. The
-/// cache outlives every caller, so admitting bytes that could be freed would
-/// make a recycled address a stale hit. Bytes supplied by a caller are
-/// therefore never cached; they load their own.
-///
-/// Thread-local because the parsed instance owns a C++ Sleigh object that
-/// declares neither `Send` nor `Sync`. The bound is one per embedded
-/// specification per lifting thread: at most the number of languages the build
-/// embeds, and in practice one.
-fn shared_specification(
+/// The cost of not caching is the whole cost: measured on x86-64, parsing is
+/// 84 to 295 milliseconds against 1.4 to 67 for the register table and 3 to 9
+/// for the architecture extraction, so sharing only the derived tables saves
+/// almost nothing. Restoring the sharing needs the decode cache flushed
+/// instead, which `ghidra::Sleigh::clearCache` does and the `libsla-sys` bridge
+/// does not currently expose. That is recorded in the handoff as a decision to
+/// take, not a detail to slip in.
+fn load_embedded_specification(
     sla_bytes: &'static [u8],
     pspec: &'static str,
     arch_name: &'static str,
 ) -> Result<Rc<LoadedSpecification>> {
-    thread_local! {
-        static MANIFEST_BY_ADDRESS: RefCell<HashMap<(usize, usize, &'static str), u64>> =
-            RefCell::new(HashMap::new());
-        static LOADED: RefCell<HashMap<u64, Rc<LoadedSpecification>>> =
-            RefCell::new(HashMap::new());
-    }
-    let address = (sla_bytes.as_ptr() as usize, sla_bytes.len(), arch_name);
-    let manifest = MANIFEST_BY_ADDRESS.with(|memo| memo.borrow().get(&address).copied());
-    let manifest = match manifest {
-        Some(manifest) => manifest,
-        None => {
-            let manifest = stable_lift_manifest_hash(sla_bytes, pspec, arch_name);
-            MANIFEST_BY_ADDRESS.with(|memo| {
-                memo.borrow_mut().insert(address, manifest);
-            });
-            manifest
-        }
-    };
-    if let Some(loaded) = LOADED.with(|cache| cache.borrow().get(&manifest).map(Rc::clone)) {
-        return Ok(loaded);
-    }
-    // Loaded outside the borrow: parsing is fallible and is the slow path.
-    let loaded = Rc::new(LoadedSpecification::load(
+    Ok(Rc::new(LoadedSpecification::load(
         sla_bytes, pspec, arch_name, true,
-    )?);
-    LOADED.with(|cache| {
-        cache.borrow_mut().insert(manifest, Rc::clone(&loaded));
-    });
-    Ok(loaded)
+    )?))
 }
 
 /// The architecture an embedded specification describes, with the processor
@@ -1470,7 +1435,7 @@ pub fn shared_arch_spec(
     pspec: &'static str,
     arch_name: &'static str,
 ) -> Result<r2il::ArchSpec> {
-    let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+    let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
     let mut arch = (*spec.arch).clone();
     arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
     Ok(arch)
@@ -1521,7 +1486,7 @@ impl Disassembler {
         pspec: &'static str,
         arch_name: &'static str,
     ) -> Result<Self> {
-        let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+        let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
         Ok(Self::wrap(spec, arch_name, None))
     }
 
@@ -1530,7 +1495,7 @@ impl Disassembler {
     /// This is the only constructor that can mint genuine lift authority.
     pub fn from_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
         let (sla_bytes, pspec, arch_name) = profile.specification();
-        let spec = shared_specification(sla_bytes, pspec, arch_name)?;
+        let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
         Ok(Self::wrap(spec, arch_name, Some(profile)))
     }
 
@@ -4645,37 +4610,91 @@ mod sleigh_specification_load_cost {
     }
 
     #[test]
-    fn one_specification_is_parsed_once_and_shared_by_every_caller() {
+    fn one_specification_serves_both_consumers_without_sharing_a_decode_cache() {
+        // The plugin's architecture and the lifter's disassembler come from the
+        // same loader rather than two hand-written parses, which is the part of
+        // the sharing that is safe: derived tables are immutable.
         let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
-        let first = shared_specification(sla, pspec, name).expect("first ask");
-        let second = shared_specification(sla, pspec, name).expect("second ask");
-        assert!(
-            Rc::ptr_eq(&first, &second),
-            "the second ask must be the same parse, not another copy"
-        );
-        // And the two consumers that used to parse separately now reach it.
         let lifter = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
             .expect("trusted disassembler");
-        assert!(Rc::ptr_eq(&lifter.spec, &first));
         assert_eq!(lifter.trusted_profile, Some(TrustedSleighProfile::X86_64));
         assert!(lifter.genuine_authority.is_some());
         let arch = shared_arch_spec(sla, pspec, name).expect("arch spec");
-        assert_eq!(arch.name, first.arch.name);
+        assert_eq!(arch.name, lifter.spec.arch.name);
         // The architecture the plugin asks for carries the processor spec's
         // program counter; the one the lifter holds is the raw extraction.
         assert!(arch.program_counter.is_some());
     }
 
     #[test]
-    fn caller_supplied_bytes_are_never_served_from_the_cache() {
-        // Only `'static` embedded bytes may be cached, because the cache
-        // outlives any other caller's buffer and a recycled address would be a
-        // wrong answer rather than a slow one.
+    fn caller_supplied_bytes_never_certify() {
+        // Only embedded bytes may mint authority, whatever else is shared.
         let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
         let owned = sla.to_vec();
         let ad_hoc = Disassembler::from_sla(&owned, pspec, name).expect("ad hoc disassembler");
-        let shared = shared_specification(sla, pspec, name).expect("shared");
-        assert!(!Rc::ptr_eq(&ad_hoc.spec, &shared));
         assert!(ad_hoc.genuine_authority.is_none());
+        assert!(ad_hoc.trusted_profile.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "x86"))]
+mod shared_instance_address_reuse {
+    use super::*;
+
+    /// One Sleigh instance returns a stale decode for a second instruction at
+    /// an address it has already decoded, which is why the specification loader
+    /// does not share instances. This is the evidence for that, kept as a gate
+    /// so a future sharing attempt fails here rather than in a rendered body.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn where_the_load_time_goes() {
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let sleigh = GhidraSleigh::builder()
+                .processor_spec(pspec)
+                .expect("pspec")
+                .build(sla)
+                .expect("sla");
+            let parse = t.elapsed();
+            let t = std::time::Instant::now();
+            let _regs = build_register_name_map(&sleigh);
+            let regs = t.elapsed();
+            let t = std::time::Instant::now();
+            let _arch = crate::sleigh::extract_architecture(&sleigh, name).expect("arch");
+            let extract = t.elapsed();
+            eprintln!(
+                "parse={}us regs={}us extract={}us",
+                parse.as_micros(),
+                regs.as_micros(),
+                extract.as_micros()
+            );
+        }
+    }
+
+    #[test]
+    fn two_instructions_at_one_address_through_one_instance() {
+        let shared =
+            Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64).expect("spec");
+        let al = shared
+            .lift_genuine_block(&[0x88, 0xd8, 0x90, 0x90], 0x1000, 2)
+            .expect("mov al, bl");
+        let ah_stale = shared
+            .lift_genuine_block(&[0x88, 0xdc, 0x90, 0x90], 0x1000, 2)
+            .expect("mov ah, bl at the same address");
+        assert_eq!(
+            al.block().ops,
+            ah_stale.block().ops,
+            "a second decode at one address is expected to come back stale; if this \
+             ever stops holding, the decode cache has been fixed and the specification \
+             loader may share instances again"
+        );
+        // The same instruction elsewhere decodes correctly, which is what makes
+        // the above a cache and not a lifting bug.
+        let fresh = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64).expect("spec");
+        let ah = fresh
+            .lift_genuine_block(&[0x88, 0xdc, 0x90, 0x90], 0x2000, 2)
+            .expect("mov ah, bl at a fresh address");
+        assert_ne!(al.block().ops, ah.block().ops);
     }
 }
