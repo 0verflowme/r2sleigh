@@ -9309,3 +9309,47 @@ ones left; `varying_predicates` in `structure.rs` already narrows the set the
 bound should come from, and the refusal at `consume_safety_budget` compares a
 counter against a limit fixed at construction to that same counter, so it can
 never fire.
+
+## Two performance figures in this document were wrong, and the method was worse
+
+**The attribution was wrong.** This document said roughly 55 milliseconds per
+function went into `sleigh_analyze_fcn`, `sleigh_get_data_refs` and
+`sleigh_op`. That number came from subtracting an `aa` timing from an `aaa`
+timing, which does not isolate what it appears to: radare2 runs the plugin's
+post-analysis during `aa` as well, so the subtraction cancelled the sweep rather
+than removing it. Measured directly with per-site counters on a quiet host, the
+three callbacks cost **17.5 milliseconds between them across a whole binary**,
+and `sleigh_op` is **never called at all**, because radare2 decodes this binary
+through a different architecture plugin. Every suspicion recorded here about
+per-instruction cost in `get_context` was about a function that is not on the
+path.
+
+**The speedups were inflated by measurement order.** Sequential before-and-after
+runs on the shared Linux host read 13.20 seconds against 3.12 for one change.
+Interleaved A/B over three alternating rounds put the same change at about
+**19 per cent**. The before block had simply run while the machine was busy with
+other agents. That makes seven measurements this project has had to correct, and
+it generalises: a private `HOME` stops another agent overwriting the plugin, and
+only interleaving stops the *machine* overwriting the answer. **Treat any
+before-and-after on that host that was not interleaved as unproven**, including
+the earlier figures in this document for the Sleigh profile load, which were
+taken the same way.
+
+What is solid, because it was measured directly rather than by subtraction:
+
+| site | calls | total | mean |
+| --- | --- | --- | --- |
+| post_analysis | 1 | 1494 ms | |
+| snapshot walk | 39 | 448 ms | 11.5 ms |
+| snapshot reuse | 43 | 9 µs | 209 ns |
+| proof engine | 22 | 387 ms | 17.6 ms |
+| context create, one `.sla` parse | 1 | 302 ms | 302 ms |
+| get_data_refs | 38 | 14.9 ms | 392 µs |
+| analyze_fcn | 32 | 2.6 ms | 81 µs |
+| sleigh_op | 0 | never called | |
+
+Two things follow that are worth more than another round of tuning. About 0.66
+of the sweep's 1.49 seconds is still unattributed, which makes it the largest
+unmeasured thing the plugin does. And the C context and the Rust trusted profile
+parse the same `.sla` file separately, at 302 milliseconds, which is the **third**
+place this project has found the same parse happening twice.
