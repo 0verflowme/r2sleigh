@@ -1961,13 +1961,16 @@ impl LegacyObservationJournal {
             .collect::<Vec<_>>();
 
         // Definitions whose values the plan proves nobody reads have no
-        // statement to carry their cells. The structural case owns no operands
-        // or semantic obligation; an unused call clobber is the example. A
-        // pre-placement dead computation also loses the operand reads and the
-        // LiveValueProducer obligation its statement would have carried. Only
-        // that dependency obligation is authorized here: any observable effect
-        // on the same instruction remains at zero occurrences and the effect
-        // ledger refuses it instead of relabelling it dead.
+        // statement to carry their cells. A structural definition owns no
+        // semantic obligation, but it may still have dependency operands: a
+        // call restore reads the carrier it certifies unchanged. Once the
+        // structural output is unused, those operands have zero occurrences
+        // with the statement too. A pre-placement dead computation likewise
+        // loses its operand reads and the LiveValueProducer obligation its
+        // statement would have carried. Only that dependency obligation is
+        // authorized here: any observable effect on the same instruction
+        // remains at zero occurrences and the effect ledger refuses it instead
+        // of relabelling it dead.
         //
         // This is deliberately not done for every elided value. Most elisions
         // mean some other rendering answers for the value, and claiming its
@@ -1992,9 +1995,6 @@ impl LegacyObservationJournal {
                 continue;
             }
             elided_writes.entry(inst).or_insert(*reason);
-            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
-                continue;
-            }
             let instruction = graph
                 .inst(inst)
                 .expect("the exact definition was validated above");
@@ -2002,6 +2002,9 @@ impl LegacyObservationJournal {
                 elided_uses
                     .entry(UseSite { inst, input_idx })
                     .or_insert(*reason);
+            }
+            if *reason != r2ssa::ledger::ElisionReason::DeadUnusedTemporary {
+                continue;
             }
             self.dead_unused_value_effects.extend(
                 source
