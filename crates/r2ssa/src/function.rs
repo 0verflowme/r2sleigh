@@ -1375,24 +1375,36 @@ impl TrustedSsaArtifact {
                     );
                     break 'recovered None;
                 };
-                // Function-interface recovery must see the same exact call
-                // boundaries as final preparation. In particular, a tail
-                // transfer is the function's result boundary.
-                let provisional_machine_context =
-                    SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
-                        blocks.as_slice(),
-                        Some(&arch),
-                        None,
-                        *source.machine_roles(),
-                        Some(source.convention_slots().clone()),
-                        correlated_call_sites.interfaces.clone(),
-                        correlated_call_sites.tail_jumps.clone(),
-                    );
-                let Some(recovered) = crate::recover_interface::recover_interface_with_context(
-                    &preliminary,
-                    source.convention_slots(),
-                    &provisional_machine_context,
-                ) else {
+                // Only a source-correlated tail transfer changes interface
+                // recovery: it is the function's result boundary, so recovery
+                // must see the same exact call boundary as final preparation.
+                // Ordinary functions retain the context-free recovery path;
+                // exposing their call boundaries here would independently
+                // change call-argument identity, which is not a tail-transfer
+                // fact.
+                let recovered = if correlated_call_sites.tail_jumps.is_empty() {
+                    crate::recover_interface::recover_interface(
+                        &preliminary,
+                        source.convention_slots(),
+                    )
+                } else {
+                    let provisional_machine_context =
+                        SourceMachineContext::from_blocks_with_interfaces_and_tail_jumps(
+                            blocks.as_slice(),
+                            Some(&arch),
+                            None,
+                            *source.machine_roles(),
+                            Some(source.convention_slots().clone()),
+                            correlated_call_sites.interfaces.clone(),
+                            correlated_call_sites.tail_jumps.clone(),
+                        );
+                    crate::recover_interface::recover_interface_with_context(
+                        &preliminary,
+                        source.convention_slots(),
+                        &provisional_machine_context,
+                    )
+                };
+                let Some(recovered) = recovered else {
                     break 'recovered None;
                 };
                 let minted = crate::recover_interface::mint_recovered_interface(
