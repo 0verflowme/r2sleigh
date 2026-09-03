@@ -1241,28 +1241,6 @@ pub(crate) fn compile_target_precondition_with_summaries<'ctx>(
     compile_reverse_paths(func, initial_state, reverse_paths, None, call_summaries)
 }
 
-pub(crate) fn compile_branch_precondition_with_summaries<'ctx>(
-    func: &SsaArtifact,
-    initial_state: &SymState<'ctx>,
-    block_addr: u64,
-    truth: bool,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
-) -> Option<CompiledBackwardCondition> {
-    let predicate = func
-        .predicates()
-        .predicates
-        .iter()
-        .find_map(|(id, fact)| (fact.block_addr == block_addr).then_some(*id))?;
-    let reverse_paths = enumerate_reverse_paths(func, block_addr, DEFAULT_REVERSE_PATH_LIMIT)?;
-    compile_reverse_paths(
-        func,
-        initial_state,
-        reverse_paths,
-        Some((predicate, truth)),
-        call_summaries,
-    )
-}
-
 pub(crate) fn compile_branch_preconditions_with_summaries<'ctx>(
     func: &SsaArtifact,
     initial_state: &SymState<'ctx>,
@@ -1620,32 +1598,6 @@ fn finish_reverse_path_compilation(
         },
         predicate: simplified,
     })
-}
-
-pub(crate) fn compile_value_postcondition_with_summaries<'ctx, F>(
-    func: &SsaArtifact,
-    initial_state: &SymState<'ctx>,
-    block_addr: u64,
-    value_var: r2ssa::SSAVar,
-    postcondition: F,
-    call_summaries: &HashMap<u64, DerivedCallSummaryView<'ctx>>,
-) -> Option<CompiledBackwardCondition>
-where
-    F: Fn(&SymValue<'ctx>) -> Bool + Clone,
-{
-    let reverse_paths = enumerate_reverse_paths(func, block_addr, DEFAULT_REVERSE_PATH_LIMIT)?;
-    compile_reverse_paths_with_extra(
-        func,
-        initial_state,
-        reverse_paths,
-        None,
-        call_summaries,
-        move |translator, path| {
-            let _ = path;
-            let value = translator.eval_ssa_var(&value_var)?;
-            Ok(Some(postcondition.clone()(&value)))
-        },
-    )
 }
 
 fn build_call_transform_contexts<'ctx>(
@@ -2565,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_branch_compilation_preserves_symbolic_memory_input() {
+    fn branch_precondition_preserves_symbolic_memory_input() {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.add_register(RegisterDef::new("RDI", 56, 8));
@@ -2615,28 +2567,12 @@ mod tests {
         let mut state = SymState::new(&ctx, 0x1000);
         crate::runtime::seed_default_state_for_arch(&mut state, &func, Some(&arch));
 
-        let (when_true, when_false) =
-            compile_branch_preconditions_with_summaries(&func, &state, 0x1000, &HashMap::new())
-                .expect("paired branch conditions");
-        let single_true = compile_branch_precondition_with_summaries(
-            &func,
-            &state,
-            0x1000,
-            true,
-            &HashMap::new(),
-        )
-        .expect("true branch condition");
-        let single_false = compile_branch_precondition_with_summaries(
-            &func,
-            &state,
-            0x1000,
-            false,
-            &HashMap::new(),
-        )
-        .expect("false branch condition");
+        // The condition for reaching the taken arm is the branch predicate
+        // itself, and its load from the parameter pointer must survive as a
+        // symbolic memory input rather than collapse to a constant.
+        let when_true =
+            compile_target_precondition(&func, &state, 0x1010).expect("true branch condition");
 
-        assert_eq!(when_true.summary, single_true.summary);
-        assert_eq!(when_false.summary, single_false.summary);
         assert_eq!(
             when_true.summary.precision,
             BackwardConditionPrecision::Exact

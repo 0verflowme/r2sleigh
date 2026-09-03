@@ -1092,7 +1092,7 @@ impl TypeInference {
         field
             .ty
             .as_deref()
-            .and_then(|spec| crate::facts::parse_type_like_spec(spec, self.ptr_size))
+            .and_then(|spec| crate::parse_c_type_like(spec, self.ptr_size))
             .and_then(|ty| crate::function_facts::type_like_size_bytes(&ty, self.ptr_size))
             .is_none_or(|width| width == u64::from(access_width))
     }

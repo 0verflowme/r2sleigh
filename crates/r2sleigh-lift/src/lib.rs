@@ -27,7 +27,6 @@ pub mod context;
 pub mod disasm;
 pub mod esil;
 mod internal_control;
-pub mod pcode;
 pub mod sleigh;
 pub mod translate;
 
@@ -41,7 +40,6 @@ pub use disasm::{
     TrustedLiftedFunction, TrustedSleighProfile,
 };
 pub use esil::{OpEsil, block_to_esil, format_op, op_esil, op_to_esil};
-pub use pcode::{PcodeTranslator, RawPcodeOp, RawVarnode};
 use r2il::ArchSpec;
 use r2il::Endianness;
 pub use sleigh::{SleighInfo, build_arch_spec, extract_arch_spec, get_sleigh_info};
@@ -54,9 +52,6 @@ pub enum LiftError {
 
     #[error("Parse error: {0}")]
     Parse(String),
-
-    #[error("P-code translation error: {0}")]
-    Pcode(#[from] pcode::PcodeError),
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),

@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use super::claims::SemanticClaimSummary;
 use super::plan::{
-    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryExecutionRoute, TargetQueryPlan,
-    TargetQueryRoutePlan, TypePlan, derive_artifact_build_plan, derive_decompile_plan,
-    derive_query_plan, derive_target_query_plan, derive_target_query_route_plan, derive_type_plan,
+    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
+    derive_artifact_build_plan, derive_decompile_plan, derive_query_plan, derive_target_query_plan,
+    derive_target_query_route_plan, derive_type_plan,
 };
 use super::region::{
     ArtifactGranularity, ExecutionModel, NativeArtifactBody, RefinementStage,
@@ -15,14 +15,6 @@ use super::region::{
 };
 use super::vm::InterpreterKind;
 use crate::sim::PreparedFunctionScope;
-
-#[derive(Debug, Clone)]
-pub(crate) struct TargetQueryRouteInput<'a> {
-    pub(crate) route: TargetQueryRoutePlan,
-    pub(crate) condition_source: Option<SemanticTargetConditionSource<'a>>,
-    pub(crate) memory_terms: Vec<&'a crate::backward::BackwardMemoryCondition>,
-    pub(crate) allow_exact_proof: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SliceClass {
@@ -614,22 +606,6 @@ fn same_scope_owners(left: &PreparedFunctionScope, right: &PreparedFunctionScope
 }
 
 impl SemanticArtifactReport {
-    fn downgrade_query_route_to_residual(
-        route: TargetQueryRoutePlan,
-        reason: impl Into<String>,
-    ) -> TargetQueryRoutePlan {
-        let mut reasons = match route.execution {
-            TargetQueryExecutionRoute::ResidualOnly { reasons } => reasons,
-            TargetQueryExecutionRoute::Refuse { reason } => vec![reason],
-            _ => Vec::new(),
-        };
-        reasons.push(reason.into());
-        TargetQueryRoutePlan {
-            target_plan: route.target_plan,
-            execution: TargetQueryExecutionRoute::ResidualOnly { reasons },
-        }
-    }
-
     fn has_native_semantics(&self) -> bool {
         self.native_body()
             .is_some_and(|body| !body.regions.is_empty() || body.has_summary_islands())
@@ -712,36 +688,6 @@ impl SemanticArtifactReport {
             condition_source.is_some(),
             has_memory_guidance,
         )
-    }
-
-    pub(crate) fn target_query_route_input<'a>(
-        &'a self,
-        target_addr: u64,
-        assumption_conflicted: bool,
-    ) -> TargetQueryRouteInput<'a> {
-        let mut route = self.target_query_route_plan(target_addr);
-        let canonical_source = self.target_condition_source(target_addr, false);
-        let memory_terms = self
-            .authoritative_memory_region_for_target(target_addr)
-            .map(|region| region.actionable_memory_terms_for_target(target_addr))
-            .unwrap_or_default();
-        if assumption_conflicted {
-            route = Self::downgrade_query_route_to_residual(route, "assumption conflict");
-        }
-        if self.target_has_ambiguous_sources(target_addr) {
-            route = Self::downgrade_query_route_to_residual(
-                route,
-                "conflicting target guidance sources",
-            );
-        }
-        let allow_exact_proof =
-            !assumption_conflicted && !self.target_has_ambiguous_sources(target_addr);
-        TargetQueryRouteInput {
-            route,
-            condition_source: canonical_source,
-            memory_terms,
-            allow_exact_proof,
-        }
     }
 
     pub fn type_plan(&self) -> TypePlan {

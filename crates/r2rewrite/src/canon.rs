@@ -160,7 +160,7 @@ pub fn affine_normalize(arena: &mut TermArena, id: TermId) -> TermId {
     emitted
 }
 
-fn collect_affine(
+pub(crate) fn collect_affine(
     arena: &TermArena,
     id: TermId,
     scale: u64,
@@ -220,11 +220,11 @@ fn collect_affine(
 }
 
 /// Whether a coefficient reads as negative at `width`.
-fn is_negative(k: u64, width: u32) -> bool {
+pub(crate) fn is_negative(k: u64, width: u32) -> bool {
     width < 64 && k >> (width - 1) == 1 || width == 64 && k >> 63 == 1
 }
 
-fn emit_affine(
+pub(crate) fn emit_affine(
     arena: &mut TermArena,
     ty: r2ssa::MachineType,
     width: u32,

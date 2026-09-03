@@ -3890,11 +3890,13 @@ impl SSAFunction {
     }
 }
 
+/// One storage range inside a register family, identified by where it starts
+/// and how wide it is rather than by any name the architecture gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RegisterFamilySlot {
-    family_id: usize,
-    offset: u64,
-    width: u32,
+pub struct RegisterFamilySlot {
+    pub family_id: usize,
+    pub offset: u64,
+    pub width: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3904,8 +3906,10 @@ struct RegisterFamilyMember {
     width: u32,
 }
 
+/// Which register storage ranges alias which, derived from the architecture's
+/// own register geometry rather than from a table of names.
 #[derive(Debug, Clone, Default)]
-struct RegisterFamilyInfo {
+pub struct RegisterFamilyInfo {
     name_to_member: HashMap<String, RegisterFamilyMember>,
     /// Whether a 32-bit write to a general register clears the rest of it.
     /// Which family covers a register-space range, for storage the arch does not name.
@@ -3969,7 +3973,24 @@ fn cached_register_family_info(arch: &ArchSpec) -> Arc<RegisterFamilyInfo> {
 }
 
 impl RegisterFamilyInfo {
-    fn from_arch(arch: &ArchSpec) -> Self {
+    pub fn from_arch(arch: &ArchSpec) -> Self {
+        Self::from_register_storages(
+            arch.registers
+                .iter()
+                .map(|reg| (reg.name.as_str(), reg.offset, reg.size)),
+        )
+    }
+
+    /// Build the families from register storage geometry alone.
+    ///
+    /// Membership is a fact about which byte ranges overlap, so any caller
+    /// holding names and canonical storage -- an `ArchSpec` or a prepared
+    /// function's machine context -- gets the same answer from the same
+    /// geometry, with no per-architecture name table in between.
+    pub fn from_register_storages<'a, I>(registers: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, u64, u32)>,
+    {
         #[derive(Clone)]
         struct RangeReg {
             name: String,
@@ -3997,13 +4018,12 @@ impl RegisterFamilyInfo {
             reg.offset.saturating_add(reg.size as u64)
         }
 
-        let regs: Vec<RangeReg> = arch
-            .registers
-            .iter()
-            .map(|reg| RangeReg {
-                name: reg.name.to_lowercase(),
-                offset: reg.offset,
-                size: reg.size,
+        let regs: Vec<RangeReg> = registers
+            .into_iter()
+            .map(|(name, offset, size)| RangeReg {
+                name: name.to_lowercase(),
+                offset,
+                size,
             })
             .collect();
 
@@ -4054,10 +4074,6 @@ impl RegisterFamilyInfo {
                 .insert(reg.size);
         }
 
-        if arch.name.eq_ignore_ascii_case("x86-64") || arch.name.eq_ignore_ascii_case("x86") {
-            seed_x86_low_register_aliases(&mut name_to_member, &mut family_width_sets);
-        }
-
         let family_widths_by_offset: HashMap<(usize, u64), Vec<u32>> = family_width_sets
             .into_iter()
             .map(|(family_and_offset, mut widths)| {
@@ -4103,6 +4119,32 @@ impl RegisterFamilyInfo {
             family_widths_by_offset,
             family_slots,
         }
+    }
+
+    /// The slot a named register occupies, or `None` when the architecture
+    /// does not name it.
+    pub fn slot_for_name(&self, name: &str) -> Option<RegisterFamilySlot> {
+        let member = self.member_for_name(name)?;
+        Some(RegisterFamilySlot {
+            family_id: member.family_id,
+            offset: member.offset,
+            width: member.width,
+        })
+    }
+
+    /// The widest register containing the named one: the canonical identity of
+    /// the family, which every alias of it shares.
+    pub fn widest_slot_for_name(&self, name: &str) -> Option<RegisterFamilySlot> {
+        self.widest_slot_containing(self.member_for_name(name)?)
+    }
+
+    fn member_for_name(&self, name: &str) -> Option<RegisterFamilyMember> {
+        if let Some(member) = self.name_to_member.get(name) {
+            return Some(*member);
+        }
+        self.name_to_member
+            .get(name.to_ascii_lowercase().as_str())
+            .copied()
     }
 
     /// The whole register a storage range is part of.
@@ -4172,52 +4214,6 @@ fn register_family_member_for(
         }
         Some(_) => None,
         None => family_info.member_for(var),
-    }
-}
-
-fn seed_x86_low_register_aliases(
-    name_to_member: &mut HashMap<String, RegisterFamilyMember>,
-    family_width_sets: &mut HashMap<(usize, u64), HashSet<u32>>,
-) {
-    const GPR_ALIASES: &[&[(&str, u32)]] = &[
-        &[("rax", 8), ("eax", 4), ("ax", 2), ("al", 1)],
-        &[("rbx", 8), ("ebx", 4), ("bx", 2), ("bl", 1)],
-        &[("rcx", 8), ("ecx", 4), ("cx", 2), ("cl", 1)],
-        &[("rdx", 8), ("edx", 4), ("dx", 2), ("dl", 1)],
-        &[("rsi", 8), ("esi", 4), ("si", 2), ("sil", 1)],
-        &[("rdi", 8), ("edi", 4), ("di", 2), ("dil", 1)],
-        &[("rbp", 8), ("ebp", 4), ("bp", 2), ("bpl", 1)],
-        &[("rsp", 8), ("esp", 4), ("sp", 2), ("spl", 1)],
-        &[("r8", 8), ("r8d", 4), ("r8w", 2), ("r8b", 1)],
-        &[("r9", 8), ("r9d", 4), ("r9w", 2), ("r9b", 1)],
-        &[("r10", 8), ("r10d", 4), ("r10w", 2), ("r10b", 1)],
-        &[("r11", 8), ("r11d", 4), ("r11w", 2), ("r11b", 1)],
-        &[("r12", 8), ("r12d", 4), ("r12w", 2), ("r12b", 1)],
-        &[("r13", 8), ("r13d", 4), ("r13w", 2), ("r13b", 1)],
-        &[("r14", 8), ("r14d", 4), ("r14w", 2), ("r14b", 1)],
-        &[("r15", 8), ("r15d", 4), ("r15w", 2), ("r15b", 1)],
-    ];
-
-    for family in GPR_ALIASES {
-        let Some(member) = family
-            .iter()
-            .find_map(|(name, _)| name_to_member.get(*name).copied())
-        else {
-            continue;
-        };
-        let widths = family_width_sets
-            .entry((member.family_id, member.offset))
-            .or_default();
-        for (name, width) in *family {
-            widths.insert(*width);
-            name_to_member
-                .entry((*name).to_string())
-                .or_insert(RegisterFamilyMember {
-                    family_id: member.family_id,
-                    offset: member.offset,
-                    width: *width,
-                });
-        }
     }
 }
 
@@ -4853,7 +4849,7 @@ fn kill_overlapping_family_roots(state: &mut FamilyRootState, written: RegisterF
     }
 }
 
-fn family_slot_contains(container: RegisterFamilySlot, contained: RegisterFamilySlot) -> bool {
+pub fn family_slot_contains(container: RegisterFamilySlot, contained: RegisterFamilySlot) -> bool {
     if container.family_id != contained.family_id || contained.offset < container.offset {
         return false;
     }
@@ -10175,6 +10171,74 @@ mod tests {
         }
     }
 
+    /// `ah` and `al` are one byte each of `rax`, and they are not the same
+    /// byte. A table keyed on register names cannot say so -- both spell
+    /// "the a register" -- and the tables this replaced gave them one key,
+    /// so an assumption about `ah` was applied to whatever `al` carried.
+    /// Geometry says it plainly: same family, different offset.
+    #[test]
+    fn register_families_separate_the_two_low_bytes_of_one_register() {
+        let families = RegisterFamilyInfo::from_register_storages([
+            ("RAX", 0x00u64, 8u32),
+            ("EAX", 0x00, 4),
+            ("AX", 0x00, 2),
+            ("AL", 0x00, 1),
+            ("AH", 0x01, 1),
+            ("RDX", 0x10, 8),
+            ("DL", 0x10, 1),
+        ]);
+
+        let al = families.slot_for_name("al").expect("al is named");
+        let ah = families.slot_for_name("ah").expect("ah is named");
+        let rax = families.slot_for_name("rax").expect("rax is named");
+
+        // One register, so one family.
+        assert_eq!(al.family_id, ah.family_id);
+        assert_eq!(al.family_id, rax.family_id);
+        // Two different bytes of it, so two different slots.
+        assert_ne!(al, ah);
+        assert_eq!(al.offset, 0x00);
+        assert_eq!(ah.offset, 0x01);
+        assert!(family_slot_contains(rax, al));
+        assert!(family_slot_contains(rax, ah));
+        assert!(!family_slot_contains(al, ah));
+
+        // A low alias shares the register's starting offset; a high byte does
+        // not, which is what separates "same parameter" from "same register".
+        for alias in ["rax", "eax", "ax", "al"] {
+            let slot = families.slot_for_name(alias).expect(alias);
+            assert_eq!(slot.offset, rax.offset, "{alias}");
+        }
+        assert_ne!(ah.offset, rax.offset);
+
+        // And a different register is a different family, whatever it is called.
+        let dl = families.slot_for_name("dl").expect("dl is named");
+        assert_ne!(dl.family_id, al.family_id);
+    }
+
+    /// The widest slot is the family's canonical identity, and every alias
+    /// reaches the same one whatever width it names.
+    #[test]
+    fn widest_slot_is_one_canonical_identity_per_register() {
+        let families = RegisterFamilyInfo::from_register_storages([
+            ("RDI", 0x38u64, 8u32),
+            ("EDI", 0x38, 4),
+            ("DI", 0x38, 2),
+            ("DIL", 0x38, 1),
+        ]);
+
+        let widest = families.widest_slot_for_name("rdi").expect("rdi is named");
+        assert_eq!(widest.width, 8);
+        for alias in ["edi", "di", "dil", "RDI"] {
+            assert_eq!(
+                families.widest_slot_for_name(alias).expect(alias),
+                widest,
+                "{alias}"
+            );
+        }
+        assert!(families.widest_slot_for_name("rsi").is_none());
+    }
+
     #[test]
     fn test_decompile_normalization_seeds_missing_x86_low_byte_alias() {
         let blocks = vec![R2ILBlock {
@@ -10189,6 +10253,7 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
         arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+        arch.add_register(RegisterDef::new("AL", 0x00, 1));
 
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
         let block = func.get_block_mut(0x1000).expect("entry block");
@@ -10228,6 +10293,7 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("RAX", 0x00, 8));
         arch.add_register(RegisterDef::new("EAX", 0x00, 4));
+        arch.add_register(RegisterDef::new("AL", 0x00, 1));
 
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
         let block = func.get_block_mut(0x1000).expect("entry block");
@@ -10327,6 +10393,7 @@ mod tests {
         let mut arch = ArchSpec::new("x86-64");
         arch.add_register(RegisterDef::new("R8", 0x40, 8));
         arch.add_register(RegisterDef::new("R8D", 0x40, 4));
+        arch.add_register(RegisterDef::new("R8B", 0x40, 1));
 
         let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
         let block = func.get_block_mut(0x1000).expect("entry block");

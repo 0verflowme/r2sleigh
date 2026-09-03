@@ -9162,6 +9162,179 @@ them:
 The shape run was executed twice under the lock and produced identical column
 totals both times, so the fourteen renderings and the eight differential passes
 are reproducible rather than a scheduling artifact.
+
+## Array indexing: the cell becomes a term, and what that measured
+
+Array indexing appeared in zero per cent of rendered functions, and the cause
+was not the renderer being timid. Nothing on the certified path could *say*
+"this cell is an element". The two pieces that came closest --
+`typed_subscript_access`, which divided a rendered index by the pointee width,
+and `certified_pointer_base_expr`, which decided which operand of a C address
+expression was the base -- worked on emitted text with no proof behind either
+decision, which is the second rewriting layer this branch exists to remove.
+
+The decision now lives in `r2rewrite`. Three term kinds carry it: `Load`, which
+is also the cell a store writes, because the cell a store writes is the one a
+load at that address would read; `Subscript`, the read at
+`base + index * (width / 8)`; and `ObjectAddress`, what a placed object's name
+decays to. Three rules turn the first into the second, each proven at 8, 16, 32
+and 64 bits like every other rule in the table. `constant_stride` needs no
+certificate for its *equivalence* -- `Mem[p + i*k]` is that cell whichever
+operand is called the base -- so the certificate only chooses the spelling.
+`stack_element[stack_slot]` and `pointer_walk[induction]` do rest on
+certificates and say so in their ids.
+
+**A pointer is proven by a dereference, not by being a parameter.** The first
+version asked whether a value had parameter address provenance, and every
+parameter has it: `arr_sum(const uint32_t *a, size_t n)` gives `n` a parameter
+expression exactly as it gives one to `a`. With both called pointers a sum has
+two candidate bases at unit coefficients and the rule refuses. Object existence
+is no better -- an object is made for every parameter appearing in any address
+expression, `n` included. What is evidence is a certified access whose address
+carries that parameter's provenance: memory was read or written through it. A
+value is a base when its provenance is that parameter with *no terms added*;
+with terms it is the whole address, and an address that is its own base leaves
+no index behind.
+
+**The shape that makes this work is the `-O0` parameter home.** A parameter is
+stored to the stack, reloaded, and the reload is indexed. The reload is a
+legitimate base only because the address provenance pass carries the parameter
+base through the spill -- a fact a reader of the emitted C cannot recover,
+which is why the earlier renderer-side attempts could not see it and were
+correctly recorded here as inert.
+
+**One case refuses and is worth naming.** Where both operands of an address sum
+are parameters -- `s[i]` with `i` itself a parameter -- the provenance pass
+gives the sum no expression at all, because two parameter bases combined have
+no single base. The access then has no proven pointer and the rule declines
+rather than picking an operand. The corpus's own shape indexes by a local
+initialised to a constant, which the pass does resolve, so this is a real
+limitation with no corpus cost yet measured.
+
+### Measured: zero subscripts to twenty-one, and two accounting defects
+
+On the fifty-four hash cells, counted exactly before and after:
+
+    subscript expressions        0 -> 21   (in 11 of 54 cells)
+    array declarations           0 ->  0
+    for loops                    0 ->  0
+    while headers               17 -> 17
+    do-while                    43 -> 43
+
+All fifty-four cells pass generation, raw, diagnostic, differential, binding
+audit, effect obligations, placement audit and render refusal. The snapshot
+column reports exactly eleven mismatches, and they are the same eleven cells
+that gained a subscript, which is the corroboration worth having: the output
+that changed is precisely the output that was meant to.
+
+What it looks like. `xxhash32` reads its lanes as
+`((uint32_t *)RDI_0)[1]` where it used to spell `*(uint32_t *)(p + 4)`, and
+`pearson` indexes its table as `((uint8_t *)RCX_2)[RDX_2]` with a variable
+index. Both are `constant_stride`; the `-O2` cells index because the compiler
+unrolled the byte loop into `p + i + k` forms, which is the shape the rule was
+written for.
+
+Array declarations and `for` loops are still zero. Stack buffers and
+region-level `for` construction were not reached, and nothing here should be
+read as evidence about either.
+
+**Two accounting defects, both found by the gates and neither by reading.**
+They are worth keeping because both are the same mistake in different clothes:
+the subscript path does not go through the code that used to answer for a
+cell, so it has to answer for that cell itself, and twice it did not.
+
+The first refused six `x64_O2` cells with `RenderedValueRequired`. The
+dereference path marks the address value inside
+`certified_memory_address_expr`; the subscript path bypasses that function, and
+marked the address only when the canonical term had absorbed a producer. That
+made the accounting depend on which rule fired rather than on what was
+rendered -- `constant_stride` absorbs the add and the multiply so the cell was
+filled by luck, `pointer_walk` absorbs nothing so it was not filled at all.
+
+Marking the address unconditionally did *not* clear those six cells, and the
+failure to clear was the useful part: it proved the address was never the
+missing thing. `R2DEC_TRACE_REFUSAL` then named the value outright --
+`ValueId(378)`, `Inline`, one use, **no defining instruction**, constant
+storage, read by the `IntAdd` that formed the address.
+`observe_discharged_expr` marks each consumed instruction's write, its output
+value and its operands' *uses*; a constant is nobody's output, so it never
+appears in a discharged set, and its only occurrence was inside the expression
+the subscript replaced.
+
+An earlier attempt at that same cell searched the term's leaves and found
+nothing, because import turns a constant into `TermKind::Literal` and `leaves`
+collects only `Leaf` and `Opaque`. Asking the graph for each consumed
+instruction's operands does not depend on how a constant happens to be
+represented in a term, which was the right question from the start. The marks
+are deduplicated: one literal can be an operand of two consumed instructions,
+and two marks would count one execution twice.
+
+The second defect refused every store to a proven element.
+`expr_is_store_target_candidate` saw through `Paren` but not `Observed`, and
+had never needed to, because the dereference path hands it an unmarked
+`CExpr::Deref` while the subscript path marks the address it renders. It now
+asks `unobserved()`, the idiom the rest of the tree already uses.
+
+The lesson for whoever adds the next rendering path: the cells a path must
+fill are not the cells its author thinks about, they are the cells the path it
+replaced used to fill. Diff the two.
+
+### Declared member and proven stride are one owner, not a ranking
+
+These look like two authorities over one access and cannot both answer.
+`certified_member_fact_for_memory` returns a fact only when it matches the
+access's object, access id *and* width, and only when exactly one such fact
+exists. So either it describes this very access or it is absent, and the states
+are disjoint: a matching member owns the access and the subscript declines; a
+width disagreement or a duplicate means no member fact is returned and the
+proven stride answers; neither present means the rewriter answers if it proved
+anything. There is deliberately no tie-break code, because a tie cannot occur,
+and a resolver for an impossible tie would be a second answerer for a settled
+question. This is stated again in the module documentation so nobody adds one.
+
+The one decided rather than derived case: a member fact matches but the member
+renderer cannot build an expression, because the C address carries no base
+identity to split around. That access renders as a dereference, not a
+subscript. Asserting an array shape a declared type contradicts is worse than
+declining to name the shape, which is the same rule under which a conflicting
+type refuses per value instead of guessing. **Revisit it only on a measurement
+showing those accesses are common enough to cost `type_match`.**
+
+### The benchmark witness never reached the binary, and the guard always fired
+
+`tests/decbench/run_decbench.sh` exists so that a `make install` aborting on
+stale objects cannot be mistaken for a change with no effect. As written it
+appended `pub const DECBENCH_WITNESS: &str = "..."` to `r2engine` and searched
+the installed library for the string. A `const` is inlined at its use sites and
+this one has none, so no storage is emitted and nothing reaches the binary: the
+check failed on every tree it was ever pointed at. The install had succeeded --
+a fresh 22MB library, minutes old -- and the run aborted claiming the library
+was stale. Two of the integration branch's own runs were read as hangs because
+of it.
+
+A guard that always fires is exactly as useless as one that never does, and
+worse than either, because it sends a reader hunting a build problem that does
+not exist and invites the next reader to disable it. `#[used]` with an exported
+symbol is emitted whether or not anything reads it, which is the property
+wanted, and it was verified against a real built `cdylib` -- symbol exported,
+string in the image -- rather than reasoned about. The search is `grep -a` now
+too, since BSD grep reports no match on a binary whose bytes do match, which
+would have made the check wrong again the first time anyone ran it against a
+locally built library instead of over ssh.
+
+### Two operational hazards this stretch hit
+
+A corpus run started while the tree is being edited measures neither the commit
+before nor the commit after. `locked_matrix.sh` builds, then queues for the
+shared install lock, and `run_matrix.sh` rebuilds once it has it -- so an edit
+made during the queue wait silently reaches the captured plugin. With four
+worktrees queued the wait is long enough that this is easy to do by accident.
+Cancel and re-run rather than editing through a queued measurement.
+
+The benchmark host is shared, and a run's remote directory can be removed by
+another agent's cleanup while it is still building. One run here died that way
+with its own install log already deleted underneath it. A run that vanishes
+mid-build is not a build failure and should not be read as one.
 ## The `aa` path measured directly, and the figure it replaces
 
 The last section named the `aa` path as the dominant remaining cost, at about
@@ -9309,3 +9482,406 @@ ones left; `varying_predicates` in `structure.rs` already narrows the set the
 bound should come from, and the refusal at `consume_safety_budget` compares a
 counter against a limit fixed at construction to that same counter, so it can
 never fire.
+
+## Two performance figures in this document were wrong, and the method was worse
+
+**The attribution was wrong.** This document said roughly 55 milliseconds per
+function went into `sleigh_analyze_fcn`, `sleigh_get_data_refs` and
+`sleigh_op`. That number came from subtracting an `aa` timing from an `aaa`
+timing, which does not isolate what it appears to: radare2 runs the plugin's
+post-analysis during `aa` as well, so the subtraction cancelled the sweep rather
+than removing it. Measured directly with per-site counters on a quiet host, the
+three callbacks cost **17.5 milliseconds between them across a whole binary**,
+and `sleigh_op` is **never called at all**, because radare2 decodes this binary
+through a different architecture plugin. Every suspicion recorded here about
+per-instruction cost in `get_context` was about a function that is not on the
+path.
+
+**The speedups were inflated by measurement order.** Sequential before-and-after
+runs on the shared Linux host read 13.20 seconds against 3.12 for one change.
+Interleaved A/B over three alternating rounds put the same change at about
+**19 per cent**. The before block had simply run while the machine was busy with
+other agents. That makes seven measurements this project has had to correct, and
+it generalises: a private `HOME` stops another agent overwriting the plugin, and
+only interleaving stops the *machine* overwriting the answer. **Treat any
+before-and-after on that host that was not interleaved as unproven**, including
+the earlier figures in this document for the Sleigh profile load, which were
+taken the same way.
+
+What is solid, because it was measured directly rather than by subtraction:
+
+| site | calls | total | mean |
+| --- | --- | --- | --- |
+| post_analysis | 1 | 1494 ms | |
+| snapshot walk | 39 | 448 ms | 11.5 ms |
+| snapshot reuse | 43 | 9 µs | 209 ns |
+| proof engine | 22 | 387 ms | 17.6 ms |
+| context create, one `.sla` parse | 1 | 302 ms | 302 ms |
+| get_data_refs | 38 | 14.9 ms | 392 µs |
+| analyze_fcn | 32 | 2.6 ms | 81 µs |
+| sleigh_op | 0 | never called | |
+
+Two things follow that are worth more than another round of tuning. About 0.66
+of the sweep's 1.49 seconds is still unattributed, which makes it the largest
+unmeasured thing the plugin does. And the C context and the Rust trusted profile
+parse the same `.sla` file separately, at 302 milliseconds, which is the **third**
+place this project has found the same parse happening twice.
+
+## Working rules for parallel worktrees, learned the expensive way
+
+Several worktrees building and measuring at once produced four distinct
+failures in one session, three of them destructive, and none of them visible in
+the output of the thing that failed. They are recorded here because each one
+looked like a defect in the work rather than in the surroundings.
+
+**Reclaim a build directory, never a worktree.** A `target/` costs a rebuild to
+delete. A worktree can hold uncommitted work and can still be the workspace of
+an agent that is between steps, so removing one because its branch merged
+destroys work and orphans whoever was using it. That happened here, and only a
+commit-early habit saved the contents.
+
+**Never delete by glob on a shared host.** A sweep of stale directories matched
+a live run's source tree and deleted it underneath the compiler, twice, which
+reads as a build that failed before writing its log. The fix that holds is
+structural rather than careful: runs live under their own root that a sweep of
+the old namespace cannot match, they write a marker while live, and the
+collector spares anything marked, anything younger than a day whose state is
+unknown, and reports rather than removes unless forced.
+
+**Interleave every before-and-after.** Sequential blocks on a shared host
+measured the machine's load, not the change: one change read as four-fold
+sequentially and about nineteen per cent interleaved. A private plugin
+directory stops another worktree overwriting the binary; only interleaving
+stops the machine overwriting the answer.
+
+**A build outside a lock is a different tree from the one measured inside it.**
+The lock wrapper builds before it queues so a cold build does not block others,
+and the command it runs builds again once it holds the lock. Anything edited
+during the wait is what gets measured, silently. It now fingerprints the tree on
+both sides and refuses rather than report one tree's numbers under another
+tree's name.
+
+**Put a build setting in the manifest, not in the instructions.** Every worktree
+was told to build with line tables rather than full debug info. One did not, and
+grew a twelve gigabyte debug directory against three or four for the others.
+The setting is now in `Cargo.toml`.
+
+## The first integration measurement, and what it caught
+
+The benchmark harness ran end to end for the first time against the merged
+tree, with the witness present in the installed library and the run compared
+per function against the record. It found five gains, one function lost, and a
+score below what one of the merged branches had measured on its own.
+
+| function | recorded | merged tree |
+| --- | --- | --- |
+| readError | 0.214 | 0.255 |
+| writeError | 0.214 | 0.255 |
+| mallocFail | 0.161 | 0.182 |
+| endsInBz2 | 0.088 | 0.089 |
+| tooManyBlocks | 0.156 | **0.148** |
+| bsClose | 0.000 | **refuses** |
+
+`byte_match` 0.140 over 7 functions against a recorded 0.111 over 8, and
+`type_match` 0.125 over 4 against 0.100 over 5. Both means rose partly because
+the function that stopped rendering had scored zero, which is exactly why the
+record is per function and carries `decompiled` beside each score: a mean that
+improves because a bad case disappeared is not an improvement.
+
+**The merged tree scored below one of its own branches, and the cause was not
+the merge.** Measured alone, the inlining branch put `readError` at 0.400 and
+`tooManyBlocks` at 0.316; through the integration harness they are 0.255 and
+0.148. Two trees, one before and one after the performance merge, were measured
+and render byte-identically, and the branch's own files are unchanged by the
+merge. The variable is the radare2 fork. The integration harness syncs it, so
+those runs carry the ellipsis predicate fix and the branch measurements did not.
+
+The fix is doing exactly what it should and the result is still worse, which is
+worth seeing rendered:
+
+```c
+uint64_t sym_imp_fprintf(uint64_t, uint64_t, ...);
+RAX_3 = sym_imp_fprintf(RDI_1, "%s: I/O error reading `%s'...\n", &progName, RCX_1);
+RAX_8 = sym_imp_fprintf(RDI_5, (char*)RCX_4, &progName, RCX_4);
+```
+
+The declaration is correctly variadic and the first call is right for the first
+time: four arguments, matching the source. The second call, whose source passes
+three, has a spurious fourth from gcc's use of `rcx` as scratch at `-O0`, and its
+format argument is a register rather than the literal, with that same register
+also handed over as the fourth argument. Correct on one call, worse on the
+other, worse in total.
+
+The discriminator for this was reported as not existing, on the grounds that
+counting format conversions would be a name test. It is not. Keying on a callee
+being *called* `printf` is forbidden because identity here is structural, but
+reading the bytes of a literal argument the program carries is data, in the same
+category as the string literals already recovered and rendered. Which parameter
+holds the format comes from radare2's prototype, which is load-bearing when
+marked. So: a variadic callee whose format argument resolves to a literal takes
+its count from that literal's conversion specifiers, and one whose format does
+not resolve refuses, which is what the second call above should be doing today
+instead of inventing a fourth argument.
+
+Both deltas in that run are now accounted for, and the record has been re-taken
+against the merged tree so the next change is measured against reality rather
+than against a state nobody will return to.
+
+`tooManyBlocks` falling from 0.156 to 0.148 is the second `fprintf` above,
+gaining an argument it should refuse over.
+
+`bsClose` going from rendered to refusing is **not a loss**, and it is worth
+being exact about why, because the count of decompiled functions fell from eight
+to seven and that reads badly. It refuses with `unrepresentable operation`, from
+the linearizer, which is the guard this branch added for a transfer that leaves
+the function. Before the guard it rendered a `goto` to a label the function
+never defines, which does not compile, and it scored 0.000. It scores nothing
+now. No information was lost: a wrong answer was replaced by an honest refusal,
+and the guard already carries a comment naming the commit that must delete it,
+which is the one that gives such a transfer a callsite and renders it as a
+terminal call. When that lands, `bsClose` should return, and this time with a
+score.
+
+This is the case the per-function record was built for, and it is worth saying
+what would have happened without it. The aggregate went up. A run that reported
+only `byte_match 0.111 → 0.140` would have read as progress, and both the lost
+function and the halved gain would have travelled forward invisibly.
+
+Note also that `byte_match` and `type_match` are deterministic, unlike the
+timing figures corrected earlier in this document, so a single run of each tree
+settles a comparison between them. Only the timings need interleaving.
+
+## An unowned refusal that hides which argument failed
+
+`missing machine projection authorization` accounts for six of the seventy-two
+real-function refusals in the coverage baseline and sixteen of the seventy-eight
+shape cells. Three sites raise it, and they are not one problem.
+
+`memory_renderer.rs:81` was a store to a proven array element being rejected
+because the store-target predicate looked through `Paren` but not through an
+observation marker; that is fixed on the array branch.
+
+`calls.rs:144` is two callsites of one callee that would need different
+declarations, which refuses correctly and is the right answer.
+
+`calls.rs:308` is the one worth taking, and its defect is as much about
+diagnosis as about rendering. The site collects every call argument through
+`collect::<Option<Vec<_>>>()`, so a single argument that cannot be spelled
+becomes a refusal of the whole function, and the refusal says only that a
+projection authorization was missing. Which argument, and why, is discarded at
+exactly the point where it is known. Every other refusal on this branch has been
+made to name its subject -- placement now names the binding and its occurrences,
+the ledger names the layer and the obligation ids -- and this one has not, which
+is why it has stayed unowned while smaller causes were traced. Name the argument
+index and the value first, then the cause will be a short read rather than a
+hunt.
+
+## Candidate: the install lock is held about four times longer than it needs to be
+
+`locked_run.sh` wraps a whole command, so `run_matrix.sh` holds the lock across
+install, six sweeps, six compiles, six oracle builds and six verifications.
+Only the install and the six sweeps touch the installed plugin.
+
+The verification half was checked rather than assumed. `verify_rendering.py`
+invokes radare2 three times, for `iSj`, `iSSj` and `p8j`: a section list, a
+section-header list and raw bytes. None disassembles, none decompiles, and none
+depends on which plugin is installed. The compiles and the oracle runs touch
+nothing of ours at all.
+
+So the held window could shrink to install plus sweeps, which at six agents and
+a queue five deep is the difference between a wait measured in hours and one
+measured in minutes.
+
+It is not a small edit. The lock is owned by the wrapper, and moving it to the
+script that installs changes the contract of five callers -- the matrix, probe,
+coverage, shapes and values wrappers -- every one of which is being executed by
+a running agent. Bash reads a script by byte offset as it runs, so an in-place
+edit of a file mid-execution corrupts the instance reading it; an atomic replace
+avoids that, since the running shell keeps its descriptor on the old inode.
+
+Do it when the queue drains, not before, and use atomic replacement for every
+script edit from then on. Note also that whoever does it should keep the one-
+owner property that made the wrapper worth building: the lock belongs with the
+thing that needs exclusivity, so the honest end state is the installing script
+taking it directly rather than a wrapper guessing when to let go.
+## Two subsystems deleted, and the register tables collapsed onto geometry
+
+Three things landed on `arch/expr-accounting`, and one design fork is left
+open at the end because it is a decision rather than a bug.
+
+**The symbolic query island: nine modules, 17,446 lines.** The brief named
+`kernel.rs`, `telemetry.rs`, `r2api.rs`, the native worker's libc table and
+the `EngineSession` entry points. Checking each first, as the brief required,
+moved the boundary twice. `telemetry.rs` was already gone. The "libc table" is
+`function_semantic_summary_seed_for_name`, which returns `None`
+unconditionally and is *pinned* there by a dylint forbidding name-derived
+seeds -- it is a refusal the lint depends on, not a table, and deleting it
+would remove an assertion rather than dead code. And the island is larger than
+five names: `query`, `verification`, `symbol`, `spec`, `tactics`,
+`constraints`, `kernel`, `replay` and `r2api` reach each other and nothing
+else.
+
+What decides it is a single seam. Every export of those nine enters the rest
+of the tree only through `EngineSession::{symbolic_summary, symbolic_paths,
+symbolic_target_explore, symbolic_target_solve}` and their
+`_with_execution_control` variants, and those have no caller outside
+r2engine's own tests. Checked against radare2 rather than only against Rust,
+because that is how this survey has been wrong before: the C plugin sends
+three request kinds, seventeen analysis kinds, four query kinds and three
+planner kinds through `r2sleigh_api_v2`, and not one reaches a symbolic entry
+point. `r2api.rs` sits behind an `r2` cargo feature nothing enables.
+
+Four facts were asserted only inside the island and were kept. Three moved to
+`path.rs`, where `explore` runs the same worklist the deleted
+`summarize_function` wrapped, and they ask `ExploreStats` directly instead of
+through a `QueryCompletion` that was only the wrapper's spelling: a
+pre-cancelled exploration is a cooperative stop and not budget exhaustion, an
+expired deadline is not an exploration timeout, and the `max_states` budget
+stays distinct from execution control. The fourth stayed in `backward.rs`
+under a truer name -- it was checking that a load through a parameter pointer
+survives as a symbolic memory term, which belongs to the reverse-path compiler
+and not to the paired-branch entry it happened to call.
+
+Two traps in that deletion, both real. `replay.rs` cannot go without
+`compiled_semantic_info_with_replay_seed`, and with it go the `seed_mode` and
+`replay_seed_fingerprint` fields nothing else could populate. And
+`FactPrecision` is the one `kernel.rs` export with a user outside its module,
+`verification.rs`, which was going too -- so it escapes to nothing.
+
+**The register tables were producing wrong answers, and that turned out to
+matter more than the deletions.** Three tables in `r2types` answered
+register-identity questions by matching spellings. `register_family_matches`
+mapped `rdx` and `dh` to the same key "dx" and said they were the same
+parameter, so an externally supplied type assumption for `dh` was applied to
+the `rdx` parameter, counted toward the applied-parameter slots that grant
+signature-certificate authority, and named a stack slot after a parameter it
+does not carry.
+
+`dh` really is a byte of `rdx`, which is what makes the wrong answer tempting.
+The distinction a name cannot make is *where a register starts*: a parameter
+in `rdx` is read back as `rdx`, `edx`, `dx` or `dl`, all beginning where the
+register begins, and never as `dh`, which begins one byte in. So the predicate
+is not "same family" -- `dh` passes that -- but "same space at the same
+offset", which is exactly `CanonicalStorageId`.
+
+The owner already knew this and was not being asked. `RegisterFamilyInfo::
+from_arch` derives families by union-find over register byte ranges, so
+overlap decides membership and no name is consulted. Sitting on top of it was
+`seed_x86_low_register_aliases`, sixteen rows of GPR alias names behind an
+`arch.name.eq_ignore_ascii_case("x86-64")` gate. That seed is a no-op in
+production -- the real `ArchSpec` comes from `sleigh.register_name_map()`,
+which declares `AL`, `AH`, `AX`, `EAX` and `RAX` as separate varnodes -- and
+was load-bearing only for hand-built test `ArchSpec`s that name `RAX` and
+`EAX` and then use `AL`, a shape sleigh never emits. Three such tests now
+declare the register they use. The gate was wrong in the direction that
+matters too: keyed on the architecture's *name*, it silently supplied nothing
+for every architecture but two, making aliasing an x86 privilege rather than a
+property of storage.
+
+`RegisterFamilyInfo`, `RegisterFamilySlot` and `family_slot_contains` are now
+public, `from_arch` delegates to a `from_register_storages` that any holder of
+names-and-geometry can call, and `r2types::RegisterIdentity` builds one from
+the prepared function's machine context. `same_parameter_storage` replaces
+`register_family_matches` with no x86 branch and no arm64 branch: `w0` is the
+low half of `x0` for the same reason `edi` is the low half of `rdi`.
+
+**Where it stops, and the fork.** Two of the three tables are still there, and
+the second one needs a decision rather than more work.
+
+`scalar_register_family_key` (`prepare.rs:342`) gives `ah` and `al` one key,
+so `collect_register_live_in_aliases` emits an alias pair between disjoint
+storages and pointer-ness propagates across it; it also maps `rsp`, `esp` and
+`spl` to an x86 key while the reachable two-byte `SP` falls through to the
+AArch64 arm and becomes `aarch64:sp`. Its callers are internal helpers under
+`recover_vars_from_ssa(ssa_blocks, arch_name, ...)`, which has no machine
+context -- but `recover_vars_from_prepared_ssa(source, ptr_bits)` does. The
+work is to route the family key through `RegisterIdentity` on the prepared
+path; the legacy entry point is pinned by a dylint
+(`plugin_variable_recovery_ownership_expr`) and would need to keep answering
+something.
+
+`stack_base_from_var` (`writeback.rs:8781`) is the fork, and deleting it as
+briefed would be a regression rather than a fix. It builds the *raw* key that
+the rebase in `canonicalize_external_stack_slots_with_prep_facts` looks up in
+the externally supplied slot map, and the canonical key comes from
+`stack_address_root_of`; the rebase exists precisely because the two differ.
+Delete the raw side and no rebase can be attempted at all, on x86 either.
+
+The deeper problem is that the external key is minted where the machine is not
+known. `parse_external_stack_base` (`context.rs:1226`) runs over radare2 JSON
+inside `parse_external_vars`, before any prepared artifact exists, and maps a
+base register name to `FramePointer`, `StackPointer` or `Named(raw)` with a
+table knowing only `bp/ebp/rbp/fp` and `sp/esp/rsp`. So on AArch64 both halves
+fail differently and never meet: parsing yields `Named("x29")` while
+`stack_base_from_var` yields `None`. That is why AArch64 frame-pointer slots
+are structurally un-rebasable, and adding an `x29` case to either table would
+be extending the bug.
+
+Three defensible answers, and this is the decision to make:
+
+  (a) *Canonicalise at parse.* Thread a machine context into
+      `parse_external_vars` so `x29` becomes `FramePointer` at the source and
+      both sides agree by construction. Costs an ordering change to the
+      context pipeline, which today runs before a prepared artifact exists,
+      and touches every caller of the parser.
+
+  (b) *Record the raw name, resolve in writeback.* `parse_external_stack_base`
+      keeps `Named(raw)` whenever it is not certain, and the rebase resolves
+      `Named(n)` through `RegisterIdentity` and the machine context's
+      `frame_pointer_storage()` / `stack_pointer_carrier()`. Smallest change
+      and resolves where the knowledge is, but `ExternalStackBase` keeps a
+      variant meaning "unresolved", and every consumer must know that
+      `Named("x29")` and `FramePointer` may be the same slot.
+
+  (c) *Make the canonical key the only key.* Drop the name-derived variants
+      and key every external stack slot by `StackAddressRoot`, treating a slot
+      prep cannot root as unplaceable. Cleanest invariant, and it will lose
+      slots that work today wherever prep facts are absent or cannot root the
+      base.
+
+(b) looks right from here -- it fixes at the cause, which is that the parse
+layer genuinely does not know the machine -- but it decides what
+`ExternalStackBase` means for every consumer, so it is being asked rather than
+picked.
+
+The related `prepared_arch_name` defect (`prepare.rs:184`) is untouched: it
+re-spells the typed architecture family into a string that
+`recover_vars_arch_profile` then substring-matches, so `"x86"` matches the
+`contains("x86")` arm and 32-bit x86 is handed the SysV-64 argument
+registers. The fix is to pass `MachineArchitectureFamily` and read
+`machine_context().abi_model().argument_registers()`, and note the second
+feeder at `r2plugin/src/lib.rs:3268` passes radare2's own `"x86"` for both
+widths, so fixing one site leaves the other ambiguous.
+
+## The benchmark cannot see the array work, and that is a fact about the workload
+
+Array indexing landed and is measurably working: subscripts went from zero in
+all fifty-four corpus cells to twenty-one across eleven of them, with the
+snapshot column reporting mismatches on exactly those eleven and no others.
+
+`type_match` on DecBench did not move, and the reason is not the feature.
+Rendering every function of `bzip2recover` and counting gives **one** subscript
+in the whole binary, a store, against twenty-one on the hash corpus. The seven
+functions r2sleigh renders there are small input and output helpers with almost
+no indexed access at all.
+
+So the benchmark's *rendered subset* contains almost none of the construct, and
+a metric computed over it measures nothing about that construct. The apparent
+`type_match` rise, 0.100 to 0.125, is an artefact of a different kind and was
+caught by the per-function record: every function that scores is unchanged, and
+the mean moved only because a function scoring zero stopped being decompiled and
+left the denominator. Zero perfect functions, unchanged, against angr's three.
+
+Two consequences for how this project measures itself.
+
+A metric is only evidence about a feature if the population it is computed over
+exercises that feature. Before reporting that a change did or did not move a
+benchmark number, count how often the construct appears in what was actually
+rendered. That count is cheap and it is the difference between a result and a
+coincidence.
+
+And the way to make `type_match` mean something here is coverage, not more
+rules. The functions in that binary which do index arrays are among the ones
+r2sleigh still refuses, so the array work will remain unmeasurable there until
+the refusals fall. A second benchmark project with indexed access in its
+rendered subset would also serve, and is cheaper than waiting.

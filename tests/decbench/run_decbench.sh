@@ -23,6 +23,13 @@ baseline="$root/tests/decbench/baseline.json"
 accept=0
 gc_force=0
 run_root=${R2SLEIGH_DECBENCH_REMOTE_ROOT:-/root/r2sleigh-decbench-runs}
+
+# Keepalives, because a silent connection is the failure this script keeps
+# hitting. A build on a loaded host produces no output for many minutes, and if
+# the link drops in that window neither end notices: the remote work finishes,
+# the local script waits forever, and it reads as a hung build. Six missed
+# thirty-second probes ends it with an error instead.
+ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes)
 project=${R2SLEIGH_DECBENCH_PROJECT:-projects/sailr/bzip2.toml}
 opt=${R2SLEIGH_DECBENCH_OPT:-O0}
 
@@ -35,7 +42,7 @@ while [[ $# -gt 0 ]]; do
             # whose marker is still present belongs to a run that has not
             # reported, so it is left alone however old it looks; a marker
             # older than a day is treated as a crash and collected.
-            ssh "${host}" "GC_FORCE='${gc_force}' GC_ROOT='${run_root}' bash -s" <<'GC'
+            ssh "${ssh_keepalive[@]}" "${host}" "GC_FORCE='${gc_force}' GC_ROOT='${run_root}' bash -s" <<'GC'
 set -euo pipefail
 now=$(date -u +%s)
 force=${GC_FORCE:-0}
@@ -108,11 +115,11 @@ echo "witness $witness"
 # stale ones deleted a live run mid-build, which looks exactly like a build
 # failure and is not one. `--gc` below removes only directories without a live
 # marker, and nobody should be deleting them by hand instead.
-ssh "$host" "mkdir -p '$remote' && date -u +%s > '$remote/.running'"
-trap 'ssh "$host" "rm -f '"'$remote/.running'"'" 2>/dev/null || true' EXIT
+ssh "${ssh_keepalive[@]}" "$host" "mkdir -p '$remote' && date -u +%s > '$remote/.running'"
+trap 'ssh "${ssh_keepalive[@]}" "$host" "rm -f '"'$remote/.running'"'" 2>/dev/null || true' EXIT
 
-ssh "$host" "mkdir -p '$remote/tree'"
-git -C "$root" ls-files -z | rsync -a --files-from=- --from0 "$root/" "$host:$remote/tree/"
+ssh "${ssh_keepalive[@]}" "$host" "mkdir -p '$remote/tree'"
+git -C "$root" ls-files -z | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 "$root/" "$host:$remote/tree/"
 
 # The plugin's C is compiled against the radare2 fork, and this project changes
 # that fork. A tree whose C calls an API the host's fork does not have fails to
@@ -126,12 +133,12 @@ if [ -d "$fork_local/.git" ]; then
     # host's git HEAD: only tracked files are copied, so the host's `.git` never
     # advances and its HEAD would always disagree.
     want=$(git -C "$fork_local" rev-parse HEAD)
-    have=$(ssh "$host" "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
+    have=$(ssh "${ssh_keepalive[@]}" "$host" "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
     if [ "$want" != "$have" ]; then
         echo "radare2 fork: host at ${have:-none}, this tree wants $want; syncing and rebuilding"
         git -C "$fork_local" ls-files -z \
-            | rsync -a --files-from=- --from0 "$fork_local/" "$host:$fork_remote/"
-        ssh "$host" bash -s <<EOF
+            | rsync -a -e "ssh ${ssh_keepalive[*]}" --files-from=- --from0 "$fork_local/" "$host:$fork_remote/"
+        ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
 set -euo pipefail
 cd '$fork_remote'
 git config --global --add safe.directory '$fork_remote' 2>/dev/null || true
@@ -151,13 +158,13 @@ fi
 # check below failed on every tree it was ever pointed at -- a guard that
 # always fires is as useless as one that never does, and this one hid a
 # working install behind a stale-plugin error.
-ssh "$host" "cat >> $remote/tree/crates/r2engine/src/lib.rs" <<WITNESS
+ssh "${ssh_keepalive[@]}" "$host" "cat >> $remote/tree/crates/r2engine/src/lib.rs" <<WITNESS
 #[used]
 #[unsafe(no_mangle)]
 pub static DECBENCH_WITNESS: &str = "$witness";
 WITNESS
 
-ssh "$host" bash -s <<EOF
+ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
 set -euo pipefail
 mkdir -p '$private_home'
 export HOME='$private_home'
@@ -187,7 +194,7 @@ fi
 echo "installed \$lib, witness present"
 EOF
 
-ssh "$host" bash -s <<EOF
+ssh "${ssh_keepalive[@]}" "$host" bash -s <<EOF
 set -euo pipefail
 export HOME='$private_home'
 cd /root/decbench
@@ -201,9 +208,9 @@ test -f '$remote/out/function_results.json'
 EOF
 
 mkdir -p "$root/tests/decbench/artifacts"
-scp -q "$host:$remote/out/function_results.json" "$root/tests/decbench/artifacts/function_results.json"
-scp -q "$host:$remote/out/scoreboard.toml" "$root/tests/decbench/artifacts/scoreboard.toml"
-ssh "$host" "rm -rf '$remote'"
+scp -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -q "$host:$remote/out/function_results.json" "$root/tests/decbench/artifacts/function_results.json"
+scp -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -q "$host:$remote/out/scoreboard.toml" "$root/tests/decbench/artifacts/scoreboard.toml"
+ssh "${ssh_keepalive[@]}" "$host" "rm -rf '$remote'"
 
 python3 "$root/tests/decbench/report_decbench.py" \
     --results "$root/tests/decbench/artifacts/function_results.json" \

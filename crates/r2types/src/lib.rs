@@ -11,6 +11,7 @@ pub(crate) mod lattice;
 pub(crate) mod model;
 pub(crate) mod oracle;
 pub(crate) mod prepare;
+mod register_identity;
 pub(crate) mod role_registry;
 pub(crate) mod signature;
 pub(crate) mod signature_infer;
@@ -19,8 +20,7 @@ pub(crate) mod solver;
 pub(crate) mod writeback;
 
 pub fn parse_external_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
-    let normalized = external::normalize_external_type_name(spec);
-    facts::parse_type_like_spec(&normalized, ptr_bits)
+    convert::parse_c_type_like(spec, ptr_bits)
 }
 
 pub use callee::{
@@ -63,7 +63,7 @@ pub use facts::{
     SIGNATURE_PROJECTION_STRONG_CONFIDENCE, SIGNATURE_PROJECTION_WEAK_CONFIDENCE,
     ScalarArrayRenderCandidate, SignatureCertificate, SignatureCertificateSource,
     SignatureProjectionRejection, SignatureProjectionResult, SignatureProjectionSource,
-    VisibleBinding, VisibleBindingKind, is_generic_signature_type, parse_type_like_spec,
+    VisibleBinding, VisibleBindingKind, is_generic_signature_type,
     signature_hint_can_replace_existing, signature_param_count_is_authoritative,
     signature_param_name_is_weak, signature_projection_is_exact,
     signature_return_hint_can_replace_existing, signature_strength,
@@ -96,6 +96,7 @@ pub use prepare::{
 };
 pub use r2source::DisplayNames;
 pub use r2ssa::AssumptionUsageReport;
+pub use register_identity::RegisterIdentity;
 pub use role_registry::{
     signature_hint_for_role_identity, signature_hint_for_summary_kinds,
     type_projection_for_role_identity,
@@ -180,7 +181,7 @@ mod tests {
         );
         assert_eq!(
             parse_external_type_like_spec("type.IOCPU_VTable.setCPUNumber", 64),
-            Some(ptr_type(CTypeLike::Void))
+            None
         );
         assert_eq!(
             parse_external_type_like_spec("type.intptr_t", 64),

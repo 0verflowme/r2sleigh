@@ -615,18 +615,21 @@ fn normalized_signature_type(ty: &CTypeLike, ptr_bits: u32) -> CTypeLike {
 /// because both print `int32_t`. Parsing the name is how to get it right on
 /// purpose.
 ///
-/// The fold applies only when the parsed type spells itself the same way again.
-/// That is what separates `int32_t`, which is merely another way of writing the
-/// integer, from `size_t`, which is also sixty-four bits unsigned on this target
-/// but is not the same statement about the value: keeping it distinct is what
-/// lets a `size_t` still replace a bare `uint64_t` downstream. The round trip
-/// decides it, so there is no list of privileged names to maintain.
+/// The fold normally applies only when the parsed type spells itself the same
+/// way again. That separates `int32_t` from `size_t`, which is also sixty-four
+/// bits unsigned on this target but is a more specific statement about the
+/// value. Plain C `int` is the exception: it is a language scalar spelling, not
+/// a typedef identity, and this model's canonical spelling for it is
+/// `int32_t`.
 fn resolve_builtin_typedefs(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
     match ty {
         CTypeLike::Typedef(name) => {
-            let parsed = crate::convert::parse_c_type_like(&name, ptr_bits);
+            let Some(parsed) = crate::convert::parse_c_type_like(&name, ptr_bits) else {
+                return CTypeLike::Typedef(name);
+            };
+            let is_plain_c_int = matches!(name.trim().to_ascii_lowercase().as_str(), "int");
             if matches!(parsed, CTypeLike::Typedef(_))
-                || render_signature_type(&parsed, ptr_bits) != name
+                || (!is_plain_c_int && render_signature_type(&parsed, ptr_bits) != name)
             {
                 CTypeLike::Typedef(name)
             } else {
@@ -1534,6 +1537,35 @@ pub fn build_inferred_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_machine_bitvectors_parse_back_to_the_same_type() {
+        for bits in [1, 24, 129, 256] {
+            let ty = CTypeLike::BitVector(bits);
+            let spelling = render_signature_type(&ty, 64);
+            assert_eq!(crate::parse_c_type_like(&spelling, 64), Some(ty));
+        }
+    }
+
+    #[test]
+    fn plain_int_and_canonical_int32_are_equivalent() {
+        let source_spelling = CTypeLike::Typedef("int".to_string());
+        let canonical = CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Signed,
+        };
+
+        assert!(signature_types_are_equivalent(
+            &source_spelling,
+            &canonical,
+            64
+        ));
+        assert!(signature_types_are_equivalent(
+            &CTypeLike::Pointer(Box::new(source_spelling)),
+            &CTypeLike::Pointer(Box::new(canonical)),
+            64
+        ));
+    }
 
     /// Where comparing types differs from comparing the text they print to.
     ///

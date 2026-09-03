@@ -55,3 +55,9 @@ r2plugin/snapshot_walk.o
 
 # Whole-binary coverage sweep artifacts (binaries, dumps, measured report)
 tests/coverage/artifacts/
+
+# Benchmark run output. Only tests/decbench/baseline.json is a record; the
+# artifacts a run leaves behind are regenerated every time and differ per
+# machine, so tracking them made every worktree's merge collide on a file
+# nobody reads.
+tests/decbench/artifacts/

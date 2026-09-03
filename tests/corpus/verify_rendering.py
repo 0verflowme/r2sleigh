@@ -410,9 +410,35 @@ SHAPE_SPECS: dict[str, ScalarSpec] = {
     )
 }
 
+# Leaf functions, deliberately. The shape corpus asks whether a program shape
+# renders at all and mostly gets a refusal at a call boundary or a frame object.
+# These have neither, so the renderer has nothing to decline on and must commit
+# to an answer; the hazard is in the arithmetic, where a wrong result is a
+# plausible number rather than a refusal.
+VALUE_SPECS: dict[str, ScalarSpec] = {
+    name: ScalarSpec(64, 2, SHAPE_ARGUMENTS)
+    for name in (
+        "value_sign_extend",
+        "value_arith_shift",
+        "value_signed_compare",
+        "value_narrow_wrap",
+        "value_div_pow2",
+        "value_rotate",
+        "value_carry_chain",
+        "value_mul_high",
+        "value_byte_order",
+        "value_count_bits",
+        "value_overflow_flags",
+        "value_abs_minmax",
+        "value_width_conflict",
+    )
+}
+
 # The helpers each corpus carries. They are not scored, but a rendered call
 # needs its callee defined in the same translation unit, so the sweep captures
 # them under their own marker and `callee_definitions` picks them up by name.
+# The value corpus has none on purpose: a helper would reintroduce the call
+# boundary those functions exist to avoid.
 CORPUS_CALLEES = {
     "hashes": ("rotl32",),
     "shapes": (
@@ -430,11 +456,13 @@ CORPUS_CALLEES = {
         "op_xor",
         "op_mul",
     ),
+    "values": (),
 }
 
 CORPUS_SPECS: dict[str, dict[str, Any]] = {
     "hashes": SPECS,
     "shapes": SHAPE_SPECS,
+    "values": VALUE_SPECS,
 }
 
 
