@@ -9162,3 +9162,152 @@ them:
 The shape run was executed twice under the lock and produced identical column
 totals both times, so the fourteen renderings and the eight differential passes
 are reproducible rather than a scheduling artifact.
+
+## Two subsystems deleted, and the register tables collapsed onto geometry
+
+Three things landed on `arch/expr-accounting`, and one design fork is left
+open at the end because it is a decision rather than a bug.
+
+**The symbolic query island: nine modules, 17,446 lines.** The brief named
+`kernel.rs`, `telemetry.rs`, `r2api.rs`, the native worker's libc table and
+the `EngineSession` entry points. Checking each first, as the brief required,
+moved the boundary twice. `telemetry.rs` was already gone. The "libc table" is
+`function_semantic_summary_seed_for_name`, which returns `None`
+unconditionally and is *pinned* there by a dylint forbidding name-derived
+seeds -- it is a refusal the lint depends on, not a table, and deleting it
+would remove an assertion rather than dead code. And the island is larger than
+five names: `query`, `verification`, `symbol`, `spec`, `tactics`,
+`constraints`, `kernel`, `replay` and `r2api` reach each other and nothing
+else.
+
+What decides it is a single seam. Every export of those nine enters the rest
+of the tree only through `EngineSession::{symbolic_summary, symbolic_paths,
+symbolic_target_explore, symbolic_target_solve}` and their
+`_with_execution_control` variants, and those have no caller outside
+r2engine's own tests. Checked against radare2 rather than only against Rust,
+because that is how this survey has been wrong before: the C plugin sends
+three request kinds, seventeen analysis kinds, four query kinds and three
+planner kinds through `r2sleigh_api_v2`, and not one reaches a symbolic entry
+point. `r2api.rs` sits behind an `r2` cargo feature nothing enables.
+
+Four facts were asserted only inside the island and were kept. Three moved to
+`path.rs`, where `explore` runs the same worklist the deleted
+`summarize_function` wrapped, and they ask `ExploreStats` directly instead of
+through a `QueryCompletion` that was only the wrapper's spelling: a
+pre-cancelled exploration is a cooperative stop and not budget exhaustion, an
+expired deadline is not an exploration timeout, and the `max_states` budget
+stays distinct from execution control. The fourth stayed in `backward.rs`
+under a truer name -- it was checking that a load through a parameter pointer
+survives as a symbolic memory term, which belongs to the reverse-path compiler
+and not to the paired-branch entry it happened to call.
+
+Two traps in that deletion, both real. `replay.rs` cannot go without
+`compiled_semantic_info_with_replay_seed`, and with it go the `seed_mode` and
+`replay_seed_fingerprint` fields nothing else could populate. And
+`FactPrecision` is the one `kernel.rs` export with a user outside its module,
+`verification.rs`, which was going too -- so it escapes to nothing.
+
+**The register tables were producing wrong answers, and that turned out to
+matter more than the deletions.** Three tables in `r2types` answered
+register-identity questions by matching spellings. `register_family_matches`
+mapped `rdx` and `dh` to the same key "dx" and said they were the same
+parameter, so an externally supplied type assumption for `dh` was applied to
+the `rdx` parameter, counted toward the applied-parameter slots that grant
+signature-certificate authority, and named a stack slot after a parameter it
+does not carry.
+
+`dh` really is a byte of `rdx`, which is what makes the wrong answer tempting.
+The distinction a name cannot make is *where a register starts*: a parameter
+in `rdx` is read back as `rdx`, `edx`, `dx` or `dl`, all beginning where the
+register begins, and never as `dh`, which begins one byte in. So the predicate
+is not "same family" -- `dh` passes that -- but "same space at the same
+offset", which is exactly `CanonicalStorageId`.
+
+The owner already knew this and was not being asked. `RegisterFamilyInfo::
+from_arch` derives families by union-find over register byte ranges, so
+overlap decides membership and no name is consulted. Sitting on top of it was
+`seed_x86_low_register_aliases`, sixteen rows of GPR alias names behind an
+`arch.name.eq_ignore_ascii_case("x86-64")` gate. That seed is a no-op in
+production -- the real `ArchSpec` comes from `sleigh.register_name_map()`,
+which declares `AL`, `AH`, `AX`, `EAX` and `RAX` as separate varnodes -- and
+was load-bearing only for hand-built test `ArchSpec`s that name `RAX` and
+`EAX` and then use `AL`, a shape sleigh never emits. Three such tests now
+declare the register they use. The gate was wrong in the direction that
+matters too: keyed on the architecture's *name*, it silently supplied nothing
+for every architecture but two, making aliasing an x86 privilege rather than a
+property of storage.
+
+`RegisterFamilyInfo`, `RegisterFamilySlot` and `family_slot_contains` are now
+public, `from_arch` delegates to a `from_register_storages` that any holder of
+names-and-geometry can call, and `r2types::RegisterIdentity` builds one from
+the prepared function's machine context. `same_parameter_storage` replaces
+`register_family_matches` with no x86 branch and no arm64 branch: `w0` is the
+low half of `x0` for the same reason `edi` is the low half of `rdi`.
+
+**Where it stops, and the fork.** Two of the three tables are still there, and
+the second one needs a decision rather than more work.
+
+`scalar_register_family_key` (`prepare.rs:342`) gives `ah` and `al` one key,
+so `collect_register_live_in_aliases` emits an alias pair between disjoint
+storages and pointer-ness propagates across it; it also maps `rsp`, `esp` and
+`spl` to an x86 key while the reachable two-byte `SP` falls through to the
+AArch64 arm and becomes `aarch64:sp`. Its callers are internal helpers under
+`recover_vars_from_ssa(ssa_blocks, arch_name, ...)`, which has no machine
+context -- but `recover_vars_from_prepared_ssa(source, ptr_bits)` does. The
+work is to route the family key through `RegisterIdentity` on the prepared
+path; the legacy entry point is pinned by a dylint
+(`plugin_variable_recovery_ownership_expr`) and would need to keep answering
+something.
+
+`stack_base_from_var` (`writeback.rs:8781`) is the fork, and deleting it as
+briefed would be a regression rather than a fix. It builds the *raw* key that
+the rebase in `canonicalize_external_stack_slots_with_prep_facts` looks up in
+the externally supplied slot map, and the canonical key comes from
+`stack_address_root_of`; the rebase exists precisely because the two differ.
+Delete the raw side and no rebase can be attempted at all, on x86 either.
+
+The deeper problem is that the external key is minted where the machine is not
+known. `parse_external_stack_base` (`context.rs:1226`) runs over radare2 JSON
+inside `parse_external_vars`, before any prepared artifact exists, and maps a
+base register name to `FramePointer`, `StackPointer` or `Named(raw)` with a
+table knowing only `bp/ebp/rbp/fp` and `sp/esp/rsp`. So on AArch64 both halves
+fail differently and never meet: parsing yields `Named("x29")` while
+`stack_base_from_var` yields `None`. That is why AArch64 frame-pointer slots
+are structurally un-rebasable, and adding an `x29` case to either table would
+be extending the bug.
+
+Three defensible answers, and this is the decision to make:
+
+  (a) *Canonicalise at parse.* Thread a machine context into
+      `parse_external_vars` so `x29` becomes `FramePointer` at the source and
+      both sides agree by construction. Costs an ordering change to the
+      context pipeline, which today runs before a prepared artifact exists,
+      and touches every caller of the parser.
+
+  (b) *Record the raw name, resolve in writeback.* `parse_external_stack_base`
+      keeps `Named(raw)` whenever it is not certain, and the rebase resolves
+      `Named(n)` through `RegisterIdentity` and the machine context's
+      `frame_pointer_storage()` / `stack_pointer_carrier()`. Smallest change
+      and resolves where the knowledge is, but `ExternalStackBase` keeps a
+      variant meaning "unresolved", and every consumer must know that
+      `Named("x29")` and `FramePointer` may be the same slot.
+
+  (c) *Make the canonical key the only key.* Drop the name-derived variants
+      and key every external stack slot by `StackAddressRoot`, treating a slot
+      prep cannot root as unplaceable. Cleanest invariant, and it will lose
+      slots that work today wherever prep facts are absent or cannot root the
+      base.
+
+(b) looks right from here -- it fixes at the cause, which is that the parse
+layer genuinely does not know the machine -- but it decides what
+`ExternalStackBase` means for every consumer, so it is being asked rather than
+picked.
+
+The related `prepared_arch_name` defect (`prepare.rs:184`) is untouched: it
+re-spells the typed architecture family into a string that
+`recover_vars_arch_profile` then substring-matches, so `"x86"` matches the
+`contains("x86")` arm and 32-bit x86 is handed the SysV-64 argument
+registers. The fix is to pass `MachineArchitectureFamily` and read
+`machine_context().abi_model().argument_registers()`, and note the second
+feeder at `r2plugin/src/lib.rs:3268` passes radare2's own `"x86"` for both
+widths, so fixing one site leaves the other ambiguous.
