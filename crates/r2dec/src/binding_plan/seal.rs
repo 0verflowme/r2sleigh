@@ -487,13 +487,7 @@ impl BindingPlan {
             source,
             &self.machine_projection,
             &|query: &r2rewrite::ExpansionQuery<'_>| {
-                sealed_inlinable.contains(&query.value)
-                    || r2rewrite::term_is_duplicable(
-                        query.projection,
-                        query.arena,
-                        query.entry_never_redefined,
-                        query.producer_term,
-                    )
+                super::rules::term_absorbs_producer(&sealed_inlinable, query)
             },
         )
         .map_err(BindingPlanBuildError::Canonicalisation)?;
