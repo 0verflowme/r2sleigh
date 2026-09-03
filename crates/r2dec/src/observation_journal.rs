@@ -2780,6 +2780,29 @@ impl LegacyObservationJournal {
                                 .collect::<String>())
                         );
                     }
+                    let other_unaccounted = self
+                        .values
+                        .iter()
+                        .enumerate()
+                        .skip(index + 1)
+                        .filter(|(_, observation)| observation.is_none())
+                        .map(|(index, _)| {
+                            let value = ValueId(index as u32);
+                            let definition = graph
+                                .def_inst(value)
+                                .and_then(|inst| graph.inst(inst))
+                                .map(|inst| {
+                                    format!("{:?}", inst.payload)
+                                        .chars()
+                                        .take(70)
+                                        .collect::<String>()
+                                });
+                            (value, self.plan.disposition(value), definition)
+                        })
+                        .collect::<Vec<_>>();
+                    if !other_unaccounted.is_empty() {
+                        eprintln!("other unaccounted values: {other_unaccounted:?}");
+                    }
                 }
                 return Some(LegacyObservationJournalError::RenderedValueRequired(value));
             }

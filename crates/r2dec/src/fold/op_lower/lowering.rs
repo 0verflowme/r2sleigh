@@ -552,8 +552,22 @@ impl<'a> FoldingContext<'a> {
                     None => match definition
                         .and_then(|definition| self.inlined_definition_expr(definition))
                     {
-                        Some(rendered) => rendered,
-                        None => self.materialize_machine_expr(names, value, expr, 0)?,
+                        Some(rendered) => {
+                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                eprintln!(
+                                    "inline value {value:?} uses definition lowering {definition:?}"
+                                );
+                            }
+                            rendered
+                        }
+                        None => {
+                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                eprintln!(
+                                    "inline value {value:?} uses machine expression {expr:?}; definition={definition:?}"
+                                );
+                            }
+                            self.materialize_machine_expr(names, value, expr, 0)?
+                        }
                     },
                 };
                 // A constant has no defining instruction and owes no write or
