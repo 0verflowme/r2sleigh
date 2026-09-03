@@ -601,6 +601,199 @@ static bool sleigh_v2_analysis_result_release(R2SleighAnalysisResultV2 **result)
  * single-threaded radare2 usage. If radare2 becomes multi-threaded,
  * this code must be updated with proper synchronization (e.g., mutex).
  */
+/* Where the analysis callbacks spend their time.
+ *
+ * `sla.profilej` reports per function and only for the stages a decompile
+ * walks. The analysis callbacks are a different population: `op` runs per
+ * instruction and several times over for one byte, `analyze_fcn` and
+ * `get_data_refs` run per function, and none of the three had ever been
+ * separated from the others. Measured on bzip2recover, they are together
+ * about five times the proof sweep, so knowing only their sum is knowing the
+ * wrong thing.
+ *
+ * One counter and one accumulator per site, printed once at `fini` when
+ * `R2SLEIGH_TIMING` asks. Reading the clock twice per instruction is the whole
+ * cost when the switch is off, and the alternative -- deriving a per-callback
+ * figure by differencing whole-binary runs -- is the method this project has
+ * already had to withdraw a conclusion for. */
+typedef enum {
+	SLEIGH_CB_OP = 0,
+	SLEIGH_CB_OP_CONTEXT,
+	SLEIGH_CB_OP_LIFT,
+	SLEIGH_CB_OP_DISASM,
+	SLEIGH_CB_OP_ESIL,
+	SLEIGH_CB_OP_VAL,
+	SLEIGH_CB_ANALYZE_FCN,
+	SLEIGH_CB_DATA_REFS,
+	SLEIGH_CB_POST_ANALYSIS,
+	SLEIGH_CB_ELIGIBLE,
+	SLEIGH_CB_CONTEXT_CREATE,
+	SLEIGH_CB_REG_PROFILE,
+	SLEIGH_CB_SNAPSHOT_WALK,
+	SLEIGH_CB_SNAPSHOT_REUSE,
+	SLEIGH_CB_PROOF_ENGINE,
+	SLEIGH_CB_COUNT
+} SleighCallbackSite;
+
+static const char *const sleigh_callback_names[SLEIGH_CB_COUNT] = {
+	"op", "op.context", "op.lift", "op.disasm", "op.esil", "op.val",
+	"analyze_fcn", "get_data_refs", "post_analysis",
+	"eligible", "context.create", "context.regprofile",
+	"snapshot.walk", "snapshot.reuse", "proof.engine"
+};
+
+static ut64 sleigh_callback_calls[SLEIGH_CB_COUNT];
+static ut64 sleigh_callback_us[SLEIGH_CB_COUNT];
+
+static bool sleigh_callback_timing_enabled(void) {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = r_sys_getenv ("R2SLEIGH_TIMING")? 1: 0;
+	}
+	return enabled == 1;
+}
+
+static ut64 sleigh_callback_start(void) {
+	return sleigh_callback_timing_enabled ()? r_time_now_mono (): 0;
+}
+
+static void sleigh_callback_end(SleighCallbackSite site, ut64 started) {
+	if (!started) {
+		return;
+	}
+	sleigh_callback_calls[site]++;
+	sleigh_callback_us[site] += r_time_now_mono () - started;
+}
+
+static void sleigh_callback_report(void) {
+	if (!sleigh_callback_timing_enabled ()) {
+		return;
+	}
+	size_t i;
+	for (i = 0; i < SLEIGH_CB_COUNT; i++) {
+		if (!sleigh_callback_calls[i]) {
+			continue;
+		}
+		eprintf ("r2sleigh callback timing: %-14s calls=%-8"PFMT64u" total=%"PFMT64u"us mean=%"PFMT64u"ns\n",
+			sleigh_callback_names[i], sleigh_callback_calls[i],
+			sleigh_callback_us[i],
+			(sleigh_callback_us[i] * 1000) / sleigh_callback_calls[i]);
+		sleigh_callback_calls[i] = 0;
+		sleigh_callback_us[i] = 0;
+	}
+}
+
+/* One function's snapshot, taken once and read by everything that needs it.
+ *
+ * `r_core_function_snapshot_at` collects the function, its blocks, its bytes,
+ * its type graph and the bodies of everything it calls. Three separate places
+ * asked for one per function and each threw away all but the part it wanted:
+ * `sleigh_artifact_plan_init` walked the whole thing to read one 64-bit
+ * revision, once for the proof plan and again for the taint plan, and
+ * `sleigh_proven_facts_json` walked it a third time for the wire buffer.
+ * Measured on bzip2recover: 60 walks costing 3.04 seconds for the revision
+ * alone, plus 22 more costing 0.98 seconds for the buffer, against a
+ * post-analysis pass of about three seconds when the machine is quiet.
+ *
+ * One entry, because the three readers are consecutive for one function and a
+ * per-program cache of whole snapshots would hold the program twice over for
+ * no extra hit. It is keyed by the address together with both dirty epochs, so
+ * anything that edits the function or the type graph invalidates it by
+ * changing the key rather than by anyone remembering to.
+ *
+ * The wire buffer is always built. The walk is the cost -- 44.5ms with the
+ * buffer against 50.6ms without it, which is the same number twice -- so
+ * making it conditional would only add a way for the entry to miss. */
+typedef struct {
+	bool valid;
+	ut64 addr;
+	ut64 function_epoch;
+	ut64 type_epoch;
+	ut64 revision;
+	uint8_t *wire;
+	size_t wire_len;
+} SleighFunctionCapture;
+
+static SleighFunctionCapture sleigh_held_capture;
+
+typedef struct {
+	bool captured;
+	ut64 revision;
+	uint8_t *wire;
+	size_t wire_len;
+} SleighCaptureRequest;
+
+static bool sleigh_function_capture_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
+	SleighCaptureRequest *request = user;
+	RAnalFunctionSnapshotView view = {0};
+	if (!r_anal_function_snapshot_view (snapshot, &view)) {
+		return false;
+	}
+	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+	if (!writer) {
+		return false;
+	}
+	if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
+		request->wire = r2sleigh_wire_writer_finish (writer, &request->wire_len);
+	}
+	r2sleigh_wire_writer_free (writer);
+	if (!request->wire) {
+		return false;
+	}
+	request->revision = view.revision_identity;
+	request->captured = true;
+	return true;
+}
+
+static void sleigh_function_capture_release(void) {
+	free (sleigh_held_capture.wire);
+	memset (&sleigh_held_capture, 0, sizeof (sleigh_held_capture));
+}
+
+/* The snapshot for this function, walking for it only when what is held is not
+ * already exactly it. Returns NULL when the walk refused or when the analysis
+ * changed underneath it, which is the same fail-closed answer the three
+ * callers gave before. */
+static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFunction *fcn) {
+	if (!anal || !fcn) {
+		return NULL;
+	}
+	RCore *core = anal->coreb.core;
+	if (!core) {
+		return NULL;
+	}
+	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
+	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
+	SleighFunctionCapture *held = &sleigh_held_capture;
+	if (held->valid && held->addr == fcn->addr
+			&& held->function_epoch == function_epoch
+			&& held->type_epoch == type_epoch) {
+		const ut64 reuse_started = sleigh_callback_start ();
+		sleigh_callback_end (SLEIGH_CB_SNAPSHOT_REUSE, reuse_started);
+		return held;
+	}
+	sleigh_function_capture_release ();
+	SleighCaptureRequest request = {0};
+	const ut64 walk_started = sleigh_callback_start ();
+	const bool walked = r_core_function_snapshot_at (core, fcn->addr,
+		sleigh_function_capture_cb, &request, NULL);
+	sleigh_callback_end (SLEIGH_CB_SNAPSHOT_WALK, walk_started);
+	if (!walked || !request.captured || !request.revision
+			|| r_anal_function_dirty_epoch (fcn) != function_epoch
+			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+		free (request.wire);
+		return NULL;
+	}
+	held->valid = true;
+	held->addr = fcn->addr;
+	held->function_epoch = function_epoch;
+	held->type_epoch = type_epoch;
+	held->revision = request.revision;
+	held->wire = request.wire;
+	held->wire_len = request.wire_len;
+	return held;
+}
+
 static R2ILContext *sleigh_ctx = NULL;
 static char *sleigh_arch = NULL;
 static char *sleigh_reg_profile = NULL;
@@ -1665,11 +1858,6 @@ typedef struct {
 } TaintSummaryMap;
 
 typedef struct {
-	ut64 revision;
-	bool captured;
-} SleighArtifactRevision;
-
-typedef struct {
 	RCore *core;
 	const char *domain_id;
 	ut64 scope_id;
@@ -1688,17 +1876,6 @@ typedef struct {
 	bool failed;
 } SleighArtifactPlan;
 
-static bool sleigh_artifact_revision_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
-	SleighArtifactRevision *result = user;
-	RAnalFunctionSnapshotView view = {0};
-	if (!r_anal_function_snapshot_view (snapshot, &view)) {
-		return false;
-	}
-	result->revision = view.revision_identity;
-	result->captured = true;
-	return true;
-}
-
 static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 		RAnalFunction *fcn, const char *domain_id) {
 	if (!plan || !anal || !fcn || !domain_id || !*domain_id) {
@@ -1709,22 +1886,16 @@ static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 	if (!core) {
 		return false;
 	}
-	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
-	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
-	SleighArtifactRevision revision = {0};
-	if (!r_core_function_snapshot_at (core, fcn->addr,
-			sleigh_artifact_revision_cb, &revision, NULL)
-			|| !revision.captured || !revision.revision
-			|| r_anal_function_dirty_epoch (fcn) != function_epoch
-			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+	const SleighFunctionCapture *capture = sleigh_function_capture (anal, fcn);
+	if (!capture) {
 		return false;
 	}
 	plan->core = core;
 	plan->domain_id = domain_id;
 	plan->scope_id = fcn->addr;
-	plan->function_epoch = function_epoch;
-	plan->type_epoch = type_epoch;
-	plan->snapshot_revision = revision.revision;
+	plan->function_epoch = capture->function_epoch;
+	plan->type_epoch = capture->type_epoch;
+	plan->snapshot_revision = capture->revision;
 	return true;
 }
 
@@ -2832,80 +3003,6 @@ static bool sleigh_mode_is_fast(RAnal *anal) {
 	return mode == SLEIGH_MODE_FAST;
 }
 
-/* Where the analysis callbacks spend their time.
- *
- * `sla.profilej` reports per function and only for the stages a decompile
- * walks. The analysis callbacks are a different population: `op` runs per
- * instruction and several times over for one byte, `analyze_fcn` and
- * `get_data_refs` run per function, and none of the three had ever been
- * separated from the others. Measured on bzip2recover, they are together
- * about five times the proof sweep, so knowing only their sum is knowing the
- * wrong thing.
- *
- * One counter and one accumulator per site, printed once at `fini` when
- * `R2SLEIGH_TIMING` asks. Reading the clock twice per instruction is the whole
- * cost when the switch is off, and the alternative -- deriving a per-callback
- * figure by differencing whole-binary runs -- is the method this project has
- * already had to withdraw a conclusion for. */
-typedef enum {
-	SLEIGH_CB_OP = 0,
-	SLEIGH_CB_OP_CONTEXT,
-	SLEIGH_CB_OP_LIFT,
-	SLEIGH_CB_OP_DISASM,
-	SLEIGH_CB_OP_ESIL,
-	SLEIGH_CB_OP_VAL,
-	SLEIGH_CB_ANALYZE_FCN,
-	SLEIGH_CB_DATA_REFS,
-	SLEIGH_CB_POST_ANALYSIS,
-	SLEIGH_CB_COUNT
-} SleighCallbackSite;
-
-static const char *const sleigh_callback_names[SLEIGH_CB_COUNT] = {
-	"op", "op.context", "op.lift", "op.disasm", "op.esil", "op.val",
-	"analyze_fcn", "get_data_refs", "post_analysis"
-};
-
-static ut64 sleigh_callback_calls[SLEIGH_CB_COUNT];
-static ut64 sleigh_callback_us[SLEIGH_CB_COUNT];
-
-static bool sleigh_callback_timing_enabled(void) {
-	static int enabled = -1;
-	if (enabled < 0) {
-		enabled = r_sys_getenv ("R2SLEIGH_TIMING")? 1: 0;
-	}
-	return enabled == 1;
-}
-
-static ut64 sleigh_callback_start(void) {
-	return sleigh_callback_timing_enabled ()? r_time_now_mono (): 0;
-}
-
-static void sleigh_callback_end(SleighCallbackSite site, ut64 started) {
-	if (!started) {
-		return;
-	}
-	sleigh_callback_calls[site]++;
-	sleigh_callback_us[site] += r_time_now_mono () - started;
-}
-
-static void sleigh_callback_report(void) {
-	if (!sleigh_callback_timing_enabled ()) {
-		return;
-	}
-	size_t i;
-	for (i = 0; i < SLEIGH_CB_COUNT; i++) {
-		if (!sleigh_callback_calls[i]) {
-			continue;
-		}
-		eprintf ("r2sleigh callback timing: %-14s calls=%-8"PFMT64u" total=%"PFMT64u"us mean=%"PFMT64u"ns\n",
-			sleigh_callback_names[i], sleigh_callback_calls[i],
-			sleigh_callback_us[i],
-			(sleigh_callback_us[i] * 1000) / sleigh_callback_calls[i]);
-		sleigh_callback_calls[i] = 0;
-		sleigh_callback_us[i] = 0;
-	}
-}
-
 static void sleigh_profile_clear(void) {
 	for (size_t i = 0; i < sleigh_profile_count; i++) {
 		free (sleigh_profile_entries[i].name);
@@ -3322,7 +3419,10 @@ R2ILContext *get_context(RAnal *anal) {
 
 	/* Check if we need to reinitialize */
 	if (sleigh_ctx && sleigh_arch && !strcmp (sleigh_arch, sleigh_arch_str)) {
-		if (!install_context_reg_profile (anal, sleigh_ctx)) {
+		const ut64 profile_started = sleigh_callback_start ();
+		const bool installed = install_context_reg_profile (anal, sleigh_ctx);
+		sleigh_callback_end (SLEIGH_CB_REG_PROFILE, profile_started);
+		if (!installed) {
 			R_LOG_DEBUG ("r2sleigh: cached register profile installation failed for %s", sleigh_arch_str);
 			return NULL;
 		}
@@ -3339,7 +3439,9 @@ R2ILContext *get_context(RAnal *anal) {
 	sleigh_arch = NULL;
 
 	/* Initialize new context */
+	const ut64 create_started = sleigh_callback_start ();
 	uint32_t status = sleigh_v2_context_create (sleigh_arch_str, &sleigh_ctx);
+	sleigh_callback_end (SLEIGH_CB_CONTEXT_CREATE, create_started);
 	if (status != R2SLEIGH_STATUS_OK_V2 || !sleigh_ctx) {
 		/* Optional-arch builds are expected to miss some backends; stay silent
 		 * so unsupported architectures fall back to other anal plugins. */
@@ -3477,6 +3579,10 @@ static bool sleigh_init(RAnal *anal) {
 
 static bool sleigh_fini(RAnal *anal) {
 	(void)anal;
+	/* Also here, not only after post-analysis: an `aa` run never reaches the
+	 * sweep, and `aa` is where most of the callback cost turned out to be. */
+	sleigh_callback_report ();
+	sleigh_function_capture_release ();
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
 	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
@@ -4721,46 +4827,25 @@ static bool sleigh_function_may_prove(RAnal *anal, RAnalFunction *fcn) {
 	return false;
 }
 
-/* Every fact the engine proved about one function, as JSON.
- *
- * The snapshot has to be serialized inside the borrow: the pointer tables the
- * proof needs are read from memory during the capture, and the snapshot stops
- * being valid the moment the callback returns. */
-typedef struct {
-	uint8_t *buffer;
-	size_t len;
-} SleighSnapshotWire;
-
-static bool sleigh_snapshot_wire_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
-	SleighSnapshotWire *out = user;
-	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
-	if (!writer) {
-		return false;
-	}
-	if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
-		out->buffer = r2sleigh_wire_writer_finish (writer, &out->len);
-	}
-	r2sleigh_wire_writer_free (writer);
-	return out->buffer != NULL;
-}
-
-static char *sleigh_proven_facts_json(RCore *core, ut64 function_addr) {
-	SleighSnapshotWire wire = {0};
-	if (!r_core_function_snapshot_at (core, function_addr,
-			sleigh_snapshot_wire_cb, &wire, NULL) || !wire.buffer) {
-		free (wire.buffer);
+/* The buffer comes from the capture rather than from a walk of this function's
+ * own. The proof plan has already taken one for its revision, and walking again
+ * for the same bytes was 0.98 seconds of bzip2recover's post-analysis. */
+static char *sleigh_proven_facts_json(RAnal *anal, RAnalFunction *fcn) {
+	const SleighFunctionCapture *capture = sleigh_function_capture (anal, fcn);
+	if (!capture || !capture->wire) {
 		return NULL;
 	}
 	const R2SleighEngineRequestPayloadV2 payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
 		.struct_size = sizeof (payload),
 		.timeout_us = 0,
-		.snapshot_buffer = wire.buffer,
-		.snapshot_buffer_len = wire.len,
+		.snapshot_buffer = capture->wire,
+		.snapshot_buffer_len = capture->wire_len,
 	};
+	const ut64 engine_started = sleigh_callback_start ();
 	char *json = sleigh_engine_execute_v2 (R2SLEIGH_REQUEST_PROVEN_FACTS_V2,
 		R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2, &payload);
-	free (wire.buffer);
+	sleigh_callback_end (SLEIGH_CB_PROOF_ENGINE, engine_started);
 	return json;
 }
 
@@ -4771,8 +4856,8 @@ static char *sleigh_proven_facts_json(RCore *core, ut64 function_addr) {
  * next to it names the table and the count so a reader can check the claim
  * instead of taking it. */
 static bool collect_proof_artifacts_for_function(SleighArtifactPlan *plan,
-		RCore *core, RAnalFunction *fcn, size_t *out_xrefs, size_t *out_dead) {
-	char *json = sleigh_proven_facts_json (core, fcn->addr);
+		RAnal *anal, RAnalFunction *fcn, size_t *out_xrefs, size_t *out_dead) {
+	char *json = sleigh_proven_facts_json (anal, fcn);
 	if (!json) {
 		// Refusing is the fail-closed path, so say which function and move on.
 		R_LOG_DEBUG ("r2sleigh: no proofs for 0x%08"PFMT64x, fcn->addr);
@@ -5101,7 +5186,9 @@ cleanup:
 
 /* Eligibility/priority callback: score > 0 = eligible with priority, < 0 = ineligible */
 static int sleigh_eligible(RAnal *anal) {
+	const ut64 started = sleigh_callback_start ();
 	R2ILContext *ctx = get_context (anal);
+	sleigh_callback_end (SLEIGH_CB_ELIGIBLE, started);
 	return ctx ? 10 : -1;
 }
 
@@ -5191,7 +5278,7 @@ static bool sleigh_post_analysis_inner(RAnal *anal) {
 		const bool proof_eligible = post_mode >= SLEIGH_MODE_FULL
 			|| sleigh_function_may_prove (anal, fcn);
 		if (proof_eligible && sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
-			if (collect_proof_artifacts_for_function (&proof_plan, core, fcn,
+			if (collect_proof_artifacts_for_function (&proof_plan, anal, fcn,
 					&proof_xrefs, &proof_dead_blocks)
 					&& sleigh_artifact_plan_submit (&proof_plan)) {
 				proof_fcns++;
@@ -5297,6 +5384,7 @@ static bool sleigh_post_analysis_inner(RAnal *anal) {
 		proof_fcns, proof_skipped, proof_refused, proof_xrefs, proof_dead_blocks);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
+	sleigh_function_capture_release ();
 	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",
 		num_fcns, post_budget_exhausted? 1: 0);
 	if (best_sink_label) {
