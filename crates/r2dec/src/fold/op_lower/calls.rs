@@ -359,21 +359,31 @@ impl<'a> FoldingContext<'a> {
     ) -> Option<CExpr> {
         let prepared = self.inputs.prepared_ssa?;
         let call = prepared.graph().inst_id_for_op_site(site.0, site.1)?;
-        if let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
-            prepared,
-            call,
-            argument_index,
-            value,
-        )
-        .filter(|_| {
-            self.inputs.binding_names.is_some_and(|names| {
-                matches!(
-                    names.require_value(value),
-                    Ok(crate::binding_plan::PlannedValueSymbol::Inline(_))
-                )
+        // Object identity licenses the source-level spelling only when the
+        // same plan also gave that object a program variable. A refused stack
+        // identity still has a valid ordinary machine spelling; declining
+        // this replacement must therefore fall through rather than turn that
+        // unrelated function into a lowering refusal.
+        if let Some((object, (expr, ty))) =
+            crate::binding_plan::certified_frame_object_call_argument(
+                prepared,
+                call,
+                argument_index,
+                value,
+            )
+            .filter(|_| {
+                self.inputs.binding_names.is_some_and(|names| {
+                    matches!(
+                        names.require_value(value),
+                        Ok(crate::binding_plan::PlannedValueSymbol::Inline(_))
+                    )
+                })
             })
-        }) {
-            let (expr, ty) = self.certified_stack_address_expr_for_object(object)?;
+            .and_then(|object| {
+                self.certified_stack_address_expr_for_object(object)
+                    .map(|spelling| (object, spelling))
+            })
+        {
             let expr = self.finish_replacement_expr(PendingReplacementExpr::escaped_stack_address(
                 value,
                 call,

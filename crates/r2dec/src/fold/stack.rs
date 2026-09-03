@@ -41,9 +41,6 @@ impl<'a> FoldingContext<'a> {
         let crate::binding_plan::StackObjectDisposition::Bound { binding } =
             names.plan().stack_object_disposition(object)?
         else {
-            self.retain_first_lowering_refusal(
-                super::op_lower::OpLoweringRefusal::missing_program_variable(),
-            );
             return None;
         };
         let ty = names.plan().binding(binding)?.declaration_type().clone();
