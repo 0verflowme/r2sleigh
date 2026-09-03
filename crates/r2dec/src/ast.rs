@@ -999,6 +999,15 @@ impl StmtObservationChain {
         stmt
     }
 
+    /// Move the exact statement occurrence into an expression-valued header
+    /// position without dropping its observation ownership.
+    pub(crate) fn reapply_expr(self, mut expr: CExpr) -> CExpr {
+        for id in self.outer_to_inner.into_iter().rev() {
+            expr = CExpr::observed(id, expr);
+        }
+        expr
+    }
+
     /// Reattach this chain when decomposition has one exact surviving statement.
     ///
     /// Returning `false` means the semantic position was deleted or split into

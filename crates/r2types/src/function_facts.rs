@@ -937,6 +937,7 @@ pub enum CertifiedEntity {
         base: r2ssa::StackAddressBase,
         offset: i64,
         size: Option<u32>,
+        array_layout: r2ssa::StackArrayLayoutDisposition,
         /// Full source slot identity, including its local/parameter-home role.
         /// Absence grants no source-variable identity; a separate upstream
         /// callee-allocation proof is required for an anonymous C object.
@@ -1165,6 +1166,7 @@ pub struct LoopStructureFact {
     pub body: Vec<u64>,
     pub latches: Vec<u64>,
     pub exits: Vec<u64>,
+    pub for_loop: Option<r2ssa::ForLoopCertificate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4111,6 +4113,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                     base: cert.base,
                     offset: cert.offset,
                     size: cert.size,
+                    array_layout: cert.array_layout.clone(),
                     source_slot: cert.source_slot,
                     callee_allocation: cert.callee_allocation.clone(),
                 },
@@ -4434,6 +4437,7 @@ fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts
                     body: sorted_u64s(&cert.body),
                     latches: sorted_u64s(&cert.latches),
                     exits: sorted_u64s(&cert.exits),
+                    for_loop: cert.for_loop.clone(),
                 },
             )
         })
@@ -4833,6 +4837,7 @@ mod tests {
             base: r2ssa::StackAddressBase::FramePointer,
             offset: -8,
             size: Some(8),
+            array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
             source_slot: None,
             callee_allocation: None,
         };
@@ -5275,6 +5280,7 @@ mod tests {
                             base,
                             offset,
                             size: None,
+                            array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
                             source_slot: None,
                             callee_allocation: None,
                         },
@@ -7093,6 +7099,7 @@ mod tests {
             body: vec![0x403000, 0x403010],
             latches: vec![0x403010],
             exits: vec![0x403020],
+            for_loop: None,
         };
         let control = FunctionControlFacts {
             branch_predicates: BTreeMap::from([(branch.block_addr, branch.clone())]),
@@ -7177,6 +7184,7 @@ mod tests {
                     base: r2ssa::StackAddressBase::FramePointer,
                     offset: -8,
                     size: None,
+                    array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
                     source_slot: None,
                     callee_allocation: None,
                 },
