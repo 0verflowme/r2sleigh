@@ -10704,3 +10704,34 @@ the machine projection, or for a rendering through
 rather than a ten-minute locked run. Both assertions now exist:
 `a_call_leaves_the_stack_pointer_where_the_convention_says_it_found_it` in
 `r2ssa::function` and `a_restored_stack_pointer_renders` in `r2dec`.
+
+## A noise improvement that was two cells going missing
+
+Earlier in this session the call-restore work appeared to reduce the noise
+columns substantially, and reverting it appeared to put them back:
+
+| column | "with" | "without" |
+| --- | --- | --- |
+| same-type casts | 136 | 185 |
+| gotos | 39 | 55 |
+| self-assignments | 148 | 155 |
+| flag carriers | 183 | 192 |
+
+That reading was wrong and the mechanism is worth naming, because it is the
+third time this session the same trap has caught someone. The "with" column was
+measured while `murmur3_32` and `xxhash32` at x64_O0 were **refusing**. A cell
+that renders nothing contributes no noise, so removing two of the largest cells
+from the corpus lowered every count. With the sealing order fixed, both cells
+render again and the honest figures are the higher ones.
+
+The same shape has now appeared three ways. A benchmark mean rose because a
+function scoring zero stopped being decompiled and left the denominator. An
+inlining attempt turned away every candidate and produced a green gate that had
+done nothing. And here, a noise column fell because two cells vanished.
+
+**A count over a population is only comparable when the population is.** Before
+reading any improvement in a per-corpus total, check that the same cells are
+present on both sides. The coverage report already records `decompiled` beside
+each score for exactly this reason; the noise columns do not, and a
+`cells_rendered` denominator printed beside them would make this class of
+mistake impossible rather than merely detectable.
