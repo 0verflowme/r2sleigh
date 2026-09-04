@@ -326,8 +326,17 @@ class RawR2SleighDecompiler(Decompiler):
             if not common.should_skip_function(name, to_file_addr(addr), text_range)
         ]
         if functions is not None:
-            requested = {name for (name, _) in functions}
-            candidates = [(name, addr) for (name, addr) in candidates if name in requested]
+            # Compare on the source's own name, not radare2's flag. radare2
+            # spells a function it learned from DWARF `dbg.slide_hash`, while the
+            # benchmark asks for `slide_hash`, so a raw comparison matches
+            # nothing and silently discards every candidate -- the binary then
+            # reports no functions at all, which reads as a decompiler with
+            # nothing to say rather than a filter that removed the work.
+            requested = {_source_name(name) for (name, _) in functions}
+            candidates = [
+                (name, addr) for (name, addr) in candidates
+                if _source_name(name) in requested
+            ]
         # The benchmark hands a stripped binary and names its own targets by
         # DWARF low_pc, so narrowing is by address, not by symbol.
         narrowed = common.narrow_to_source(
