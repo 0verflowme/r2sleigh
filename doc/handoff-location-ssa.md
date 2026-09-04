@@ -12135,3 +12135,33 @@ measurement and has not been run. It costs about 13.7 hours and 0.06 GiB with
 per-project garbage collection, so it is affordable; what makes it premature is
 that ninety-four functions are known dark. Running it now would measure a state
 we already know is wrong, and the number would then be quoted.
+
+### Why four local gates missed ninety-four dark functions
+
+Not gate design. Coverage level.
+
+When the variadic argument-count proof landed, the benchmark lost 94 functions
+that had been rendering. Locally: the differential corpus stayed at 54 of 54,
+the pinned binaries reported **zero** regressions, and `/bin/ls` reported zero.
+The class was plainly visible in all of them -- 30 `variadic callsite argument
+count` refusals in the coverage sweep against zero in the baseline, 17 of them
+in `/bin/ls` alone -- but every single one arrived as a *cause change* on a
+function that was already refusing for some other reason.
+
+**A regression cannot be observed in a function that already fails to render.**
+The local populations refuse too much to be sensitive: `system_ls` renders 12 of
+136. The benchmark renders 645 of 1,768, so it had something to lose and lost
+it. That is the whole of the difference.
+
+Two consequences worth holding onto.
+
+Sensitivity is a function of coverage, so every function recovered makes the
+local gates better at detecting the next regression, quite apart from the
+coverage number itself. The argument for pushing coverage is not only that
+angr renders 99.2 per cent to our 36.5.
+
+And adding shapes to the corpus does not fix this on its own. A synthetic cell
+that refuses for an unrelated reason is exactly as blind as `/bin/ls` was:
+`shape_bool_probe` was added for this class and refuses on machine-projection
+authorization instead, so it too would report nothing the day the variadic path
+breaks something. A gate cell only guards what it renders.
