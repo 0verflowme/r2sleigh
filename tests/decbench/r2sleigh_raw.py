@@ -30,6 +30,15 @@ where the tool actually reported an honest decline, and both are zero on every
 metric anyway; the counts are kept in the result metadata so the decline rate
 stays visible.
 
+Two very different things can leave a function with no output, and this adapter
+keeps them apart. r2sleigh declining is an answer. The ``r2`` process dying
+part-way through the batch is the harness failing to ask, and because the batch
+is one process, every function past the cut would otherwise look exactly like a
+decline -- which is how five zlib binaries reported zero functions apiece
+without anyone reading it as a crash. Those functions are declined with a
+``harness:`` cause naming how the process ended and where the stream stopped,
+and the run's metadata records the ending of both ``r2`` passes.
+
 Locate the CLI via ``$R2SLEIGH_R2_BIN`` (an explicit ``r2`` path) or ``r2`` on
 ``$PATH``. The plugin itself must already be installed into radare2's plugin
 directory (``make -C r2plugin install`` in the r2sleigh tree); availability is
@@ -43,8 +52,10 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -114,18 +125,90 @@ def _r2_bin() -> Path | None:
     return Path(found) if found else None
 
 
-def _run_r2(binary: Path, commands: str, timeout: float) -> str:
+def _signal_name(number: int) -> str:
+    """``SIGSEGV`` rather than ``11``; the bare number hides which bug it is."""
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return "unknown"
+
+
+def _subprocess_text(value: Any) -> str:
+    """Whatever a subprocess handed back, as text, without ever raising.
+
+    ``TimeoutExpired`` carries its partial stdout as *bytes* even under
+    ``text=True``: the POSIX reader joins the raw chunks into the exception
+    before the decode that text mode would otherwise apply. The stream is also
+    cut wherever the kill landed, so it can end mid-character. Replacing rather
+    than raising matters here -- output lost to a decode error is exactly the
+    evidence this adapter is trying to keep.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return ""
+
+
+@dataclass(frozen=True)
+class _R2Run:
+    """What one ``r2`` invocation printed, together with how the process ended.
+
+    Handing back bare stdout makes a crash indistinguishable from a quiet run: a
+    truncated stream simply has fewer function markers in it, and everything
+    past the cut is dropped as though the decompiler had declined it. Carrying
+    the exit status alongside the text is what lets a caller tell "r2sleigh had
+    nothing to say" from "r2 was not alive to be asked".
+    """
+
+    stdout: str
+    returncode: int | None
+    """``None`` when the process was killed on timeout and so has no status."""
+    timeout: float
+
+    @property
+    def ended_early(self) -> bool:
+        """Whether it finished any way other than a clean exit."""
+        return self.returncode != 0
+
+    @property
+    def ending(self) -> str:
+        """How it finished, in the words the census and metadata should carry."""
+        if self.returncode is None:
+            return f"timed out after {self.timeout:g}s"
+        if self.returncode < 0:
+            # POSIX reports a fatal signal as the negated signal number, and the
+            # number on its own is not something a reader should have to look
+            # up: SIGSEGV and SIGKILL point at very different bugs.
+            return f"killed by signal {-self.returncode} ({_signal_name(-self.returncode)})"
+        if self.returncode:
+            return f"exited {self.returncode}"
+        return "completed"
+
+
+def _run_r2(binary: Path, commands: str, timeout: float) -> _R2Run:
     executable = _r2_bin()
     if executable is None:
         raise RuntimeError("no r2 on PATH and $R2SLEIGH_R2_BIN unset")
-    proc = subprocess.run(  # noqa: S603
-        [str(executable), *_R2_FLAGS, "-c", commands, str(binary)],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    return proc.stdout
+    argv = [str(executable), *_R2_FLAGS, "-c", commands, str(binary)]
+    try:
+        proc = subprocess.run(  # noqa: S603
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as expired:
+        # Letting this propagate loses the whole binary -- its census with it --
+        # when the process had in fact answered for most of the batch. Partial
+        # output is strictly more informative than none, and it cannot be
+        # mistaken for a complete run because the result says how it ended.
+        log.warning("r2 timed out after %ss on %s", timeout, binary.name)
+        return _R2Run(stdout=_subprocess_text(expired.stdout), returncode=None, timeout=timeout)
+    if proc.returncode != 0:
+        log.warning("r2 exited %s on %s", proc.returncode, binary.name)
+    return _R2Run(stdout=proc.stdout, returncode=proc.returncode, timeout=timeout)
 
 
 @register_decompiler("r2sleigh")
@@ -150,7 +233,7 @@ class RawR2SleighDecompiler(Decompiler):
         # The plugin is what we are benchmarking, not radare2: probe that
         # `a:sla` actually swaps the architecture rather than that r2 exists.
         try:
-            out = _run_r2(Path("/bin/ls"), "a:sla; e asm.arch", timeout=60.0)
+            out = _run_r2(Path("/bin/ls"), "a:sla; e asm.arch", timeout=60.0).stdout
         except Exception:  # noqa: BLE001
             return False
         return "sla: loaded architecture" in out or "sleigh" in out.lower()
@@ -176,9 +259,19 @@ class RawR2SleighDecompiler(Decompiler):
     # Discovery
     #
 
-    def _discover(self, binary_path: Path, timeout: float) -> tuple[list[tuple[str, int]], int]:
-        """Every function radare2 finds, with its address and the load base."""
-        out = _run_r2(binary_path, "a:sla; aaa; e bin.baddr; aflj", timeout=timeout)
+    def _discover(
+        self, binary_path: Path, timeout: float
+    ) -> tuple[list[tuple[str, int]], int, _R2Run]:
+        """Every function radare2 finds, its address, the load base, and the run.
+
+        The run comes back because an empty function list has two causes that
+        look identical from here: a binary radare2 genuinely found nothing in,
+        and an `aaa` that never finished. The caller has to be able to say which
+        one it is reporting, otherwise the fix for the batch pass just moves the
+        silence one step earlier.
+        """
+        run = _run_r2(binary_path, "a:sla; aaa; e bin.baddr; aflj", timeout=timeout)
+        out = run.stdout
         # `e bin.baddr` answers with a bare integer, decimal or `0x`-prefixed,
         # and prints `0` for a position-independent executable.
         baddr = 0
@@ -193,15 +286,17 @@ class RawR2SleighDecompiler(Decompiler):
             except ValueError:
                 continue
         if payload is None:
-            return [], baddr
+            return [], baddr, run
         try:
             functions = json.loads(payload)
         except json.JSONDecodeError:
-            return [], baddr
+            return [], baddr, run
         # `aflj` names the entry `addr`; older builds used `offset`.
-        return [
-            (f.get("name", ""), int(f.get("addr", f.get("offset", 0)))) for f in functions
-        ], baddr
+        return (
+            [(f.get("name", ""), int(f.get("addr", f.get("offset", 0)))) for f in functions],
+            baddr,
+            run,
+        )
 
     #
     # Decompilation
@@ -218,7 +313,7 @@ class RawR2SleighDecompiler(Decompiler):
         started = time.time()
         binary_timeout = float(self.config.binary_timeout_seconds)
 
-        discovered, baddr = self._discover(binary_path, binary_timeout)
+        discovered, baddr, discovery = self._discover(binary_path, binary_timeout)
         min_vaddr = common.elf_min_vaddr(binary_path)
         text_range = common.elf_text_ranges(binary_path)
 
@@ -246,6 +341,8 @@ class RawR2SleighDecompiler(Decompiler):
 
         rendered: dict[str, FunctionDecompilation] = {}
         declined: dict[str, str] = {}
+        decompile: _R2Run | None = None
+        unreached = 0
 
         if candidates:
             script = ["a:sla", "aaa"]
@@ -254,11 +351,29 @@ class RawR2SleighDecompiler(Decompiler):
                 script.append(f"s {addr}")
                 script.append("pdd")
                 script.append(f"?e {_END}{index}")
-            out = _run_r2(binary_path, "; ".join(script), timeout=binary_timeout)
+            decompile = _run_r2(binary_path, "; ".join(script), timeout=binary_timeout)
+
+            # Slice once and keep the answers, because where the slices stop is
+            # itself the finding. The batch is a single process, so the first
+            # function it fails to bracket is where r2 stopped being alive, and
+            # every later one is missing for that same reason rather than for
+            # anything about its own code -- one cause, named once, counted by
+            # how many functions carry it.
+            bodies = [_slice(decompile.stdout, index) for index in range(len(candidates))]
+            stopped_at = next((i for i, body in enumerate(bodies) if body is None), None)
+            harness = ""
+            if stopped_at is not None:
+                harness = _harness_cause(decompile, stopped_at, len(candidates))
 
             for index, (name, addr) in enumerate(candidates):
-                body = _slice(out, index)
+                body = bodies[index]
                 if body is None:
+                    # Skipping quietly here is the whole defect: it makes a dead
+                    # process read as a decompiler with nothing to say. Nothing
+                    # was produced, so it is recorded as declined, but with a
+                    # cause that says the reason is ours.
+                    declined[name] = harness
+                    unreached += 1
                     continue
                 refusal = _REFUSAL.search(body)
                 if refusal is not None:
@@ -277,7 +392,13 @@ class RawR2SleighDecompiler(Decompiler):
                     metadata=common.extract_metrics(code),
                 )
 
+        # Unconditionally, and after the harness causes have been folded in. A
+        # crashed process is the case where the census is most worth having and
+        # was previously the one case that never wrote one, because the timeout
+        # escaped before this line.
         _write_refusal_census(output_dir, binary_path, declined, len(rendered))
+
+        ended_early = discovery.ended_early or (decompile is not None and decompile.ended_early)
 
         elapsed = time.time() - started
         return DecompilationResult(
@@ -292,6 +413,18 @@ class RawR2SleighDecompiler(Decompiler):
                     "rendered": len(rendered),
                     "declined": len(declined),
                     "decline_causes": declined,
+                    # A sweep is read by comparing its counts against the last
+                    # one's, and a count that fell because r2 died means the
+                    # opposite of a count that fell because the decompiler got
+                    # worse. Both passes report, since a discovery that never
+                    # finished yields no candidates at all and would otherwise
+                    # be indistinguishable from a binary with no functions.
+                    "process_ended_early": ended_early,
+                    "process_ending": {
+                        "discovery": discovery.ending,
+                        "decompile": decompile.ending if decompile is not None else "not run",
+                    },
+                    "unreached": unreached,
                 },
             ),
             functions=rendered,
@@ -349,6 +482,25 @@ def _write_refusal_census(
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:
         return
+
+
+def _harness_cause(run: _R2Run, stopped_at: int, total: int) -> str:
+    """The cause for a function the batch produced no output for at all.
+
+    A refusal is r2sleigh saying it could not prove what the code means; this is
+    the harness saying it never got to ask. Spelling them the same way is how
+    five zlib binaries reported zero functions each -- 68% of the benchmark's
+    refusals -- while looking like an unusually shy decompiler. The `harness:`
+    prefix separates the two at a glance in the census, the ending names which
+    failure it was, and the stop point says how far the batch got before it
+    died; the number of functions carrying the string is the size of the loss.
+    """
+    if not run.ended_early:
+        # A missing marker under a clean exit is a hole rather than a
+        # truncation, so it says something swallowed the sentinels, not that r2
+        # stopped. Worth a distinct cause: the two want different investigations.
+        return "harness: r2 exited cleanly but printed no markers for this function"
+    return f"harness: r2 process {run.ending}; output stopped at function {stopped_at} of {total}"
 
 
 def _slice(out: str, index: int) -> str | None:
