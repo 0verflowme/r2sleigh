@@ -9,16 +9,19 @@
 //! reading a program that does not exist.
 //!
 //! This pass is deliberately a verifier, not a repair pass. A repeated call
-//! site needs an upstream certificate that identifies its one result binding
-//! and proves where the evaluation occurs. The rendered AST does not currently
-//! carry that certificate, so repetition is refused. Moving the first textual
-//! occurrence, adopting a nearby assignment, or retargeting later occurrences
-//! would reconstruct execution and dominance facts in the renderer.
+//! site needs an upstream certificate proving that no execution can reach two
+//! occurrences. Structured rendering carries exactly that certificate in its
+//! sealed lexical-region artifact; repeated occurrences are admitted only when
+//! every pair lies in mutually exclusive selection arms. Moving the first
+//! textual occurrence, adopting a nearby assignment, or retargeting later
+//! occurrences would reconstruct execution and dominance facts in the
+//! renderer.
 
 use std::collections::BTreeMap;
 
 use crate::ast::{CExpr, CFunction, CStmt};
 use crate::binding_plan::BindingNameResolution;
+use crate::structured_region::{RegionId, SealedStructuredRegionArtifact};
 
 /// A call site, identified by the address of the call and its index there.
 pub(crate) type CallSite = (u64, usize);
@@ -42,36 +45,81 @@ fn source_of(expr: &CExpr) -> Option<CallSite> {
 pub(crate) fn bind_each_call_site_once(
     func: &mut CFunction,
     _names: &BindingNameResolution,
+    regions: Option<&SealedStructuredRegionArtifact>,
 ) -> Result<(), SingleEvaluationError> {
-    verify_call_sites_are_single(func)
+    verify_call_sites_are_single_per_execution(func, regions)
 }
 
-fn verify_call_sites_are_single(func: &CFunction) -> Result<(), SingleEvaluationError> {
-    let mut counts: BTreeMap<CallSite, usize> = BTreeMap::new();
+fn verify_call_sites_are_single_per_execution(
+    func: &CFunction,
+    regions: Option<&SealedStructuredRegionArtifact>,
+) -> Result<(), SingleEvaluationError> {
+    let mut occurrences: BTreeMap<CallSite, Vec<Option<RegionId>>> = BTreeMap::new();
     for stmt in &func.body {
-        count_in_stmt(stmt, &mut counts);
+        collect_in_stmt(stmt, regions, None, &mut occurrences);
     }
-    match counts.into_iter().find(|(_, occurrences)| *occurrences > 1) {
-        Some((site, occurrences)) => {
-            Err(SingleEvaluationError::RepeatedCallRequiresCertifiedBinding { site, occurrences })
+    for (site, occurrence_regions) in occurrences {
+        if occurrence_regions.len() < 2 {
+            continue;
         }
-        None => Ok(()),
+        let pairwise_exclusive = regions.is_some_and(|regions| {
+            occurrence_regions.iter().enumerate().all(|(index, left)| {
+                occurrence_regions[index + 1..].iter().all(|right| {
+                    left.zip(*right)
+                        .is_some_and(|(left, right)| regions.regions_are_exclusive(left, right))
+                })
+            })
+        });
+        if !pairwise_exclusive {
+            return Err(
+                SingleEvaluationError::RepeatedCallRequiresCertifiedBinding {
+                    site,
+                    occurrences: occurrence_regions.len(),
+                },
+            );
+        }
     }
+    Ok(())
 }
 
-fn count_in_stmt(stmt: &CStmt, counts: &mut BTreeMap<CallSite, usize>) {
-    for_each_expr(stmt, &mut |expr| count_in_expr(expr, counts));
+fn collect_in_stmt(
+    stmt: &CStmt,
+    regions: Option<&SealedStructuredRegionArtifact>,
+    current_region: Option<RegionId>,
+    occurrences: &mut BTreeMap<CallSite, Vec<Option<RegionId>>>,
+) {
+    match stmt {
+        CStmt::StructuredRegion { marker, stmt } => {
+            let region = regions
+                .and_then(|regions| regions.node_for_marker(marker).map(|(region, _)| region));
+            collect_in_stmt(stmt, regions, region, occurrences);
+            return;
+        }
+        CStmt::Observed { stmt, .. } => {
+            collect_in_stmt(stmt, regions, current_region, occurrences);
+            return;
+        }
+        _ => {}
+    }
+
+    for_each_expr(stmt, &mut |expr| {
+        collect_in_expr(expr, current_region, occurrences)
+    });
     for_each_child_block(stmt, &mut |stmts| {
         for inner in stmts {
-            count_in_stmt(inner, counts);
+            collect_in_stmt(inner, regions, current_region, occurrences);
         }
     });
 }
 
-fn count_in_expr(expr: &CExpr, counts: &mut BTreeMap<CallSite, usize>) {
+fn collect_in_expr(
+    expr: &CExpr,
+    current_region: Option<RegionId>,
+    occurrences: &mut BTreeMap<CallSite, Vec<Option<RegionId>>>,
+) {
     expr.visit(&mut |node| {
         if let Some(source) = source_of(node) {
-            *counts.entry(source).or_insert(0) += 1;
+            occurrences.entry(source).or_default().push(current_region);
         }
     });
 }
@@ -102,8 +150,8 @@ fn for_each_expr(stmt: &CStmt, f: &mut impl FnMut(&CExpr)) {
 
 pub(crate) fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
     match stmt {
-        CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
-            for_each_child_block(stmt, f)
+        CStmt::StructuredRegion { .. } | CStmt::Observed { .. } => {
+            unreachable!("leading wrappers are handled by collect_in_stmt")
         }
         CStmt::Block(stmts) => f(stmts),
         CStmt::If {
@@ -141,6 +189,9 @@ pub(crate) fn for_each_child_block(stmt: &CStmt, f: &mut impl FnMut(&[CStmt])) {
 mod tests {
     use super::*;
     use crate::ast::{CLocal, CParam, CType};
+    use crate::structured_region::{
+        StructuredRegionKind, StructuredRegionMarker, seal_structured_body_for_test,
+    };
 
     /// The names a fixture in this module declares.
     fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
@@ -194,7 +245,7 @@ mod tests {
         let before = func.body.clone();
 
         assert_eq!(
-            verify_call_sites_are_single(&func),
+            verify_call_sites_are_single_per_execution(&func, None),
             Err(
                 SingleEvaluationError::RepeatedCallRequiresCertifiedBinding {
                     site: (0x1000, 0),
@@ -217,7 +268,40 @@ mod tests {
         );
         let before = func.body.clone();
 
-        assert_eq!(verify_call_sites_are_single(&func), Ok(()));
+        assert_eq!(
+            verify_call_sites_are_single_per_execution(&func, None),
+            Ok(())
+        );
         assert_eq!(func.body, before);
+    }
+
+    #[test]
+    fn repeated_site_in_exclusive_regions_is_one_evaluation_per_execution() {
+        let symbols = test_table();
+        let marked = CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::structured_region(
+                StructuredRegionMarker::unsealed(0x1010, StructuredRegionKind::IfThenElse),
+                CStmt::If {
+                    cond: CExpr::IntLit(1),
+                    then_body: Box::new(CStmt::structured_region(
+                        StructuredRegionMarker::unsealed(0x1020, StructuredRegionKind::Block),
+                        CStmt::Expr(call(&symbols, "fcn.1000", (0x1000, 0))),
+                    )),
+                    else_body: Some(Box::new(CStmt::structured_region(
+                        StructuredRegionMarker::unsealed(0x1030, StructuredRegionKind::Block),
+                        CStmt::Expr(call(&symbols, "fcn.1000", (0x1000, 0))),
+                    ))),
+                },
+            ),
+        );
+        let sealed = seal_structured_body_for_test(marked).expect("sealed structured body");
+        let (stmt, regions) = sealed.into_marked_parts();
+        let func = function_from(&symbols, vec![stmt]);
+
+        assert_eq!(
+            verify_call_sites_are_single_per_execution(&func, Some(&regions)),
+            Ok(())
+        );
     }
 }
