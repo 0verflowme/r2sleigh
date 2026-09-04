@@ -613,6 +613,8 @@ mod tests {
                 noreturn: None,
                 result_kind: None,
                 fixed_argument_count: Some(arguments.len()),
+                variadic_argument_count_evidence: None,
+                variadic_argument_count_refusal: None,
                 arguments,
                 results: Vec::new(),
                 complete: true,

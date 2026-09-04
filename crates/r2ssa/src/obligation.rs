@@ -1804,7 +1804,7 @@ mod tests {
                 identity,
                 true,
                 [],
-                true,
+                false,
                 true,
                 SourceCallResult::Void,
             )],
@@ -1821,7 +1821,7 @@ mod tests {
             explicit_call.calling_convention.as_deref(),
             Some("test-call-abi")
         );
-        assert_eq!(explicit_call.variadic, Some(true));
+        assert_eq!(explicit_call.variadic, Some(false));
         assert_eq!(explicit_call.noreturn, Some(true));
         assert_eq!(explicit_call.result_kind, Some(SourceCallResult::Void));
         assert!(explicit_call.arguments.is_empty());
@@ -2374,6 +2374,8 @@ mod tests {
                     },
                 ],
                 fixed_argument_count: Some(2),
+                variadic_argument_count_evidence: None,
+                variadic_argument_count_refusal: None,
                 results: Vec::new(),
                 complete: true,
             },

@@ -44,6 +44,7 @@ pub(crate) mod obligation;
 pub(crate) mod op;
 pub(crate) mod optimize;
 pub(crate) mod phi;
+pub(crate) mod printf;
 pub mod proven;
 pub(crate) mod reaching_rules;
 pub mod recover_interface;
@@ -127,6 +128,7 @@ pub use machine_context::{
     SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceMachineRoles,
     SourceMachineRolesError, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
     SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    SourceVariadicArgumentCountRule,
 };
 pub use obligation::{
     CanonicalInstructionId, CanonicalInstructionSite, ObligationCoverageReport,
@@ -166,6 +168,8 @@ pub use semantic::{
     StackObjectKey, StackSlotCertificate, StructuredAccessId, StructuredDataflowFacts,
     StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
     StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
+    VariadicCallsiteArgumentCountEvidence, VariadicCallsiteArgumentCountRefusal,
+    VariadicCallsiteArgumentCountSource,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::{CanonicalStorageId, CanonicalStorageSpace, SSAVar, SSAVarNameKind};

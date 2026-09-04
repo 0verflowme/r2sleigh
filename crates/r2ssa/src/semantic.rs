@@ -544,6 +544,52 @@ pub struct SourceCallArgumentFact {
     pub value: SourceCallArgumentValue,
 }
 
+/// Canonical provenance for a variadic callsite's argument count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VariadicCallsiteArgumentCountSource {
+    /// The exact radare2 prototype identified the format parameter and the
+    /// exact source snapshot supplied the literal stored at its address.
+    Radare2FormatString,
+}
+
+/// Per-callsite proof of a variadic argument count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariadicCallsiteArgumentCountEvidence {
+    pub source: VariadicCallsiteArgumentCountSource,
+    pub format_argument_index: usize,
+    pub format_literal_address: u64,
+    pub format_consumed_argument_count: usize,
+    pub total_argument_count: usize,
+}
+
+/// Why a variadic callsite could not prove and project its own argument list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariadicCallsiteArgumentCountRefusal {
+    MissingFormatParameter,
+    FormatArgumentUnavailable,
+    FormatArgumentNotLiteral,
+    InvalidFormatString,
+    ArgumentCountOverflow,
+    CallingConventionMismatch,
+    InsufficientRegisterArgumentCarriers,
+    UnresolvedArgumentCarrier,
+}
+
+impl VariadicCallsiteArgumentCountRefusal {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingFormatParameter => "missing_format_parameter",
+            Self::FormatArgumentUnavailable => "format_argument_unavailable",
+            Self::FormatArgumentNotLiteral => "format_argument_not_literal",
+            Self::InvalidFormatString => "invalid_format_string",
+            Self::ArgumentCountOverflow => "argument_count_overflow",
+            Self::CallingConventionMismatch => "calling_convention_mismatch",
+            Self::InsufficientRegisterArgumentCarriers => "insufficient_register_argument_carriers",
+            Self::UnresolvedArgumentCarrier => "unresolved_argument_carrier",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCallBoundaryFact {
     pub call_site: CallSiteId,
@@ -560,6 +606,8 @@ pub struct SourceCallBoundaryFact {
     /// The split has to travel, because the declaration a rendering owes the
     /// callee can only spell the named ones.
     pub fixed_argument_count: Option<usize>,
+    pub variadic_argument_count_evidence: Option<VariadicCallsiteArgumentCountEvidence>,
+    pub variadic_argument_count_refusal: Option<VariadicCallsiteArgumentCountRefusal>,
     /// Result values this function actually observes.
     ///
     /// A complete non-void boundary may carry no entries here when the caller
@@ -1377,6 +1425,8 @@ pub struct CallsiteCertificate {
     /// Absent where no prototype described the call, which is not the same as
     /// zero: zero says the callee is declared to take nothing.
     pub fixed_argument_count: Option<usize>,
+    pub variadic_argument_count_evidence: Option<VariadicCallsiteArgumentCountEvidence>,
+    pub variadic_argument_count_refusal: Option<VariadicCallsiteArgumentCountRefusal>,
     pub stack_argument_values: Vec<StackCallArgumentCertificate>,
     pub argument_certificates: Vec<CallArgumentCertificate>,
 }
@@ -3038,95 +3088,130 @@ fn collect_structured_dataflow_facts(
     }
 }
 
-/// The arguments a variadic call passes past the ones its prototype names.
+/// Prove the count of one variadic call from its own literal format.
 ///
-/// A prototype describes the callee, and a variadic callee's prototype
-/// deliberately stops before the interesting part: `fprintf` declares two
-/// parameters and every call to it passes as many as its format asks for. The
-/// count therefore belongs to the call site and cannot be read off the callee
-/// at all -- which is why taking it from the prototype rendered all three
-/// `fprintf` calls in `bzip2recover`'s `tooManyBlocks` with the same two
-/// arguments, silently dropping what the machine plainly loaded for the first.
-///
-/// What proves a tail argument is the same evidence the fixed ones rest on:
-/// the convention says which register carries argument `n`, and the reaching
-/// scan says whether this function defined that register on the way to the
-/// call. That scan treats a call as a barrier, so a value left in a register
-/// by an earlier call's argument setup cannot be mistaken for this call's --
-/// only a definition this function made since the last barrier counts.
-///
-/// A slot the function never defines ends the tail. `PreservedEntry` is
-/// evidence for a *named* parameter, where the callee's prototype says the
-/// argument exists and the value is simply the one this function was entered
-/// with; for a tail slot there is no such statement, and an untouched register
-/// is no evidence at all. Neither is a merge of two different definitions: it
-/// says the register holds something, which every register does. The tail
-/// stops at the first slot without one definition reaching the call rather
-/// than skipping it, because arguments fill the convention's registers in
-/// order and a gap cannot be resolved.
-///
-/// Where the evidence over-reaches it does so in the harmless direction: an
-/// extra argument to a variadic function is well-defined C that the callee
-/// ignores, while a dropped one destroys information the machine code carries.
-///
-/// The convention's slots are radare2's fact about the convention, captured
-/// for this function and named with the convention they belong to. They may be
-/// continued past the prototype's arguments only when both name the same
-/// convention and the prototype's arguments are exactly that convention's
-/// leading slots; anything else leaves no ground for saying where argument
-/// `n + 1` would go, and the tail is refused rather than guessed.
-fn variadic_call_tail_arguments(
+/// The rule naming the format parameter comes from the exact radare2
+/// prototype already correlated with this callsite. The literal contents come
+/// from the same immutable source snapshot. Register liveness is intentionally
+/// absent from this decision: it can prove a requested carrier's value after
+/// the count is known, but it cannot decide how many arguments the call made.
+fn variadic_callsite_argument_count(
     function: &SSAFunction,
     graph: &SsaGraph,
     machine_context: &SourceMachineContext,
     interface: &r2source::SourceCallSiteInterface,
+    fixed_arguments: &[Option<SourceCallArgumentFact>],
+) -> Result<VariadicCallsiteArgumentCountEvidence, VariadicCallsiteArgumentCountRefusal> {
+    let Some(r2source::SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index }) =
+        interface.variadic_argument_count_rule()
+    else {
+        return Err(VariadicCallsiteArgumentCountRefusal::MissingFormatParameter);
+    };
+    let format_argument_index = usize::try_from(parameter_index)
+        .map_err(|_| VariadicCallsiteArgumentCountRefusal::FormatArgumentUnavailable)?;
+    let format_value = fixed_arguments
+        .get(format_argument_index)
+        .and_then(Option::as_ref)
+        .ok_or(VariadicCallsiteArgumentCountRefusal::FormatArgumentUnavailable)?;
+    let SourceCallArgumentValue::Value(format_value) = format_value.value else {
+        return Err(VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral);
+    };
+    let format_var = graph
+        .value(format_value)
+        .map(|value| &value.var)
+        .ok_or(VariadicCallsiteArgumentCountRefusal::FormatArgumentUnavailable)?;
+    let format_literal_address =
+        resolve_const_value(function.decompile_prep_facts(), format_var)
+            .ok_or(VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral)?;
+    let format = machine_context
+        .source_string_literal(format_literal_address)
+        .ok_or(VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral)?;
+    let format_consumed_argument_count = crate::printf::printf_consumed_argument_count(format)
+        .map_err(|_| VariadicCallsiteArgumentCountRefusal::InvalidFormatString)?;
+    let total_argument_count = interface
+        .arguments()
+        .len()
+        .checked_add(format_consumed_argument_count)
+        .ok_or(VariadicCallsiteArgumentCountRefusal::ArgumentCountOverflow)?;
+    Ok(VariadicCallsiteArgumentCountEvidence {
+        source: VariadicCallsiteArgumentCountSource::Radare2FormatString,
+        format_argument_index,
+        format_literal_address,
+        format_consumed_argument_count,
+        total_argument_count,
+    })
+}
+
+/// Recover exactly the carriers requested by a proven format count.
+struct VariadicCallsiteRecovery<'a> {
+    function: &'a SSAFunction,
+    graph: &'a SsaGraph,
+    machine_context: &'a SourceMachineContext,
+    entry_values: &'a BTreeMap<CanonicalStorageId, Option<ValueId>>,
     block_addr: u64,
     op_index: usize,
-) -> Vec<SourceCallArgumentFact> {
-    if !interface.is_variadic() {
-        return Vec::new();
-    }
-    let Some(convention) = machine_context.convention_slots() else {
-        return Vec::new();
-    };
-    if convention.calling_convention() != interface.calling_convention() {
-        return Vec::new();
-    }
-    let named = interface.arguments();
+}
+
+fn variadic_callsite_arguments(
+    recovery: VariadicCallsiteRecovery<'_>,
+    interface: &r2source::SourceCallSiteInterface,
+    fixed_arguments: &[Option<SourceCallArgumentFact>],
+    evidence: VariadicCallsiteArgumentCountEvidence,
+) -> Result<Vec<SourceCallArgumentFact>, VariadicCallsiteArgumentCountRefusal> {
+    let convention = recovery
+        .machine_context
+        .convention_slots()
+        .ok_or(VariadicCallsiteArgumentCountRefusal::CallingConventionMismatch)?;
     let slots = convention.argument_slots();
-    if named.len() > slots.len()
-        || named
+    if convention.calling_convention() != interface.calling_convention()
+        || interface.arguments().len() > slots.len()
+        || interface
+            .arguments()
             .iter()
-            .zip(slots.iter())
+            .zip(slots)
             .any(|(argument, slot)| argument.storage() != *slot)
     {
-        return Vec::new();
+        return Err(VariadicCallsiteArgumentCountRefusal::CallingConventionMismatch);
+    }
+    if evidence.total_argument_count > slots.len() {
+        // The current typed convention contract describes register carriers,
+        // not outgoing stack argument slots. Refuse instead of pretending the
+        // register prefix is the complete call.
+        return Err(VariadicCallsiteArgumentCountRefusal::InsufficientRegisterArgumentCarriers);
     }
 
-    let mut tail = Vec::new();
-    for (position, slot) in slots.iter().enumerate().skip(named.len()) {
-        let Ok(index) = u32::try_from(position) else {
-            break;
-        };
-        let Some(value) = reaching_variadic_tail_argument_in_block(
-            function,
-            graph,
-            machine_context,
-            block_addr,
-            op_index,
-            *slot,
-        ) else {
-            break;
-        };
-        tail.push(SourceCallArgumentFact {
+    let mut arguments = Vec::with_capacity(evidence.total_argument_count);
+    for (position, slot) in slots
+        .iter()
+        .copied()
+        .enumerate()
+        .take(evidence.total_argument_count)
+    {
+        if let Some(argument) = fixed_arguments.get(position).and_then(|fact| *fact) {
+            arguments.push(argument);
+            continue;
+        }
+        let value = reaching_abi_argument_in_block(
+            recovery.function,
+            recovery.graph,
+            recovery.machine_context,
+            recovery.entry_values,
+            recovery.block_addr,
+            recovery.op_index,
+            slot,
+        )
+        .ok_or(VariadicCallsiteArgumentCountRefusal::UnresolvedArgumentCarrier)?;
+        let index = u32::try_from(position)
+            .map_err(|_| VariadicCallsiteArgumentCountRefusal::ArgumentCountOverflow)?;
+        arguments.push(SourceCallArgumentFact {
             slot: CallBoundarySlot::Register {
                 index,
-                storage: *slot,
+                storage: slot,
             },
-            value: SourceCallArgumentValue::Value(value),
+            value,
         });
     }
-    tail
+    Ok(arguments)
 }
 
 /// What a call boundary carries when nothing knows the callee's signature.
@@ -3248,6 +3333,8 @@ fn collect_source_boundary_facts(
             result_kind: None,
             arguments: Vec::new(),
             fixed_argument_count: None,
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             results: Vec::new(),
             // Calls carry implicit machine state. Only an exact source-owned
             // callsite interface may change this state to complete.
@@ -3268,10 +3355,10 @@ fn collect_source_boundary_facts(
             if interface.is_complete()
                 && let Some((block_addr, op_index)) = graph.op_site_for_inst(call_site.at)
             {
-                let arguments = interface
+                let fixed_arguments = interface
                     .arguments()
                     .iter()
-                    .filter_map(|argument| {
+                    .map(|argument| {
                         // An argument the function passes straight through from
                         // its own entry has no definition here and is never read
                         // explicitly, so no SSA value names it. That is a
@@ -3310,20 +3397,51 @@ fn collect_source_boundary_facts(
                         )
                     }
                 };
-                let arguments_complete = arguments.len() == interface.arguments().len();
-                if arguments_complete {
-                    let mut arguments = arguments;
-                    boundary.fixed_argument_count = Some(arguments.len());
-                    arguments.extend(variadic_call_tail_arguments(
+                boundary.fixed_argument_count = Some(interface.arguments().len());
+                let arguments_complete = if interface.is_variadic() {
+                    match variadic_callsite_argument_count(
                         function,
                         graph,
                         machine_context,
                         interface,
-                        block_addr,
-                        op_index,
-                    ));
-                    boundary.arguments = arguments;
-                }
+                        &fixed_arguments,
+                    ) {
+                        Ok(evidence) => {
+                            boundary.variadic_argument_count_evidence = Some(evidence);
+                            match variadic_callsite_arguments(
+                                VariadicCallsiteRecovery {
+                                    function,
+                                    graph,
+                                    machine_context,
+                                    entry_values: &entry_values,
+                                    block_addr,
+                                    op_index,
+                                },
+                                interface,
+                                &fixed_arguments,
+                                evidence,
+                            ) {
+                                Ok(arguments) => {
+                                    boundary.arguments = arguments;
+                                    true
+                                }
+                                Err(refusal) => {
+                                    boundary.variadic_argument_count_refusal = Some(refusal);
+                                    false
+                                }
+                            }
+                        }
+                        Err(refusal) => {
+                            boundary.variadic_argument_count_refusal = Some(refusal);
+                            false
+                        }
+                    }
+                } else if fixed_arguments.iter().all(Option::is_some) {
+                    boundary.arguments = fixed_arguments.into_iter().flatten().collect();
+                    true
+                } else {
+                    false
+                };
                 let results_complete = results.is_some();
                 if let Some(results) = results {
                     boundary.results = results;
@@ -6195,27 +6313,37 @@ fn collect_prepared_function_certificates(
             let boundary = boundaries
                 .calls
                 .get(id)
-                .filter(|boundary| boundary.complete && boundary.at == fact.at);
-            let (argument_values, mut argument_certificates) = boundary
+                .filter(|boundary| boundary.at == fact.at);
+            let complete_boundary = boundary.filter(|boundary| boundary.complete);
+            let (argument_values, mut argument_certificates) = complete_boundary
                 .map(|boundary| exact_register_call_arguments(boundary, graph))
                 .unwrap_or_default();
-            // The split describes the arguments this certificate carries, so
-            // it travels only when they are the boundary's own. Argument
-            // recovery reports nothing at all when any one slot fails, and a
-            // fixed count over arguments nothing recovered would claim the
-            // call passes fewer than its prototype names.
-            let (variadic, fixed_argument_count) = boundary
-                .filter(|boundary| argument_values.len() == boundary.arguments.len())
-                .map_or((false, None), |boundary| {
+            // The prototype and its callsite-count disposition must survive an
+            // incomplete boundary: that incompleteness is exactly what lets a
+            // renderer refuse an unresolved variadic format explicitly.
+            let (variadic, fixed_argument_count, count_evidence, count_refusal) =
+                boundary.map_or((false, None, None, None), |boundary| {
                     (
                         boundary.variadic.unwrap_or(false),
                         boundary.fixed_argument_count,
+                        boundary.variadic_argument_count_evidence,
+                        boundary.variadic_argument_count_refusal,
                     )
                 });
-            argument_certificates.extend(collect_stack_call_argument_certificates(
-                &stack_argument_values,
-                structured,
-            ));
+            // A proven variadic count currently authorizes the convention's
+            // exact register prefix only. Do not append the old outgoing-store
+            // scan and accidentally duplicate or renumber its arguments.
+            let stack_argument_values = if variadic {
+                Vec::new()
+            } else {
+                stack_argument_values
+            };
+            if !variadic {
+                argument_certificates.extend(collect_stack_call_argument_certificates(
+                    &stack_argument_values,
+                    structured,
+                ));
+            }
             callsites_by_inst.insert(fact.at, *id);
             (
                 *id,
@@ -6231,6 +6359,8 @@ fn collect_prepared_function_certificates(
                     argument_values,
                     variadic,
                     fixed_argument_count,
+                    variadic_argument_count_evidence: count_evidence,
+                    variadic_argument_count_refusal: count_refusal,
                     stack_argument_values,
                     argument_certificates,
                 },
