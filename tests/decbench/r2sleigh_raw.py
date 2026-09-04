@@ -317,8 +317,11 @@ def _write_refusal_census(
     Failure to write is deliberately silent. This is measurement about a
     measurement, and it must never be the reason a sweep fails.
     """
-    if output_dir is None:
-        return
+    # The benchmark does not always hand the decompiler an output directory, and
+    # when it does not, a census that silently declines to write is a census that
+    # is never there when it is wanted. Fall back to the binary's own directory,
+    # which by construction exists and is inside the run being garbage-collected.
+    target = Path(output_dir) if output_dir is not None else binary_path.parent
     try:
         counts: dict[str, int] = {}
         for cause in declined.values():
@@ -331,7 +334,7 @@ def _write_refusal_census(
             "causes": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
             "by_function": dict(sorted(declined.items())),
         }
-        path = Path(output_dir) / f"r2sleigh-refusals-{binary_path.name}.json"
+        path = target / f"r2sleigh-refusals-{binary_path.name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:
