@@ -320,6 +320,31 @@ NOINL uint64_t shape_function_pointer(uint64_t a, uint64_t b) {
 }
 
 /* A main so the corpus binary links, and so nothing is dead-stripped. */
+/* A callee whose boolean result the caller tests, which is how radare2 comes to
+ * believe a fixed function is variadic.
+ *
+ * The SysV convention passes the count of vector registers in `al`, so radare2
+ * reads `test al, al` as a varargs marker (libr/anal/fcn.c, the `op_is_cmp`
+ * arm: a compare whose destination is the lowest subregister of rax, with the
+ * same register on both sides, sets `fcn->is_variadic`). A compiler emits that
+ * exact instruction for an ordinary `_Bool` return tested by its caller, and
+ * then nothing about the function is variadic at all.
+ *
+ * This cost ninety-four functions on the benchmark while the fifty-four-cell
+ * corpus stayed at 54 of 54: the callsite was flagged variadic, the renderer
+ * demanded the format parameter a variadic call must have, none existed, and
+ * every caller of such a function refused. bzip2's `myfeof` is the real
+ * instance; this is the same shape in nine lines.
+ */
+NOINL unsigned char shape_bool_probe(uint64_t a) { return (unsigned char)(a > 7u); }
+
+NOINL uint64_t shape_bool_caller(uint64_t a, uint64_t b) {
+    uint64_t seen = 0;
+    if (shape_bool_probe(a)) { seen += b; }
+    if (shape_bool_probe(b)) { seen += a; }
+    return seen;
+}
+
 int main(void) {
     uint64_t a = 0x0123456789abcdefull;
     uint64_t b = 0xfedcba9876543210ull;
@@ -336,5 +361,6 @@ int main(void) {
     printf("%016llx\n", (unsigned long long)shape_multiword_return(a, b));
     printf("%016llx\n", (unsigned long long)shape_pointer_to_pointer(a, b));
     printf("%016llx\n", (unsigned long long)shape_function_pointer(a, b));
+    printf("%016llx\n", (unsigned long long)shape_bool_caller(a, b));
     return 0;
 }
