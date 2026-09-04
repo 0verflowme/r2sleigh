@@ -3886,8 +3886,9 @@ fn reaching_source_return_register_in_block(
     storage: CanonicalStorageId,
     boundary_at: InstId,
 ) -> Option<ReachingAbiReturnRegister> {
-    let logical_storage = projected_return_value_storage(machine_context, storage)?;
-    if logical_storage != storage
+    let logical_storage = projected_return_value_storage(machine_context, storage);
+    if let Some(logical_storage) = logical_storage
+        && logical_storage != storage
         && let Some(value) = reaching_abi_value_in_block(
             function,
             graph,
@@ -3911,7 +3912,7 @@ fn reaching_source_return_register_in_block(
     ) {
         exact @ Some(ReachingAbiReturnRegister::Exact(_)) => exact,
         composition @ Some(ReachingAbiReturnRegister::Composition(_))
-            if logical_storage == storage =>
+            if logical_storage.is_none_or(|logical_storage| logical_storage == storage) =>
         {
             composition
         }
