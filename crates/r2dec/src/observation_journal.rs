@@ -1456,15 +1456,14 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
-    fn expr_has_value_observation(&self, expr: &CExpr, value: ValueId) -> bool {
-        let mut found = false;
+    fn expr_value_observations(&self, expr: &CExpr) -> BTreeSet<ValueId> {
+        let mut values = BTreeSet::new();
         expr.visit_render_observations(&mut |id| {
-            found |= matches!(
-                self.targets.get(id.index() as usize),
-                Some(ObservationTarget::Value(observed)) if *observed == value
-            );
+            if let Some(ObservationTarget::Value(value)) = self.targets.get(id.index() as usize) {
+                values.insert(*value);
+            }
         });
-        found
+        values
     }
 
     /// Consume placement's complete removal report as one cell contract.
@@ -2466,7 +2465,8 @@ impl LegacyObservationJournal {
     /// can never occur in `replaced`, but it is still an operand of one of
     /// those instructions and has no other occurrence after replacement. Its
     /// value cell is therefore part of this same contract, deduplicated with
-    /// the root and produced values.
+    /// the root, produced values, and exact child markers already carried by
+    /// the expression.
     pub(crate) fn observe_rendered_replacement_expr(
         &mut self,
         contract: crate::fold::op_lower::RenderedReplacementContract,
@@ -2590,6 +2590,9 @@ impl LegacyObservationJournal {
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
+        if let Some(expr) = expr {
+            represented_values.extend(self.expr_value_observations(expr));
+        }
         let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
@@ -2647,11 +2650,11 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                let Some(expr) = expr else {
+                if expr.is_none() {
                     continue;
-                };
+                }
                 let input = inst.inputs[input_idx];
-                if !produced.contains(&input) {
+                if !produced.contains(&input) && !represented_values.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
                         // `&frame_object` semantically contains the frame base
                         // and displacement without spelling either as a C
@@ -2665,11 +2668,6 @@ impl LegacyObservationJournal {
                             if self.source.graph().def_inst(input).is_none() =>
                         {
                             true
-                        }
-                        Some(ValueDisposition::Inline { .. })
-                            if self.expr_has_value_observation(expr, input) =>
-                        {
-                            false
                         }
                         Some(ValueDisposition::Inline { .. })
                         | Some(ValueDisposition::Elided { .. })
@@ -6513,8 +6511,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_replacement_requires_and_reuses_the_inner_value_occurrence() {
-        let (source, plan, _function, mut journal) = journal_fixture();
+    fn nested_replacement_reuses_inner_inline_and_bound_value_occurrences() {
+        let (source, plan, function, mut journal) = journal_fixture();
         let graph = source.source().graph();
         let (folded, folded_definition) = graph
             .values
@@ -6537,6 +6535,29 @@ mod tests {
             .inst(reader)
             .and_then(|inst| inst.output)
             .expect("the reader defines a value");
+        let (bound, binding, bound_input_idx) = graph
+            .inst(reader)
+            .expect("folded value reader")
+            .inputs
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(input_idx, value)| match plan.disposition(value) {
+                Some(ValueDisposition::Bound { binding }) => Some((value, *binding, input_idx)),
+                _ => None,
+            })
+            .expect("the folded reader also consumes a bound value");
+        let (block_addr, op_idx) = source
+            .source()
+            .inst_op_site(reader)
+            .expect("reader operation site");
+        let site = NormalizedOpSite {
+            block: graph
+                .block_id_for_addr(block_addr)
+                .expect("reader graph block"),
+            op_idx,
+        };
+        let bound_symbol = declare_legacy_symbol(&function, &plan, binding, "bound_input");
 
         assert!(
             matches!(
@@ -6567,11 +6588,19 @@ mod tests {
                 ),
             )
             .expect("the inner replacement owns the folded value occurrence");
+        let bound_occurrence = journal
+            .observe_normalized_input_value_expr(site, bound_input_idx, CExpr::Var(bound_symbol))
+            .expect("the child expression owns the bound value occurrence");
         let before_outer = journal.targets.len();
+        let bound_occurrences_before_outer = journal
+            .targets
+            .iter()
+            .filter(|target| **target == ObservationTarget::Value(bound))
+            .count();
         journal
             .observe_rendered_replacement_expr(
                 crate::fold::op_lower::RenderedReplacementContract::for_test(
-                    CExpr::binary(BinaryOp::Add, inner, CExpr::IntLit(4)),
+                    CExpr::binary(BinaryOp::Add, inner, bound_occurrence),
                     rendered,
                     vec![reader],
                     BTreeSet::new(),
@@ -6591,6 +6620,19 @@ mod tests {
                 .count(),
             1,
             "the nested expression carries exactly one folded-value occurrence"
+        );
+        assert!(
+            !journal.targets[before_outer..].contains(&ObservationTarget::Value(bound)),
+            "the outer replacement must not claim a bound value its child already names"
+        );
+        assert_eq!(
+            journal
+                .targets
+                .iter()
+                .filter(|target| **target == ObservationTarget::Value(bound))
+                .count(),
+            bound_occurrences_before_outer,
+            "the outer replacement adds no bound-value occurrence"
         );
     }
 
