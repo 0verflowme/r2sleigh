@@ -11844,7 +11844,23 @@ aligner can match. The handoff already recorded the symptom from the other side 
 and this is the metric confirming it is the binding constraint rather than a
 secondary one.
 
-Read together with the earlier finding that DecBench strips `const` and maps
-`size_t` and `uint64_t` alike to `long long`, the shape of the remaining
-`type_match` work is: alignable variables first, then widths and pointer-ness,
-and qualifier spelling not at all.
+**Read the diagnostic as evidence, not as a specification.** The paragraphs above
+were first written the wrong way round -- as "emit alignable variables so the
+metric can score", and, from the earlier finding that DecBench strips `const`, as
+"do not spend on qualifiers because the scorer ignores them". Both are reasoning
+from the harness, and the owner's standing position is that correct output is the
+goal and a score is a consequence of it.
+
+Stated correctly: a decompiler should recover named, typed variables with real
+offsets because that is what a reader needs and what the original source had.
+That the aligner then finds them is confirmation, not motivation. And whether a
+pointer the function never stores through should render `const` is a question
+about the honesty of the declaration; the scorer's indifference to it is not an
+argument on either side, and it should be decided on whether the claim is proven
+and useful.
+
+What the diagnostic legitimately tells us is narrower and still valuable: our
+variable recovery is weak enough that an external aligner cannot match a single
+one of 58, which is independent evidence that `stack_m40` and register-named
+locals are not adequate output. That was already suspected from the other
+direction and is now measured.
