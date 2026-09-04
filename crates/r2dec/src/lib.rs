@@ -1388,6 +1388,7 @@ fn count_residual_markers(stmts: &[CStmt]) -> usize {
 fn note_unproven_constructs(
     func: &mut CFunction,
     ledger: Option<&r2ssa::ledger::ObligationLedger>,
+    radare2_variadic_format_counts: usize,
 ) {
     let rendered_nothing = func.body.is_empty();
     let residuals = count_residual_markers(&func.body);
@@ -1455,6 +1456,17 @@ fn note_unproven_constructs(
             "data object types"
         };
         let _ = write!(&mut detail, "; {refused_object_types} {noun} refused");
+    }
+    if radare2_variadic_format_counts > 0 {
+        let noun = if radare2_variadic_format_counts == 1 {
+            "variadic callsite argument count"
+        } else {
+            "variadic callsite argument counts"
+        };
+        let _ = write!(
+            &mut detail,
+            "; {radare2_variadic_format_counts} {noun} supplied by radare2 format literals"
+        );
     }
     func.body.insert(
         0,
@@ -3187,6 +3199,7 @@ impl std::hash::Hash for MachineProjectionRefusalOrigin {
 pub enum DecompileRenderRefusal {
     MissingMachineProjectionAuthorization(MachineProjectionRefusalOrigin),
     MissingProgramVariableAuthorization,
+    VariadicCallsiteArgumentCount(r2ssa::VariadicCallsiteArgumentCountRefusal),
     /// The legacy observation journal could not be constructed.
     ///
     /// The journal already computes a precise typed cause. Reporting this as a
@@ -3212,6 +3225,7 @@ impl DecompileRenderRefusal {
                 "missing_machine_projection_authorization"
             }
             Self::MissingProgramVariableAuthorization => "missing_program_variable_authorization",
+            Self::VariadicCallsiteArgumentCount(_) => "variadic_callsite_argument_count",
             Self::ObservationJournal(failure) => failure.kind(),
             Self::DeclarationPlacement(refusal) => refusal.kind(),
             Self::RefusedBindingDisposition { .. } => "refused_binding_disposition",
@@ -3295,6 +3309,9 @@ impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
             }
             crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation(..) => {
                 Self::UnrepresentableOperation
+            }
+            crate::fold::op_lower::OpLoweringRefusal::VariadicCallsiteArgumentCount(refusal) => {
+                Self::VariadicCallsiteArgumentCount(refusal)
             }
         }
     }
@@ -5068,9 +5085,11 @@ impl Decompiler {
         );
         c_function.extern_objects = used_objects.into_inner().into_values().collect();
 
-        if let Err(error) =
-            single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names)
-        {
+        if let Err(error) = single_evaluation::bind_each_call_site_once(
+            &mut c_function,
+            &binding_names,
+            structured_regions.as_ref(),
+        ) {
             debug_log_render_contract_error(prepared, "single-evaluation", &error);
             let refusal = DecompileRenderRefusal::MissingProgramVariableAuthorization;
             return Ok(InternalBuildProduct::refused(
@@ -5136,7 +5155,21 @@ impl Decompiler {
             native.effect_observations(),
         );
         debug_log_ledger(prepared, &ledger);
-        native.finalize_effect_ledger(&ledger);
+        let radare2_variadic_format_counts = self
+            .context
+            .function_facts
+            .callsites()
+            .into_iter()
+            .flat_map(|facts| facts.by_callsite.values())
+            .filter(|fact| {
+                fact.variadic_argument_count_evidence
+                    .is_some_and(|evidence| {
+                        evidence.source
+                            == r2ssa::VariadicCallsiteArgumentCountSource::Radare2FormatString
+                    })
+            })
+            .count();
+        native.finalize_effect_ledger(&ledger, radare2_variadic_format_counts);
         Ok(InternalBuildProduct::Native(native))
     }
 
@@ -7073,7 +7106,7 @@ mod tests {
             64,
         );
         function.extern_objects = used.into_inner().into_values().collect();
-        note_unproven_constructs(&mut function, None);
+        note_unproven_constructs(&mut function, None, 0);
         let ready = crate::codegen::prepare_function_for_emission(&function);
         let rendered =
             crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
@@ -7117,7 +7150,7 @@ mod tests {
             64,
         );
         function.extern_objects = used.into_inner().into_values().collect();
-        note_unproven_constructs(&mut function, None);
+        note_unproven_constructs(&mut function, None, 0);
         let ready = crate::codegen::prepare_function_for_emission(&function);
         let rendered =
             crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
@@ -8220,7 +8253,7 @@ mod tests {
         ];
         assert_eq!(count_residual_markers(&func.body), 2);
 
-        note_unproven_constructs(&mut func, None);
+        note_unproven_constructs(&mut func, None, 0);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
@@ -8244,13 +8277,30 @@ mod tests {
     fn a_rendering_says_so_even_with_nothing_marked() {
         let mut func = CFunction::new("unclaimed".to_string(), CType::Unknown);
         func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
-        note_unproven_constructs(&mut func, None);
+        note_unproven_constructs(&mut func, None, 0);
         let note = match func.body.first() {
             Some(CStmt::Comment(text)) => text.clone(),
             other => panic!("expected a leading proof note, got {other:?}"),
         };
         assert!(note.contains("r2dec proof:"), "{note}");
         assert!(note.contains("no individual construct is marked"), "{note}");
+    }
+
+    #[test]
+    fn proof_line_attributes_variadic_format_counts_to_radare2() {
+        let mut func = CFunction::new("formatted".to_string(), CType::Unknown);
+        func.body = vec![CStmt::Return(None)];
+        note_unproven_constructs(&mut func, None, 2);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text,
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(
+            note.contains(
+                "2 variadic callsite argument counts supplied by radare2 format literals"
+            ),
+            "{note}"
+        );
     }
 
     /// Rendering nothing is not the same as proving the function does nothing.
@@ -8260,7 +8310,7 @@ mod tests {
     fn a_body_that_rendered_nothing_says_so_rather_than_reading_as_empty() {
         let mut func = CFunction::new("nothing_rendered".to_string(), CType::Unknown);
         func.body = Vec::new();
-        note_unproven_constructs(&mut func, None);
+        note_unproven_constructs(&mut func, None, 0);
         let text = format!("{:?}", func.body);
         assert!(
             text.contains("r2dec proof: rendering produced no statements"),

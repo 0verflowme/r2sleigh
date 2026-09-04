@@ -84,7 +84,7 @@ pub enum StackAddressBase {
 }
 
 pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 11;
-pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 2;
+pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 3;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
 
 /// Typed classification of one source-owned calling-convention spelling.
@@ -1728,6 +1728,18 @@ pub enum SourceCallResult {
     Register { storage: CanonicalStorageId },
 }
 
+/// Source-owned rule that can prove how many arguments one variadic callsite
+/// passes.
+///
+/// This is deliberately attached to the exact callsite interface rather than
+/// to a callee type. A variadic prototype names only its fixed prefix; each
+/// call's literal format decides the length of its own tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceVariadicArgumentCountRule {
+    /// radare2's recovered prototype named this fixed parameter `format`.
+    Radare2FormatString { parameter_index: u32 },
+}
+
 /// Source-owned prototype and observed carrier contract for one exact raw
 /// callsite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1740,6 +1752,7 @@ pub struct SourceCallSiteInterface {
     abi_class: SourceAbiClass,
     arguments: Box<[SourceCallArgumentSpec]>,
     variadic: bool,
+    variadic_argument_count_rule: Option<SourceVariadicArgumentCountRule>,
     noreturn: bool,
     result: SourceCallResult,
     /// Exact callee-owned interface recovered from a body in the same capture.
@@ -1760,6 +1773,8 @@ pub enum SourceCallSiteInterfaceError {
     InvalidArgumentOrder,
     InvalidRegisterStorage,
     OverlappingRegisterStorages,
+    VariadicCountRuleOnFixedPrototype,
+    InvalidFormatParameterIndex,
     NoreturnWithResult,
     IncompatibleCalleeInterface,
 }
@@ -1833,6 +1848,7 @@ impl SourceCallSiteInterface {
             abi_class,
             arguments: arguments.into_boxed_slice(),
             variadic,
+            variadic_argument_count_rule: None,
             noreturn,
             result,
             exact_callee_interface: None,
@@ -1901,6 +1917,31 @@ impl SourceCallSiteInterface {
 
     pub const fn is_variadic(&self) -> bool {
         self.variadic
+    }
+
+    /// Bind the format parameter identified by the source owner's recovered
+    /// prototype. The checked builder keeps an untrusted presentation name
+    /// from manufacturing an out-of-range semantic role.
+    pub fn with_radare2_format_parameter(
+        mut self,
+        parameter_index: u32,
+    ) -> Result<Self, SourceCallSiteInterfaceError> {
+        if !self.variadic {
+            return Err(SourceCallSiteInterfaceError::VariadicCountRuleOnFixedPrototype);
+        }
+        if usize::try_from(parameter_index)
+            .ok()
+            .is_none_or(|index| index >= self.arguments.len())
+        {
+            return Err(SourceCallSiteInterfaceError::InvalidFormatParameterIndex);
+        }
+        self.variadic_argument_count_rule =
+            Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index });
+        Ok(self)
+    }
+
+    pub const fn variadic_argument_count_rule(&self) -> Option<SourceVariadicArgumentCountRule> {
+        self.variadic_argument_count_rule
     }
 
     pub const fn is_noreturn(&self) -> bool {
@@ -2025,6 +2066,60 @@ mod tests {
         assert_eq!(first.abi_class(), SourceAbiClass::Other);
         assert_eq!(renamed.abi_class(), SourceAbiClass::Other);
         assert_ne!(first.calling_convention(), renamed.calling_convention());
+    }
+
+    #[test]
+    fn a_format_count_rule_is_checked_against_the_variadic_fixed_prefix() {
+        let identity = SourceCallSiteIdentity::new(
+            0x1000,
+            0,
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Constant,
+                offset: 0x2000,
+                size: 8,
+            },
+        );
+        let arguments = [
+            SourceCallArgumentSpec::new(0, register_storage(0, 8)),
+            SourceCallArgumentSpec::new(1, register_storage(8, 8)),
+        ];
+        let variadic = SourceCallSiteInterface::new(
+            b"format-rule".to_vec(),
+            identity,
+            true,
+            "sysv-amd64",
+            arguments,
+            true,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("variadic interface")
+        .with_radare2_format_parameter(1)
+        .expect("second fixed parameter is the format");
+        assert_eq!(
+            variadic.variadic_argument_count_rule(),
+            Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index: 1 })
+        );
+        assert_eq!(
+            variadic.clone().with_radare2_format_parameter(2),
+            Err(SourceCallSiteInterfaceError::InvalidFormatParameterIndex)
+        );
+
+        let fixed = SourceCallSiteInterface::new(
+            b"fixed-format-rule".to_vec(),
+            identity,
+            true,
+            "sysv-amd64",
+            arguments,
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("fixed interface");
+        assert_eq!(
+            fixed.with_radare2_format_parameter(1),
+            Err(SourceCallSiteInterfaceError::VariadicCountRuleOnFixedPrototype)
+        );
     }
 
     #[test]

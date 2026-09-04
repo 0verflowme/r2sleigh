@@ -71,6 +71,7 @@ pub(crate) enum OpLoweringRefusal {
     MissingMachineProjectionAuthorization(RefusalOrigin),
     MissingProgramVariableAuthorization(RefusalOrigin),
     UnrepresentableOperation(RefusalOrigin),
+    VariadicCallsiteArgumentCount(r2ssa::VariadicCallsiteArgumentCountRefusal),
 }
 
 impl std::fmt::Debug for OpLoweringRefusal {
@@ -80,6 +81,9 @@ impl std::fmt::Debug for OpLoweringRefusal {
     /// point: a reader who sees `op lowering` learns nothing, and a reader who
     /// sees `op lowering: return-boundary` knows which predicate to open.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::VariadicCallsiteArgumentCount(refusal) = self {
+            return write!(f, "VariadicCallsiteArgumentCount({})", refusal.kind());
+        }
         let (kind, origin) = match self {
             Self::MissingMachineProjectionAuthorization(origin) => {
                 ("MissingMachineProjectionAuthorization", origin)
@@ -88,6 +92,7 @@ impl std::fmt::Debug for OpLoweringRefusal {
                 ("MissingProgramVariableAuthorization", origin)
             }
             Self::UnrepresentableOperation(origin) => ("UnrepresentableOperation", origin),
+            Self::VariadicCallsiteArgumentCount(_) => unreachable!(),
         };
         write!(f, "{kind}({origin:?})")
     }
@@ -111,6 +116,12 @@ impl OpLoweringRefusal {
     #[track_caller]
     pub(crate) fn missing_program_variable() -> Self {
         Self::MissingProgramVariableAuthorization(Self::note("program-variable"))
+    }
+
+    pub(crate) const fn variadic_callsite_argument_count(
+        refusal: r2ssa::VariadicCallsiteArgumentCountRefusal,
+    ) -> Self {
+        Self::VariadicCallsiteArgumentCount(refusal)
     }
 
     #[track_caller]

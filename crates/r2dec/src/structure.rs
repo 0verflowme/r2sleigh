@@ -186,6 +186,10 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     /// A labeled side entry can join another certified alternative without
     /// weakening the domain checks for downstream blocks.
     active_domains: Vec<RenderedBlockDomain>,
+    /// Exact domain produced when the most recently rendered region exits a
+    /// loop normally. A following lexical region consumes this before adding
+    /// the loop condition's exit edge.
+    completed_loop_exit: Option<RenderedLoopExit>,
     /// Every lexical domain in which a source block was emitted. Shared CFG
     /// blocks may be duplicated by structuring, so coverage is checked only
     /// after all occurrences are known.
@@ -215,6 +219,12 @@ struct CertifiedForRegion {
     loop_id: LoopId,
     init: CStmt,
     update: CExpr,
+}
+
+#[derive(Debug, Clone)]
+struct RenderedLoopExit {
+    condition_block: u64,
+    domains: Vec<RenderedBlockDomain>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -443,6 +453,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             deferred_shared_exits: BTreeMap::new(),
             shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
+            completed_loop_exit: None,
             rendered_block_domains: BTreeMap::new(),
             retain_region_markers: false,
             structured_region_blocks: BTreeSet::new(),
@@ -478,6 +489,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             deferred_shared_exits: BTreeMap::new(),
             shared_joins: BTreeSet::new(),
             active_domains: vec![RenderedBlockDomain::default()],
+            completed_loop_exit: None,
             rendered_block_domains: BTreeMap::new(),
             retain_region_markers: false,
             structured_region_blocks: BTreeSet::new(),
@@ -1069,6 +1081,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         self.reset_safety_reason();
         self.control_render_proofs.clear();
         self.active_domains = vec![RenderedBlockDomain::default()];
+        self.completed_loop_exit = None;
         self.rendered_block_domains.clear();
         self.emitted_labels.clear();
         self.structured_region_blocks.clear();
@@ -1139,12 +1152,16 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         if !self.poll() {
             return Ok(CStmt::Empty);
         }
+        self.completed_loop_exit = None;
         let inherited_domains = self.active_domains.clone();
         if let Some(domains) = self.transfer_target_domains.remove(&region.entry()) {
             self.certify_transfer_domain_join(region.entry(), domains);
         }
         let stmt = self.structure_region_in_active_domains(region)?;
         self.active_domains = inherited_domains;
+        if Self::trailing_loop_condition_block(region).is_none() {
+            self.completed_loop_exit = None;
+        }
         if !self.retain_region_markers || matches!(stmt.unobserved(), CStmt::Empty) {
             Ok(stmt)
         } else {
@@ -1289,6 +1306,10 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             return Ok(CStmt::Empty);
         }
         let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body)?);
+        self.completed_loop_exit = Some(RenderedLoopExit {
+            condition_block: header,
+            domains: outer_domains.clone(),
+        });
         self.active_domains = outer_domains;
         let loop_stmt = match counted {
             Some(for_region) if for_region.loop_id == loop_id => CStmt::For {
@@ -1332,15 +1353,9 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                         stmts.push(stmt);
                     }
                     if let Some(next) = regions.get(index + 1)
-                        && let Some(condition_block) =
-                            self.normal_loop_exit_condition_block(region, next.entry())
-                        && let Err(reason) =
-                            self.push_exact_edge_guard(condition_block, next.entry())
+                        && let Err(reason) = self.certify_sequential_loop_exit(region, next.entry())
                     {
-                        self.safety_reason = Some(format!(
-                            "loop condition at 0x{condition_block:x} cannot certify sequential exit 0x{:x}: {reason}",
-                            next.entry()
-                        ));
+                        self.safety_reason = Some(reason);
                         return Ok(CStmt::Empty);
                     }
                 }
@@ -1466,10 +1481,23 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                     if !self.release_deferred_merge(*cond_block) {
                         return Ok(CStmt::Empty);
                     }
+                    if let Err(reason) = self.certify_sequential_loop_exit(body, *cond_block) {
+                        self.safety_reason = Some(reason);
+                        return Ok(CStmt::Empty);
+                    }
                     let mut stmts = Self::stmt_into_vec(body_stmt);
                     Self::append_stmt_body_flat(&mut stmts, self.structure_block(*cond_block)?);
                     body_stmt = Self::stmt_from_vec(stmts);
                 }
+                let mut exit_domains = self.active_domains.clone();
+                for domain in &mut exit_domains {
+                    domain.loops.retain(|active| *active != loop_id);
+                }
+                Self::normalize_rendered_domains(&mut exit_domains);
+                self.completed_loop_exit = Some(RenderedLoopExit {
+                    condition_block: *cond_block,
+                    domains: exit_domains,
+                });
                 self.active_domains = outer_domains;
                 self.observe_loop_control_ownership(
                     loop_id,
@@ -1639,17 +1667,19 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
     /// Identify the exact loop condition whose normal exit reaches the next
     /// lexical region. A nested sequence has the continuation of its final
     /// child; no other region shape implies a loop-exit edge.
-    fn normal_loop_exit_condition_block(&self, region: &Region, successor: u64) -> Option<u64> {
-        let condition = match region {
+    fn trailing_loop_condition_block(region: &Region) -> Option<u64> {
+        Some(match region {
             Region::WhileLoop { header, .. } => *header,
             Region::DoWhileLoop { cond_block, .. } => *cond_block,
             Region::Sequence(regions) => {
-                return regions
-                    .last()
-                    .and_then(|last| self.normal_loop_exit_condition_block(last, successor));
+                return regions.last().and_then(Self::trailing_loop_condition_block);
             }
             _ => return None,
-        };
+        })
+    }
+
+    fn normal_loop_exit_condition_block(&self, region: &Region, successor: u64) -> Option<u64> {
+        let condition = Self::trailing_loop_condition_block(region)?;
         // The caller still obtains the guard from the canonical edge facts;
         // this check only avoids treating a non-adjacent lexical successor as
         // an implied loop continuation.
@@ -1657,6 +1687,35 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             .successors(condition)
             .contains(&successor)
             .then_some(condition)
+    }
+
+    /// Carry a loop's exact normal-exit edge into its following lexical region.
+    /// Both ordinary sequences and the loop-body flattening path must perform
+    /// this transition: flattening changes braces, not the control domain in
+    /// which the next region executes.
+    fn certify_sequential_loop_exit(
+        &mut self,
+        region: &Region,
+        successor: u64,
+    ) -> Result<(), String> {
+        let Some(condition_block) = self.normal_loop_exit_condition_block(region, successor) else {
+            return Ok(());
+        };
+        if let Some(completed) = self.completed_loop_exit.take() {
+            if completed.condition_block != condition_block {
+                return Err(format!(
+                    "rendered loop exit at 0x{:x} does not match trailing loop condition 0x{condition_block:x}",
+                    completed.condition_block
+                ));
+            }
+            self.active_domains = completed.domains;
+        }
+        self.push_exact_edge_guard(condition_block, successor)
+            .map_err(|reason| {
+                format!(
+                    "loop condition at 0x{condition_block:x} cannot certify sequential exit 0x{successor:x}: {reason}"
+                )
+            })
     }
 
     fn exact_control_guard_for_edge(
@@ -2397,6 +2456,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
                 match region {
                     Region::Block(addr) => {
+                        self.completed_loop_exit = None;
                         // Inline the block's statements directly
                         self.structure_block_stmts_into(*addr, &mut all_stmts)?;
                     }
@@ -2411,6 +2471,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 if let Some(merge) = deferred_merge
                     && !self.release_deferred_merge(merge)
                 {
+                    return Ok(CStmt::Empty);
+                }
+                if let Some(next) = regions.get(index + 1)
+                    && let Err(reason) = self.certify_sequential_loop_exit(region, next.entry())
+                {
+                    self.safety_reason = Some(reason);
                     return Ok(CStmt::Empty);
                 }
             }
@@ -6006,6 +6072,155 @@ mod tests {
             domain.guards.contains(&ControlGuard::Branch {
                 predicate,
                 truth: true,
+            })
+        }));
+    }
+
+    #[test]
+    fn nested_while_continuation_retains_exact_inner_exit_guard() {
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut outer_header = R2ILBlock::new(0x1004, 4);
+        outer_header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x101c, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut inner_preheader = R2ILBlock::new(0x1008, 4);
+        inner_preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut inner_header = R2ILBlock::new(0x100c, 4);
+        inner_header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1014, 8),
+            cond: Varnode::register(0x11, 8),
+        });
+        let mut inner_body = R2ILBlock::new(0x1010, 4);
+        inner_body.push(R2ILOp::Branch {
+            target: Varnode::constant(0x100c, 8),
+        });
+        let mut inner_continuation = R2ILBlock::new(0x1014, 4);
+        inner_continuation.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1018, 8),
+        });
+        let mut outer_latch = R2ILBlock::new(0x1018, 4);
+        outer_latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut exit = R2ILBlock::new(0x101c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let blocks = [
+            entry,
+            outer_header,
+            inner_preheader,
+            inner_header,
+            inner_body,
+            inner_continuation,
+            outer_latch,
+            exit,
+        ];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let region = Region::WhileLoop {
+            header: 0x1004,
+            body: Box::new(Region::Sequence(vec![
+                Region::Block(0x1008),
+                Region::WhileLoop {
+                    header: 0x100c,
+                    body: Box::new(Region::Block(0x1010)),
+                },
+                Region::Block(0x1014),
+                Region::Block(0x1018),
+            ])),
+        };
+
+        structurer
+            .structure_region(&region)
+            .expect("source-owned nested loops must lower");
+
+        assert!(
+            structurer.safety_reason().is_none(),
+            "the inner loop's lexical continuation must retain its exit proof: {:?}",
+            structurer.safety_reason()
+        );
+        let predicate = ctx
+            .control_facts()
+            .and_then(|facts| facts.branch_for_block(0x100c))
+            .expect("canonical inner-loop predicate")
+            .id;
+        let continuation = &structurer
+            .rendered_block_domains
+            .get(&0x1014)
+            .expect("inner-loop continuation occurrence")[0];
+        assert!(continuation.alternatives.iter().all(|domain| {
+            domain.guards.contains(&ControlGuard::Branch {
+                predicate,
+                truth: true,
+            })
+        }));
+    }
+
+    #[test]
+    fn outer_do_while_condition_retains_exact_inner_exit_guard() {
+        let mut outer_body = R2ILBlock::new(0x1000, 4);
+        outer_body.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut inner_latch = R2ILBlock::new(0x1004, 4);
+        inner_latch.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1004, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut outer_latch = R2ILBlock::new(0x1008, 4);
+        outer_latch.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1000, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let blocks = [outer_body, inner_latch, outer_latch, exit];
+        let facts = source_owned_test_fixture(&blocks);
+        let ctx = exact_structure_context(facts);
+        let mut structurer = ControlFlowStructurer::new(facts.source().function(), &ctx);
+        let region = Region::DoWhileLoop {
+            body: Box::new(Region::Sequence(vec![
+                Region::Block(0x1000),
+                Region::DoWhileLoop {
+                    body: Box::new(Region::Block(0x1004)),
+                    cond_block: 0x1004,
+                },
+            ])),
+            cond_block: 0x1008,
+        };
+
+        structurer
+            .structure_region(&region)
+            .expect("source-owned nested do-while loops must lower");
+
+        assert!(
+            structurer.safety_reason().is_none(),
+            "the outer latch must retain the inner loop's normal exit proof: {:?}",
+            structurer.safety_reason()
+        );
+        let predicate = ctx
+            .control_facts()
+            .and_then(|facts| facts.branch_for_block(0x1004))
+            .expect("canonical inner-loop predicate")
+            .id;
+        let outer_latch = &structurer
+            .rendered_block_domains
+            .get(&0x1008)
+            .expect("outer latch occurrence")[0];
+        assert!(outer_latch.alternatives.iter().all(|domain| {
+            domain.guards.contains(&ControlGuard::Branch {
+                predicate,
+                truth: false,
             })
         }));
     }

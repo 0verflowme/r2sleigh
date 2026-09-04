@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[cfg(test)]
 use r2ssa::SSAOp;
-use r2ssa::{CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree};
+use r2ssa::{
+    BlockTerminator, CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree,
+};
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -1295,6 +1297,7 @@ impl<'a> RegionAnalyzer<'a> {
             .copied()
             .filter(|id| reachable.contains(id))
             .collect();
+        let switch_arm_nodes = self.working_switch_arm_nodes(graph, &reachable);
 
         // Map from node → composed region.
         let mut region_map: HashMap<usize, Region> = HashMap::new();
@@ -1323,8 +1326,23 @@ impl<'a> RegionAnalyzer<'a> {
                         } else {
                             base
                         }
+                    } else if switch_arm_nodes.contains(&next) {
+                        // Keep switch arms as separate regions. The switch
+                        // renderer owns their exact fallthrough edges and
+                        // widens the later arm's guard to every reaching case.
+                        // Copying the later arm here would instead turn one
+                        // fallthrough chain into several guarded occurrences.
+                        base
+                    } else if self.working_join_requires_path_copy(next, graph, &reachable) {
+                        if let Some(next_region) = region_map.get(&next).cloned() {
+                            Self::sequence_merge(base, next_region)
+                        } else {
+                            base
+                        }
                     } else {
-                        // Multi-predecessor: don't absorb; leave next for its own composition.
+                        // A proper merge is emitted once by the condition it
+                        // post-dominates. A partial join must instead be copied
+                        // into each disjoint path that reaches it.
                         base
                     }
                 }
@@ -1344,12 +1362,19 @@ impl<'a> RegionAnalyzer<'a> {
                         .find(|node| graph.node_is_latch_transfer(*node))
                         .or_else(|| self.find_working_merge_point(true_succ, false_succ, graph));
                     let then_region = if Some(true_succ) != merge {
-                        region_map.remove(&true_succ).map(Box::new)
+                        self.take_working_path_region(true_succ, graph, &reachable, &mut region_map)
+                            .map(Box::new)
                     } else {
                         None
                     };
                     let else_region = if Some(false_succ) != merge {
-                        region_map.remove(&false_succ).map(Box::new)
+                        self.take_working_path_region(
+                            false_succ,
+                            graph,
+                            &reachable,
+                            &mut region_map,
+                        )
+                        .map(Box::new)
                     } else {
                         None
                     };
@@ -1576,6 +1601,16 @@ impl<'a> RegionAnalyzer<'a> {
         let mut common: Vec<usize> = true_reachable
             .into_iter()
             .filter(|id| false_reachable.contains(id))
+            .filter(|id| {
+                let Some(candidate) = graph.node_entry(*id) else {
+                    return false;
+                };
+                [true_target, false_target].into_iter().all(|target| {
+                    graph
+                        .node_entry(target)
+                        .is_some_and(|start| self.post_dominates(start, candidate))
+                })
+            })
             .collect();
         common.sort_by_key(|id| {
             let true_distance = self
@@ -1591,6 +1626,82 @@ impl<'a> RegionAnalyzer<'a> {
             )
         });
         common.into_iter().next()
+    }
+
+    /// Case entries are lexical boundaries even when an earlier case reaches
+    /// them by an ordinary one-successor edge. Collect their working nodes once
+    /// so iterative composition does not repeatedly rescan switch metadata.
+    fn working_switch_arm_nodes(
+        &self,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        let mut arms = HashSet::new();
+        for block_addr in self.func.block_addrs() {
+            let Some(block) = self.func.cfg().get_block(*block_addr) else {
+                continue;
+            };
+            let BlockTerminator::Switch { cases, default } = &block.terminator else {
+                continue;
+            };
+            for target in cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(default.iter().copied())
+            {
+                if let Some(node) = graph.node_for_block(target)
+                    && reachable.contains(&node)
+                {
+                    arms.insert(node);
+                }
+            }
+        }
+        arms
+    }
+
+    /// Whether a multi-predecessor node is reached only by some control paths
+    /// through one of its predecessors. Such a node is not a proper lexical
+    /// merge: placing it after an enclosing conditional would run it on paths
+    /// that bypass it, while placing it in only one arm would drop other paths.
+    fn working_join_requires_path_copy(
+        &self,
+        node: usize,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+    ) -> bool {
+        let predecessors = graph
+            .preds
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|predecessor| reachable.contains(predecessor))
+            .collect::<Vec<_>>();
+        if predecessors.len() < 2 {
+            return false;
+        }
+        let Some(join) = graph.node_entry(node) else {
+            return false;
+        };
+        predecessors.into_iter().any(|predecessor| {
+            graph
+                .node_entry(predecessor)
+                .is_some_and(|start| !self.post_dominates(start, join))
+        })
+    }
+
+    fn take_working_path_region(
+        &self,
+        node: usize,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+        region_map: &mut HashMap<usize, Region>,
+    ) -> Option<Region> {
+        if self.working_join_requires_path_copy(node, graph, reachable) {
+            region_map.get(&node).cloned()
+        } else {
+            region_map.remove(&node)
+        }
     }
 
     fn find_working_switch_merge(&self, targets: &[usize], graph: &WorkingGraph) -> Option<usize> {
@@ -2633,6 +2744,162 @@ mod tests {
             Some(0x1004),
             "else branch should be false-target"
         );
+    }
+
+    fn explicit_block_occurrences(region: &Region, expected: u64) -> usize {
+        match region {
+            Region::Block(addr) => usize::from(*addr == expected),
+            Region::Sequence(regions) => regions
+                .iter()
+                .map(|region| explicit_block_occurrences(region, expected))
+                .sum(),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                explicit_block_occurrences(then_region, expected)
+                    + else_region
+                        .as_deref()
+                        .map_or(0, |region| explicit_block_occurrences(region, expected))
+            }
+            Region::WhileLoop { body, .. }
+            | Region::DoWhileLoop { body, .. }
+            | Region::MultiExit { head: body, .. } => explicit_block_occurrences(body, expected),
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .map(|(_, region)| explicit_block_occurrences(region, expected))
+                    .sum::<usize>()
+                    + default
+                        .as_deref()
+                        .map_or(0, |region| explicit_block_occurrences(region, expected))
+            }
+            Region::Transfer { .. } | Region::Irreducible { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn iterative_composition_duplicates_partial_joins_on_disjoint_paths() {
+        let blocks = [
+            R2ILBlock::new(0x1000, 4),
+            R2ILBlock::new(0x1010, 4),
+            R2ILBlock::new(0x1020, 4),
+            R2ILBlock::new(0x1030, 4),
+            R2ILBlock::new(0x1040, 4),
+            R2ILBlock::new(0x1060, 4),
+            R2ILBlock::new(0x1080, 4),
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1060,
+                false_target: 0x1010,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x1010,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1040,
+                false_target: 0x1020,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x1020,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1080,
+                false_target: 0x1030,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1040 });
+        func.cfg_mut()
+            .set_terminator(0x1040, BlockTerminator::Branch { target: 0x1060 });
+        func.cfg_mut()
+            .set_terminator(0x1060, BlockTerminator::Branch { target: 0x1080 });
+        func.cfg_mut()
+            .set_terminator(0x1080, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let true_target = graph.node_for_block(0x1060).expect("true target");
+        let false_target = graph.node_for_block(0x1010).expect("false target");
+        assert_eq!(
+            analyzer
+                .find_working_merge_point(true_target, false_target, &graph)
+                .and_then(|node| graph.node_entry(node)),
+            Some(0x1080),
+            "a partial join reachable from both arms is not a merge unless it post-dominates both"
+        );
+        let topo = graph
+            .topological_order()
+            .expect("acyclic partial-join graph");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1040),
+            2,
+            "the inner partial join executes on two disjoint paths"
+        );
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1060),
+            3,
+            "the outer partial join executes on three disjoint paths"
+        );
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1080),
+            1,
+            "the true post-dominating merge must remain a single continuation"
+        );
+    }
+
+    #[test]
+    fn iterative_composition_preserves_switch_fallthrough_boundaries() {
+        let blocks = [
+            R2ILBlock::new(0x1000, 4),
+            R2ILBlock::new(0x1010, 4),
+            R2ILBlock::new(0x1020, 4),
+            R2ILBlock::new(0x1030, 4),
+            R2ILBlock::new(0x1080, 4),
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::Switch {
+                cases: vec![(1, 0x1010), (2, 0x1020), (3, 0x1030)],
+                default: Some(0x1080),
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1080 });
+        func.cfg_mut()
+            .set_terminator(0x1080, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let topo = graph
+            .topological_order()
+            .expect("acyclic switch-fallthrough graph");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        for case_entry in [0x1010, 0x1020, 0x1030] {
+            assert_eq!(
+                explicit_block_occurrences(&region, case_entry),
+                1,
+                "the switch renderer, not generic path copying, owns fallthrough into case 0x{case_entry:x}"
+            );
+        }
     }
 
     fn build_latch_condition_loop_cfg() -> SSAFunction {

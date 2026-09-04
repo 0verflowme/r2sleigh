@@ -1296,12 +1296,47 @@ fn correlate_call_site_interfaces(
         ) else {
             continue;
         };
+        // A callee body captured with the caller owns the logical fixed-call
+        // signature, but only after its physical carriers agree exactly with
+        // this source-owned callsite contract.
         if let Some(callee) = recovered
             && let Ok(with_callee) = interface
                 .clone()
                 .with_exact_callee_interface(callee.clone())
         {
             interface = with_callee;
+        }
+        // The exact target identity correlates this call with the prototype
+        // radare2 recovered for that target. Parameter names are otherwise
+        // presentation-only; promote precisely one `format` name into the
+        // checked callsite contract, where it can serve as provenance for
+        // literal format counting. Missing or ambiguous names stay unknown.
+        if prototype.variadic
+            && let Some(target_name) = call.target_name()
+        {
+            let mut signatures =
+                source
+                    .presentation()
+                    .callee_signatures()
+                    .iter()
+                    .filter(|(name, signature)| {
+                        name.as_ref() == target_name
+                            && signature.is_variadic()
+                            && signature.named_parameters().len() == prototype.arguments.len()
+                    });
+            if let (Some((_, signature)), None) = (signatures.next(), signatures.next()) {
+                let mut formats = signature
+                    .named_parameters()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, parameter)| parameter.name() == Some("format"));
+                if let (Some((index, _)), None) = (formats.next(), formats.next())
+                    && let Ok(index) = u32::try_from(index)
+                    && let Ok(bound) = interface.clone().with_radare2_format_parameter(index)
+                {
+                    interface = bound;
+                }
+            }
         }
         interfaces.push(interface);
     }
@@ -1453,7 +1488,7 @@ impl TrustedSsaArtifact {
                 minted
             }
         };
-        let machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+        let mut machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
             blocks.as_slice(),
             Some(&arch),
             function_interface,
@@ -1462,6 +1497,7 @@ impl TrustedSsaArtifact {
             correlated_call_sites.interfaces,
             correlated_call_sites.tail_calls,
         );
+        machine_context.bind_source_string_literals(source.image().string_literals());
         let mut function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
             blocks.as_slice(),
             Some(&arch),
@@ -7664,12 +7700,14 @@ mod tests {
         assert_eq!(call.target, 0x1500);
     }
 
-    /// A machine, a convention and a call site that passes more than the
-    /// callee's prototype names.
-    ///
-    /// `defined` says how many of the convention's argument registers the
-    /// function writes before the call; the prototype names one of them.
-    fn variadic_tail_call_artifact(defined: usize, variadic: bool) -> SsaArtifact {
+    /// A machine, a convention and a callsite whose prototype names two
+    /// parameters. The second is optionally the radare2-identified format.
+    fn variadic_format_call_artifact(
+        defined: usize,
+        variadic: bool,
+        format_parameter: Option<u32>,
+        format: Option<&str>,
+    ) -> SsaArtifact {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
         for (index, name) in ["rdi", "rsi", "rdx", "rcx"].iter().enumerate() {
@@ -7684,7 +7722,14 @@ mod tests {
         let mut ops = (0..defined)
             .map(|index| R2ILOp::Copy {
                 dst: make_reg((index as u64) * 8, 8),
-                src: make_const(0x10 + index as u64, 8),
+                src: make_const(
+                    if u32::try_from(index).ok() == format_parameter {
+                        0x3000
+                    } else {
+                        0x10 + index as u64
+                    },
+                    8,
+                ),
             })
             .collect::<Vec<_>>();
         let call_index = ops.len();
@@ -7702,7 +7747,7 @@ mod tests {
             op_metadata: Default::default(),
         }];
 
-        let interface = SourceCallSiteInterface::new(
+        let mut interface = SourceCallSiteInterface::new(
             b"variadic-tail".to_vec(),
             SourceCallSiteIdentity::new(
                 0x1600,
@@ -7715,60 +7760,255 @@ mod tests {
             ),
             true,
             "amd64",
-            [SourceCallArgumentSpec::new(0, slot(0))],
+            [
+                SourceCallArgumentSpec::new(0, slot(0)),
+                SourceCallArgumentSpec::new(1, slot(1)),
+            ],
             variadic,
             false,
             SourceCallResult::Void,
         )
         .expect("exact callsite interface");
+        if let Some(index) = format_parameter {
+            interface = interface
+                .with_radare2_format_parameter(index)
+                .expect("format parameter belongs to the fixed prefix");
+        }
         let convention =
             SourceConventionSlots::new("amd64", (0..4).map(slot).collect::<Vec<_>>(), None)
                 .expect("convention slots");
-        SsaArtifact::for_decompile_with_interfaces_roles_and_convention(
+        let mut machine_context = SourceMachineContext::from_blocks_with_interfaces(
             &blocks,
             Some(&arch),
             None,
             SourceMachineRoles::default(),
             Some(convention),
             vec![interface],
+        );
+        if let Some(format) = format {
+            machine_context.bind_source_string_literals(&[(0x3000, format.to_string())]);
+        }
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            &blocks,
+            Some(&arch),
+            coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
+            &UncheckedSsaWorkControl,
         )
-        .expect("prepared SSA")
+        .expect("decompile SSA");
+        SsaArtifact::new_with_context(function, FunctionPrepareMode::Decompile, machine_context)
     }
 
-    fn variadic_tail_arity(defined: usize, variadic: bool) -> (usize, bool, Option<usize>) {
-        let prepared = variadic_tail_call_artifact(defined, variadic);
-        let call = prepared
+    fn variadic_format_call(
+        defined: usize,
+        variadic: bool,
+        format_parameter: Option<u32>,
+        format: Option<&str>,
+    ) -> CallsiteCertificate {
+        variadic_format_call_artifact(defined, variadic, format_parameter, format)
             .callsite_certificate_for_op(0x1600, defined)
-            .expect("callsite certificate");
-        (
-            call.argument_values.len(),
-            call.variadic,
-            call.fixed_argument_count,
-        )
+            .expect("callsite certificate")
+            .clone()
     }
 
-    /// How many arguments a call passes is a fact about the call.
-    ///
-    /// A variadic callee's prototype names only the fixed ones, so the count
-    /// cannot be read off the callee at all: `fprintf` declares two parameters
-    /// and its calls pass as many as their formats ask for. The tail continues
-    /// through the convention's remaining argument registers for as long as
-    /// this function defines them on the way to the call.
     #[test]
-    fn a_variadic_call_passes_the_arguments_the_machine_writes() {
-        assert_eq!(variadic_tail_arity(1, true), (1, true, Some(1)));
-        assert_eq!(variadic_tail_arity(2, true), (2, true, Some(1)));
-        assert_eq!(variadic_tail_arity(3, true), (3, true, Some(1)));
-        assert_eq!(variadic_tail_arity(4, true), (4, true, Some(1)));
+    fn a_variadic_call_uses_its_literal_format_not_written_scratch_registers() {
+        let no_tail = variadic_format_call(4, true, Some(1), Some("complete: 100%%"));
+        assert_eq!(no_tail.argument_values.len(), 2);
+        assert_eq!(no_tail.fixed_argument_count, Some(2));
+        assert_eq!(
+            no_tail
+                .variadic_argument_count_evidence
+                .expect("literal count evidence")
+                .format_consumed_argument_count,
+            0
+        );
+
+        let width_and_value = variadic_format_call(4, true, Some(1), Some("%*d"));
+        assert_eq!(width_and_value.argument_values.len(), 4);
+        assert_eq!(
+            width_and_value
+                .variadic_argument_count_evidence
+                .expect("literal count evidence")
+                .format_consumed_argument_count,
+            2
+        );
+
+        let first_parameter_is_format = variadic_format_call(3, true, Some(0), Some("%u"));
+        assert_eq!(first_parameter_is_format.argument_values.len(), 3);
+        assert_eq!(
+            first_parameter_is_format
+                .variadic_argument_count_evidence
+                .expect("literal count evidence")
+                .format_argument_index,
+            0
+        );
     }
 
-    /// The same callee, called two different ways, is two different counts.
+    /// Two sites reaching one variadic callee keep separate literal-count
+    /// evidence. Both sites write every convention register, so a result of
+    /// four for either call would expose the old register-write guess.
     #[test]
     fn two_calls_to_one_variadic_callee_may_pass_different_counts() {
-        let (few, _, few_fixed) = variadic_tail_arity(2, true);
-        let (many, _, many_fixed) = variadic_tail_arity(4, true);
-        assert_ne!(few, many);
-        assert_eq!((few_fixed, many_fixed), (Some(1), Some(1)));
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        for (index, name) in ["rdi", "rsi", "rdx", "rcx"].iter().enumerate() {
+            arch.add_register(RegisterDef::new(*name, (index as u64) * 8, 8));
+        }
+        let slot = |index: usize| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: (index as u64) * 8,
+            size: 8,
+        };
+        let target = make_const(0x2000, 8);
+        let first_call_index = 4;
+        let second_call_index = 9;
+        let blocks = vec![R2ILBlock {
+            addr: 0x1680,
+            size: 11,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(8, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(16, 8),
+                    src: make_const(2, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(24, 8),
+                    src: make_const(3, 8),
+                },
+                R2ILOp::Call {
+                    target: target.clone(),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(4, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(8, 8),
+                    src: make_const(0x3010, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(16, 8),
+                    src: make_const(5, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(24, 8),
+                    src: make_const(6, 8),
+                },
+                R2ILOp::Call {
+                    target: target.clone(),
+                },
+                R2ILOp::Return {
+                    target: make_const(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let interface = |op_index| {
+            SourceCallSiteInterface::new(
+                b"same-variadic-callee".to_vec(),
+                SourceCallSiteIdentity::new(
+                    0x1680,
+                    op_index,
+                    CanonicalStorageId::from_varnode(&target),
+                ),
+                true,
+                "amd64",
+                [
+                    SourceCallArgumentSpec::new(0, slot(0)),
+                    SourceCallArgumentSpec::new(1, slot(1)),
+                ],
+                true,
+                false,
+                SourceCallResult::Void,
+            )
+            .and_then(|interface| interface.with_radare2_format_parameter(1))
+            .expect("exact variadic callsite interface")
+        };
+        let convention =
+            SourceConventionSlots::new("amd64", (0..4).map(slot).collect::<Vec<_>>(), None)
+                .expect("convention slots");
+        let mut machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            &blocks,
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(convention),
+            vec![interface(first_call_index), interface(second_call_index)],
+        );
+        machine_context.bind_source_string_literals(&[
+            (0x3000, "%u:%u".to_string()),
+            (0x3010, "complete: 100%%".to_string()),
+        ]);
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            &blocks,
+            Some(&arch),
+            coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
+            &UncheckedSsaWorkControl,
+        )
+        .expect("decompile SSA");
+        let artifact = SsaArtifact::new_with_context(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+        );
+
+        let calls = artifact
+            .certificates()
+            .callsites
+            .values()
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let [first, second] = calls.as_slice() else {
+            unreachable!("the callsite count was checked above")
+        };
+        assert_eq!(first.target, second.target);
+        assert_eq!(first.fixed_argument_count, Some(2));
+        assert_eq!(second.fixed_argument_count, Some(2));
+        assert_eq!(first.argument_values.len(), 4);
+        assert_eq!(second.argument_values.len(), 2);
+        assert_eq!(
+            first
+                .variadic_argument_count_evidence
+                .expect("first literal count")
+                .format_literal_address,
+            0x3000
+        );
+        assert_eq!(
+            second
+                .variadic_argument_count_evidence
+                .expect("second literal count")
+                .format_literal_address,
+            0x3010
+        );
+    }
+
+    #[test]
+    fn variadic_calls_without_literal_format_evidence_refuse() {
+        let no_format_role = variadic_format_call(4, true, None, Some("%d"));
+        assert!(no_format_role.argument_values.is_empty());
+        assert_eq!(
+            no_format_role.variadic_argument_count_refusal,
+            Some(crate::VariadicCallsiteArgumentCountRefusal::MissingFormatParameter)
+        );
+
+        let non_literal = variadic_format_call(4, true, Some(1), None);
+        assert!(non_literal.argument_values.is_empty());
+        assert_eq!(
+            non_literal.variadic_argument_count_refusal,
+            Some(crate::VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral)
+        );
     }
 
     /// A callee that is not variadic takes what its prototype says, however
@@ -7777,7 +8017,10 @@ mod tests {
     /// observation about the call.
     #[test]
     fn a_fixed_callee_takes_only_the_arguments_its_prototype_names() {
-        assert_eq!(variadic_tail_arity(4, false), (1, false, Some(1)));
+        let call = variadic_format_call(4, false, None, None);
+        assert_eq!(call.argument_values.len(), 2);
+        assert!(!call.variadic);
+        assert_eq!(call.fixed_argument_count, Some(2));
     }
 
     #[test]

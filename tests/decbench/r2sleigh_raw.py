@@ -277,6 +277,8 @@ class RawR2SleighDecompiler(Decompiler):
                     metadata=common.extract_metrics(code),
                 )
 
+        _write_refusal_census(output_dir, binary_path, declined, len(rendered))
+
         elapsed = time.time() - started
         return DecompilationResult(
             binary_path=binary_path,
@@ -295,6 +297,45 @@ class RawR2SleighDecompiler(Decompiler):
             functions=rendered,
             output_dir=output_dir,
         )
+
+
+def _write_refusal_census(
+    output_dir: Path | None,
+    binary_path: Path,
+    declined: dict[str, str],
+    rendered: int,
+) -> None:
+    """Record why each function was declined, beside the run's own results.
+
+    The benchmark keeps a per-function ``decompiled`` boolean and discards
+    everything else this adapter learned, so a sweep says *how many* functions
+    refused and never *why*. Reading a refusal census off fifty-four corpus
+    cells and then prioritising work for a sixteen-hundred-function population
+    is how a cause that dominates the wide set stays invisible; this makes the
+    wide census a by-product of every sweep instead of a separate exercise.
+
+    Failure to write is deliberately silent. This is measurement about a
+    measurement, and it must never be the reason a sweep fails.
+    """
+    if output_dir is None:
+        return
+    try:
+        counts: dict[str, int] = {}
+        for cause in declined.values():
+            counts[cause] = counts.get(cause, 0) + 1
+        payload = {
+            "schema_version": 1,
+            "binary": binary_path.name,
+            "rendered": rendered,
+            "declined": len(declined),
+            "causes": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "by_function": dict(sorted(declined.items())),
+        }
+        path = Path(output_dir) / f"r2sleigh-refusals-{binary_path.name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return
 
 
 def _slice(out: str, index: int) -> str | None:

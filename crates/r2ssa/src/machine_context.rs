@@ -25,10 +25,11 @@ pub use r2source::{
     SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
     SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceMachineRolesError,
     SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
-    SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind, StackAddressBase,
+    SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    SourceVariadicArgumentCountRule, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 22;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 23;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -526,6 +527,10 @@ pub struct SourceMachineContext {
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
     tail_call_sites: BTreeSet<CallSiteId>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
+    /// Literal bytes captured by the same immutable source transaction as the
+    /// callsite interfaces. Unlike display strings, these participate in
+    /// semantic identity because a variadic format literal is count evidence.
+    source_string_literals: BTreeMap<u64, String>,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
 
@@ -808,6 +813,13 @@ fn write_call_site_interface(
         writer.storage(argument.storage());
     }
     writer.bool(interface.is_variadic());
+    match interface.variadic_argument_count_rule() {
+        Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index }) => {
+            writer.u8(1);
+            writer.u32(parameter_index);
+        }
+        None => writer.u8(0),
+    }
     writer.bool(interface.is_noreturn());
     match interface.result() {
         SourceCallResult::Void => writer.u8(0),
@@ -1090,6 +1102,7 @@ impl SourceMachineContext {
             raw_call_sites_by_id,
             tail_call_sites,
             call_site_interfaces: call_site_interfaces_by_identity,
+            source_string_literals: BTreeMap::new(),
             memory_spaces_by_op,
         }
     }
@@ -1320,6 +1333,31 @@ impl SourceMachineContext {
             .and_then(|identity| self.call_site_interfaces.get(&identity))
     }
 
+    /// Retain literal contents from the exact source snapshot before semantic
+    /// preparation. Duplicate addresses with different contents are omitted;
+    /// ambiguity is not literal evidence.
+    pub(crate) fn bind_source_string_literals(&mut self, literals: &[(u64, String)]) {
+        let mut ambiguous = BTreeSet::new();
+        for (address, text) in literals {
+            if self
+                .source_string_literals
+                .insert(*address, text.clone())
+                .is_some_and(|previous| previous != *text)
+            {
+                ambiguous.insert(*address);
+            }
+        }
+        for address in ambiguous {
+            self.source_string_literals.remove(&address);
+        }
+    }
+
+    pub fn source_string_literal(&self, address: u64) -> Option<&str> {
+        self.source_string_literals
+            .get(&address)
+            .map(String::as_str)
+    }
+
     pub fn memory_space_at(&self, block_addr: u64, op_index: usize) -> Option<SpaceId> {
         self.memory_spaces_by_op
             .get(&(block_addr, op_index))
@@ -1334,7 +1372,7 @@ impl SourceMachineContext {
     /// machine/source fact that can affect prepared semantics or certification.
     pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
         let mut writer = MachineContextIdentityWriter::new();
-        writer.bytes(b"r2ssa-machine-context-semantic-v5");
+        writer.bytes(b"r2ssa-machine-context-semantic-v6");
         writer.u32(self.schema_version);
         writer.u8(match self.architecture_family {
             MachineArchitectureFamily::Unknown => 0,
@@ -1468,6 +1506,12 @@ impl SourceMachineContext {
         writer.usize(self.call_site_interfaces.len());
         for interface in self.call_site_interfaces.values() {
             write_call_site_interface(&mut writer, interface);
+        }
+
+        writer.usize(self.source_string_literals.len());
+        for (address, text) in &self.source_string_literals {
+            writer.u64(*address);
+            writer.bytes(text.as_bytes());
         }
 
         writer.usize(self.memory_spaces_by_op.len());
@@ -2063,8 +2107,8 @@ mod tests {
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 22);
-        assert_eq!(x86_context.schema_version(), 22);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 23);
+        assert_eq!(x86_context.schema_version(), 23);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64
