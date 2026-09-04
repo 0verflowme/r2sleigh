@@ -11818,3 +11818,33 @@ is large, measure what is actually consumed before redesigning it — asked whet
 to keep, shrink or split the 6,128-line snapshot API, the owner chose to find out
 which entry points and which *fields* the decompiler actually reads and delete
 what is copied but never consumed.
+
+### `type_match` needs variables to align, not better type spellings
+
+The 2026-09-04 sweep printed its own diagnosis for every cell that scored zero:
+
+    bzip2: type_match scored 0 for all matched functions
+      (gt_funcs=9, gt_vars=58, gt_stack_vars=5). Likely causes:
+      (a) the decompiler produced no structured variables (arguments/stack vars)
+          to align positionally or by offset;
+      (b) variable names/offsets/types did not align between DWARF and the
+          decompiler output.
+
+This changes the ordering of the type work. The metric aligns *variables* against
+DWARF and then compares their types; with nothing alignable it scores zero
+whatever the types say. Ground truth carries 58 variables and 5 stack variables
+per binary here, and the rendering offers `stack_m40`-style slot names and
+register-named locals, which align with neither an offset nor a name.
+
+So the parameter and return work is necessary and not sufficient. Recovering
+return widths took the corpus column from 6 of 54 to 32 of 54 and is real, but on
+this metric it cannot show until the same functions also emit variables the
+aligner can match. The handoff already recorded the symptom from the other side --
+"the ground truth for `bzip2recover` has 39 stack variables and we align none" --
+and this is the metric confirming it is the binding constraint rather than a
+secondary one.
+
+Read together with the earlier finding that DecBench strips `const` and maps
+`size_t` and `uint64_t` alike to `long long`, the shape of the remaining
+`type_match` work is: alignable variables first, then widths and pointer-ness,
+and qualifier spelling not at all.
