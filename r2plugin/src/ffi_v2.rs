@@ -1864,12 +1864,9 @@ fn binding_observation_journal_failure_json(
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
             cause.insert("instruction_id".to_string(), serde_json::json!(at.0));
         }
-        Failure::InvalidPlannedInline { value, expr_index } => {
+        Failure::InvalidPlannedInline { value, term_index } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
-            cause.insert(
-                "expression_index".to_string(),
-                serde_json::json!(expr_index),
-            );
+            cause.insert("term_index".to_string(), serde_json::json!(term_index));
         }
         Failure::InvalidUse { site }
         | Failure::RefusedRenderedUse { site }
@@ -4326,7 +4323,7 @@ mod tests {
             Failure::MissingPlannedValue { value },
             Failure::InvalidPlannedInline {
                 value,
-                expr_index: 66,
+                term_index: 66,
             },
             Failure::ExactUseRequiresRenderedOccurrence { site },
             Failure::ExactWriteRequiresRenderedOccurrence { inst },
@@ -4783,7 +4780,7 @@ mod tests {
             (
                 Failure::InvalidPlannedInline {
                     value: r2ssa::ValueId(35),
-                    expr_index: 36,
+                    term_index: 36,
                 },
                 "invalid_planned_inline",
             ),
@@ -5038,6 +5035,9 @@ mod tests {
             refused: 0,
             unaccounted: 0,
             conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         let admitted_json = effect_obligations_json(Some(admitted));
         assert_eq!(admitted_json["schema_version"], 1);
@@ -5058,6 +5058,9 @@ mod tests {
             refused: 2,
             unaccounted: 1,
             conflicts: 1,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         let raw = response_diagnostics_json(
             &r2engine::EngineDiagnostics::default(),
@@ -5092,6 +5095,9 @@ mod tests {
             refused: 1,
             unaccounted: 0,
             conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         assert_eq!(
             response_outcome(

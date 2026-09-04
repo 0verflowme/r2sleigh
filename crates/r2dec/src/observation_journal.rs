@@ -85,6 +85,12 @@ enum ObservationTarget {
         binding: crate::binding_plan::BindingId,
         symbol: SymbolId,
     },
+    CertifiedArrayIndexRead {
+        access: r2ssa::StructuredAccessId,
+        value: ValueId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+    },
     Use {
         site: UseSite,
         observation: LegacyUseObservation,
@@ -104,6 +110,17 @@ enum ObservationTarget {
         binding: crate::binding_plan::BindingId,
         symbol: SymbolId,
         is_write: bool,
+    },
+    /// One call-boundary occurrence of a certified frame object's base
+    /// address. This authorizes the program-object spelling and tells
+    /// placement that the object's declaration is its storage definition.
+    EscapedStackAddress {
+        call: InstId,
+        argument_index: usize,
+        value: ValueId,
+        object: r2ssa::ObjectId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
     },
     /// One exact cell from the source-owned semantic obligation inventory.
     ///
@@ -155,7 +172,7 @@ pub(crate) enum LegacyObservationJournalError {
     MissingPlannedValue(ValueId),
     InvalidPlannedInline {
         value: ValueId,
-        expr: r2ssa::MachineExprId,
+        term: r2rewrite::TermId,
     },
     ExactUseRequiresRenderedOccurrence(UseSite),
     ExactWriteRequiresRenderedOccurrence(InstId),
@@ -529,10 +546,10 @@ impl From<&LegacyObservationJournalError> for BindingObservationJournalFailure {
             LegacyObservationJournalError::MissingPlannedValue(value) => {
                 Self::MissingPlannedValue { value: *value }
             }
-            LegacyObservationJournalError::InvalidPlannedInline { value, expr } => {
+            LegacyObservationJournalError::InvalidPlannedInline { value, term } => {
                 Self::InvalidPlannedInline {
                     value: *value,
-                    expr_index: expr.index(),
+                    term_index: term.index(),
                 }
             }
             LegacyObservationJournalError::ExactUseRequiresRenderedOccurrence(site) => {
@@ -963,6 +980,22 @@ fn placement_refusal(
         },
         Private::ReadBeforeAssignment {
             binding,
+            read: crate::binding_plan::PlacementRead::ArrayIndex { access, value },
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: access.inst.0,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
+            read: crate::binding_plan::PlacementRead::EscapedStackAddress { call, value },
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: call.0,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
             read:
                 crate::binding_plan::PlacementRead::StackAccess(access)
                 | crate::binding_plan::PlacementRead::IndexedStackAccess(access),
@@ -1156,6 +1189,7 @@ impl MarkedNativeDraft {
                 None => return Err(NativePlacementFailure::MissingBindingRole { binding }),
             }
         }
+        entry_declared.extend(occurrences.escaped_stack_bindings().iter().copied());
         let decisions = crate::placement::derive_placement_decisions(
             &placement.regions,
             source.source().function(),
@@ -1498,6 +1532,19 @@ impl LegacyObservationJournal {
                     symbol: *symbol,
                 },
             ),
+            ObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding,
+                symbol,
+            } => Some(
+                crate::placement::PlacementObservationTarget::CertifiedArrayIndexRead {
+                    access: *access,
+                    value: *value,
+                    binding: *binding,
+                    symbol: *symbol,
+                },
+            ),
             ObservationTarget::Use { site, block, .. } => Some(
                 self.source
                     .graph()
@@ -1553,6 +1600,23 @@ impl LegacyObservationJournal {
                 symbol: *symbol,
                 is_write: *is_write,
             }),
+            ObservationTarget::EscapedStackAddress {
+                call,
+                argument_index,
+                value,
+                object,
+                binding,
+                symbol,
+            } => Some(
+                crate::placement::PlacementObservationTarget::EscapedStackAddress {
+                    call: *call,
+                    argument_index: *argument_index,
+                    value: *value,
+                    object: *object,
+                    binding: *binding,
+                    symbol: *symbol,
+                },
+            ),
             ObservationTarget::Value(_) | ObservationTarget::Effect(_) => {
                 Some(crate::placement::PlacementObservationTarget::Other)
             }
@@ -1779,15 +1843,38 @@ impl LegacyObservationJournal {
                         input.value, dispositions.0, output.value, dispositions.1
                     );
                 }
-                if matches!(
+                let same_binding = matches!(
                     dispositions,
                     (
                         Some(ValueDisposition::Bound { binding: input }),
                         Some(ValueDisposition::Bound { binding: output }),
                     ) if input == output
-                ) {
+                );
+                // A preserved carrier whose restored value has no reader is
+                // the other exact no-op shape. There is deliberately no
+                // output object to coalesce in that case: the binding plan's
+                // authority-bound elision proves the restored value is unused,
+                // while `boundary_restores_carrier` proves the call did not
+                // change the carrier. Together those facts answer the source
+                // operand read without inventing a C assignment.
+                let unused_boundary_restore = matches!(
+                    (
+                        op,
+                        plan.disposition(input.value),
+                        plan.disposition(output.value)
+                    ),
+                    (
+                        r2ssa::SSAOp::CallRestore { .. },
+                        Some(ValueDisposition::Bound { .. }),
+                        Some(ValueDisposition::Elided {
+                            reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                            ..
+                        }),
+                    )
+                );
+                if same_binding || unused_boundary_restore {
                     coalesced_carrier_copy_sites.insert(site);
-                    if let Some(inst) = program_copy {
+                    if same_binding && let Some(inst) = program_copy {
                         coalesced_copy_outputs.insert(output.value);
                         coalesced_copy_writes.insert(inst);
                     }
@@ -2384,10 +2471,60 @@ impl LegacyObservationJournal {
         &mut self,
         contract: crate::fold::op_lower::RenderedReplacementContract,
     ) -> Result<CExpr, LegacyObservationJournalError> {
-        let (expr, value, replaced, obligations) = contract.into_parts();
+        let (expr, value, replaced, obligations, frame_address) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
+        targets.extend(self.discharged_instruction_targets(
+            Some(value),
+            &replaced,
+            Some(&expr),
+            frame_address.is_some(),
+        )?);
+
+        if let Some(frame_address) = frame_address {
+            let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
+                &self.source,
+                frame_address.call,
+                frame_address.argument_index,
+                value,
+            ) else {
+                return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                    value,
+                    at: frame_address.call,
+                });
+            };
+            let Some(StackObjectDisposition::Bound { binding }) =
+                self.plan.stack_object_disposition(object)
+            else {
+                return Err(LegacyObservationJournalError::MissingPlannedValue(value));
+            };
+            let symbol = self
+                .names
+                .symbol_for_binding(binding)
+                .ok_or(LegacyObservationJournalError::MissingPlannedValue(value))?;
+            if object != frame_address.object
+                || !crate::placement::frame_object_address_expr_matches(
+                    &expr,
+                    symbol,
+                    self.plan.binding(binding).is_some_and(|binding| {
+                        matches!(binding.declaration_type(), crate::ast::CType::Array(_, _))
+                    }),
+                )
+            {
+                return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                    value,
+                    at: frame_address.call,
+                });
+            }
+            targets.push(ObservationTarget::EscapedStackAddress {
+                call: frame_address.call,
+                argument_index: frame_address.argument_index,
+                value,
+                object,
+                binding,
+                symbol,
+            });
+        }
 
         for obligation in obligations {
             if !self.effect_occurrences.contains_key(&obligation) {
@@ -2425,7 +2562,7 @@ impl LegacyObservationJournal {
         discharged: &[InstId],
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let targets = self.discharged_instruction_targets(None, discharged, None)?;
+        let targets = self.discharged_instruction_targets(None, discharged, None, false)?;
         let mut marked = stmt;
         for id in self.allocate_many(targets)? {
             marked = CStmt::observed(id, marked);
@@ -2449,6 +2586,7 @@ impl LegacyObservationJournal {
         rendered: Option<ValueId>,
         discharged: &[InstId],
         expr: Option<&CExpr>,
+        abstracts_frame_base: bool,
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
@@ -2515,6 +2653,13 @@ impl LegacyObservationJournal {
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
+                        // `&frame_object` semantically contains the frame base
+                        // and displacement without spelling either as a C
+                        // value. Their exact use cells are owned by this
+                        // replacement, but a bound value cell must remain on
+                        // an occurrence of its own symbol rather than being
+                        // misclassified as the frame-object binding.
+                        Some(ValueDisposition::Bound { .. }) if abstracts_frame_base => false,
                         Some(ValueDisposition::Bound { .. }) => true,
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>
@@ -2626,6 +2771,63 @@ impl LegacyObservationJournal {
             .next()
             .ok_or(LegacyObservationJournalError::TooManyObservations)?;
         Ok(CExpr::observed(read_id, CExpr::observed(value_id, expr)))
+    }
+
+    /// Mark the exact value a certified stack-array subscript uses as its
+    /// element index.
+    ///
+    /// The machine store reads the completed address, not this earlier SSA
+    /// value directly. Replacing that address with `array[index]` introduces a
+    /// C read of the index binding, so the array element certificate is the
+    /// authority for that replacement occurrence. The ordinary value marker
+    /// installed while the term is rendered still fills the value cell; this
+    /// target supplies the placement read.
+    pub(crate) fn observe_certified_array_index_expr(
+        &mut self,
+        access: r2ssa::StructuredAccessId,
+        value: ValueId,
+        symbol: SymbolId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadDispositionNotBound,
+                self.plan.disposition(value),
+            ));
+        };
+        if !crate::placement::certified_array_index_read_matches(
+            &self.source,
+            &self.names,
+            access,
+            value,
+            *binding,
+            symbol,
+        ) {
+            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                value,
+                at: access.inst,
+            });
+        }
+        if !crate::placement::expr_reads_symbol(&expr, symbol) {
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadExpressionMissingSymbol,
+                self.plan.disposition(value),
+            ));
+        }
+        let read_id = self
+            .allocate_many(vec![ObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding: *binding,
+                symbol,
+            }])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(read_id, expr))
     }
 
     /// Mark one exact rendered access to a source-owned stack-object binding.
@@ -2924,7 +3126,9 @@ impl LegacyObservationJournal {
                     self.placement_elided_effects.insert(obligation);
                 }
                 ObservationTarget::StackAccess { .. }
-                | ObservationTarget::CertifiedValueRead { .. } => {}
+                | ObservationTarget::CertifiedValueRead { .. }
+                | ObservationTarget::CertifiedArrayIndexRead { .. }
+                | ObservationTarget::EscapedStackAddress { .. } => {}
             }
         }
 
@@ -3239,6 +3443,38 @@ impl LegacyObservationJournal {
         Ok(marked)
     }
 
+    /// Attach only the implicit effects a composite statement's children do
+    /// not already own.
+    ///
+    /// A structured loop owns an implicit latch transfer, while an explicit
+    /// conditional latch inside its body owns its own predicate and transfer.
+    /// Both come from the same source loop fact. Reading the marker tree here
+    /// keeps the concrete child occurrence authoritative and prevents the
+    /// parent from placing a second marker on that one rendered control node.
+    pub(crate) fn observe_composite_effect_stmt(
+        &mut self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let mut already_owned = BTreeSet::new();
+        for id in crate::ast::stmt_render_observation_ids(&stmt) {
+            let target = self.targets.get(id.index() as usize).ok_or(
+                LegacyObservationJournalError::Markers(RenderObservationStripError::OutOfRange {
+                    id,
+                    expected_count: self.targets.len(),
+                }),
+            )?;
+            if let ObservationTarget::Effect(obligation) = target {
+                already_owned.insert(*obligation);
+            }
+        }
+        let implicit = obligation_ids
+            .difference(&already_owned)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.observe_effect_stmt(&implicit, stmt)
+    }
+
     /// Record a value only when the sealed plan proves that no rendered AST
     /// occurrence is allowed for it.
     pub(crate) fn record_nonrendered_value(
@@ -3497,6 +3733,7 @@ impl LegacyObservationJournal {
                     // value or use slot of its own, and the placement audit is
                     // what it exists to answer.
                     ObservationTarget::CertifiedValueRead { .. } => Ok(()),
+                    ObservationTarget::CertifiedArrayIndexRead { .. } => Ok(()),
                     ObservationTarget::Value(value) => {
                         match plan.disposition(value) {
                             Some(ValueDisposition::Elided { reason, .. }) => {
@@ -3562,7 +3799,8 @@ impl LegacyObservationJournal {
                         inst, observation, ..
                     } => record_same(&mut writes[inst.0 as usize], observation)
                         .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst)),
-                    ObservationTarget::StackAccess { .. } => Ok(()),
+                    ObservationTarget::StackAccess { .. }
+                    | ObservationTarget::EscapedStackAddress { .. } => Ok(()),
                     ObservationTarget::Effect(effect) => {
                         let occurrences = effect_occurrences.get_mut(&effect).ok_or(
                             LegacyObservationJournalError::InvalidEffectObligation(effect),
@@ -3771,20 +4009,21 @@ impl LegacyObservationJournal {
     /// The obligations of every value the plan spells as a literal wherever it
     /// is read.
     ///
-    /// Asked of `r2rewrite::machine_expr_is_literal`, which is the one place
-    /// that says what a literal expression is; the binding plan asked the same
-    /// function when it decided to inline the value, so the two cannot
-    /// disagree about which values these are.
+    /// Asked of the plan's canonical term, which is the same identity the
+    /// inline disposition renders, so planning and accounting cannot disagree
+    /// about which values are literals.
     fn repeated_literal_effects(&self) -> BTreeSet<SemanticObligationId> {
-        let projection = self.plan.machine_projection();
         let graph = self.source.graph();
         let mut ids = BTreeSet::new();
         for graph_value in &graph.values {
-            let Some(ValueDisposition::Inline { expr, .. }) = self.plan.disposition(graph_value.id)
+            let Some(ValueDisposition::Inline { term, .. }) = self.plan.disposition(graph_value.id)
             else {
                 continue;
             };
-            if !r2rewrite::machine_expr_is_literal(projection, *expr) {
+            if !matches!(
+                self.plan.canonical().arena().term(*term).kind,
+                r2rewrite::TermKind::Literal(_)
+            ) {
                 continue;
             }
             let Some(definition) = graph.def_inst(graph_value.id) else {
@@ -5024,7 +5263,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_memory_effect_is_a_typed_refusal_not_a_rendered_occurrence() {
+    fn residual_memory_effect_is_unaccounted_not_a_rendered_occurrence() {
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Store {
             space: r2il::SpaceId::Ram,
@@ -5070,15 +5309,13 @@ mod tests {
             crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
         assert_eq!(
             ledger.outcome(&obligation),
-            r2ssa::ledger::Outcome::Refused {
-                layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::NoRenderedOccurrence,
-            }
+            r2ssa::ledger::Outcome::Unattributed
         );
+        assert!(ledger.unattributed().any(|id| *id == obligation));
     }
 
     #[test]
-    fn duplicate_surviving_effect_occurrence_is_a_codegen_refusal() {
+    fn duplicate_surviving_effect_occurrence_is_a_conflict() {
         let (source, _plan, mut function, mut journal) = journal_fixture();
         let obligation = *source
             .source()
@@ -5107,13 +5344,48 @@ mod tests {
             NormalizationOrigins::for_unchanged(source.source().function(), source.source());
         let ledger =
             crate::effect_ledger::build_obligation_ledger(source.source(), &origins, &effects);
-        assert_eq!(
+        assert!(matches!(
             ledger.outcome(&obligation),
-            r2ssa::ledger::Outcome::Refused {
-                layer: r2ssa::ledger::LedgerLayer::Codegen,
-                reason: r2ssa::ledger::RefusalReason::DuplicateRenderedOccurrence,
-            }
+            r2ssa::ledger::Outcome::Rendered { .. }
+        ));
+        assert_eq!(
+            ledger.conflicts().collect::<Vec<_>>(),
+            vec![(&obligation, 1)]
         );
+    }
+
+    #[test]
+    fn composite_effect_owner_adds_only_obligations_its_child_does_not_own() {
+        let (source, _plan, mut function, mut journal) = journal_fixture();
+        let obligations = source
+            .source()
+            .obligations()
+            .obligations()
+            .keys()
+            .copied()
+            .take(2)
+            .collect::<Vec<_>>();
+        let [child_obligation, implicit_obligation] = obligations.as_slice() else {
+            panic!("fixture needs two source obligations");
+        };
+        let child = journal
+            .observe_effect_stmt(&BTreeSet::from([*child_obligation]), CStmt::Return(None))
+            .expect("concrete child occurrence");
+        function.body = vec![
+            journal
+                .observe_composite_effect_stmt(
+                    &BTreeSet::from([*child_obligation, *implicit_obligation]),
+                    CStmt::while_loop(CExpr::UIntLit(1), child),
+                )
+                .expect("composite effect ownership"),
+        ];
+
+        let mut ready = crate::codegen::prepare_function_for_emission(&function);
+        let effects = journal
+            .seal_effects_only(&source, &mut ready)
+            .expect("final effect occurrences seal independently of V/U/W");
+        assert_eq!(effects.occurrence_count(*child_obligation), Some(1));
+        assert_eq!(effects.occurrence_count(*implicit_obligation), Some(1));
     }
 
     #[test]
@@ -5615,7 +5887,7 @@ mod tests {
                 .values
                 .iter()
                 .find_map(|value| match plan.disposition(value.id) {
-                    Some(ValueDisposition::Inline { expr, .. }) => Some(*expr),
+                    Some(ValueDisposition::Inline { term, .. }) => Some(*term),
                     _ => None,
                 })
                 .expect("fixture inline expression")
@@ -5737,11 +6009,11 @@ mod tests {
             (
                 LegacyObservationJournalError::InvalidPlannedInline {
                     value: ValueId(35),
-                    expr: inline_expr,
+                    term: inline_expr,
                 },
                 BindingObservationJournalFailure::InvalidPlannedInline {
                     value: ValueId(35),
-                    expr_index: inline_expr.index(),
+                    term_index: inline_expr.index(),
                 },
             ),
             (

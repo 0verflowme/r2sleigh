@@ -2589,7 +2589,7 @@ pub enum BindingObservationJournalFailure {
     },
     InvalidPlannedInline {
         value: r2ssa::ValueId,
-        expr_index: usize,
+        term_index: usize,
     },
     ExactUseRequiresRenderedOccurrence {
         site: r2ssa::UseSite,
@@ -2798,6 +2798,12 @@ pub struct EffectObligationAudit {
     pub refused: usize,
     pub unaccounted: usize,
     pub conflicts: usize,
+    /// First refused obligation in canonical source order, for diagnostics.
+    pub refused_obligation: Option<r2ssa::SemanticObligationId>,
+    /// First obligation with no occurrence or certificate, for diagnostics.
+    pub unaccounted_obligation: Option<r2ssa::SemanticObligationId>,
+    /// First obligation with incompatible occurrences, for diagnostics.
+    pub conflicting_obligation: Option<r2ssa::SemanticObligationId>,
 }
 
 impl EffectObligationAudit {
@@ -2809,6 +2815,9 @@ impl EffectObligationAudit {
         refused: 0,
         unaccounted: 0,
         conflicts: 0,
+        refused_obligation: None,
+        unaccounted_obligation: None,
+        conflicting_obligation: None,
     };
 
     fn from_ledger(ledger: &r2ssa::ledger::ObligationLedger) -> Self {
@@ -2829,6 +2838,11 @@ impl EffectObligationAudit {
             refused: closure.refused,
             unaccounted: closure.unattributed,
             conflicts: closure.conflicts,
+            refused_obligation: ledger.entries().find_map(|(id, outcome)| {
+                matches!(outcome, r2ssa::ledger::Outcome::Refused { .. }).then_some(*id)
+            }),
+            unaccounted_obligation: ledger.unattributed().next().copied(),
+            conflicting_obligation: ledger.conflicts().next().map(|(id, _)| *id),
         }
     }
 
@@ -3486,6 +3500,10 @@ impl PendingDecompileBindingAudit {
 ///
 /// Native output retains the exact binding plan and final-AST observations.
 /// Residual output is marker-free and carries no pretend native audit.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "all variants are request-local products; boxing native output would add allocation only to hide its typed audit payload"
+)]
 enum InternalBuildProduct {
     Native(SealedNativeFunction),
     Residual(EmissionReadyFunction),
@@ -7899,8 +7917,8 @@ mod tests {
                         crate::binding_plan::ValueDisposition::Bound { binding } => {
                             format!("bound:{}", binding.index())
                         }
-                        crate::binding_plan::ValueDisposition::Inline { expr, .. } => {
-                            format!("inline:{}", expr.index())
+                        crate::binding_plan::ValueDisposition::Inline { term, .. } => {
+                            format!("inline:{}", term.index())
                         }
                         crate::binding_plan::ValueDisposition::Elided { reason, .. } => {
                             format!("elided:{reason:?}")

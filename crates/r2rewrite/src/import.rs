@@ -506,6 +506,7 @@ impl Importer<'_> {
             }
             MachineExprKind::Copy { input } => self.import_expr(input),
             MachineExprKind::MemoryRead {
+                access,
                 object,
                 address,
                 width_bits,
@@ -516,6 +517,11 @@ impl Importer<'_> {
                 }
                 let (a, trace, substituted) = self.import_expr(address)?;
                 self.place_object(object);
+                if let Some(term) =
+                    self.certified_bound_stack_array_cell(access, object, a, width_bits, ty)
+                {
+                    return Some((term, trace, substituted));
+                }
                 Some((
                     self.arena.intern(ty, TermKind::Load { object, address: a }),
                     trace,
@@ -818,19 +824,93 @@ impl Importer<'_> {
             width_bits,
             signedness: MachineSignedness::Unsigned,
         };
-        let term = self.arena.intern(
-            ty,
-            TermKind::Load {
-                object: fact.object,
-                address,
-            },
-        );
+        let term = self
+            .certified_bound_stack_array_cell(access, fact.object, address, width_bits, ty)
+            .unwrap_or_else(|| {
+                self.arena.intern(
+                    ty,
+                    TermKind::Load {
+                        object: fact.object,
+                        address,
+                    },
+                )
+            });
         Some(ImportedAccess {
             access,
             term,
             trace,
             substituted,
         })
+    }
+
+    /// A bound indexed address cannot be expanded without deleting a producer
+    /// that another SSA reader still needs. The stack-object certificate has a
+    /// stronger, access-local answer: it names the exact element index, so the
+    /// cell can enter the ordinary canonical subscript/render path while the
+    /// address producer remains a statement of its own.
+    fn certified_bound_stack_array_cell(
+        &mut self,
+        access: StructuredAccessId,
+        object: ObjectId,
+        imported_address: TermId,
+        width_bits: u32,
+        cell_ty: MachineType,
+    ) -> Option<TermId> {
+        let TermKind::Leaf(address_node) = self.arena.term(imported_address).kind else {
+            // An expanded address already carries its producer and discharge
+            // set. Let the algebraic subscript rules decide that path.
+            return None;
+        };
+        let MachineExprKind::Source { binding, .. } = self.projection.expr(address_node)?.kind()
+        else {
+            return None;
+        };
+        let fact = self.artifact.structured().memory_accesses.get(&access)?;
+        if fact.object != object
+            || fact.address != binding.value()
+            || fact.width.checked_mul(8) != Some(width_bits)
+            || !fact.provenance_complete
+        {
+            return None;
+        }
+        let slot = self.artifact.certificates().stack_slots.get(&object)?;
+        let r2ssa::StackArrayLayoutDisposition::Proven(layout) = &slot.array_layout else {
+            return None;
+        };
+        if layout.object != object
+            || layout.element_width != layout.stride
+            || layout.element_width.checked_mul(8) != Some(width_bits)
+        {
+            return None;
+        }
+        let element = layout
+            .indexed_elements
+            .iter()
+            .find(|element| element.address == fact.address)?;
+        let index = match element.element_index? {
+            r2ssa::StackArrayElementIndex::Value(value) => {
+                self.leaf_for_value_at_own_width(value)?
+            }
+            r2ssa::StackArrayElementIndex::Constant(value) => {
+                let address_width = self.arena.term(imported_address).width_bits();
+                let bits = MachineBitVector::new(address_width, value)?;
+                self.arena.intern(
+                    MachineType::Integer {
+                        width_bits: address_width,
+                        signedness: MachineSignedness::Unsigned,
+                    },
+                    TermKind::Literal(bits),
+                )
+            }
+        };
+        let base = self.arena.intern(
+            self.arena.term(imported_address).ty,
+            TermKind::ObjectAddress(object),
+        );
+        Some(
+            self.arena
+                .intern(cell_ty, TermKind::Subscript { base, index }),
+        )
     }
 
     /// Record where the object a load reaches is placed, when it is.
@@ -986,6 +1066,12 @@ impl Importer<'_> {
         }
         self.declare_leaf_facts(leaf, value);
         Some(leaf)
+    }
+
+    fn leaf_for_value_at_own_width(&mut self, value: ValueId) -> Option<TermId> {
+        let node = *self.source_nodes.get(&value)?;
+        let width_bits = self.projection.expr(node)?.ty().width_bits();
+        self.leaf_for_value(value, width_bits)
     }
 
     /// The producer's term, when it is modelled, for a leaf that keeps

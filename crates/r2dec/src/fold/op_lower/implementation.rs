@@ -1,3 +1,9 @@
+#[derive(Debug, Clone)]
+pub(crate) struct FoldedOpStmt {
+    pub(crate) site: crate::normalize::NormalizedOpSite,
+    pub(crate) stmt: CStmt,
+}
+
 impl<'a> FoldingContext<'a> {
     pub(super) fn certified_const_bits(&self, var: &SSAVar) -> Option<u64> {
         let value = var.constant_bits()?;
@@ -916,15 +922,8 @@ impl<'a> FoldingContext<'a> {
     /// The conversion to the declared object is not made here. The write
     /// projection is applied to the statement after it is built, and the
     /// declared type is met once, outside it, from the type the projection
-    /// produced; this records what the projection starts from. An inlined
-    /// definition is the bare expression, and the reader converts it from
-    /// the same type.
+    /// produced; this records what the projection starts from.
     fn assign_typed(&self, lhs: CExpr, rhs: CExpr, rhs_type: Option<CValue>) -> Option<CStmt> {
-        if self.inlined_definition.get() {
-            // The result is read where it is computed, so there is nothing to
-            // assign it to; the expression is the whole of the answer.
-            return Some(CStmt::Expr(rhs));
-        }
         self.pending_assignment_type.set(rhs_type);
         // Both sides are exact occurrence projections. Identity-looking text
         // is not an elision proof: distinct SSA values may intentionally share
@@ -953,11 +952,6 @@ impl<'a> FoldingContext<'a> {
     }
 
     fn assignment_lhs_expr(&self, _dst: &SSAVar) -> OpLoweringResult<CExpr> {
-        if self.inlined_definition.get() {
-            // Discarded by `assign_stmt` under the same flag. Asking the plan
-            // for a symbol it deliberately withheld would refuse the lowering.
-            return Ok(CExpr::IntLit(0));
-        }
         match self.planned_current_output_expr() {
             Ok(Some(planned)) => Ok(planned),
             Ok(None) => Err(OpLoweringRefusal::missing_program_variable()),
@@ -1250,6 +1244,15 @@ impl<'a> FoldingContext<'a> {
         block: &SSABlock,
         current_block_addr: u64,
     ) -> OpLoweringResult<Vec<CStmt>> {
+        self.fold_block_with_sites(block, current_block_addr)
+            .map(|stmts| stmts.into_iter().map(|stmt| stmt.stmt).collect())
+    }
+
+    pub(crate) fn fold_block_with_sites(
+        &self,
+        block: &SSABlock,
+        current_block_addr: u64,
+    ) -> OpLoweringResult<Vec<FoldedOpStmt>> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_block_id.set(
             self.inputs
@@ -1334,7 +1337,12 @@ impl<'a> FoldingContext<'a> {
                         op_idx,
                         &carried,
                     );
-                    stmts.push(self.observe_effect_stmt(&obligations, stmt));
+                    stmts.push(FoldedOpStmt {
+                        site: self
+                            .normalized_site(block.addr, op_idx)
+                            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                        stmt: self.observe_effect_stmt(&obligations, stmt),
+                    });
                     break;
                 }
 
@@ -1393,7 +1401,12 @@ impl<'a> FoldingContext<'a> {
                     op_idx,
                     return_value,
                 );
-                stmts.push(self.observe_effect_stmt(&obligations, stmt));
+                stmts.push(FoldedOpStmt {
+                    site: self
+                        .normalized_site(block.addr, op_idx)
+                        .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                    stmt: self.observe_effect_stmt(&obligations, stmt),
+                });
 
                 break;
             }
@@ -1416,7 +1429,12 @@ impl<'a> FoldingContext<'a> {
 
             if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx)? {
                 let is_return = matches!(stmt.unobserved(), CStmt::Return(_));
-                stmts.push(stmt);
+                stmts.push(FoldedOpStmt {
+                    site: self
+                        .normalized_site(block.addr, op_idx)
+                        .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                    stmt,
+                });
                 if is_return {
                     break;
                 }

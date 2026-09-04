@@ -371,8 +371,8 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     {
         assert!(matches!(
             plan.disposition(constant.id),
-            Some(ValueDisposition::Inline { expr, proof })
-                if expr == &proof.literal && proof.authority == *source.authority()
+            Some(ValueDisposition::Inline { term, proof })
+                if term == &proof.term && proof.authority == *source.authority()
         ));
     }
     assert_eq!(plan.validate_source(source), Ok(()));
@@ -1498,6 +1498,98 @@ fn exact_callee_allocation_binds_anonymous_stack_object_without_source_identity(
             SemanticId::StackSlot(certified)
         )]) if *certified == object
     ));
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
+fn certified_indexed_stack_extent_declares_one_array_binding() {
+    let index = Varnode::unique(0xa0, 8);
+    let address = Varnode::unique(0xa8, 8);
+    let mut block = R2ILBlock::new(0x1100, 4);
+    for op in [
+        R2ILOp::IntSub {
+            dst: Varnode::register(0x28, 8),
+            a: Varnode::register(0x28, 8),
+            b: Varnode::constant(16, 8),
+        },
+        R2ILOp::IntAnd {
+            dst: index.clone(),
+            a: Varnode::register(0x38, 8),
+            b: Varnode::constant(15, 8),
+        },
+        R2ILOp::IntAdd {
+            dst: address.clone(),
+            a: Varnode::register(0x28, 8),
+            b: index,
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(7, 1),
+        },
+        // Keep the computed address live for a second real reader. The array
+        // access must still enter the canonical subscript path without
+        // deleting the producer this store needs.
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x4000, 8),
+            val: address,
+        },
+        R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        },
+    ] {
+        block.push(op);
+    }
+    let source_owned = source_owned_blocks_with_stack_slots(
+        &[block],
+        Vec::new(),
+        Some(SourceStackAllocationContract::new(
+            SourceStackGrowth::LowerAddresses,
+        )),
+    );
+    let certificate = source_owned
+        .source()
+        .certificates()
+        .stack_slots
+        .values()
+        .find(|slot| {
+            matches!(
+                slot.array_layout,
+                r2ssa::StackArrayLayoutDisposition::Proven(_)
+            )
+        })
+        .expect("indexed stack array certificate");
+    let plan = BindingPlan::build_shadow(&source_owned).expect("array-aware binding plan");
+    let Some(StackObjectDisposition::Bound { binding }) =
+        plan.stack_object_disposition(certificate.object)
+    else {
+        panic!("certified stack array was not bound");
+    };
+    assert_eq!(
+        plan.binding(binding).map(Binding::declaration_type),
+        Some(&CType::Array(Box::new(CType::u8()), Some(16)))
+    );
+    let stack_access = source_owned
+        .source()
+        .structured()
+        .memory_accesses
+        .values()
+        .find(|access| access.object == certificate.object)
+        .expect("indexed stack access");
+    let canonical = plan
+        .canonical()
+        .access(stack_access.id)
+        .expect("canonical indexed stack cell");
+    assert!(matches!(
+        plan.canonical().arena().term(canonical.canonical).kind,
+        r2rewrite::TermKind::Subscript { base, .. }
+            if matches!(
+                plan.canonical().arena().term(base).kind,
+                r2rewrite::TermKind::ObjectAddress(object) if object == certificate.object
+            )
+    ));
+    assert!(canonical.discharges.is_empty());
     assert!(plan.validate_seal(&source_owned).is_ok());
 }
 

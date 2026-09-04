@@ -103,6 +103,12 @@ pub(crate) enum PlacementObservationTarget {
         binding: BindingId,
         symbol: crate::symbol::SymbolId,
     },
+    CertifiedArrayIndexRead {
+        access: r2ssa::StructuredAccessId,
+        value: r2ssa::ValueId,
+        binding: BindingId,
+        symbol: crate::symbol::SymbolId,
+    },
     Write {
         inst: InstId,
         projection: r2ssa::MachineWriteProjection,
@@ -123,6 +129,14 @@ pub(crate) enum PlacementObservationTarget {
         symbol: crate::symbol::SymbolId,
         is_write: bool,
     },
+    EscapedStackAddress {
+        call: InstId,
+        argument_index: usize,
+        value: r2ssa::ValueId,
+        object: r2ssa::ObjectId,
+        binding: BindingId,
+        symbol: crate::symbol::SymbolId,
+    },
     Other,
 }
 
@@ -130,6 +144,7 @@ pub(crate) enum PlacementObservationTarget {
 pub(crate) struct FinalPlacementOccurrences {
     reads: Box<[FinalBindingRead]>,
     writes: Box<[FinalBindingWrite]>,
+    escaped_stack_bindings: BTreeSet<BindingId>,
 }
 
 impl FinalPlacementOccurrences {
@@ -139,6 +154,10 @@ impl FinalPlacementOccurrences {
 
     pub(crate) fn writes(&self) -> &[FinalBindingWrite] {
         &self.writes
+    }
+
+    pub(crate) fn escaped_stack_bindings(&self) -> &BTreeSet<BindingId> {
+        &self.escaped_stack_bindings
     }
 }
 
@@ -182,6 +201,28 @@ pub(crate) fn collect_final_placement_occurrences(
                 return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
             }
         }
+        if let PlacementObservationTarget::CertifiedArrayIndexRead {
+            access,
+            value,
+            binding,
+            symbol,
+        } = target
+        {
+            if !certified_array_index_read_matches(source, names, access, value, binding, symbol) {
+                return Err(PlacementAnalysisError::InvalidUse {
+                    site: UseSite {
+                        inst: access.inst,
+                        input_idx: 0,
+                    },
+                });
+            }
+            let RenderObservationNode::Expr(expr) = node else {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            };
+            if !expr_reads_symbol(expr, symbol) {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            }
+        }
         if let PlacementObservationTarget::StackAccess {
             access,
             object,
@@ -213,6 +254,28 @@ pub(crate) fn collect_final_placement_occurrences(
                 });
             }
         }
+        if let PlacementObservationTarget::EscapedStackAddress {
+            call,
+            argument_index: _,
+            value,
+            object: _,
+            binding,
+            symbol,
+        } = target
+        {
+            if !frame_object_address_matches(source, names, target) {
+                return Err(PlacementAnalysisError::InvalidCertifiedValueRead { value, at: call });
+            }
+            let RenderObservationNode::Expr(expr) = node else {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            };
+            let is_array = names.plan().binding(binding).is_some_and(|binding| {
+                matches!(binding.declaration_type(), crate::ast::CType::Array(_, _))
+            });
+            if !frame_object_address_expr_matches(expr, symbol, is_array) {
+                return Err(PlacementAnalysisError::UnobservedBindingRead { binding });
+            }
+        }
         let index = id.index() as usize;
         targets[index] = Some(target);
         statement_assignment[index] = match node {
@@ -238,8 +301,10 @@ pub(crate) fn collect_final_placement_occurrences(
             Some(
                 PlacementObservationTarget::Use { .. }
                     | PlacementObservationTarget::CertifiedValueRead { .. }
+                    | PlacementObservationTarget::CertifiedArrayIndexRead { .. }
                     | PlacementObservationTarget::Write { .. }
                     | PlacementObservationTarget::StackAccess { .. }
+                    | PlacementObservationTarget::EscapedStackAddress { .. }
             )
         ) {
             match scoped[index] {
@@ -280,6 +345,7 @@ pub(crate) fn collect_final_placement_occurrences(
     let answered_effect_sites = crate::binding_plan::certified_dead_frame_slot_accesses(source);
     let mut reads = Vec::new();
     let mut writes = Vec::new();
+    let mut escaped_stack_bindings = BTreeSet::new();
     for (index, target) in targets.iter().copied().enumerate() {
         let Some(FinalObservationScope::Exact {
             region,
@@ -331,6 +397,41 @@ pub(crate) fn collect_final_placement_occurrences(
                         value: Some(value),
                         statement,
                         source: PlacementRead::CertifiedValue { value, at },
+                        region,
+                        block,
+                        order,
+                    });
+                }
+            }
+            PlacementObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding,
+                symbol: _,
+            } => {
+                let inst = graph
+                    .inst(access.inst)
+                    .ok_or(PlacementAnalysisError::InvalidUse {
+                        site: UseSite {
+                            inst: access.inst,
+                            input_idx: 0,
+                        },
+                    })?;
+                if bound_value(names, value)? == Some(binding) {
+                    let block = graph
+                        .block(inst.block)
+                        .ok_or(PlacementAnalysisError::InvalidUse {
+                            site: UseSite {
+                                inst: access.inst,
+                                input_idx: 0,
+                            },
+                        })?
+                        .addr;
+                    reads.push(FinalBindingRead {
+                        binding,
+                        value: Some(value),
+                        statement,
+                        source: PlacementRead::ArrayIndex { access, value },
                         region,
                         block,
                         order,
@@ -442,6 +543,32 @@ pub(crate) fn collect_final_placement_occurrences(
                     });
                 }
             }
+            PlacementObservationTarget::EscapedStackAddress {
+                call,
+                argument_index: _,
+                value,
+                object: _,
+                binding,
+                symbol: _,
+            } => {
+                let inst = graph
+                    .inst(call)
+                    .ok_or(PlacementAnalysisError::InvalidWrite { inst: call })?;
+                let block = graph
+                    .block(inst.block)
+                    .ok_or(PlacementAnalysisError::InvalidWrite { inst: call })?
+                    .addr;
+                escaped_stack_bindings.insert(binding);
+                reads.push(FinalBindingRead {
+                    binding,
+                    value: Some(value),
+                    statement,
+                    source: PlacementRead::EscapedStackAddress { call, value },
+                    region,
+                    block,
+                    order,
+                });
+            }
             PlacementObservationTarget::Other => {}
         }
     }
@@ -452,6 +579,7 @@ pub(crate) fn collect_final_placement_occurrences(
     Ok(FinalPlacementOccurrences {
         reads: reads.into_boxed_slice(),
         writes: writes.into_boxed_slice(),
+        escaped_stack_bindings,
     })
 }
 
@@ -876,6 +1004,7 @@ fn observation_is_placement_relevant(
                 | PlacementObservationTarget::CertifiedValueRead { .. }
                 | PlacementObservationTarget::Write { .. }
                 | PlacementObservationTarget::StackAccess { .. }
+                | PlacementObservationTarget::EscapedStackAddress { .. }
         )
     )
 }
@@ -920,8 +1049,11 @@ fn expression_has_placement_write(
 /// carries is therefore ordered -- the address reads before the store that uses
 /// them -- and none of them makes the statement ambiguous.
 ///
-/// Only a chain that bottoms out in a plain variable qualifies. Anything else is
-/// a computed destination whose order this cannot state, and stays ambiguous.
+/// A chain that bottoms out in a plain variable qualifies, as does a subscript
+/// whose base and index contain only reads. Both subscript operands are part of
+/// evaluating the destination lvalue and therefore precede the store; neither
+/// is allowed to smuggle in another machine write. Anything else is a computed
+/// destination whose order this cannot state, and stays ambiguous.
 fn direct_stack_assignment_observations(
     expr: &CExpr,
     targets: &[Option<PlacementObservationTarget>],
@@ -943,9 +1075,11 @@ fn direct_stack_assignment_observations(
                     Some(
                         PlacementObservationTarget::Use { .. }
                         | PlacementObservationTarget::CertifiedValueRead { .. }
+                        | PlacementObservationTarget::CertifiedArrayIndexRead { .. }
                         | PlacementObservationTarget::StackAccess {
                             is_write: false, ..
-                        },
+                        }
+                        | PlacementObservationTarget::EscapedStackAddress { .. },
                     ) => {
                         reads.push(*id);
                     }
@@ -956,7 +1090,10 @@ fn direct_stack_assignment_observations(
                 }
                 collect(expr, targets, reads, writes)
             }
-            CExpr::Paren(expr) => collect(expr, targets, reads, writes),
+            CExpr::Paren(expr) | CExpr::Cast { expr, .. } => collect(expr, targets, reads, writes),
+            CExpr::Subscript { base, index } => {
+                collect(base, targets, reads, writes) && collect(index, targets, reads, writes)
+            }
             CExpr::Var(_) => true,
             _ => false,
         }
@@ -1641,7 +1778,7 @@ fn audit_expr(
                     | BinaryOp::ShlAssign
                     | BinaryOp::ShrAssign
             );
-            if assignment && matches!(left.unobserved(), CExpr::Var(_)) {
+            if assignment && matches!(left.unobserved(), CExpr::Var(_) | CExpr::Subscript { .. }) {
                 if *op != BinaryOp::Assign {
                     audit_expr(
                         left,
@@ -1700,11 +1837,10 @@ fn audit_expr(
                 )?;
             }
         }
-        CExpr::Cast { expr, .. }
-        | CExpr::Sizeof(expr)
-        | CExpr::AddrOf(expr)
-        | CExpr::Deref(expr)
-        | CExpr::Paren(expr) => {
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => {
+            audit_expr(expr, access, active, source, names, targets, by_symbol)?;
+        }
+        CExpr::Sizeof(expr) | CExpr::AddrOf(expr) | CExpr::Deref(expr) => {
             audit_expr(
                 expr,
                 SymbolAccess::Read,
@@ -1738,17 +1874,23 @@ fn audit_expr(
             }
         }
         CExpr::Subscript { base, index } => {
-            for expr in [base.as_ref(), index.as_ref()] {
-                audit_expr(
-                    expr,
-                    SymbolAccess::Read,
-                    active,
-                    source,
-                    names,
-                    targets,
-                    by_symbol,
-                )?;
-            }
+            let base_access = if access == SymbolAccess::Write
+                && subscript_base_is_array_stack_object(base, names, by_symbol)
+            {
+                SymbolAccess::Write
+            } else {
+                SymbolAccess::Read
+            };
+            audit_expr(base, base_access, active, source, names, targets, by_symbol)?;
+            audit_expr(
+                index,
+                SymbolAccess::Read,
+                active,
+                source,
+                names,
+                targets,
+                by_symbol,
+            )?;
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
             audit_expr(
@@ -1784,6 +1926,42 @@ fn audit_expr(
         | CExpr::SizeofType(_) => {}
     }
     Ok(())
+}
+
+/// Whether a subscript base is the name of one certified stack array.
+///
+/// A pointer variable is read by `p[i] = value`; an array object is the
+/// destination written by `array[i] = value`. The declaration type and stack
+/// role are sealed binding facts, so this distinction does not depend on a
+/// spelling or on reinterpreting the address expression in placement.
+fn subscript_base_is_array_stack_object(
+    expr: &CExpr,
+    names: &BindingNameResolution,
+    by_symbol: &BTreeMap<crate::symbol::SymbolId, BindingId>,
+) -> bool {
+    let symbol = match expr {
+        CExpr::Observed { expr, .. } | CExpr::Paren(expr) | CExpr::Cast { expr, .. } => {
+            return subscript_base_is_array_stack_object(expr, names, by_symbol);
+        }
+        CExpr::Var(symbol) => *symbol,
+        _ => return false,
+    };
+    let Some(binding) = by_symbol.get(&symbol).copied() else {
+        return false;
+    };
+    matches!(
+        (
+            names.plan().binding_role(binding),
+            names
+                .plan()
+                .binding(binding)
+                .map(|binding| binding.declaration_type()),
+        ),
+        (
+            Some(crate::binding_plan::BindingRole::StackObject { .. }),
+            Some(crate::ast::CType::Array(_, Some(_))),
+        )
+    )
 }
 
 fn audit_program_symbol(
@@ -1877,6 +2055,25 @@ fn target_authorizes_binding(
                     read_source,
                     certified_binding,
                     symbol,
+            )
+        }
+        (
+            PlacementObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding: certified_binding,
+                symbol,
+            },
+            SymbolAccess::Read,
+        ) => {
+            certified_binding == binding
+                && certified_array_index_read_matches(
+                    source,
+                    names,
+                    access,
+                    value,
+                    certified_binding,
+                    symbol,
                 )
         }
         (
@@ -1954,8 +2151,35 @@ fn target_authorizes_binding(
                     false,
                 )
         }
+        (
+            PlacementObservationTarget::EscapedStackAddress {
+                call,
+                argument_index,
+                value,
+                object,
+                binding: escaped_binding,
+                symbol,
+            },
+            SymbolAccess::Read,
+        ) => {
+            escaped_binding == binding
+                && frame_object_address_matches(
+                    source,
+                    names,
+                    PlacementObservationTarget::EscapedStackAddress {
+                        call,
+                        argument_index,
+                        value,
+                        object,
+                        binding: escaped_binding,
+                        symbol,
+                    },
+                )
+        }
         (PlacementObservationTarget::Use { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::CertifiedValueRead { .. }, SymbolAccess::Write)
+        | (PlacementObservationTarget::CertifiedArrayIndexRead { .. }, SymbolAccess::Write)
+        | (PlacementObservationTarget::EscapedStackAddress { .. }, SymbolAccess::Write)
         | (PlacementObservationTarget::Other, _) => false,
     }
 }
@@ -1979,6 +2203,94 @@ fn certified_value_read_matches(
             Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
         )
         && names.symbol_for_binding(binding) == Some(symbol)
+}
+
+/// Revalidate the replacement read introduced when a certified stack address
+/// is rendered as `array[index]`.
+pub(super) fn certified_array_index_read_matches(
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    access: r2ssa::StructuredAccessId,
+    value: r2ssa::ValueId,
+    binding: BindingId,
+    symbol: crate::symbol::SymbolId,
+) -> bool {
+    let Some(memory) = source
+        .structured()
+        .memory_accesses
+        .get(&access)
+        .filter(|memory| memory.id == access && memory.provenance_complete)
+    else {
+        return false;
+    };
+    let Some(layout) = source
+        .certificates()
+        .stack_slots
+        .get(&memory.object)
+        .and_then(|slot| match &slot.array_layout {
+            r2ssa::StackArrayLayoutDisposition::Proven(layout) => Some(layout),
+            r2ssa::StackArrayLayoutDisposition::NotIndexed
+            | r2ssa::StackArrayLayoutDisposition::Refused(_) => None,
+        })
+    else {
+        return false;
+    };
+    layout.object == memory.object
+        && layout.indexed_elements.iter().any(|element| {
+            element.address == memory.address
+                && element.element_index == Some(r2ssa::StackArrayElementIndex::Value(value))
+        })
+        && matches!(
+            names.disposition_for_value(value),
+            Some(ValueDisposition::Bound { binding: owner }) if *owner == binding
+        )
+        && names.symbol_for_binding(binding) == Some(symbol)
+}
+
+fn frame_object_address_matches(
+    source: &r2ssa::SsaArtifact,
+    names: &BindingNameResolution,
+    target: PlacementObservationTarget,
+) -> bool {
+    let PlacementObservationTarget::EscapedStackAddress {
+        call,
+        argument_index,
+        value,
+        object,
+        binding,
+        symbol,
+    } = target
+    else {
+        return false;
+    };
+    crate::binding_plan::certified_frame_object_call_argument(source, call, argument_index, value)
+        == Some(object)
+        && matches!(
+            names.plan().stack_object_disposition(object),
+            Some(crate::binding_plan::StackObjectDisposition::Bound { binding: owner })
+                if owner == binding
+        )
+        && names.symbol_for_binding(binding) == Some(symbol)
+}
+
+/// Whether an expression gives one frame object its exact address spelling.
+///
+/// Arrays decay from a bare name; scalar and aggregate objects use `&name`.
+/// Casts belong to the call boundary outside this marker and therefore do not
+/// broaden the spelling accepted here.
+pub(crate) fn frame_object_address_expr_matches(
+    expr: &CExpr,
+    symbol: crate::symbol::SymbolId,
+    is_array: bool,
+) -> bool {
+    if is_array {
+        return matches!(expr.unobserved(), CExpr::Var(actual) if *actual == symbol);
+    }
+    matches!(
+        expr.unobserved(),
+        CExpr::AddrOf(inner)
+            if matches!(inner.unobserved(), CExpr::Var(actual) if *actual == symbol)
+    )
 }
 
 /// Revalidate one stack-object occurrence without resolving a stack offset or
@@ -3479,6 +3791,14 @@ impl Occurrence {
                 at.0,
                 value.0 as usize,
             ),
+            OccurrenceKind::Read(PlacementRead::ArrayIndex { access, value }) => (
+                self.statement,
+                self.read_rank(),
+                self.block,
+                self.region.index(),
+                access.inst.0,
+                value.0 as usize,
+            ),
             OccurrenceKind::Read(
                 PlacementRead::StackAccess(access) | PlacementRead::IndexedStackAccess(access),
             ) => (
@@ -3488,6 +3808,14 @@ impl Occurrence {
                 self.region.index(),
                 access.inst.0,
                 access.ordinal as usize,
+            ),
+            OccurrenceKind::Read(PlacementRead::EscapedStackAddress { call, value }) => (
+                self.statement,
+                self.read_rank(),
+                self.block,
+                self.region.index(),
+                call.0,
+                value.0 as usize,
             ),
             OccurrenceKind::Read(PlacementRead::PreservedCarrierWrite(inst)) => (
                 self.statement,
@@ -4333,6 +4661,62 @@ mod tests {
     }
 
     #[test]
+    fn escaped_frame_object_address_uses_its_declaration_as_definition() {
+        let region = Region::Block(0x1000);
+        let regions = StructuredRegionDraft::from_region(0x1000, &region)
+            .expect("frame-object region")
+            .seal();
+        let cfg = TestCfg::new(0x1000, &[]);
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let block_region = region_with_entry(&regions, 0x1000, StructuredRegionKind::Block);
+        let call = InstId(2);
+        let value = r2ssa::ValueId(3);
+        let reads = [FinalBindingRead {
+            statement: 0,
+            value: Some(value),
+            binding,
+            source: PlacementRead::EscapedStackAddress { call, value },
+            region: block_region,
+            block: 0x1000,
+            order: FinalOccurrenceOrder(0),
+        }];
+
+        let decisions = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::from([binding]),
+            &reads,
+            &[],
+        )
+        .expect("address-taken frame-object placement");
+        assert_eq!(
+            decisions.decision(binding),
+            Some(PlacementDecision::LexicalDeclaration {
+                region: block_region,
+            })
+        );
+
+        let unescaped = derive_with_cfg(
+            &regions,
+            &cfg,
+            1,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &reads,
+            &[],
+        )
+        .expect("unescaped frame-object placement");
+        assert_eq!(
+            unescaped.decision(binding),
+            Some(PlacementDecision::Refused(
+                PlacementRefusal::MissingDefinition { binding }
+            ))
+        );
+    }
+
+    #[test]
     fn exact_region_insertion_uses_the_sealed_anchor_not_the_block_address() {
         let repeated_entry = CStmt::structured_region(
             StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
@@ -4645,5 +5029,88 @@ mod tests {
 
         assert!(order_of(2) < order_of(0));
         assert_eq!(scopes[1], None);
+    }
+
+    #[test]
+    fn final_scope_sequences_direct_stack_array_assignment_after_its_index_and_value() {
+        let stack_write = observation(0);
+        let address_use = observation(1);
+        let index_read = observation(2);
+        let value_read = observation(3);
+        let symbols = std::rc::Rc::new(std::cell::RefCell::new(SymbolTable::new()));
+        let symbol = symbols.borrow_mut().declare(
+            "stack_m64",
+            crate::ast::CType::Array(Box::new(crate::ast::CType::u8()), Some(64)),
+            SymbolRole::StackLocal(-64),
+        );
+        let index =
+            symbols
+                .borrow_mut()
+                .declare("i", crate::ast::CType::u64(), SymbolRole::Carrier);
+        let expression = CExpr::assign(
+            CExpr::observed(
+                address_use,
+                CExpr::observed(
+                    stack_write,
+                    CExpr::Subscript {
+                        base: Box::new(CExpr::cast(
+                            crate::ast::CType::ptr(crate::ast::CType::i8()),
+                            CExpr::Var(symbol),
+                        )),
+                        index: Box::new(CExpr::observed(index_read, CExpr::Var(index))),
+                    },
+                ),
+            ),
+            CExpr::observed(value_read, CExpr::UIntLit(7)),
+        );
+        let sealed = seal_structured_body(CStmt::structured_region(
+            StructuredRegionMarker::unsealed(0x1000, StructuredRegionKind::FunctionBody),
+            CStmt::Expr(expression),
+        ))
+        .expect("sealed stack array assignment");
+        let (statement, regions) = sealed.into_marked_parts();
+        let binding = BindingId::from_dense_index(0).expect("binding");
+        let targets = [
+            Some(PlacementObservationTarget::StackAccess {
+                access: r2ssa::StructuredAccessId {
+                    inst: InstId(0),
+                    ordinal: 0,
+                },
+                object: r2ssa::ObjectId(0),
+                binding,
+                symbol,
+                is_write: true,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(0),
+                    input_idx: 0,
+                },
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(0),
+                    input_idx: 1,
+                },
+                block: 0x1000,
+            }),
+            Some(PlacementObservationTarget::Use {
+                site: UseSite {
+                    inst: InstId(0),
+                    input_idx: 2,
+                },
+                block: 0x1000,
+            }),
+        ];
+        let scopes = collect_final_observation_scopes(&[statement], &regions, &targets);
+        let order_of = |index| match scopes[index] {
+            Some(FinalObservationScope::Exact { order, .. }) => order,
+            other => panic!("expected exact scope, got {other:?}"),
+        };
+
+        assert!(order_of(3) < order_of(1));
+        assert_eq!(order_of(1), order_of(2));
+        assert!(order_of(2) < order_of(0));
     }
 }

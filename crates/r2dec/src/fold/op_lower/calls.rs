@@ -313,7 +313,7 @@ impl<'a> FoldingContext<'a> {
         let mut args = Vec::with_capacity(indexed.len());
         for (index, value) in indexed.iter().copied() {
             let Some(expr) =
-                self.certified_call_arg_expr_for_value_at_site((block_addr, op_idx), value)
+                self.certified_call_arg_expr_for_value_at_site((block_addr, op_idx), index, value)
             else {
                 // The typed refusal deliberately keeps only its stable kind
                 // and deciding site. The argument identity is per-call
@@ -327,7 +327,7 @@ impl<'a> FoldingContext<'a> {
                 );
                 return Err(OpLoweringRefusal::missing_machine_projection());
             };
-            args.push(self.call_argument_as_machine_word(value, expr));
+            args.push(expr);
         }
         Ok(CertifiedCallArgs {
             args,
@@ -354,8 +354,47 @@ impl<'a> FoldingContext<'a> {
     fn certified_call_arg_expr_for_value_at_site(
         &self,
         site: (u64, usize),
+        argument_index: usize,
         value: r2ssa::ValueId,
     ) -> Option<CExpr> {
+        let prepared = self.inputs.prepared_ssa?;
+        let call = prepared.graph().inst_id_for_op_site(site.0, site.1)?;
+        // Object identity licenses the source-level spelling only when the
+        // same plan also gave that object a program variable. A refused stack
+        // identity still has a valid ordinary machine spelling; declining
+        // this replacement must therefore fall through rather than turn that
+        // unrelated function into a lowering refusal.
+        if let Some((object, (expr, ty))) =
+            crate::binding_plan::certified_frame_object_call_argument(
+                prepared,
+                call,
+                argument_index,
+                value,
+            )
+            .filter(|_| {
+                self.inputs.binding_names.is_some_and(|names| {
+                    matches!(
+                        names.require_value(value),
+                        Ok(crate::binding_plan::PlannedValueSymbol::Inline(_))
+                    )
+                })
+            })
+            .and_then(|object| {
+                self.certified_stack_address_expr_for_object(object)
+                    .map(|spelling| (object, spelling))
+            })
+        {
+            let expr = self.finish_replacement_expr(PendingReplacementExpr::escaped_stack_address(
+                value,
+                call,
+                argument_index,
+                object,
+                expr,
+            ));
+            let declared = self.machine_value_width_bits(value).map(CType::uint)?;
+            return Some(self.convert_from(expr, Some(&CValue::Typed(ty)), &declared));
+        }
+
         let expr = match self.planned_value_expr(value) {
             Ok(expr) => expr,
             Err(error) => {
@@ -372,14 +411,10 @@ impl<'a> FoldingContext<'a> {
                 .and_then(|names| names.disposition_for_value(value)),
             Some(crate::binding_plan::ValueDisposition::Bound { .. })
         ) {
-            return Some(expr);
+            return Some(self.call_argument_as_machine_word(value, expr));
         }
-        let at = self
-            .inputs
-            .prepared_ssa?
-            .graph()
-            .inst_id_for_op_site(site.0, site.1)?;
-        Some(self.observe_certified_value_read_expr(value, at, expr))
+        let expr = self.observe_certified_value_read_expr(value, call, expr);
+        Some(self.call_argument_as_machine_word(value, expr))
     }
 
     pub(super) fn known_signature_for_site(

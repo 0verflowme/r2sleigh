@@ -999,6 +999,15 @@ impl StmtObservationChain {
         stmt
     }
 
+    /// Move the exact statement occurrence into an expression-valued header
+    /// position without dropping its observation ownership.
+    pub(crate) fn reapply_expr(self, mut expr: CExpr) -> CExpr {
+        for id in self.outer_to_inner.into_iter().rev() {
+            expr = CExpr::observed(id, expr);
+        }
+        expr
+    }
+
     /// Reattach this chain when decomposition has one exact surviving statement.
     ///
     /// Returning `false` means the semantic position was deleted or split into
@@ -1417,6 +1426,24 @@ pub(crate) fn stmt_has_render_observations(stmt: &CStmt) -> bool {
     });
     match never {
         Ok(()) => found,
+        Err(never) => match never {},
+    }
+}
+
+/// Collect the observation identities already carried by one statement tree.
+///
+/// Composite constructs use this before claiming implicit source effects: a
+/// child statement that already owns an effect is the concrete occurrence, so
+/// attaching the same cell to the parent would create two accounting markers
+/// for one rendering.
+pub(crate) fn stmt_render_observation_ids(stmt: &CStmt) -> Vec<RenderObservationId> {
+    let mut ids = Vec::new();
+    let never = visit_stmt_observations(stmt, &mut |id| {
+        ids.push(id);
+        Ok::<_, std::convert::Infallible>(())
+    });
+    match never {
+        Ok(()) => ids,
         Err(never) => match never {},
     }
 }

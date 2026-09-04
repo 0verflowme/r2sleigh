@@ -199,12 +199,12 @@ pub(super) fn parameter_width(
 /// obligation ledger records as structurally unused, and the target of a direct
 /// call, which the call expression spells as the callee's name. A binding for
 /// one of those would be a second answer about the same value.
+#[cfg(test)]
 pub(super) fn component_eligible_values(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
-    let inlinable = inlinable_values(source_owned, projection);
-    component_eligible_with(source_owned, projection, &inlinable)
+    Ok(rewrite_inlining_partition(source_owned, projection)?.component_eligible)
 }
 
 /// The same answer from a stated inlining decision.
@@ -368,6 +368,40 @@ pub(super) fn declaration_type_for_stack_object(
 ) -> r2types::CTypeLike {
     let machine = r2types::CTypeLike::machine_bits(width_bits);
     let source = source_owned.source();
+    let array_layout = source
+        .certificates()
+        .stack_slots
+        .get(&object)
+        .map(|certificate| &certificate.array_layout);
+    match array_layout {
+        Some(r2ssa::StackArrayLayoutDisposition::Proven(layout)) => {
+            if layout.object == object
+                && layout.element_width == layout.stride
+                && layout.element_width > 0
+                && layout
+                    .extent
+                    .is_multiple_of(u64::from(layout.element_width))
+                && layout.extent.checked_mul(8) == Some(u64::from(width_bits))
+                && let Ok(count) = usize::try_from(layout.extent / u64::from(layout.element_width))
+                && let Some(element_bits) = layout.element_width.checked_mul(8)
+            {
+                return r2types::CTypeLike::Array(
+                    Box::new(r2types::CTypeLike::machine_bits(element_bits)),
+                    Some(count),
+                );
+            }
+            // A malformed aggregate certificate cannot be retried from type
+            // evidence: that would give the object a second geometry owner.
+            return machine;
+        }
+        Some(r2ssa::StackArrayLayoutDisposition::Refused(_)) => {
+            // Refusal is authoritative. In particular, conflicting access
+            // widths and a missing constant bound must remain scalar even if
+            // advisory type evidence happens to resemble an array.
+            return machine;
+        }
+        Some(r2ssa::StackArrayLayoutDisposition::NotIndexed) | None => {}
+    }
     let Some(fact) = source.objects().object(object) else {
         return machine;
     };
@@ -445,6 +479,9 @@ pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> 
         } if *bits <= 128 => Some(*bits),
         r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
         r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+        r2types::CTypeLike::Array(element, Some(count)) => {
+            declaration_type_width(element, ptr_bits)?.checked_mul(u32::try_from(*count).ok()?)
+        }
         r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
         r2types::CTypeLike::Typedef(name) => {
             r2types::parse_c_type_like(name, ptr_bits).and_then(|parsed| parsed.bits(ptr_bits))
@@ -611,10 +648,27 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
 /// That was seventy-two per cent of a render on `xxhash32`. The projection is
 /// derived from the artifact and is the same object either way; deriving it
 /// again is not a second opinion, only the same answer at a cost.
-pub(super) fn inlinable_values(
+pub(super) struct RewriteInliningPartition {
+    pub(super) canonical: r2rewrite::CanonicalRoots,
+    pub(super) inlinable: BTreeSet<ValueId>,
+    pub(super) component_eligible: Vec<bool>,
+}
+
+/// Compute producer expansion, expression inlining, and binding membership as
+/// one bounded fixed point.
+///
+/// Pass one imports without absorbing producers. That is enough to decide
+/// whether each value's own canonical root has a C form, without feeding a
+/// binding decision back into the rewriter. The existing conservative
+/// singleton partition then admits only bound literals that cannot orphan a
+/// coalesced object. Pass two canonicalises once with that settled inlining set
+/// as the expansion policy and derives the final component eligibility from the
+/// same set. Every lookup is indexed; each pass is linear in the machine and
+/// term arenas apart from the existing ordered component lookups.
+pub(super) fn rewrite_inlining_partition(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
-) -> BTreeSet<ValueId> {
+) -> Result<RewriteInliningPartition, BindingPlanBuildError> {
     // Two passes, in a stated order, and no iteration.
     //
     // The gate below turns away a literal that lives in a register because
@@ -642,24 +696,36 @@ pub(super) fn inlinable_values(
     // is also unsound: excluding a value removes it from the member set
     // `merge_would_interfere` reads, so it can remove the interference
     // blocking a merge and make a component *grow*.
-    let conservative = inlinable_core(source_owned, projection, &BTreeSet::new());
-    let Ok(eligible) = component_eligible_with(source_owned, projection, &conservative) else {
-        return conservative;
-    };
-    let Ok(components) = super::construction::binding_components_with(source_owned, &eligible)
-    else {
-        return conservative;
-    };
+    let source = source_owned.source();
+    let seed_canonical = r2rewrite::canonicalize_with(source, projection, &|_| false)
+        .map_err(BindingPlanBuildError::Canonicalisation)?;
+    let conservative = inlinable_core(source_owned, projection, &seed_canonical, &BTreeSet::new());
+    let eligible = component_eligible_with(source_owned, projection, &conservative)?;
+    let components = super::construction::binding_components_with(source_owned, &eligible)?;
     let alone = components
         .iter()
         .filter(|component| component.members.len() == 1)
         .filter_map(|component| component.members.first().copied())
         .collect::<BTreeSet<_>>();
     let admitted = duplicable_bound_literals(projection, source_owned, &alone);
-    if admitted.is_empty() {
-        return conservative;
-    }
-    inlinable_core(source_owned, projection, &admitted)
+    let inlinable = if admitted.is_empty() {
+        conservative
+    } else {
+        inlinable_core(source_owned, projection, &seed_canonical, &admitted)
+    };
+    let component_eligible = component_eligible_with(source_owned, projection, &inlinable)?;
+    let canonical =
+        r2rewrite::canonicalize_with(source, projection, &|query: &r2rewrite::ExpansionQuery<
+            '_,
+        >| {
+            term_absorbs_producer(&inlinable, query)
+        })
+        .map_err(BindingPlanBuildError::Canonicalisation)?;
+    Ok(RewriteInliningPartition {
+        canonical,
+        inlinable,
+        component_eligible,
+    })
 }
 
 /// Whether a reader's term may absorb the producer of `value`.
@@ -732,9 +798,76 @@ fn duplicable_bound_literals(
     literal_candidates.iter().copied().collect()
 }
 
+/// The frame object base whose exact call-boundary readers may replace this value.
+///
+/// This is deliberately narrower than a generic multi-reader exception.  The
+/// graph readers must all be certified load/store address cells for the same
+/// object, and every graphless boundary reader must contain the value in an
+/// exact call-argument cell. Repeating a pure frame address across calls does
+/// not repeat a program effect; each occurrence carries the same value/use/write
+/// classification, while the effect ledger still rejects any duplicated live
+/// obligation.
+fn frame_object_address_replacement(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+    value: ValueId,
+    use_sites: &[UseSite],
+    boundary_readers: &[InstId],
+) -> Option<r2ssa::ObjectId> {
+    if boundary_readers.is_empty() {
+        return None;
+    }
+    let mut object = None;
+    for call in boundary_readers {
+        let call_site = source.certificates().callsites_by_inst.get(call)?;
+        let certificate = source.certificates().callsites.get(call_site)?;
+        let mut matched = false;
+        for (argument_index, argument) in certificate.argument_values.iter().enumerate() {
+            if *argument != value {
+                continue;
+            }
+            let candidate =
+                super::certified_frame_object_call_argument(source, *call, argument_index, value)?;
+            if object.is_some_and(|object| object != candidate) {
+                return None;
+            }
+            object = Some(candidate);
+            matched = true;
+        }
+        if !matched {
+            return None;
+        }
+    }
+    let object = object?;
+    use_sites
+        .iter()
+        .all(|site| {
+            let Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) =
+                projection.use_disposition(*site)
+            else {
+                return false;
+            };
+            let Some(access) = address.memory_access() else {
+                return false;
+            };
+            source
+                .certificates()
+                .memory_accesses
+                .get(&access)
+                .is_some_and(|memory| {
+                    memory.access == access
+                        && memory.address == value
+                        && memory.object == object
+                        && source.objects().object_for_value(value, memory.space) == Some(object)
+                })
+        })
+        .then_some(object)
+}
+
 fn inlinable_core(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
+    canonical: &r2rewrite::CanonicalRoots,
     admitted: &BTreeSet<ValueId>,
 ) -> BTreeSet<ValueId> {
     let source = source_owned.source();
@@ -834,6 +967,13 @@ fn inlinable_core(
             && (value.canonical_storage.is_none_or(|storage| {
                 matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
             }) || admitted.contains(&value.id));
+        let frame_address_replacement = frame_object_address_replacement(
+            source,
+            projection,
+            value.id,
+            use_sites,
+            boundary_readers,
+        );
         let root_kind = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
@@ -850,7 +990,7 @@ fn inlinable_core(
         // accumulator after the byte load has overwritten it, and computes a
         // wrong hash under a proof line claiming nothing was refused. Three
         // corpus cells do this and five more refuse. See the handoff.
-        if !literal_only && reader_count != 1 {
+        if !literal_only && frame_address_replacement.is_none() && reader_count != 1 {
             rejected(&format!(
                 "{reader_count} readers ({} of them certified boundary reads), of which {} sit in a \
                  certificate-elided instruction; root {root_kind}",
@@ -865,7 +1005,10 @@ fn inlinable_core(
         let renderable = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
-            .is_some_and(|expr| expression_renders_inline(expr.kind()));
+            .is_some_and(|expr| expression_renders_inline(expr.kind()))
+            && canonical.value(value.id).is_some_and(|value| {
+                term_renders_inline(&canonical.arena().term(value.canonical).kind)
+            });
         if !renderable {
             rejected(&format!(
                 "expression kind does not render inline: {root_kind}"
@@ -930,6 +1073,13 @@ fn inlinable_core(
                 .any(|inst| elided_reads.contains(inst))
         {
             rejected("a reader sits in a certificate-elided instruction");
+            continue;
+        }
+        if frame_address_replacement.is_some() {
+            // The memory-address cells remain owned by their load/store
+            // renderings.  The sole call-boundary replacement owns the
+            // producer expression and spells the canonical object's address.
+            inlinable.insert(value.id);
             continue;
         }
         if literal_only {
@@ -1074,6 +1224,37 @@ fn expression_renders_inline(kind: &r2ssa::MachineExprKind) -> bool {
             | Kind::Negate { .. }
             | Kind::Select { .. }
             | Kind::Shift { .. }
+            | Kind::Cast { .. }
+            | Kind::Extract { .. }
+            | Kind::Concat { .. }
+            | Kind::ArithmeticFlag { .. }
+    )
+}
+
+/// The canonical forms admitted by `expression_renders_inline`.
+///
+/// Keep this list identical to `materialize_term`. A machine `Copy` imports as
+/// its child and the three unary machine kinds import as the corresponding
+/// unary term kinds, so the two enums do not have identical spellings.
+fn term_renders_inline(kind: &r2rewrite::TermKind) -> bool {
+    use r2rewrite::TermKind as Kind;
+    matches!(
+        kind,
+        Kind::Leaf(_)
+            | Kind::Literal(_)
+            | Kind::Arithmetic { .. }
+            | Kind::Negate(_)
+            | Kind::Bitwise { .. }
+            | Kind::BitwiseNot(_)
+            | Kind::Boolean { .. }
+            | Kind::BooleanNot(_)
+            | Kind::Compare { .. }
+            | Kind::Cast { .. }
+            | Kind::Extract { .. }
+            | Kind::Concat { .. }
+            | Kind::Select { .. }
+            | Kind::Shift { .. }
+            | Kind::Flag { .. }
     )
 }
 

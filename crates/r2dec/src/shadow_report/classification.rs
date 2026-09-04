@@ -353,24 +353,32 @@ fn normalized_candidate_value(
             .copied()
             .map(NormalizedValueObservation::Bound)
             .ok_or(ShadowReportError::InvalidPlanValue { value }),
-        // The plan inlines two kinds of value and the oracle tells them apart:
-        // a constant, and a computed value rendered where it is read. Calling
-        // both a constant here disagreed with the oracle on every function
-        // that folded anything, which is nearly all of them.
-        ValueDisposition::Inline { expr, .. } => Ok(
-            match plan
-                .machine_projection()
-                .expr(*expr)
-                .map(|node| node.kind())
-            {
-                Some(r2ssa::MachineExprKind::Constant { binding, .. })
-                    if binding.value() == value =>
-                {
+        // This diagnostic classifies the source of the disposition, not the
+        // canonical term's final shape. A computed flag rewritten to `1` is
+        // still an inline expression; only a source-backed machine constant is
+        // an inline constant in the independently derived oracle.
+        ValueDisposition::Inline { term, .. } => {
+            let Some(canonical) = plan
+                .canonical()
+                .value(value)
+                .filter(|canonical| canonical.canonical == *term)
+            else {
+                return Err(ShadowReportError::InvalidPlanValue { value });
+            };
+            Ok(
+                if matches!(
+                    plan.machine_projection()
+                        .expr(canonical.base_root)
+                        .map(|node| node.kind()),
+                    Some(r2ssa::MachineExprKind::Constant { binding, .. })
+                        if binding.value() == value
+                ) {
                     NormalizedValueObservation::InlineConstant
-                }
-                _ => NormalizedValueObservation::InlineNonLiteral,
-            },
-        ),
+                } else {
+                    NormalizedValueObservation::InlineNonLiteral
+                },
+            )
+        }
         ValueDisposition::Elided { reason, .. } => Ok(NormalizedValueObservation::Elided(*reason)),
         ValueDisposition::Refused { reason } => Ok(NormalizedValueObservation::Refused(*reason)),
     }
