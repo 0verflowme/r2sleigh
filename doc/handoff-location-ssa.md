@@ -12073,3 +12073,95 @@ so the temporary audit branches were deleted.  No PR was opened.  The remaining
 4,317 insertions in these files form the r2sleigh capture/publication mechanism
 and should be judged or redesigned as that mechanism, not advertised as seven
 unrelated radare2 improvements.
+
+### What the boolean shape actually answered, which was not the question
+
+`shape_bool_probe` and `shape_bool_caller` were added to `tests/corpus/shapes.c`
+to reproduce the variadic misdetection that cost ninety-four benchmark
+functions, on the reasoning that radare2 reads `test al, al` as a varargs marker
+and a compiler emits exactly that for a `_Bool` return tested by its caller.
+Regenerating `tests/coverage/pinned/shapes_gcc_x64_O0` from that source answers
+the open question in that commit, and the answer is no.
+
+`shape_bool_caller` **renders**. The instruction pair is present -- the x86-64
+build contains `call shape_bool_probe` followed immediately by `test %al,%al` --
+and the harm does not follow from it. So the shape does not reproduce the class
+it was written for, and the gap in the local gates is not closed by it.
+
+It did find something else, which is why it stays. `shape_bool_probe`, an
+ordinary function returning a boolean, **refuses**:
+`missing machine projection authorization: OpLowering(implementation.rs)`. A
+nine-line function whose whole body is `return (unsigned char)(a > 7u)` is not
+an exotic shape, and that it cannot be rendered is worth a cell of its own.
+
+### Correcting the claim that the local gates cannot see the variadic class
+
+They can. The coverage sweep carries **30** `variadic callsite argument count`
+refusals against **zero** in the checked-in baseline. What it does not carry is
+the *harm*: none of the thirty is a regression, and nineteen are cause changes
+on functions that were already refusing for some other reason. So locally the
+variadic work moved refusals sideways, and only on real binaries did it take
+ninety-four rendering functions dark.
+
+The distinction matters for where to look next. The fifty-four-cell differential
+corpus is what is blind here -- it stayed at 54 of 54 throughout -- while
+coverage saw the class and simply had nothing to lose to it. A gate that sees a
+construct only where it is already broken cannot report the day it starts
+breaking things that worked.
+
+## Open threads as of `5e61091`
+
+Five branches are in flight, each on a cause that was traced before the work
+started rather than guessed at. Every one of them has its reproduction recorded
+above; this is the index.
+
+| branch | cause | how to see it |
+| --- | --- | --- |
+| `arch/r2-loc-audit` | Six functions that rendered before the snapshot pruning refuse after it, all `missing machine projection authorization`. A field classified as having no reader had one. `sym._init` appears in all three pinned binaries, so it is generic rather than corpus-specific. | `./tests/coverage/locked_coverage.sh`; the differential gate stays 54 of 54 throughout and does not see it |
+| `arch/expr-variadicguard` | Ninety-four benchmark functions went dark. radare2 reads `test al, al` as a varargs marker, flags a fixed callee variadic, and the renderer then demands a format parameter that cannot exist. `BZ2_bzRead` contains no variadic call at all. | `R2DEC_TRACE_REFUSAL=1 r2 -qq -A -e anal.sla=true -c 'pdd @ sym.BZ2_bzRead' tests/decbench/artifacts/bins/bzip2` |
+| `arch/expr-noiseregress` | `cast_chains` went 0 to 5 and `comma_conditions` 17 to 23. Two of the five cast chains are in `murmur3_32` cells that were previously discarded as gotos, so those are probably newly visible rather than new; the three in `xxhash32` are neither. | corpus matrix `machine_noise`, read per configuration |
+| `arch/expr-widths` | Copy chains: a register-to-register copy roots at `Source`, which is not inline-eligible, so one reload spells as three named locals. Carrier widths: a binding takes the widest carrier any use reads through, so `adler32`'s modulo lands on `uint64_t` and compiles to `divq` where the original had `divl`. | `tests/corpus/artifacts/raw/x64_O0_djb2.c` and `x64_O0_adler32.c` |
+| `arch/expr-boolreturn` | `shape_bool_probe`, whose entire body is `return (unsigned char)(a > 7u)`, refuses with `OpLowering(implementation.rs)` while its caller renders. | `pdd @ sym.shape_bool_probe` on the pinned shapes binary |
+
+Two things are deliberately **not** done and should not be done by accident.
+
+The corpus snapshot baseline is unblessed with all 54 cells mismatching. It is
+stale by construction because the rendering changed, and the plan's rule is one
+bless after the deletions and one at the end, never between. Blessing it now
+would record whatever these five branches happen to leave behind.
+
+The full 26-project, three-optimisation-level DecBench sweep is the acceptance
+measurement and has not been run. It costs about 13.7 hours and 0.06 GiB with
+per-project garbage collection, so it is affordable; what makes it premature is
+that ninety-four functions are known dark. Running it now would measure a state
+we already know is wrong, and the number would then be quoted.
+
+### Why four local gates missed ninety-four dark functions
+
+Not gate design. Coverage level.
+
+When the variadic argument-count proof landed, the benchmark lost 94 functions
+that had been rendering. Locally: the differential corpus stayed at 54 of 54,
+the pinned binaries reported **zero** regressions, and `/bin/ls` reported zero.
+The class was plainly visible in all of them -- 30 `variadic callsite argument
+count` refusals in the coverage sweep against zero in the baseline, 17 of them
+in `/bin/ls` alone -- but every single one arrived as a *cause change* on a
+function that was already refusing for some other reason.
+
+**A regression cannot be observed in a function that already fails to render.**
+The local populations refuse too much to be sensitive: `system_ls` renders 12 of
+136. The benchmark renders 645 of 1,768, so it had something to lose and lost
+it. That is the whole of the difference.
+
+Two consequences worth holding onto.
+
+Sensitivity is a function of coverage, so every function recovered makes the
+local gates better at detecting the next regression, quite apart from the
+coverage number itself. The argument for pushing coverage is not only that
+angr renders 99.2 per cent to our 36.5.
+
+And adding shapes to the corpus does not fix this on its own. A synthetic cell
+that refuses for an unrelated reason is exactly as blind as `/bin/ls` was:
+`shape_bool_probe` was added for this class and refuses on machine-projection
+authorization instead, so it too would report nothing the day the variadic path
+breaks something. A gate cell only guards what it renders.
