@@ -2583,6 +2583,74 @@ impl LegacyObservationJournal {
         Ok(marked)
     }
 
+    /// The cells a bound value's assignment owes when its right-hand side is
+    /// the rewriter's canonical term rather than the operation's own lowering.
+    ///
+    /// Two of them, and neither is answered by the statement's own markers.
+    ///
+    /// The producers the term absorbed are the same contract the inline path
+    /// makes: their writes, their outputs and their operands vanish into this
+    /// expression. It is the expression form of the walk rather than the
+    /// statement form, because the statement here answers for the operands of
+    /// *its* operation and not for theirs.
+    ///
+    /// The definition's own operands are the second, and they are why this is
+    /// not simply the discharge walk with one more instruction in the list.
+    /// The statement owns its write and its value, so the definition must not
+    /// be walked as a discharge; but a rewrite absorbs operands as readily as
+    /// it absorbs producers, and an operand with no definition of its own --
+    /// a folded literal, `x | 0x811c9dc5` proven to be the constant -- then
+    /// has no occurrence anywhere in the function. Everything else the rewrite
+    /// drops still has one: a bound operand has its own statement, and an
+    /// inline operand with a definition is in the absorbed list above.
+    pub(crate) fn observe_canonical_assignment_stmt(
+        &mut self,
+        value: ValueId,
+        definition: InstId,
+        absorbed: &[InstId],
+        stmt: CStmt,
+    ) -> Result<CStmt, LegacyObservationJournalError> {
+        let rhs = assignment_rhs(&stmt).ok_or_else(|| {
+            LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::NonrenderedValueDisposition,
+                self.plan.disposition(value),
+            )
+        })?;
+        let mut represented = self.expr_value_observations(rhs);
+        let mut targets = self.discharged_instruction_targets(Some(value), absorbed, Some(rhs))?;
+        represented.extend(targets.iter().filter_map(|target| match target {
+            ObservationTarget::Value(value) => Some(*value),
+            _ => None,
+        }));
+        represented.insert(value);
+        let inputs = self
+            .source
+            .graph()
+            .inst(definition)
+            .ok_or(LegacyObservationJournalError::InvalidWrite(definition))?
+            .inputs
+            .clone();
+        for input in inputs.iter().copied() {
+            if !represented.insert(input)
+                || !matches!(
+                    self.plan.disposition(input),
+                    Some(ValueDisposition::Inline { .. })
+                )
+                || self.source.graph().def_inst(input).is_some()
+            {
+                continue;
+            }
+            self.value_slot(input)?;
+            targets.push(ObservationTarget::Value(input));
+        }
+        let mut marked = stmt;
+        for id in self.allocate_many(targets)? {
+            marked = CStmt::observed(id, marked);
+        }
+        Ok(marked)
+    }
+
     /// The cells each discharged instruction still owes, in canonical order:
     /// its write, the value it produced, and every operand it read.
     ///
@@ -4204,6 +4272,25 @@ impl LegacyObservationJournal {
     ) -> Result<&mut Option<LegacyWriteObservation>, LegacyObservationJournalError> {
         self.write_slot(inst)?;
         Ok(&mut self.writes[inst.0 as usize])
+    }
+}
+
+/// The right-hand side of an assignment statement, markers intact.
+///
+/// The markers are the point: the operand walk deduplicates against the value
+/// cells the expression already carries, so handing it the stripped expression
+/// would make it claim cells a child already owns.
+fn assignment_rhs(stmt: &CStmt) -> Option<&CExpr> {
+    let CStmt::Expr(expr) = stmt.unobserved() else {
+        return None;
+    };
+    match expr.unobserved() {
+        CExpr::Binary {
+            op: BinaryOp::Assign,
+            right,
+            ..
+        } => Some(right),
+        _ => None,
     }
 }
 

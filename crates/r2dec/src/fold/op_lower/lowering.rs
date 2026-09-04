@@ -41,6 +41,19 @@ fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
     op.dst().is_some()
 }
 
+/// One bound value's assignment, spelled from the rewriter's canonical term.
+///
+/// The cells it owes travel with it because they are not the cells the
+/// operation arms' statement would have owed; see
+/// [`FoldingContext::canonical_bound_assignment`].
+struct CanonicalBoundAssignment {
+    stmt: CStmt,
+    value: ValueId,
+    definition: r2ssa::InstId,
+    /// The producers the term expanded and then stopped reading.
+    absorbed: Vec<r2ssa::InstId>,
+}
+
 impl<'a> FoldingContext<'a> {
     /// Turn one opaque rendering result into the complete source-cell set it
     /// replaces. This is the only extractor for [`PendingReplacementExpr`].
@@ -772,6 +785,105 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
+    /// The assignment a bound value's canonical term spells, where spelling it
+    /// from the term is sound.
+    ///
+    /// A value the plan inlines is rendered from the rewriter's canonical term.
+    /// A value it binds was not: the operation arms rebuilt its right-hand side
+    /// from the machine arena, so a rule that fired on the definition computed a
+    /// simpler expression and then had it thrown away. `identity.and_self`
+    /// proves `RSI_0 & RSI_0` is `RSI_0` and the reader was still shown the
+    /// conjunction, on nineteen definitions across fourteen of the corpus's
+    /// fifty-four cells. Only the *spelling* moves here; which values are bound
+    /// is the binding partition's answer and is untouched.
+    ///
+    /// Three conditions gate it, and each is a refusal rather than an
+    /// adjustment.
+    ///
+    /// The term must actually have been rewritten. An unchanged term is the
+    /// base rendering reached by a second route, and routing it through here
+    /// would trade the operation arms' spelling -- predicate resolution, the
+    /// certified memory access, the flag intrinsics -- for nothing.
+    ///
+    /// Every producer the term absorbed must be one the plan inlines. A term
+    /// that absorbed a value the plan *binds* computes it twice, once in its
+    /// own statement and again inside this expression, and the observation
+    /// journal refuses exactly that on the inline path for the same reason.
+    ///
+    /// And the term must be one `materialize_term` has a form for. A load, a
+    /// subscript or a frame-object address renders through the memory and
+    /// subscript renderers, which the term materialiser deliberately does not
+    /// duplicate, so those keep the operation arms' statement.
+    fn canonical_bound_assignment(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+    ) -> Option<CanonicalBoundAssignment> {
+        let names = self.inputs.binding_names?;
+        let prepared = self.inputs.prepared_ssa?;
+        let output = self.normalized_output_projection(site).ok()?;
+        let value = output.value;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        let symbol = names.symbol_for_binding(*binding)?;
+        let canonical = names.plan().canonical();
+        let rewrite = canonical.value(value)?;
+        if rewrite.canonical == canonical.import().value(value)?.term {
+            return None;
+        }
+        let mut absorbed = Vec::with_capacity(rewrite.discharges.len());
+        for id in &rewrite.discharges {
+            let r2ssa::CanonicalInstructionSite::Op(ordinal) = id.site else {
+                return None;
+            };
+            let inst = prepared
+                .graph()
+                .inst_id_for_op_site(id.block_addr, usize::try_from(ordinal).ok()?)?;
+            let produced = prepared.graph().inst(inst).and_then(|inst| inst.output)?;
+            if !matches!(
+                names.disposition_for_value(produced),
+                Some(crate::binding_plan::ValueDisposition::Inline { .. })
+            ) {
+                return None;
+            }
+            absorbed.push(inst);
+        }
+        let projection = self
+            .inputs
+            .normalization_origins?
+            .projection(site, prepared)
+            .ok()??;
+        let mut rhs = self
+            .materialize_term(names, value, rewrite.canonical, 0)
+            .ok()?;
+        // The operand reads the base path would have marked one at a time,
+        // marked on the whole right-hand side instead. The rewrite may have
+        // absorbed the operand that carried a read -- `x & x` reads `x` once
+        // where the machine read it twice -- and the use cell is owed by the
+        // occurrence that now stands for it either way.
+        for input_idx in 0..projection.inputs.len() {
+            rhs = self.observe_optional_normalized_input_uses_expr(Some(site), input_idx, rhs);
+        }
+        // What the right-hand side has is now the term's produced type, not the
+        // machine root's; the write projection reads this to decide how the
+        // carrier is written.
+        self.pending_assignment_type.set(
+            names
+                .plan()
+                .typed_boundaries()
+                .term_produced(rewrite.canonical)
+                .cloned(),
+        );
+        Some(CanonicalBoundAssignment {
+            stmt: CStmt::Expr(CExpr::assign(CExpr::Var(symbol), rhs)),
+            value,
+            definition: output.inst,
+            absorbed,
+        })
+    }
+
     pub(crate) fn planned_value_expr(
         &self,
         value: ValueId,
@@ -1487,7 +1599,19 @@ impl<'a> FoldingContext<'a> {
         }
         let source_call_site = source_site.or(Some((block_addr, op_idx)));
         let mut frame = LowerFrame::for_stmt(normalized_site, source_call_site, true);
-        let lowered = self.lower_op(op, &mut frame)?;
+        let (lowered, canonical) =
+            match normalized_site.and_then(|site| self.canonical_bound_assignment(site)) {
+                Some(CanonicalBoundAssignment {
+                    stmt,
+                    value,
+                    definition,
+                    absorbed,
+                }) => (
+                    LoweredOp::FinalizedStmt(stmt),
+                    Some((value, definition, absorbed)),
+                ),
+                None => (self.lower_op(op, &mut frame)?, None),
+            };
         let Some(stmt) = self.lowered_to_stmt(lowered) else {
             return Ok(None);
         };
@@ -1504,15 +1628,31 @@ impl<'a> FoldingContext<'a> {
         let obligations = self.exact_normalized_op_effects(op, block_addr, op_idx);
         let rendered = !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty);
         let stmt = if op.dst().is_some() && rendered {
-            let stmt = self.observe_normalized_output_stmt(block_addr, op_idx, stmt);
-            let discharged = source_inst
+            let mut stmt = self.observe_normalized_output_stmt(block_addr, op_idx, stmt);
+            let extensions = source_inst
                 .map(|inst| self.absorbed_extensions_discharged_by(inst))
                 .unwrap_or_default();
-            if discharged.is_empty() {
-                stmt
-            } else {
-                self.observe_discharged_stmt(&discharged, &obligations, stmt)
+            if !extensions.is_empty() {
+                stmt = self.observe_discharged_stmt(&extensions, &obligations, stmt);
             }
+            // Two contracts on one statement, because a carrier extension and
+            // a producer a canonical term absorbed owe different cells. They
+            // are still one statement, so an instruction both name is marked
+            // once, and the effects the extensions already answered are not
+            // answered again -- two occurrences of one effect is exactly what
+            // the ledger is there to catch.
+            if let Some((value, definition, absorbed)) = canonical {
+                let absorbed = absorbed
+                    .into_iter()
+                    .filter(|inst| !extensions.contains(inst))
+                    .collect::<Vec<_>>();
+                let mut answered = obligations.clone();
+                answered.extend(self.discharged_obligations(&extensions));
+                stmt = self.observe_canonical_assignment_stmt(
+                    value, definition, &absorbed, &answered, stmt,
+                );
+            }
+            stmt
         } else if rendered
             && matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
             && self.call_site_assigns_its_own_result((block_addr, op_idx))

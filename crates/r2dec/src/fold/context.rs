@@ -572,6 +572,61 @@ impl<'a> FoldingContext<'a> {
                 return fallback;
             }
         };
+        self.observe_discharged_effects(discharged, already, marked)
+    }
+
+    /// The cells and effects a bound value's canonical-term assignment owes,
+    /// on that assignment. See
+    /// [`LegacyObservationJournal::observe_canonical_assignment_stmt`]: the
+    /// producers the term absorbed and the operands it dropped are both
+    /// answered here, because neither is answered by the statement's own
+    /// markers.
+    pub(crate) fn observe_canonical_assignment_stmt(
+        &self,
+        value: ValueId,
+        definition: r2ssa::InstId,
+        absorbed: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let marked = match journal
+            .borrow_mut()
+            .observe_canonical_assignment_stmt(value, definition, absorbed, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return fallback;
+            }
+        };
+        self.observe_discharged_effects(absorbed, already, marked)
+    }
+
+    /// Mark the source effects the discharged instructions carry, less the
+    /// ones the caller marks on this same statement for its own operation.
+    fn observe_discharged_effects(
+        &self,
+        discharged: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let obligations = self
+            .discharged_obligations(discharged)
+            .difference(already)
+            .copied()
+            .collect();
+        self.observe_effect_stmt(&obligations, stmt)
+    }
+
+    /// The source effects the instructions a statement discharges carry.
+    pub(crate) fn discharged_obligations(
+        &self,
+        discharged: &[r2ssa::InstId],
+    ) -> BTreeSet<SemanticObligationId> {
         let mut obligations = BTreeSet::new();
         for definition in discharged {
             let output = self
@@ -585,8 +640,7 @@ impl<'a> FoldingContext<'a> {
                 output,
             ));
         }
-        let obligations = obligations.difference(already).copied().collect();
-        self.observe_effect_stmt(&obligations, marked)
+        obligations
     }
 
     /// Attach exact source-effect cells to the statement occurrence that
