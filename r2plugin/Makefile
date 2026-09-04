@@ -111,6 +111,8 @@ snapshot_wire.o: snapshot_wire.c snapshot_wire.h
 	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
 
 snapshot_walk.o: snapshot_walk.c snapshot_wire.h snapshot_capture.h
+	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
+
 snapshot_capture.o: snapshot_capture.c snapshot_capture.h
 	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
 
