@@ -835,6 +835,7 @@ fn inlinable_core(
 ) -> BTreeSet<ValueId> {
     let source = source_owned.source();
     let graph = source.graph();
+    let unobserved_uses = source.unobserved_merges().unobserved_uses();
     // Boundary certificates record reads that do not exist as SSA operands:
     // return values, call arguments, switch selectors and identity call-result
     // carriers read by derived-width results. A graph-only count made call
@@ -889,7 +890,27 @@ fn inlinable_core(
                 );
             }
         };
-        let use_sites = graph.use_sites(value.id);
+        // A dead phi has no rendered statement and therefore makes no program
+        // read. Its edge uses are still present in the SSA topology, so
+        // counting one here makes a live one-reader temporary look
+        // multi-reader. The dead-phi analysis is the canonical owner of that
+        // distinction. Restrict the exception to Sleigh `Unique` temporaries;
+        // architectural-register topology remains conservative because it
+        // participates in persistent object identity across blocks.
+        let use_sites = graph
+            .use_sites(value.id)
+            .iter()
+            .copied()
+            .filter(|site| {
+                value
+                    .canonical_storage
+                    .is_none_or(|storage| storage.space != r2ssa::CanonicalStorageSpace::Unique)
+                    || !unobserved_uses.contains(site)
+                    || !graph
+                        .inst(site.inst)
+                        .is_some_and(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+            })
+            .collect::<Vec<_>>();
         let boundary_readers = certified_readers
             .get(&value.id)
             .map(Vec::as_slice)
@@ -934,25 +955,18 @@ fn inlinable_core(
             source,
             projection,
             value.id,
-            use_sites,
+            &use_sites,
             boundary_readers,
         );
         let root_kind = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
             .map_or("<no entity>", |expr| machine_expr_kind_name(expr.kind()));
-        // Every reader, not only the ones that render. Discounting a reader
-        // whose instruction a certificate elides looks right -- such a read
-        // spells nothing -- and it is what the DecBench staging locals need.
-        // It is also unsound as the rest of this function stands: with the
-        // elided readers discounted, a value that is read again after its
-        // object is rewritten becomes single-use, and the interference test
-        // below spans only the window between the definition and the one
-        // reader it then believes in. `fnv1a64` at x86-64 -O2 renders
-        // `R8_1 = byte3; R8_1 = (R8_1 ^ (... ^ R8_1) * k) * k`, reading the
-        // accumulator after the byte load has overwritten it, and computes a
-        // wrong hash under a proof line claiming nothing was refused. Three
-        // corpus cells do this and five more refuse. See the handoff.
+        // Every program reader, including certificate-owned boundary reads.
+        // An arbitrary certificate-elided instruction still counts: dropping
+        // those readers made values live across later object rewrites look
+        // single-use and produced wrong hashes. Only source-certified dead-phi
+        // edges on lowering temporaries are absent above.
         if !literal_only && frame_address_replacement.is_none() && reader_count != 1 {
             rejected(&format!(
                 "{reader_count} readers ({} of them certified boundary reads), of which {} sit in a \
@@ -1055,7 +1069,7 @@ fn inlinable_core(
         // The one reader, whether the graph recorded it or a boundary
         // certificate did. Only its position is wanted from here on: which
         // block it sits in, and what runs between the definition and it.
-        let reader = match (use_sites, boundary_readers) {
+        let reader = match (use_sites.as_slice(), boundary_readers) {
             ([site], []) => site.inst,
             ([], [inst]) => *inst,
             _ => unreachable!("a value that is not literal-only was required to have one reader"),
@@ -1084,6 +1098,23 @@ fn inlinable_core(
         // location the instruction itself never mentions. Checking only the
         // instruction's inputs let three corpus cells compute the wrong answer.
         let mut read_locations = BTreeSet::new();
+        let source_reads_machine_location = |source: ValueId| {
+            let storage_is_lowering_temporary = graph.value(source).is_some_and(|value| {
+                value
+                    .canonical_storage
+                    .is_some_and(|storage| storage.space == r2ssa::CanonicalStorageSpace::Unique)
+            });
+            if !storage_is_lowering_temporary {
+                return true;
+            }
+            expr_by_value
+                .get(&source)
+                .and_then(|root| projection.expr(*root))
+                .is_some_and(|source_expr| expression_renders_inline(source_expr.kind()))
+                && canonical.value(source).is_some_and(|value| {
+                    term_renders_inline(&canonical.arena().term(value.canonical).kind)
+                })
+        };
         let mut pending = vec![*expr_by_value.get(&value.id).expect("checked above")];
         let mut seen = BTreeSet::new();
         while let Some(node) = pending.pop() {
@@ -1094,13 +1125,24 @@ fn inlinable_core(
                 continue;
             };
             if let r2ssa::MachineExprKind::Source { binding, storage } = expr.kind() {
-                if let Some(storage) = storage {
-                    read_locations.insert(storage.location());
-                } else if let Some(storage) = graph
-                    .value(binding.value())
-                    .and_then(|v| v.canonical_storage)
-                {
-                    read_locations.insert(storage.location());
+                // A source whose own producer has no inline C form is read
+                // through its planned binding, not through the machine
+                // location that once carried it.  A later reuse of a Sleigh
+                // Unique slot therefore cannot change that C object.  This is
+                // the reload/copy shape in x64 -O0 djb2: the load remains a
+                // statement, while its register copy may move past reuse of
+                // the load temporary.  Keep the location hazard for sources
+                // that can themselves expand, because their ultimate read may
+                // still move with this expression.
+                if source_reads_machine_location(binding.value()) {
+                    if let Some(storage) = storage {
+                        read_locations.insert(storage.location());
+                    } else if let Some(storage) = graph
+                        .value(binding.value())
+                        .and_then(|v| v.canonical_storage)
+                    {
+                        read_locations.insert(storage.location());
+                    }
                 }
             }
             pending.extend(expr.kind().children());
@@ -1109,6 +1151,7 @@ fn inlinable_core(
             def_inst
                 .inputs
                 .iter()
+                .filter(|input| source_reads_machine_location(**input))
                 .filter_map(|i| graph.value(*i))
                 .filter_map(|v| v.canonical_storage)
                 .map(r2ssa::CanonicalStorageId::location),
