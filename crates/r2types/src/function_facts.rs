@@ -897,6 +897,11 @@ pub fn declaration_type_width_bits(ty: &CTypeLike, ptr_bits: u32) -> Option<u32>
 
 /// Admit a logical type only where it describes this exact storage width.
 pub fn admit_declaration_type(ty: CTypeLike, width_bits: u32, ptr_bits: u32) -> CTypeLike {
+    // Fixed-width C spellings are scalar types, not distinct semantic aliases.
+    // Canonicalizing them here gives every downstream type boundary the same
+    // structured fact while preserving source-significant aliases such as
+    // `size_t`, whose canonical integer spelling differs from its name.
+    let ty = crate::signature_infer::resolve_builtin_typedefs(ty, ptr_bits);
     let admissible = match &ty {
         CTypeLike::Pointer(_) => width_bits == ptr_bits,
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => *bits == width_bits,
@@ -5806,6 +5811,22 @@ mod tests {
             64,
             &crate::ExternalTypeDb::default()
         ));
+    }
+
+    #[test]
+    fn declaration_admission_canonicalizes_only_builtin_scalar_spellings() {
+        assert_eq!(
+            admit_declaration_type(CTypeLike::Typedef("int64_t".to_string()), 64, 64),
+            CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            }
+        );
+        assert_eq!(
+            admit_declaration_type(CTypeLike::Typedef("size_t".to_string()), 64, 64),
+            CTypeLike::Typedef("size_t".to_string()),
+            "a semantic alias keeps its source-owned identity"
+        );
     }
 
     #[test]
