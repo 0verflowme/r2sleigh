@@ -28,6 +28,54 @@ fn refuse_conflicting_parameter_bindings(parameters: &mut [Option<ParameterDispo
     }
 }
 
+/// Give a full-width parameter object the type used by its declarator.
+///
+/// The binding remains owned by its certified machine width. A source parameter
+/// can name only a low slice of that binding (for example, `edi` inside a
+/// binding that also owns `rdi`); narrowing the shared object to the formal
+/// width would invalidate the machine projection before its upstream refusal
+/// can be reported. Same-width pointer and signedness refinements are safe and
+/// keep later assignments consistent with the function declarator.
+fn apply_parameter_declaration_types(
+    source_owned: &SourceOwnedFunctionFacts,
+    parameters: &[Option<ParameterDisposition>],
+    bindings: &mut [Binding],
+    ptr_bits: u32,
+) {
+    let Some(signature) = source_owned
+        .report()
+        .type_facts()
+        .render_authorized_signature()
+    else {
+        return;
+    };
+    for (slot, disposition) in parameters.iter().enumerate() {
+        let Some(ParameterDisposition::Bound { binding, .. }) = disposition else {
+            continue;
+        };
+        let Some(ty) = signature
+            .params
+            .get(slot)
+            .and_then(|parameter| parameter.ty.as_ref())
+        else {
+            continue;
+        };
+        let Some(binding) = bindings.get_mut(binding.0 as usize) else {
+            continue;
+        };
+        let Some(binding_width_bits) =
+            super::rules::declaration_type_width(binding.declaration_type(), ptr_bits)
+        else {
+            continue;
+        };
+        if super::rules::declaration_type_width(ty, ptr_bits) != Some(binding_width_bits) {
+            continue;
+        }
+        binding.declaration_type =
+            super::rules::admit_declaration(ty.clone(), binding_width_bits, ptr_bits);
+    }
+}
+
 /// Compute the transitive closure of every exact upstream coalescing set.
 ///
 /// Constants are deliberately outside the relation: they are expressions that
@@ -708,6 +756,15 @@ impl BindingPlan {
             });
         }
         refuse_conflicting_parameter_bindings(&mut parameters);
+        apply_parameter_declaration_types(
+            source_owned,
+            &parameters,
+            &mut bindings,
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+        );
 
         let mut stack_objects = BTreeMap::new();
         if let Some(render) = source_owned.report().render() {
