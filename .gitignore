@@ -32,6 +32,7 @@ r2sleigh-reversing-benchmark*.json
 r2sleigh-corpora*/
 
 # Plugin build artifacts
+r2plugin/*.o
 r2plugin/*.so
 r2plugin/*.dylib
 r2plugin/r2sleigh/*.so
