@@ -12165,3 +12165,44 @@ that refuses for an unrelated reason is exactly as blind as `/bin/ls` was:
 `shape_bool_probe` was added for this class and refuses on machine-projection
 authorization instead, so it too would report nothing the day the variadic path
 breaks something. A gate cell only guards what it renders.
+
+## The local census and the benchmark disagree about what is worth fixing
+
+The refusal census now writes (three attempts failed silently first: no output
+directory, then a fallback into a temporary build directory the benchmark
+deletes, then an environment variable read but never set). What it says is worth
+the trouble, because it contradicts the local ranking.
+
+Benchmark, `bzip2` at `-O0`, 116 functions, 57 rendered and 59 declined:
+
+    19  variadic callsite argument count: missing_format_parameter
+     8  unrepresentable operation
+     7  declaration placement: missing_definition
+     4  observation journal: ExactUseRequiresRenderedOccurrence
+     4  missing machine projection authorization: OpLowering(calls.rs)
+     4  missing machine projection authorization: OpLowering(implementation.rs)
+     3  observation journal: RenderedValueRequired
+     2  missing machine projection authorization: OpLowering(lowering.rs)
+
+Local coverage, 558 functions, 377 rendered and 181 refused:
+
+    113  observation journal: RenderedValueRequired
+     13  variadic callsite argument count: format_argument_not_literal
+     10  variadic callsite argument count: missing_format_parameter
+      8  missing machine projection authorization: OpLowering(implementation.rs)
+
+**`RenderedValueRequired` is 62 per cent of local refusals and 5 per cent of the
+benchmark's.** The local figure is import thunks: of the 121 cases traced when
+that label was split into its causes, 111 were thunks, and `bzip2` has almost
+none. It is a real cause and a narrow one, and ranking work by it means ranking
+by how many thunks the sampled binaries happen to contain.
+
+**The variadic misdetection is 32 per cent of the benchmark's refusals and the
+largest single cause there.** Locally it is 23 across two variants and cost
+nothing, because every instance landed on a function that was already refusing.
+
+The rule this illustrates was already written in this document -- a metric is
+evidence about a feature only if the population exercises it -- and was violated
+anyway while being quoted. The local census is convenient because it runs in
+minutes; it is not representative, and prioritising from it puts effort where
+the sampled binaries happen to be weak rather than where the decompiler is.
