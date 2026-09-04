@@ -77,6 +77,12 @@ _END = "R2SLEIGH_DECBENCH_END__"
 # cause, which is worth keeping in metadata even though the function is dropped.
 _REFUSAL = re.compile(r"/\* r2dec fallback: skipped decompilation for \S+ \((?P<cause>.*)\) \*/")
 
+# What radare2 prints when no decompiler plugin is registered at all. It is not
+# output from a decompiler and must never be scored as one: counted as rendered
+# it would give every function of the binary a body of prose, which reads as a
+# decompiler producing very poor C rather than as a plugin that never loaded.
+_NO_DECOMPILER = "r2pm -ci r2dec"
+
 _R2_FLAGS = ("-e", "scr.color=0", "-e", "bin.relocs.apply=true", "-q")
 
 # radare2 prefixes a function flag with where it learned the name -- `dbg.` from
@@ -387,6 +393,12 @@ class RawR2SleighDecompiler(Decompiler):
                 refusal = _REFUSAL.search(body)
                 if refusal is not None:
                     declined[name] = refusal.group("cause")
+                    continue
+                if _NO_DECOMPILER in body:
+                    declined[name] = (
+                        "harness: radare2 has no decompiler plugin registered; "
+                        "the r2sleigh plugin did not load"
+                    )
                     continue
                 code = body.strip()
                 if not code:
