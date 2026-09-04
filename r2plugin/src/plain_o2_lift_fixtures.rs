@@ -405,8 +405,10 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
                 }),
             recovered
                 .result()
-                .map_or(r2ssa::SourceFunctionReturn::Void, |storage| {
-                    r2ssa::SourceFunctionReturn::Register { storage }
+                .map_or(r2ssa::SourceFunctionReturn::Void, |result| {
+                    r2ssa::SourceFunctionReturn::Register {
+                        storage: result.slot(),
+                    }
                 }),
             [],
         )

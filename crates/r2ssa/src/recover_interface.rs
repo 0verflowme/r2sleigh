@@ -48,11 +48,34 @@ impl RecoveredParameter {
     }
 }
 
+/// One result slot the function proves it fills, and the part it actually fills.
+///
+/// The convention names the full carrier while the defining operation names the
+/// logical width. They differ for an `int` returned in a 64-bit register, just
+/// as they do for a narrow parameter arriving in a full argument register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredResult {
+    slot: CanonicalStorageId,
+    observed: CanonicalStorageId,
+}
+
+impl RecoveredResult {
+    /// The convention's result register.
+    pub const fn slot(self) -> CanonicalStorageId {
+        self.slot
+    }
+
+    /// The widest definition that contributes to the result.
+    pub const fn observed(self) -> CanonicalStorageId {
+        self.observed
+    }
+}
+
 /// What the machine code proves about a function's interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredInterface {
     parameters: Box<[RecoveredParameter]>,
-    result: Option<CanonicalStorageId>,
+    result: Option<RecoveredResult>,
 }
 
 impl RecoveredInterface {
@@ -62,8 +85,8 @@ impl RecoveredInterface {
         &self.parameters
     }
 
-    /// The result carrier, when the function defines it before returning.
-    pub const fn result(&self) -> Option<CanonicalStorageId> {
+    /// The result slot and observed logical width, when every return defines it.
+    pub const fn result(&self) -> Option<RecoveredResult> {
         self.result
     }
 }
@@ -158,6 +181,33 @@ fn read_covers_slot(read: CanonicalStorageId, slot: CanonicalStorageId) -> bool 
         && read.size <= slot.size
 }
 
+/// The widest low slice that contributes to a recovered result.
+///
+/// A full-width base followed by a narrow overlay is still a full-width value,
+/// while a function that only defines the low half has a narrow logical result.
+/// Requiring every contributing value to belong to the convention's exact
+/// location keeps an unrelated register from becoming return-width evidence.
+fn recovered_result(
+    graph: &SsaGraph,
+    live_out: &crate::liveout::FunctionLiveOut,
+    slot: CanonicalStorageId,
+) -> Option<RecoveredResult> {
+    let mut observed = None;
+    for value in live_out.iter() {
+        let storage = graph.value(value)?.canonical_storage?;
+        if storage.location() != slot.location() || storage.size == 0 || storage.size > slot.size {
+            return None;
+        }
+        if observed.is_none_or(|current: CanonicalStorageId| storage.size > current.size) {
+            observed = Some(storage);
+        }
+    }
+    Some(RecoveredResult {
+        slot,
+        observed: observed?,
+    })
+}
+
 /// Recover what the machine code proves about this function's interface.
 ///
 /// Parameters are the longest prefix of the convention's candidate slots that
@@ -225,7 +275,10 @@ fn recover_interface_inner(
     }
 
     let exact_tail_result = exact_tail_result_storage(&facts);
-    let mut result = exact_tail_result.flatten();
+    let mut result = exact_tail_result.flatten().map(|slot| RecoveredResult {
+        slot,
+        observed: slot,
+    });
     let mut live_out = crate::liveout::FunctionLiveOut::default();
     // An exact tail-call interface owns this boundary. Looking at the value
     // present before the branch would instead mistake a call argument for the
@@ -237,7 +290,7 @@ fn recover_interface_inner(
             crate::liveout::FunctionLiveOut::compute(func, &graph, &[candidate]);
         if !candidate_live_out.is_empty() && candidate_live_out.unresolved_blocks().next().is_none()
         {
-            result = Some(candidate);
+            result = recovered_result(&graph, &candidate_live_out, candidate);
             live_out = candidate_live_out;
         }
     }
@@ -361,7 +414,9 @@ pub fn mint_recovered_interface(
                 .iter()
                 .map(|parameter| (parameter.slot().size, parameter.observed().size))
                 .collect::<Vec<_>>(),
-            recovered.result().map(|storage| storage.size)
+            recovered
+                .result()
+                .map(|result| (result.slot().size, result.observed().size))
         );
     }
     minted
@@ -414,7 +469,7 @@ fn mint_recovered_interface_inner(
         .map(|parameter| storage_bits(parameter.slot()))
         .collect::<Option<Vec<_>>>()?;
     let result_width = match recovered.result() {
-        Some(storage) => Some(width_of(storage)?),
+        Some(result) => Some(width_of(result.observed())?),
         None => None,
     };
     widths.sort_unstable();
@@ -472,9 +527,11 @@ fn mint_recovered_interface_inner(
         .map(|(bits, carrier_bits)| logical(*bits, *carrier_bits))
         .collect::<Option<Vec<_>>>()?;
     let (return_kind, return_logical_value) = match (recovered.result(), result_width) {
-        (Some(storage), Some(bits)) => (
-            SourceFunctionReturn::Register { storage },
-            Some(logical(bits, bits)?),
+        (Some(result), Some(bits)) => (
+            SourceFunctionReturn::Register {
+                storage: result.slot(),
+            },
+            Some(logical(bits, result.slot().size.checked_mul(8)?)?),
         ),
         _ => (SourceFunctionReturn::Void, None),
     };
@@ -669,7 +726,47 @@ mod tests {
             &[register(0, 8), register(8, 8)]
         );
         // x0 was written, so the result carrier is defined
-        assert_eq!(interface.result(), Some(register(0, 8)));
+        assert_eq!(
+            interface.result(),
+            Some(RecoveredResult {
+                slot: register(0, 8),
+                observed: register(0, 8),
+            })
+        );
+    }
+
+    #[test]
+    fn a_narrow_result_keeps_the_full_slot_and_mints_its_observed_width() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(7, 4),
+        });
+        let recovered = recovered(block);
+        let result = recovered.result().expect("recovered narrow result");
+        assert_eq!(result.slot(), register(0, 8));
+        assert_eq!(result.observed(), register(0, 4));
+
+        let roles = SourceMachineRoles::new(Some(register(0x80, 8)), Some(register(0x88, 8)))
+            .expect("machine roles");
+        let interface =
+            mint_recovered_interface(&recovered, &roles, b"narrow-return-revision", "aapcs64")
+                .expect("minted narrow return interface");
+        assert_eq!(
+            interface.return_kind(),
+            SourceFunctionReturn::Register {
+                storage: register(0, 8),
+            }
+        );
+        let logical = interface
+            .return_logical_value()
+            .expect("logical return projection");
+        assert_eq!(logical.carrier().kind(), SourceCarrierKind::LowBits);
+        assert_eq!(logical.carrier().size_bits(), 32);
+        let source_type = &interface.type_graph().expect("return type graph").types()
+            [usize::try_from(logical.type_id()).expect("type index")];
+        assert_eq!(source_type.kind(), SourceTypeKind::UnsignedInteger);
+        assert_eq!(source_type.size_bits(), 32);
     }
 
     #[test]
