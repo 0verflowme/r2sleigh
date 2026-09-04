@@ -446,6 +446,9 @@ pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> 
         r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
         r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
         r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+        r2types::CTypeLike::Typedef(name) => {
+            r2types::parse_c_type_like(name, ptr_bits).and_then(|parsed| parsed.bits(ptr_bits))
+        }
         _ => None,
     }
 }

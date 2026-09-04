@@ -28,6 +28,16 @@ fn declaration_admission_accepts_placeable_target_sized_typedefs_only() {
         super::admit_declaration(CType::Typedef("size_t".to_string()), 32, 64),
         CType::u32()
     );
+    assert!(super::rules::declaration_type_describes_width(
+        &CType::Typedef("size_t".to_string()),
+        64,
+        64
+    ));
+    assert!(!super::rules::declaration_type_describes_width(
+        &CType::Typedef("unplaceable_t".to_string()),
+        64,
+        64
+    ));
 }
 
 fn source_owned(ops: impl IntoIterator<Item = R2ILOp>) -> SourceOwnedFunctionFacts {
