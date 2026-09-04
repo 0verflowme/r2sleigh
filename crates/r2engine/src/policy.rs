@@ -67,6 +67,18 @@ pub const SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
 pub const ENGINE_DECOMPILE_MAX_BLOCKS: usize = 200;
 pub const ENGINE_DECOMPILE_MAX_OPS: usize = 16384;
+
+/// Whether the decompile route must decline a function of this size.
+///
+/// Both bounds are inclusive -- a function sitting exactly on a limit is
+/// accepted -- because the two constants name the largest input the route is
+/// willing to take rather than the first one it refuses.
+///
+/// The counts come from the lifter, so this is answerable before the engine has
+/// built anything, and the route asks it before it does.
+pub const fn decompile_complexity_limit_exceeded(block_count: usize, op_count: usize) -> bool {
+    block_count > ENGINE_DECOMPILE_MAX_BLOCKS || op_count > ENGINE_DECOMPILE_MAX_OPS
+}
 pub const AUTO_CALLBACK_MAX_BLOCKS: u32 = 96;
 pub const AUTO_CALLBACK_MAX_COST: u32 = 512;
 pub const AUTO_CALLBACK_MAX_LINEAR_SIZE: u64 = 256 * 1024;
@@ -105,5 +117,37 @@ mod tests {
     #[test]
     fn an_absurd_function_count_does_not_wrap_the_budget() {
         assert_eq!(post_analysis_budget_usec(usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_function_sitting_exactly_on_a_decompile_limit_is_accepted() {
+        assert!(!decompile_complexity_limit_exceeded(
+            ENGINE_DECOMPILE_MAX_BLOCKS,
+            ENGINE_DECOMPILE_MAX_OPS
+        ));
+        assert!(decompile_complexity_limit_exceeded(
+            ENGINE_DECOMPILE_MAX_BLOCKS + 1,
+            ENGINE_DECOMPILE_MAX_OPS
+        ));
+        assert!(decompile_complexity_limit_exceeded(
+            ENGINE_DECOMPILE_MAX_BLOCKS,
+            ENGINE_DECOMPILE_MAX_OPS + 1
+        ));
+    }
+
+    #[test]
+    fn either_decompile_limit_declines_on_its_own() {
+        // The two counts do not track each other: a flag-expanded instruction
+        // stream puts thousands of operations in one basic block, and a long
+        // switch puts hundreds of near-empty blocks in a small function. A
+        // limit that only fired when both were exceeded would decline neither.
+        assert!(decompile_complexity_limit_exceeded(
+            1,
+            ENGINE_DECOMPILE_MAX_OPS + 1
+        ));
+        assert!(decompile_complexity_limit_exceeded(
+            ENGINE_DECOMPILE_MAX_BLOCKS + 1,
+            0
+        ));
     }
 }

@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-
-use r2il::R2ILBlock;
-use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
+use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{DecompileCapabilityView, FunctionFacts};
 use serde::{Deserialize, Serialize};
 
@@ -246,116 +243,6 @@ impl EngineRequestPlan {
 
     pub fn diagnostics(&self) -> EngineDiagnostics {
         self.decision.diagnostics()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecompileProbeDecision {
-    pub op_count: usize,
-    pub cfg_guard_reason: Option<String>,
-    pub summary_probe_needed: bool,
-    pub summary_probe_skipped_large_cfg: bool,
-}
-
-pub(super) fn raw_cfg_risk_summary_for_preprobe(blocks: &[R2ILBlock]) -> CFGRiskSummary {
-    let block_addrs = blocks
-        .iter()
-        .map(|block| block.addr)
-        .collect::<BTreeSet<_>>();
-    let mut loop_headers = BTreeSet::new();
-    let mut back_edge_count = 0usize;
-    let mut switch_block_count = 0usize;
-    let mut max_switch_cases = 0usize;
-
-    for block in blocks {
-        if let Some(switch_info) = block.switch_info.as_ref() {
-            switch_block_count += 1;
-            max_switch_cases = max_switch_cases
-                .max(switch_info.cases.len() + usize::from(switch_info.default_target.is_some()));
-            for target in switch_info
-                .cases
-                .iter()
-                .map(|case| case.target)
-                .chain(switch_info.default_target)
-            {
-                if target <= block.addr && block_addrs.contains(&target) {
-                    back_edge_count += 1;
-                    loop_headers.insert(target);
-                }
-            }
-        }
-
-        for target in raw_block_successors_for_preprobe(block) {
-            if target <= block.addr && block_addrs.contains(&target) {
-                back_edge_count += 1;
-                loop_headers.insert(target);
-            }
-        }
-    }
-
-    CFGRiskSummary {
-        block_count: blocks.len(),
-        loop_count: loop_headers.len(),
-        back_edge_count,
-        switch_block_count,
-        max_switch_cases,
-    }
-}
-
-fn raw_block_successors_for_preprobe(block: &R2ILBlock) -> Vec<u64> {
-    let fallthrough = block.addr.saturating_add(block.size as u64);
-    for op in block.ops.iter().rev() {
-        match op {
-            r2il::R2ILOp::Branch { target } => {
-                return raw_const_addr_for_preprobe(target).into_iter().collect();
-            }
-            r2il::R2ILOp::CBranch { target, .. } => {
-                let mut successors = Vec::with_capacity(2);
-                if let Some(target) = raw_const_addr_for_preprobe(target) {
-                    successors.push(target);
-                }
-                successors.push(fallthrough);
-                return successors;
-            }
-            r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. } => {
-                return vec![fallthrough];
-            }
-            r2il::R2ILOp::BranchInd { .. } | r2il::R2ILOp::Return { .. } => {
-                return Vec::new();
-            }
-            _ => {}
-        }
-    }
-    vec![fallthrough]
-}
-
-fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
-    matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
-}
-
-pub(crate) fn decompile_probe_decision<C: r2ssa::SsaWorkControl + ?Sized>(
-    blocks: &[R2ILBlock],
-    control: &C,
-) -> DecompileProbeDecision {
-    let cfg_guard_reason = cfg_guard_reason_with_control(blocks, control);
-    let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
-    let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
-    let small_structural_worker_probe = raw_cfg.block_count > 0
-        && raw_cfg.block_count <= 64
-        && (raw_cfg.loop_count > 0
-            || raw_cfg.back_edge_count > 0
-            || raw_cfg.switch_block_count > 0);
-    let skipped_large_cfg_guarded = cfg_guard_reason.is_some()
-        || blocks.len() > crate::ENGINE_DECOMPILE_MAX_BLOCKS
-        || op_count > crate::ENGINE_DECOMPILE_MAX_OPS;
-    let summary_probe_needed =
-        skipped_large_cfg_guarded || cfg_guard_reason.is_some() || small_structural_worker_probe;
-
-    DecompileProbeDecision {
-        op_count,
-        cfg_guard_reason,
-        summary_probe_needed,
-        summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
     }
 }
 
@@ -611,29 +498,6 @@ pub(crate) fn semantic_route_reason(route: &r2types::DecompileRouteFacts) -> Opt
         .reason
         .clone()
         .or_else(|| route.fallback_comment.clone())
-}
-
-pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
-    cfg_guard_reason_with_control(blocks, &r2ssa::SsaExecutionControl::default())
-}
-
-/// The same guard, answering to the caller's cancellation and deadline.
-pub(crate) fn cfg_guard_reason_with_control<C: r2ssa::SsaWorkControl + ?Sized>(
-    blocks: &[R2ILBlock],
-    control: &C,
-) -> Option<String> {
-    // Every threshold below reads graph shape alone, so the control-flow graph
-    // already settles whether any of them can trip. Asking it first is what
-    // keeps this preflight from renaming an entire function to learn that
-    // nothing was going to fire.
-    let cfg = r2ssa::CFG::from_blocks(blocks)?;
-    let reason = cfg_guard_reason_from_summary(&cfg.risk_summary())?;
-    // Blocks whose raw SSA will not form have never been guarded here; they
-    // are refused further in, by the SSA phase, under its own malformed-input
-    // reason. Confirming the build before claiming a guard keeps that division
-    // exactly where it was, at the cost of one build per guarded function.
-    SSAFunction::from_blocks_raw_with_control(blocks, None, control).ok()?;
-    Some(reason)
 }
 
 pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String> {

@@ -37,17 +37,17 @@ pub use r2dec::{
     BindingShadowAuditOutcome, BindingShadowDomainAudit, DecompileRenderRefusal,
     EffectObligationAudit, EffectObligationDisposition, PlacementAudit, PlacementAuditRefusal,
 };
+use route::decompile_route_decision;
 pub use route::{
-    DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
-    EngineRequestKind, EngineRequestPlan, EngineRouteContext, EngineRouteDecision,
-    EngineTypeRouteDecision, EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason,
-    cfg_guard_reason_from_summary, plan_type_request, prefer_symbolic_large_worker_decompile,
-    select_engine_plan, semantic_artifact_needs_fallback_type_payload,
-    semantic_or_cfg_prefers_bounded_type_plan, should_guard_program_orchestrator_decompile,
-    should_use_prepared_semantic_view, type_cfg_allows_semantic_plan, type_cfg_bounded_reason,
-    type_cfg_forces_bounded_plan, type_cfg_prefers_bounded_plan, type_route_decision,
+    EngineDiagnostics, EngineFunctionIdentity, EnginePlan, EngineRequestKind, EngineRequestPlan,
+    EngineRouteContext, EngineRouteDecision, EngineTypeRouteDecision, EngineTypeRouteKind,
+    EngineTypedRouteDecision, cfg_guard_reason_from_summary, plan_type_request,
+    prefer_symbolic_large_worker_decompile, select_engine_plan,
+    semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
+    should_guard_program_orchestrator_decompile, should_use_prepared_semantic_view,
+    type_cfg_allows_semantic_plan, type_cfg_bounded_reason, type_cfg_forces_bounded_plan,
+    type_cfg_prefers_bounded_plan, type_route_decision,
 };
-use route::{decompile_probe_decision, decompile_route_decision};
 #[cfg(test)]
 use route::{plan_decompile_request, semantic_route_reason};
 const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
@@ -2944,14 +2944,15 @@ impl EngineSession {
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
-        let probe =
-            decompile_probe_decision(&analysis_request.blocks, &execution.ssa_execution_control());
-        if actual_lifted_blocks > ENGINE_DECOMPILE_MAX_BLOCKS
-            || probe.op_count > ENGINE_DECOMPILE_MAX_OPS
-        {
+        let op_count = analysis_request
+            .blocks
+            .iter()
+            .map(|block| block.ops.len())
+            .sum::<usize>();
+        if decompile_complexity_limit_exceeded(actual_lifted_blocks, op_count) {
             let reason = format!(
-                "decompile complexity limit exceeded: blocks={actual_lifted_blocks}/{} ops={}/{}",
-                ENGINE_DECOMPILE_MAX_BLOCKS, probe.op_count, ENGINE_DECOMPILE_MAX_OPS
+                "decompile complexity limit exceeded: blocks={actual_lifted_blocks}/{} ops={op_count}/{}",
+                ENGINE_DECOMPILE_MAX_BLOCKS, ENGINE_DECOMPILE_MAX_OPS
             );
             return refused_decompile_response(
                 &display_name,
@@ -6191,7 +6192,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_cfg_preprobe_summary_counts_back_edges_without_ssa() {
+    fn cfg_risk_summary_counts_a_switch_case_back_edge_alongside_a_self_loop() {
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(r2il::R2ILOp::CBranch {
             target: r2il::Varnode::constant(0x1000, 8),
@@ -6209,10 +6210,16 @@ mod tests {
             }],
         });
 
-        let summary = route::raw_cfg_risk_summary_for_preprobe(&[entry, switch]);
+        let blocks = [entry, switch];
+        let summary = r2ssa::CFG::from_blocks(&blocks)
+            .expect("cfg should build")
+            .risk_summary();
 
         assert_eq!(summary.block_count, 2);
         assert_eq!(summary.loop_count, 1);
+        // Two edges re-enter the entry: the block's own conditional branch and
+        // the switch case. A summary that folded them into one would under-count
+        // exactly the shape the guard's back-edge threshold exists to catch.
         assert_eq!(summary.back_edge_count, 2);
         assert_eq!(summary.switch_block_count, 1);
         assert_eq!(summary.max_switch_cases, 2);
@@ -6242,23 +6249,24 @@ mod tests {
         let blocks = self_looping_blocks(0x3000, 9);
         let prepared =
             r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let from_cfg = r2ssa::CFG::from_blocks(&blocks)
+            .expect("cfg should build")
+            .risk_summary();
 
         assert_eq!(
-            r2ssa::CFG::from_blocks(&blocks)
-                .expect("cfg should build")
-                .risk_summary(),
+            from_cfg,
             prepared.cfg_risk_summary(),
             "the guard's cheap derivation must report what renamed SSA reports"
         );
         assert_eq!(
-            cfg_guard_reason(&blocks),
+            cfg_guard_reason_from_summary(&from_cfg),
             cfg_guard_reason_from_summary(&prepared.cfg_risk_summary()),
         );
-        assert!(cfg_guard_reason(&blocks).is_some());
+        assert!(cfg_guard_reason_from_summary(&from_cfg).is_some());
     }
 
     #[test]
-    fn cfg_guard_reason_stays_silent_when_raw_ssa_will_not_form() {
+    fn cfg_risk_summary_answers_for_input_whose_raw_ssa_will_not_form() {
         // An unreachable block that jumps into the entry leaves a predecessor
         // outside the domain SSA retains, so preparation refuses the input.
         let mut blocks = self_looping_blocks(0x4000, 9);
@@ -6269,6 +6277,10 @@ mod tests {
         blocks.push(orphan);
 
         assert!(r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).is_none());
+        // The two derivations do not accept the same inputs. Anything that
+        // reintroduces a block-level guard has to decide what this input is,
+        // because the CFG will happily call it complex while the SSA phase is
+        // going to refuse it as malformed under its own reason.
         assert!(
             cfg_guard_reason_from_summary(
                 &r2ssa::CFG::from_blocks(&blocks)
@@ -6277,11 +6289,6 @@ mod tests {
             )
             .is_some(),
             "the CFG alone is complex enough to trip the guard"
-        );
-        assert_eq!(
-            cfg_guard_reason(&blocks),
-            None,
-            "input whose SSA cannot form is refused by the SSA phase, not claimed by this guard"
         );
     }
 
@@ -7266,98 +7273,6 @@ mod tests {
     }
 
     #[test]
-    fn decompile_probe_decision_guards_named_large_worker() {
-        let mut blocks = const_return_blocks(0x4b30, 0);
-        for idx in 0..210 {
-            blocks.push(R2ILBlock::new(0x5000 + idx, 1));
-        }
-        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
-
-        assert!(decision.summary_probe_needed);
-        assert!(decision.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
-    fn decompile_probe_decision_keeps_medium_non_workers_on_full_route() {
-        let mut blocks = (0..8)
-            .map(|idx| R2ILBlock::new(0x6000 + idx, 1))
-            .collect::<Vec<_>>();
-        for idx in 0..129 {
-            blocks[0].push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x100 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-
-        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
-
-        assert!(!decision.summary_probe_needed);
-        assert!(!decision.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
-    fn decompile_probe_decision_does_not_prefer_full_diagnostic_name_without_evidence() {
-        let mut blocks = const_return_blocks(0x4bc0, 0);
-        for idx in 0..ENGINE_DECOMPILE_MAX_OPS as u64 + 1 {
-            blocks[0].push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x200 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-
-        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
-
-        assert!(decision.summary_probe_needed);
-        assert!(decision.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
-    fn decompile_probe_decision_uses_strict_block_count_guard_boundary() {
-        let exactly_limit = (0..200)
-            .map(|idx| R2ILBlock::new(0x7000 + idx, 1))
-            .collect::<Vec<_>>();
-        let over_limit = (0..201)
-            .map(|idx| R2ILBlock::new(0x8000 + idx, 1))
-            .collect::<Vec<_>>();
-
-        let at_limit =
-            decompile_probe_decision(&exactly_limit, &r2ssa::SsaExecutionControl::default());
-        let over_limit =
-            decompile_probe_decision(&over_limit, &r2ssa::SsaExecutionControl::default());
-
-        assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
-    fn decompile_probe_decision_uses_strict_op_count_guard_boundary() {
-        let mut exactly_limit = R2ILBlock::new(0x9000, 1);
-        let mut over_limit = R2ILBlock::new(0xa000, 1);
-        for idx in 0..ENGINE_DECOMPILE_MAX_OPS as u64 {
-            exactly_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x10000 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-            over_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x30000 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-        over_limit.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0x900, 8),
-            src: r2il::Varnode::constant(0x900, 8),
-        });
-
-        let at_limit =
-            decompile_probe_decision(&[exactly_limit], &r2ssa::SsaExecutionControl::default());
-        let over_limit =
-            decompile_probe_decision(&[over_limit], &r2ssa::SsaExecutionControl::default());
-
-        assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
     fn decompile_complexity_caps_refuse_before_analysis_construction() {
         let over_blocks = (0..=ENGINE_DECOMPILE_MAX_BLOCKS)
             .map(|index| {
@@ -7414,27 +7329,6 @@ mod tests {
                 Some(r2types::DecompileRouteKind::FallbackComment)
             );
         }
-    }
-
-    #[test]
-    fn decompile_probe_decision_probes_small_switch_cfg() {
-        let mut switch_block = R2ILBlock::new(0xb000, 4);
-        switch_block.switch_info = Some(r2il::SwitchInfo {
-            switch_addr: 0xb000,
-            min_val: 0,
-            max_val: 0,
-            default_target: None,
-            cases: vec![r2il::SwitchCase {
-                value: 0,
-                target: 0xb010,
-            }],
-        });
-        let blocks = vec![switch_block, R2ILBlock::new(0xb010, 1)];
-
-        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
-
-        assert!(!decision.summary_probe_skipped_large_cfg);
-        assert!(decision.summary_probe_needed);
     }
 
     #[test]
@@ -7516,24 +7410,13 @@ mod tests {
             target: r2il::Varnode::constant(0x9050, 8),
             cond: r2il::Varnode::constant(1, 1),
         });
-        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry.clone()], None)
+        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry], None)
             .expect("loop ssa")
             .with_name("dbg.flag_expanded_loop_worker");
-        let decision = decompile_probe_decision(&[entry], &r2ssa::SsaExecutionControl::default());
 
         assert!(should_probe_native_worker_summary_before_full_semantics(
             &loop_ssa, None
         ));
-        assert!(decision.summary_probe_needed);
-    }
-
-    #[test]
-    fn prefer_full_named_workers_need_evidence_before_decompile_preprobe() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
-
-        assert!(!decision.summary_probe_needed);
-        assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
     #[test]
