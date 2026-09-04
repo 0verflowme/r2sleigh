@@ -443,7 +443,19 @@ grep -a -q "$WITNESS" "$lib" || {
     echo "the installed library is not this tree: witness absent" >&2
     exit 70
 }
-echo "installed $lib, witness present"
+# Present on disk is not the same as loadable. A plugin that fails to dlopen is
+# skipped silently by radare2, `pdd` then reports no decompiler, and every
+# function of every binary comes back empty -- which reads in the results as a
+# decompiler with nothing to say rather than as a plugin that never ran. That is
+# exactly how a whole cell can score near zero without anything looking wrong,
+# so the run refuses here instead of producing numbers nobody can trust.
+loaded=$(r2 -qq -c 'La' /bin/ls 2>/dev/null | grep -ci sleigh || true)
+if [ "${loaded:-0}" -eq 0 ]; then
+    echo "the installed plugin does not load:" >&2
+    R2_DEBUG=1 r2 -qq -c q /bin/ls 2>&1 | grep -iE 'sleigh.*(undefined|cannot|failed)' | head -3 >&2
+    exit 70
+fi
+echo "installed $lib, witness present, plugin loads"
 INSTALL
 else
     echo "resumed plugin install, witness present"
