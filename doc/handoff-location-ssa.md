@@ -12108,3 +12108,30 @@ corpus is what is blind here -- it stayed at 54 of 54 throughout -- while
 coverage saw the class and simply had nothing to lose to it. A gate that sees a
 construct only where it is already broken cannot report the day it starts
 breaking things that worked.
+
+## Open threads as of `5e61091`
+
+Five branches are in flight, each on a cause that was traced before the work
+started rather than guessed at. Every one of them has its reproduction recorded
+above; this is the index.
+
+| branch | cause | how to see it |
+| --- | --- | --- |
+| `arch/r2-loc-audit` | Six functions that rendered before the snapshot pruning refuse after it, all `missing machine projection authorization`. A field classified as having no reader had one. `sym._init` appears in all three pinned binaries, so it is generic rather than corpus-specific. | `./tests/coverage/locked_coverage.sh`; the differential gate stays 54 of 54 throughout and does not see it |
+| `arch/expr-variadicguard` | Ninety-four benchmark functions went dark. radare2 reads `test al, al` as a varargs marker, flags a fixed callee variadic, and the renderer then demands a format parameter that cannot exist. `BZ2_bzRead` contains no variadic call at all. | `R2DEC_TRACE_REFUSAL=1 r2 -qq -A -e anal.sla=true -c 'pdd @ sym.BZ2_bzRead' tests/decbench/artifacts/bins/bzip2` |
+| `arch/expr-noiseregress` | `cast_chains` went 0 to 5 and `comma_conditions` 17 to 23. Two of the five cast chains are in `murmur3_32` cells that were previously discarded as gotos, so those are probably newly visible rather than new; the three in `xxhash32` are neither. | corpus matrix `machine_noise`, read per configuration |
+| `arch/expr-widths` | Copy chains: a register-to-register copy roots at `Source`, which is not inline-eligible, so one reload spells as three named locals. Carrier widths: a binding takes the widest carrier any use reads through, so `adler32`'s modulo lands on `uint64_t` and compiles to `divq` where the original had `divl`. | `tests/corpus/artifacts/raw/x64_O0_djb2.c` and `x64_O0_adler32.c` |
+| `arch/expr-boolreturn` | `shape_bool_probe`, whose entire body is `return (unsigned char)(a > 7u)`, refuses with `OpLowering(implementation.rs)` while its caller renders. | `pdd @ sym.shape_bool_probe` on the pinned shapes binary |
+
+Two things are deliberately **not** done and should not be done by accident.
+
+The corpus snapshot baseline is unblessed with all 54 cells mismatching. It is
+stale by construction because the rendering changed, and the plan's rule is one
+bless after the deletions and one at the end, never between. Blessing it now
+would record whatever these five branches happen to leave behind.
+
+The full 26-project, three-optimisation-level DecBench sweep is the acceptance
+measurement and has not been run. It costs about 13.7 hours and 0.06 GiB with
+per-project garbage collection, so it is affordable; what makes it premature is
+that ninety-four functions are known dark. Running it now would measure a state
+we already know is wrong, and the number would then be quoted.
