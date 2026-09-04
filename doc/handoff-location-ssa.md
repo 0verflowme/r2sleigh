@@ -12073,3 +12073,38 @@ so the temporary audit branches were deleted.  No PR was opened.  The remaining
 4,317 insertions in these files form the r2sleigh capture/publication mechanism
 and should be judged or redesigned as that mechanism, not advertised as seven
 unrelated radare2 improvements.
+
+### What the boolean shape actually answered, which was not the question
+
+`shape_bool_probe` and `shape_bool_caller` were added to `tests/corpus/shapes.c`
+to reproduce the variadic misdetection that cost ninety-four benchmark
+functions, on the reasoning that radare2 reads `test al, al` as a varargs marker
+and a compiler emits exactly that for a `_Bool` return tested by its caller.
+Regenerating `tests/coverage/pinned/shapes_gcc_x64_O0` from that source answers
+the open question in that commit, and the answer is no.
+
+`shape_bool_caller` **renders**. The instruction pair is present -- the x86-64
+build contains `call shape_bool_probe` followed immediately by `test %al,%al` --
+and the harm does not follow from it. So the shape does not reproduce the class
+it was written for, and the gap in the local gates is not closed by it.
+
+It did find something else, which is why it stays. `shape_bool_probe`, an
+ordinary function returning a boolean, **refuses**:
+`missing machine projection authorization: OpLowering(implementation.rs)`. A
+nine-line function whose whole body is `return (unsigned char)(a > 7u)` is not
+an exotic shape, and that it cannot be rendered is worth a cell of its own.
+
+### Correcting the claim that the local gates cannot see the variadic class
+
+They can. The coverage sweep carries **30** `variadic callsite argument count`
+refusals against **zero** in the checked-in baseline. What it does not carry is
+the *harm*: none of the thirty is a regression, and nineteen are cause changes
+on functions that were already refusing for some other reason. So locally the
+variadic work moved refusals sideways, and only on real binaries did it take
+ninety-four rendering functions dark.
+
+The distinction matters for where to look next. The fifty-four-cell differential
+corpus is what is blind here -- it stayed at 54 of 54 throughout -- while
+coverage saw the class and simply had nothing to lose to it. A gate that sees a
+construct only where it is already broken cannot report the day it starts
+breaking things that worked.
