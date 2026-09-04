@@ -7842,6 +7842,154 @@ mod tests {
         );
     }
 
+    /// Two sites reaching one variadic callee keep separate literal-count
+    /// evidence. Both sites write every convention register, so a result of
+    /// four for either call would expose the old register-write guess.
+    #[test]
+    fn two_calls_to_one_variadic_callee_may_pass_different_counts() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        for (index, name) in ["rdi", "rsi", "rdx", "rcx"].iter().enumerate() {
+            arch.add_register(RegisterDef::new(*name, (index as u64) * 8, 8));
+        }
+        let slot = |index: usize| CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: (index as u64) * 8,
+            size: 8,
+        };
+        let target = make_const(0x2000, 8);
+        let first_call_index = 4;
+        let second_call_index = 9;
+        let blocks = vec![R2ILBlock {
+            addr: 0x1680,
+            size: 11,
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(8, 8),
+                    src: make_const(0x3000, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(16, 8),
+                    src: make_const(2, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(24, 8),
+                    src: make_const(3, 8),
+                },
+                R2ILOp::Call {
+                    target: target.clone(),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(4, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(8, 8),
+                    src: make_const(0x3010, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(16, 8),
+                    src: make_const(5, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(24, 8),
+                    src: make_const(6, 8),
+                },
+                R2ILOp::Call {
+                    target: target.clone(),
+                },
+                R2ILOp::Return {
+                    target: make_const(0, 8),
+                },
+            ],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let interface = |op_index| {
+            SourceCallSiteInterface::new(
+                b"same-variadic-callee".to_vec(),
+                SourceCallSiteIdentity::new(
+                    0x1680,
+                    op_index,
+                    CanonicalStorageId::from_varnode(&target),
+                ),
+                true,
+                "amd64",
+                [
+                    SourceCallArgumentSpec::new(0, slot(0)),
+                    SourceCallArgumentSpec::new(1, slot(1)),
+                ],
+                true,
+                false,
+                SourceCallResult::Void,
+            )
+            .and_then(|interface| interface.with_radare2_format_parameter(1))
+            .expect("exact variadic callsite interface")
+        };
+        let convention =
+            SourceConventionSlots::new("amd64", (0..4).map(slot).collect::<Vec<_>>(), None)
+                .expect("convention slots");
+        let mut machine_context = SourceMachineContext::from_blocks_with_interfaces(
+            &blocks,
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(convention),
+            vec![interface(first_call_index), interface(second_call_index)],
+        );
+        machine_context.bind_source_string_literals(&[
+            (0x3000, "%u:%u".to_string()),
+            (0x3010, "complete: 100%%".to_string()),
+        ]);
+        let function = SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+            &blocks,
+            Some(&arch),
+            coherent_function_interface(&machine_context),
+            machine_context.machine_roles().call_preserved_carriers(),
+            machine_context.stack_pointer_carrier(),
+            &UncheckedSsaWorkControl,
+        )
+        .expect("decompile SSA");
+        let artifact = SsaArtifact::new_with_context(
+            function,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+        );
+
+        let calls = artifact
+            .certificates()
+            .callsites
+            .values()
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let [first, second] = calls.as_slice() else {
+            unreachable!("the callsite count was checked above")
+        };
+        assert_eq!(first.target, second.target);
+        assert_eq!(first.fixed_argument_count, Some(2));
+        assert_eq!(second.fixed_argument_count, Some(2));
+        assert_eq!(first.argument_values.len(), 4);
+        assert_eq!(second.argument_values.len(), 2);
+        assert_eq!(
+            first
+                .variadic_argument_count_evidence
+                .expect("first literal count")
+                .format_literal_address,
+            0x3000
+        );
+        assert_eq!(
+            second
+                .variadic_argument_count_evidence
+                .expect("second literal count")
+                .format_literal_address,
+            0x3010
+        );
+    }
+
     #[test]
     fn variadic_calls_without_literal_format_evidence_refuse() {
         let no_format_role = variadic_format_call(4, true, None, Some("%d"));
