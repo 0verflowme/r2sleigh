@@ -1,0 +1,38 @@
+/* r2sleigh's capture of one radare2 function.
+ *
+ * The capture is r2sleigh policy: which facts to take from radare2's analysis,
+ * at what granularity, and with what proof marking. radare2 does not need any
+ * of that inside radare2, so it lives here and runs against radare2's public
+ * API. What the fork still has to provide is the locking discipline its own
+ * mutators observe, which is what makes a coherent read possible at all. */
+
+#ifndef R2SLEIGH_SNAPSHOT_CAPTURE_H
+#define R2SLEIGH_SNAPSHOT_CAPTURE_H
+
+#include <r_anal.h>
+#include <r_core.h>
+
+/* Refusal and bound macros the capture uses, file-local in radare2 before the
+ * move. The two code-pointer-table bounds are deliberately duplicated rather
+ * than shared: radare2's own image code still enforces them, and a shared
+ * header between the two would put this file back inside radare2. */
+#define IMAGE_REFUSE(why) do { refusal = (why); goto fail; } while (0)
+#define SNAPSHOT_REFUSE(why) do { refusal = (why); goto fail; } while (0)
+#define SNAPSHOT_MAX_CODE_POINTER_TABLES 16
+#define SNAPSHOT_MAX_CODE_POINTER_TABLE_ENTRIES 256
+#define SNAPSHOT_MAX_CALLEE_SNAPSHOTS 4
+/* radare2's calling-convention helpers spell the sdb handle this way. */
+#define DB anal->sdb_cc
+
+@CARRIED@
+
+/* Capture one function as an owned, immutable snapshot, or NULL with *reason
+ * set. Takes the core lock and then anal->lock, so the walk sees one state.
+ * Refuses on a debug-backed target, where the bytes under a function are not
+ * stable enough to prove anything about. */
+RAnalFunctionSnapshot *r2sleigh_function_snapshot_take(RCore *core, ut64 function_addr, const char **reason);
+
+/* Release a snapshot and everything it owns. Safe on NULL. */
+void r2sleigh_function_snapshot_free(RAnalFunctionSnapshot *snapshot);
+
+#endif

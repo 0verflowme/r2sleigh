@@ -12257,3 +12257,36 @@ and any sweep understates coverage by that much.
 The same applies to the libsla pattern already in `Cargo.toml`: a fix under
 upstream review is carried on the fork so the work that depends on it is not
 blocked behind someone else's merge queue.
+
+## Radare2 fork reduction — paused, radare2 half landed
+
+The fork carried 20,136 added lines and is now at 11,569. The function-snapshot
+capture moved out of radare2 and into the plugin, because it read only public
+struct fields and public functions: it was r2sleigh policy compiled into
+someone else's project. `libr/anal/function.c` went from +5,547 to +803 and
+`r_anal.h` from +617 to +215, so every radare2 translation unit stopped parsing
+388 lines describing a structure it never touched.
+
+The radare2 half is committed on `fork/drop-unconsumed-snapshot-api` and
+verified: full build clean, 89 unit tests pass, and the 9 that fail also fail
+on unmodified radare2 with byte-identical assertion messages. The plugin half
+compiles against it but has never run.
+
+Everything needed to resume is in `doc/wip/snapshot-move/`, including the
+scripted pipeline that replays the transformation against a moved base — which
+it will need after the in-flight branches land. `doc/wip/snapshot-move/README.md`
+carries the remaining steps, the reasons radare2 keeps what it keeps, and two
+cautions about the tooling that deleted live upstream code three times before
+its rules were made exact.
+
+Session paused here at the user's request to continue on another machine; the
+work lives in the repository rather than in `/private/tmp`, which does not
+survive.
+
+### Open, unrelated: artifact store is never allocated
+
+`test_anal_artifacts` fails 8 assertions at HEAD, independent of the move.
+`priv->anal_artifacts` has no initial allocation — the only caller of
+`r_core_anal_artifact_store_new` is `artifact_store_clone`, which requires an
+existing store — so `r_core_anal_artifacts_replace` answers `INVALID_ARGUMENT`
+the first time it is called.
