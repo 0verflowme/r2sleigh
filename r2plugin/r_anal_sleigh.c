@@ -3723,6 +3723,21 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 		: NULL;
 }
 
+/* The deadline one engine call gets, derived from the engine's own budget for a
+ * program this size.
+ *
+ * Both call sites passed zero, which made `deadline` None in the boundary and
+ * every poll inside the engine a no-op: a single function could run without end.
+ * That cost far more than itself, because the benchmark harness decompiles every
+ * function of a binary in one process, so one unbounded function lost the whole
+ * binary. Bounding a call by what the entire sweep was allotted cannot refuse
+ * anything the sweep would have finished anyway. */
+static ut64 sleigh_engine_call_deadline_us(RAnal *anal) {
+	const size_t function_count = (anal && anal->fcns)
+		? (size_t)r_list_length (anal->fcns): 0;
+	return r2sleigh_engine_budget_usec_v2 (function_count);
+}
+
 static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
 	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
 	const SleighFunctionCapture *held = sleigh_function_capture (anal, fcn);
@@ -3736,7 +3751,7 @@ static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
 	const R2SleighEngineRequestPayloadV2 payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
 		.struct_size = sizeof (payload),
-		.timeout_us = 0,
+		.timeout_us = sleigh_engine_call_deadline_us (anal),
 		.snapshot_buffer = held->wire,
 		.snapshot_buffer_len = held->wire_len,
 	};
@@ -4879,7 +4894,7 @@ static char *sleigh_proven_facts_json(RAnal *anal, RAnalFunction *fcn) {
 	const R2SleighEngineRequestPayloadV2 payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
 		.struct_size = sizeof (payload),
-		.timeout_us = 0,
+		.timeout_us = sleigh_engine_call_deadline_us (anal),
 		.snapshot_buffer = capture->wire,
 		.snapshot_buffer_len = capture->wire_len,
 	};

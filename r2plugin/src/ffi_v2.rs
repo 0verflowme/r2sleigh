@@ -3676,6 +3676,21 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     planner_query,
 };
 
+/// The engine budget for a program of this many functions, in microseconds.
+///
+/// Exported so the C side can give a single engine call a deadline without
+/// restating the policy. A call bounded by the whole sweep's budget cannot make
+/// a sweep worse than it was already allowed to be, and it turns a function that
+/// would run without end into one bounded refusal instead of the loss of every
+/// function queued behind it.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_engine_budget_usec_v2(function_count: usize) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        r2engine::post_analysis_budget_usec(function_count)
+    }))
+    .unwrap_or(r2engine::POST_ANALYSIS_MINIMUM_BUDGET_USEC)
+}
+
 /// Return the immutable V2 API table. The table and all callback addresses are
 /// process-lifetime borrows and must not be freed.
 #[unsafe(no_mangle)]

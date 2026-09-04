@@ -2715,6 +2715,21 @@ fn r2sleigh_engine_proven_facts_trusted_output(
     _execution: r2engine::EngineExecutionControl,
 ) -> Option<EngineV2Output> {
     let crate::ffi_v2::TrustedIngress { root: trusted, .. } = ingress;
+    // The same size gate `decompile_function` applies, for the same reason.
+    //
+    // This path runs once per function during `aaa`, before any `pdd`, and it
+    // was the only engine entry point with neither a size guard nor a working
+    // deadline. On an optimised binary that made a single large function able
+    // to consume the whole sweep, which cost the caller every function after
+    // it rather than just that one.
+    let blocks = trusted.source_blocks();
+    let block_count = blocks.len();
+    let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
+    if block_count > r2engine::ENGINE_DECOMPILE_MAX_BLOCKS
+        || op_count > r2engine::ENGINE_DECOMPILE_MAX_OPS
+    {
+        return None;
+    }
     let facts = trusted.proven_facts();
     let output = serde_json::json!({
         "function": trusted.source().function().address(),

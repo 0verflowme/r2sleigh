@@ -577,6 +577,17 @@ uint32_t r2sleigh_snapshot_wire_decode_v2(const uint8_t *buffer,
                                           struct R2SleighSnapshotWireFactsV2 *out);
 
 /**
+ * The engine budget for a program of this many functions, in microseconds.
+ *
+ * Exported so the C side can give a single engine call a deadline without
+ * restating the policy. A call bounded by the whole sweep's budget cannot make
+ * a sweep worse than it was already allowed to be, and it turns a function that
+ * would run without end into one bounded refusal instead of the loss of every
+ * function queued behind it.
+ */
+uint64_t r2sleigh_engine_budget_usec_v2(size_t function_count);
+
+/**
  * Return the immutable V2 API table. The table and all callback addresses are
  * process-lifetime borrows and must not be freed.
  */
