@@ -5145,13 +5145,24 @@ mod tests {
             .map(|offset| provider_start + offset)
             .expect("command callback after decompiler provider");
         let provider = &c_source[provider_start..provider_end];
+        // The wire is built by the epoch-keyed capture rather than inline here,
+        // so the provider is checked for routing and the capture for serializing.
+        // The invariant is unchanged: a borrowed snapshot reaches the engine only
+        // through the V2 boundary, and never by rebuilding source state.
         assert!(
-            provider.contains("r2sleigh_wire_writer_new ()")
-                && provider.contains("free (buffer)")
-                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
-                && provider.contains(".snapshot_buffer = buffer")
+            provider.contains(".snapshot_buffer = held->wire")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 (")
+        );
+        let capture = c_source
+            .split("static const SleighFunctionCapture *sleigh_function_capture(")
+            .nth(1)
+            .expect("the capture that owns the wire buffer");
+        assert!(
+            capture.contains("r2sleigh_wire_writer_new ()")
+                && capture.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
+                && capture.contains("r2sleigh_function_snapshot_free (snapshot)"),
+            "the capture must serialize through the V2 wire writer and own the snapshot"
         );
         for forbidden in ["get_context (", "lift_function_blocks", "snapshot_collect"] {
             assert!(
@@ -5315,7 +5326,7 @@ mod tests {
             );
         }
         let provider_start = c_source
-            .find("static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot)")
+            .find("static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn)")
             .expect("borrowed-snapshot decompiler provider");
         let provider_end = c_source[provider_start..]
             .find("static char *sleigh_cmd(")
@@ -5323,11 +5334,8 @@ mod tests {
             .expect("command callback after provider");
         let provider = &c_source[provider_start..provider_end];
         assert!(
-            provider.contains("r2sleigh_wire_writer_new ()")
-                && provider.contains("free (buffer)")
-                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
-                && provider.contains("const R2SleighEngineRequestPayloadV2 payload")
-                && provider.contains(".snapshot_buffer = buffer")
+            provider.contains("const R2SleighEngineRequestPayloadV2 payload")
+                && provider.contains(".snapshot_buffer = held->wire")
                 && provider.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 ("),
