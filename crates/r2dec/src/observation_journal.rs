@@ -3531,9 +3531,23 @@ impl LegacyObservationJournal {
                             names.symbol_for_value(value),
                         )
                         .and_then(|observation| {
-                            record_same(&mut values[value.0 as usize], observation).map_err(|()| {
-                                LegacyObservationJournalError::ConflictingValue(value)
-                            })
+                            let slot = &mut values[value.0 as usize];
+                            if record_same(slot, observation).is_err() {
+                                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                    eprintln!(
+                                        "conflicting value {value:?}: recorded {slot:?}, rendered \
+                                         {observation:?}, disposition={:?}, node={}",
+                                        plan.disposition(value),
+                                        format!("{node:?}")
+                                            .chars()
+                                            .take(180)
+                                            .collect::<String>()
+                                    );
+                                }
+                                Err(LegacyObservationJournalError::ConflictingValue(value))
+                            } else {
+                                Ok(())
+                            }
                         })
                     }
                     ObservationTarget::Use {
