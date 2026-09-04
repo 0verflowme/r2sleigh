@@ -12206,3 +12206,25 @@ evidence about a feature only if the population exercises it -- and was violated
 anyway while being quoted. The local census is convenient because it runs in
 minutes; it is not representative, and prioritising from it puts effort where
 the sampled binaries happen to be weak rather than where the decompiler is.
+
+### Ad-hoc `r2` tracing needs the fork installed, not merely built
+
+Three times in one day a measurement was taken against an artifact that did not
+match the source, and this is the third shape of it.
+
+`r2 -qq -A -e anal.sla=true -c 'pdd @ sym.X'` is the quickest way to see why one
+function refuses, and it stopped working: `ERROR: variable 'anal.sla' not found`,
+which reads like the plugin is absent. It is not. `r2 -v` reports
+`git.6.2.0-363-ga402b8a3ef 2026-09-04__11:15:40` -- the fork as it stood *before*
+the snapshot API was restored. The fork was rebuilt afterwards and never
+installed, so the loaded radare2 is older than the headers the plugin was
+compiled against, and the plugin declines to register rather than crash.
+
+The corpus and coverage gates are unaffected because `tests/locked_run.sh`
+builds and installs together under the lock. Only hand-run `r2` is affected, and
+it fails in a way that looks like a missing plugin rather than a stale one.
+
+Two practical notes. Before trusting an ad-hoc trace, check that `r2 -v`'s birth
+line matches the fork's current HEAD. And do not `make install` the fork while
+sessions are running gates: they link against those libraries, and swapping them
+mid-run breaks a build that has nothing wrong with it.
