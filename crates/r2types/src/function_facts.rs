@@ -3225,7 +3225,10 @@ impl FunctionFacts {
             };
             let replace = match slot.ty.as_ref() {
                 None => true,
-                Some(existing) => recovered_type_outranks(existing, ty, ptr_bits, type_db),
+                Some(existing) => {
+                    recovered_type_outranks(existing, ty, ptr_bits, type_db)
+                        || recovered_scalar_signedness_outranks(existing, ty)
+                }
             };
             if !replace {
                 continue;
@@ -3245,7 +3248,10 @@ impl FunctionFacts {
             {
                 let replace = match binding.ty.as_ref() {
                     None => true,
-                    Some(existing) => recovered_type_outranks(existing, &ty, ptr_bits, type_db),
+                    Some(existing) => {
+                        recovered_type_outranks(existing, &ty, ptr_bits, type_db)
+                            || recovered_scalar_signedness_outranks(existing, &ty)
+                    }
                 };
                 if replace {
                     binding.ty = Some(ty.clone());

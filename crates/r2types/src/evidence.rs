@@ -1414,4 +1414,144 @@ mod tests {
         );
         assert_eq!(written.params[1].ty, Some(machine));
     }
+
+    #[test]
+    fn unsigned_use_after_a_stack_spill_types_the_parameter_and_home() {
+        let mut arch = r2il::ArchSpec::new("aarch64");
+        arch.add_register(r2il::RegisterDef::new("x1", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("sp", 16, 8));
+        arch.add_register(r2il::RegisterDef::new("lr", 24, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"unsigned-spilled-parameter".to_vec(),
+            "aapcs64",
+            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
+            r2ssa::SourceFunctionReturn::Void,
+            [r2ssa::SourceStackSlotSpec::new_local(
+                r2ssa::StackAddressBase::StackPointer,
+                register(16),
+                -8,
+                8,
+            )],
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(register(16)))
+        .and_then(|interface| interface.with_return_address_storage(register(24)))
+        .expect("exact source interface");
+
+        let mut entry = r2il::R2ILBlock::new(0x1000, 4);
+        entry.push(r2il::R2ILOp::IntSub {
+            dst: r2il::Varnode::unique(0x100, 8),
+            a: r2il::Varnode::register(16, 8),
+            b: r2il::Varnode::constant(8, 8),
+        });
+        entry.push(r2il::R2ILOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x100, 8),
+            val: r2il::Varnode::register(8, 8),
+        });
+        entry.push(r2il::R2ILOp::Load {
+            dst: r2il::Varnode::unique(0x108, 8),
+            space: r2il::SpaceId::Ram,
+            addr: r2il::Varnode::unique(0x100, 8),
+        });
+        entry.push(r2il::R2ILOp::IntLess {
+            dst: r2il::Varnode::unique(0x110, 1),
+            a: r2il::Varnode::unique(0x108, 8),
+            b: r2il::Varnode::constant(10, 8),
+        });
+        entry.push(r2il::R2ILOp::CBranch {
+            target: r2il::Varnode::constant(0x1008, 8),
+            cond: r2il::Varnode::unique(0x110, 1),
+        });
+        let fallthrough = r2il::R2ILBlock::new(0x1004, 4);
+        let taken = r2il::R2ILBlock::new(0x1008, 4);
+        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[entry, fallthrough, taken],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared source");
+        let parameter = source.facts().boundaries.parameters[&0].value;
+        let solved = solve_evidence_types(&source, &BTreeMap::new(), 64);
+        let unsigned = CTypeLike::Int {
+            bits: 64,
+            signedness: Signedness::Unsigned,
+        };
+
+        assert_eq!(solved.value_type(parameter), Some(&unsigned));
+        assert_eq!(
+            solved
+                .stack_slot_types()
+                .find(|(slot, _)| slot.offset == -8)
+                .map(|(_, ty)| ty),
+            Some(&unsigned),
+            "one scalar memory cell must carry the use-proven type both ways"
+        );
+
+        let signed = CTypeLike::Int {
+            bits: 64,
+            signedness: Signedness::Signed,
+        };
+        let signature = crate::FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Void),
+            params: vec![crate::FunctionParamSpec {
+                name: "length".to_string(),
+                ty: Some(signed.clone()),
+            }],
+        };
+        let slot = StackSlotKey {
+            base: ExternalStackBase::StackPointer,
+            offset: -8,
+        };
+        let mut facts = crate::FunctionFacts::new(
+            crate::FunctionTypeFacts {
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::LocalInference],
+                ),
+                merged_signature: Some(signature),
+                stack_slots: BTreeMap::from([(
+                    slot.clone(),
+                    crate::ExternalStackSlotSpec {
+                        name: "length_home".to_string(),
+                        ty: Some(signed.clone()),
+                        role: crate::ExternalStackSlotRole::Local,
+                        ..crate::ExternalStackSlotSpec::default()
+                    },
+                )]),
+                visible_bindings: vec![crate::VisibleBinding {
+                    name: "length_home".to_string(),
+                    ty: Some(signed),
+                    kind: crate::VisibleBindingKind::StackObject,
+                    stack_slot: Some(slot.clone()),
+                    param_index: None,
+                    source_reg: None,
+                }],
+                ..crate::FunctionTypeFacts::default()
+            },
+            None,
+        );
+        facts.apply_recovered_evidence_types(&source, 64);
+
+        let type_facts = facts.type_facts();
+        assert_eq!(
+            type_facts
+                .merged_signature
+                .as_ref()
+                .and_then(|signature| signature.params[0].ty.as_ref()),
+            Some(&unsigned)
+        );
+        assert_eq!(
+            type_facts
+                .stack_slots
+                .get(&slot)
+                .and_then(|slot| slot.ty.as_ref()),
+            Some(&unsigned)
+        );
+        assert_eq!(type_facts.visible_bindings[0].ty.as_ref(), Some(&unsigned));
+    }
 }
