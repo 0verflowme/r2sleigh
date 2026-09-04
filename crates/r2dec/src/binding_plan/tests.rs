@@ -380,6 +380,132 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
 }
 
 #[test]
+fn dead_phi_reader_does_not_force_a_live_temporary_copy_to_bind() {
+    let mut entry = R2ILBlock::new(0x1000, 4);
+    entry.push(R2ILOp::CBranch {
+        cond: Varnode::constant(1, 1),
+        target: Varnode::constant(0x1008, 8),
+    });
+    let mut left = R2ILBlock::new(0x1004, 4);
+    left.push(R2ILOp::Copy {
+        dst: Varnode::unique(0x38, 8),
+        src: Varnode::register(0, 8),
+    });
+    left.push(R2ILOp::Store {
+        space: SpaceId::Ram,
+        addr: Varnode::constant(0x2000, 8),
+        val: Varnode::unique(0x38, 8),
+    });
+    left.push(R2ILOp::Branch {
+        target: Varnode::constant(0x100c, 8),
+    });
+    let mut right = R2ILBlock::new(0x1008, 4);
+    right.push(R2ILOp::Copy {
+        dst: Varnode::unique(0x38, 8),
+        src: Varnode::constant(2, 8),
+    });
+    right.push(R2ILOp::Branch {
+        target: Varnode::constant(0x100c, 8),
+    });
+    let mut join = R2ILBlock::new(0x100c, 4);
+    join.push(R2ILOp::Return {
+        target: Varnode::register(0x30, 8),
+    });
+    let source_owned = source_owned_blocks(&[entry, left, right, join]);
+    let source = source_owned.source();
+    let producer = source
+        .graph()
+        .inst_id_for_op_site(0x1004, 0)
+        .and_then(|inst| source.graph().inst(inst))
+        .and_then(|inst| inst.output)
+        .expect("copy output");
+    let dead_reader = source
+        .graph()
+        .use_sites(producer)
+        .iter()
+        .find(|site| {
+            source
+                .graph()
+                .inst(site.inst)
+                .is_some_and(|inst| matches!(inst.payload, r2ssa::InstPayload::Phi { .. }))
+        })
+        .copied()
+        .expect("dead merge reader");
+    assert!(
+        source
+            .unobserved_merges()
+            .unobserved_uses()
+            .contains(&dead_reader),
+        "the source-owned dead-value analysis must own the ignored read"
+    );
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("dead-reader-aware plan");
+    assert!(matches!(
+        plan.disposition(producer),
+        Some(ValueDisposition::Inline { .. })
+    ));
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
+fn copy_of_bound_load_survives_temporary_storage_reuse_inline() {
+    let source_owned = source_owned([
+        R2ILOp::Load {
+            dst: Varnode::unique(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x38, 8),
+        },
+        R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::unique(0x10, 8),
+        },
+        R2ILOp::Load {
+            dst: Varnode::unique(0x10, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::register(0x38, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2000, 8),
+            val: Varnode::register(0, 8),
+        },
+        R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x2008, 8),
+            val: Varnode::unique(0x10, 8),
+        },
+    ]);
+    let source = source_owned.source();
+    let output_at = |op_index| {
+        source
+            .graph()
+            .inst_id_for_op_site(0x1000, op_index)
+            .and_then(|inst| source.graph().inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("operation output")
+    };
+    let load = output_at(0);
+    let copy = output_at(1);
+    let replacement_load = output_at(2);
+
+    let plan = BindingPlan::build_shadow(&source_owned).expect("bound-source copy plan");
+    assert!(matches!(
+        plan.disposition(load),
+        Some(ValueDisposition::Bound { .. })
+    ));
+    assert!(matches!(
+        plan.disposition(copy),
+        Some(ValueDisposition::Inline { .. })
+    ));
+    let binding_of = |value| match plan.disposition(value) {
+        Some(ValueDisposition::Bound { binding, .. }) => *binding,
+        disposition => panic!("expected bound value, got {disposition:?}"),
+    };
+    assert_ne!(binding_of(load), binding_of(replacement_load));
+    assert!(plan.validate_seal(&source_owned).is_ok());
+}
+
+#[test]
 fn unread_defined_value_is_elided_before_it_can_become_a_binding() {
     let source_owned = source_owned([
         R2ILOp::IntCarry {
