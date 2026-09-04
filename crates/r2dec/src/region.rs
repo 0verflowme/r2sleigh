@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[cfg(test)]
 use r2ssa::SSAOp;
-use r2ssa::{CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree};
+use r2ssa::{
+    BlockTerminator, CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree,
+};
 
 /// A control flow region.
 #[derive(Debug, Clone)]
@@ -1295,6 +1297,7 @@ impl<'a> RegionAnalyzer<'a> {
             .copied()
             .filter(|id| reachable.contains(id))
             .collect();
+        let switch_arm_nodes = self.working_switch_arm_nodes(graph, &reachable);
 
         // Map from node → composed region.
         let mut region_map: HashMap<usize, Region> = HashMap::new();
@@ -1323,6 +1326,13 @@ impl<'a> RegionAnalyzer<'a> {
                         } else {
                             base
                         }
+                    } else if switch_arm_nodes.contains(&next) {
+                        // Keep switch arms as separate regions. The switch
+                        // renderer owns their exact fallthrough edges and
+                        // widens the later arm's guard to every reaching case.
+                        // Copying the later arm here would instead turn one
+                        // fallthrough chain into several guarded occurrences.
+                        base
                     } else if self.working_join_requires_path_copy(next, graph, &reachable) {
                         if let Some(next_region) = region_map.get(&next).cloned() {
                             Self::sequence_merge(base, next_region)
@@ -1616,6 +1626,37 @@ impl<'a> RegionAnalyzer<'a> {
             )
         });
         common.into_iter().next()
+    }
+
+    /// Case entries are lexical boundaries even when an earlier case reaches
+    /// them by an ordinary one-successor edge. Collect their working nodes once
+    /// so iterative composition does not repeatedly rescan switch metadata.
+    fn working_switch_arm_nodes(
+        &self,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        let mut arms = HashSet::new();
+        for block_addr in self.func.block_addrs() {
+            let Some(block) = self.func.cfg().get_block(*block_addr) else {
+                continue;
+            };
+            let BlockTerminator::Switch { cases, default } = &block.terminator else {
+                continue;
+            };
+            for target in cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(default.iter().copied())
+            {
+                if let Some(node) = graph.node_for_block(target)
+                    && reachable.contains(&node)
+                {
+                    arms.insert(node);
+                }
+            }
+        }
+        arms
     }
 
     /// Whether a multi-predecessor node is reached only by some control paths
@@ -2814,6 +2855,51 @@ mod tests {
             1,
             "the true post-dominating merge must remain a single continuation"
         );
+    }
+
+    #[test]
+    fn iterative_composition_preserves_switch_fallthrough_boundaries() {
+        let blocks = [
+            R2ILBlock::new(0x1000, 4),
+            R2ILBlock::new(0x1010, 4),
+            R2ILBlock::new(0x1020, 4),
+            R2ILBlock::new(0x1030, 4),
+            R2ILBlock::new(0x1080, 4),
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::Switch {
+                cases: vec![(1, 0x1010), (2, 0x1020), (3, 0x1030)],
+                default: Some(0x1080),
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1080 });
+        func.cfg_mut()
+            .set_terminator(0x1080, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let topo = graph
+            .topological_order()
+            .expect("acyclic switch-fallthrough graph");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        for case_entry in [0x1010, 0x1020, 0x1030] {
+            assert_eq!(
+                explicit_block_occurrences(&region, case_entry),
+                1,
+                "the switch renderer, not generic path copying, owns fallthrough into case 0x{case_entry:x}"
+            );
+        }
     }
 
     fn build_latch_condition_loop_cfg() -> SSAFunction {
