@@ -71,6 +71,28 @@ plugin translation unit compiles against the new fork with zero errors.
 4. Re-run `pipeline.sh` after the in-flight branches land — the move is
    scripted precisely so it can be replayed against a moved base.
 
+## The radare2 merge is a replay, not a resolve
+
+Merging `fork/drop-unconsumed-snapshot-api` into `anal/subregister-argument-spills`
+conflicts in four files, and resolving it by hand loses work. Two commits landed
+on the base after the move branched:
+
+    39be056200  Carry loader-owned initialization return arity in snapshots
+    4e9e163f83  Expose logical return arity in function snapshots
+
+They add `RAnalSnapshotReturnArity`, a `return_arity` field on both the
+signature view and the snapshot, a derivation helper, a hash contribution and a
+bin-symbol fallback -- all inside the code the move relocated. Taking the move's
+side of the conflict silently drops every one of them; that was confirmed by
+resolving it and then finding the arity gone from radare2 and absent from the
+plugin's carried header.
+
+The correct path is to re-run `pipeline.sh` with the base at
+`anal/subregister-argument-spills`, so the move is regenerated from a tree that
+already contains the arity work and it flows into the capture automatically.
+That needs a build to converge, which is why it was left for a machine with
+headroom rather than hand-ported here.
+
 ## Reproducing
 
 `pipeline.sh` replays the whole radare2-side transformation from a pristine
