@@ -438,25 +438,7 @@ pub(crate) fn admit_declaration(
     width_bits: u32,
     ptr_bits: u32,
 ) -> r2types::CTypeLike {
-    let admissible = match &ty {
-        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
-        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
-        r2types::CTypeLike::Float(bits) => *bits == width_bits,
-        // Preserve a target-sized scalar typedef only when its spelling is one
-        // the canonical parser can place. An unknown identifier remains
-        // unplaceable and therefore cannot displace a machine type merely by
-        // looking more specific.
-        r2types::CTypeLike::Typedef(name) => {
-            r2types::parse_c_type_like(name, ptr_bits).and_then(|parsed| parsed.bits(ptr_bits))
-                == Some(width_bits)
-        }
-        _ => false,
-    };
-    if admissible {
-        ty
-    } else {
-        r2types::CTypeLike::machine_bits(width_bits)
-    }
+    r2types::admit_declaration_type(ty, width_bits, ptr_bits)
 }
 
 /// The storage width a declared type describes.
@@ -468,26 +450,7 @@ pub(crate) fn admit_declaration(
 /// the part the seal can re-derive from the source; what the evidence proved
 /// beyond it is not something a second derivation of the *plan* can confirm.
 pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
-    match ty {
-        r2types::CTypeLike::Int {
-            bits,
-            signedness: r2types::Signedness::Unsigned,
-        } if *bits <= 128 => Some(*bits),
-        r2types::CTypeLike::Int {
-            bits,
-            signedness: r2types::Signedness::Signed,
-        } if *bits <= 128 => Some(*bits),
-        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
-        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
-        r2types::CTypeLike::Array(element, Some(count)) => {
-            declaration_type_width(element, ptr_bits)?.checked_mul(u32::try_from(*count).ok()?)
-        }
-        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
-        r2types::CTypeLike::Typedef(name) => {
-            r2types::parse_c_type_like(name, ptr_bits).and_then(|parsed| parsed.bits(ptr_bits))
-        }
-        _ => None,
-    }
+    r2types::declaration_type_width_bits(ty, ptr_bits)
 }
 
 /// Whether a declaration describes an object of exactly this storage width.

@@ -1512,7 +1512,7 @@ mod tests {
                 ),
                 merged_signature: Some(signature),
                 stack_slots: BTreeMap::from([(
-                    slot.clone(),
+                    slot,
                     crate::ExternalStackSlotSpec {
                         name: "length_home".to_string(),
                         ty: Some(signed.clone()),
@@ -1524,7 +1524,7 @@ mod tests {
                     name: "length_home".to_string(),
                     ty: Some(signed),
                     kind: crate::VisibleBindingKind::StackObject,
-                    stack_slot: Some(slot.clone()),
+                    stack_slot: Some(slot),
                     param_index: None,
                     source_reg: None,
                 }],

@@ -6,7 +6,7 @@
 //! needed for a request. Analysis artifacts are built directly for each
 //! source snapshot request.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1522,6 +1522,9 @@ pub struct EngineAnalyzeRequest {
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
     /// Bodies of the functions the root calls, captured in the same transaction.
     trusted_callees: Vec<Arc<r2ssa::SsaArtifact>>,
+    /// Each callee's own typed source context, retained until `r2types` derives
+    /// the source-owned signature that callers may consume.
+    trusted_callee_contexts: BTreeMap<u64, r2types::ParsedExternalContext>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -1978,6 +1981,39 @@ fn trusted_callee_signatures(
         .collect()
 }
 
+fn trusted_parsed_context(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> r2types::ParsedExternalContext {
+    let signature = trusted_source_signature(trusted, ptr_bits);
+    let external_type_db = trusted_external_type_db(trusted);
+    let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
+        trusted
+            .source()
+            .image()
+            .data_symbols()
+            .iter()
+            .map(|object| (object.address(), object.type_spelling())),
+        ptr_bits,
+        &external_type_db,
+    );
+    let program_data_objects = cache_program_data_object_types(&observed_data_objects);
+    r2types::ParsedExternalContext {
+        known_function_signatures: trusted_callee_signatures(trusted, ptr_bits),
+        stack_slots: trusted_stack_slot_names(trusted, ptr_bits),
+        callconv: signature
+            .as_ref()
+            .and_then(|(_, callconv, _)| callconv.clone()),
+        noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
+        current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
+        merged_signature: signature.map(|(spec, _, _)| spec),
+        external_type_db,
+        program_data_objects,
+        assumptions: trusted.artifact().facts().assumptions.clone(),
+        ..r2types::ParsedExternalContext::default()
+    }
+}
+
 fn trusted_stack_slot_names(
     trusted: &r2ssa::TrustedSsaArtifact,
     ptr_bits: u32,
@@ -2083,6 +2119,7 @@ impl EngineAnalyzeRequest {
             source_snapshot: parts.source_snapshot,
             trusted_ssa: None,
             trusted_callees: Vec::new(),
+            trusted_callee_contexts: BTreeMap::new(),
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
@@ -2116,32 +2153,7 @@ impl EngineAnalyzeRequest {
         self.source_snapshot = None;
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
-        let signature = trusted_source_signature(&trusted, self.ptr_bits);
-        let external_type_db = trusted_external_type_db(&trusted);
-        let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
-            trusted
-                .source()
-                .image()
-                .data_symbols()
-                .iter()
-                .map(|object| (object.address(), object.type_spelling())),
-            self.ptr_bits,
-            &external_type_db,
-        );
-        let program_data_objects = cache_program_data_object_types(&observed_data_objects);
-        self.parsed_context = r2types::ParsedExternalContext {
-            known_function_signatures: trusted_callee_signatures(&trusted, self.ptr_bits),
-            stack_slots: trusted_stack_slot_names(&trusted, self.ptr_bits),
-            callconv: signature
-                .as_ref()
-                .and_then(|(_, callconv, _)| callconv.clone()),
-            noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
-            current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
-            merged_signature: signature.map(|(spec, _, _)| spec),
-            external_type_db,
-            program_data_objects,
-            ..r2types::ParsedExternalContext::default()
-        };
+        self.parsed_context = trusted_parsed_context(&trusted, self.ptr_bits);
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);
         self.semantic_mode = EngineSemanticMode::Full;
         self.trusted_ssa = Some(trusted);
@@ -2156,10 +2168,18 @@ impl EngineAnalyzeRequest {
         mut self,
         callees: impl IntoIterator<Item = Arc<r2ssa::TrustedSsaArtifact>>,
     ) -> Self {
-        self.trusted_callees = callees
-            .into_iter()
-            .map(|callee| callee.shared_artifact())
-            .collect();
+        self.trusted_callees.clear();
+        self.trusted_callee_contexts.clear();
+        for callee in callees {
+            let source = callee.shared_artifact();
+            let address = source.function().entry;
+            if self.trusted_callee_contexts.contains_key(&address) {
+                continue;
+            }
+            self.trusted_callee_contexts
+                .insert(address, trusted_parsed_context(&callee, self.ptr_bits));
+            self.trusted_callees.push(source);
+        }
         self
     }
 
@@ -3991,6 +4011,31 @@ fn build_prepared_interproc_summary_set(
     )
 }
 
+/// Derive each captured callee's C signature from its own typed body once.
+///
+/// The returned certificate retains that exact SSA owner. A callee that cannot
+/// prove a complete signature contributes nothing; the root keeps the ordinary
+/// call-carrier fallback instead of manufacturing the missing source types.
+fn build_source_owned_callee_signatures(
+    request: &EngineAnalyzeRequest,
+) -> Vec<r2types::SourceOwnedCalleeSignature> {
+    request
+        .trusted_callees
+        .iter()
+        .filter_map(|callee| {
+            let context = request
+                .trusted_callee_contexts
+                .get(&callee.function().entry)?
+                .clone();
+            let analysis = r2types::build_source_owned_type_writeback_analysis(
+                r2types::TypeWritebackAnalysisRequest::new(Arc::clone(callee), context).ok()?,
+            )
+            .ok()?;
+            analysis.source_owned_callee_signature()
+        })
+        .collect()
+}
+
 /// Build the analysis artifact, naming the cause when one cannot be built.
 ///
 /// The reason is surfaced to the user, so every exit below says which stage
@@ -4076,6 +4121,11 @@ fn build_engine_analysis_artifact(
         request.parsed_context.clone(),
     )
     .map_err(|error| format!("type writeback request rejected the source: {error:?}"))?;
+    writeback_request = writeback_request
+        .with_source_owned_callee_signatures(build_source_owned_callee_signatures(request))
+        .map_err(|error| {
+            format!("type writeback request rejected the captured callees: {error:?}")
+        })?;
     if let Some(semantic_artifact) = semantic_artifact {
         writeback_request = writeback_request
             .with_semantic_artifact(semantic_artifact)
@@ -5151,6 +5201,7 @@ mod tests {
                 source_snapshot: Some(exact_rdi_test_source_snapshot("sym.assumed/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -6173,6 +6224,7 @@ mod tests {
             source_snapshot: Some(exact_empty_test_source_snapshot("sym.zero/analyze/rev1")),
             trusted_ssa: None,
             trusted_callees: Vec::new(),
+            trusted_callee_contexts: BTreeMap::new(),
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -7571,6 +7623,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7607,6 +7660,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7712,6 +7766,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("dbg.init_node/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8022,6 +8077,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("sym.direct_partial/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8070,6 +8126,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("dbg.raw_name/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8114,6 +8171,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("sym.caller/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8156,6 +8214,7 @@ mod tests {
                 source_snapshot: Some(test_source_snapshot("sym.string_const/rev1")),
                 trusted_ssa: None,
                 trusted_callees: Vec::new(),
+                trusted_callee_contexts: BTreeMap::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),

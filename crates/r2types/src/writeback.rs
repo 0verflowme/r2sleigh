@@ -987,6 +987,7 @@ pub struct TypeWritebackAnalysis {
     source: Arc<SsaArtifact>,
     function_facts: FunctionFacts,
     plan: TypeWritebackPlan,
+    callee_signatures: BTreeMap<u64, crate::SourceOwnedCalleeSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,6 +1014,53 @@ impl TypeWritebackAnalysis {
         &self.function_facts
     }
 
+    /// Export the signature this exact retained body proves for its callers.
+    ///
+    /// The opaque result keeps the SSA and physical interface that authorize
+    /// the logical C types, so it cannot be reattached to an unrelated call.
+    pub fn source_owned_callee_signature(&self) -> Option<crate::SourceOwnedCalleeSignature> {
+        let signature = self
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()?;
+        let return_type = signature.ret_type.clone()?;
+        let render = self.function_facts.render()?;
+        let ptr_bits = self
+            .source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        let params = signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(slot, parameter)| {
+                let id = r2ssa::SemanticId::parameter(slot)?;
+                let crate::CertifiedEntity::Parameter { carrier_width, .. } =
+                    render.certified_entities.get(&id)?
+                else {
+                    return None;
+                };
+                let width_bits = carrier_width.checked_mul(8)?;
+                Some(crate::admit_declaration_type(
+                    parameter.ty.clone()?,
+                    width_bits,
+                    ptr_bits,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        crate::SourceOwnedCalleeSignature::new(
+            Arc::clone(&self.source),
+            crate::FunctionType {
+                return_type,
+                params,
+                // Function interfaces own fixed carriers. Variadicity belongs
+                // to the exact callsite prototype and is attached there.
+                variadic: false,
+            },
+        )
+    }
+
     fn enrich_from_source_for_decompile(&mut self) -> bool {
         if crate::prepare::prepared_arch_display_name(self.source.as_ref()).is_none() {
             return false;
@@ -1020,9 +1068,10 @@ impl TypeWritebackAnalysis {
         let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
         let (changed_parameters, return_type_changed) =
-            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+            SourceOwnedFunctionFacts::enrich_report_from_source_with_callee_signatures(
                 self.source.as_ref(),
                 &mut self.function_facts,
+                &self.callee_signatures,
             );
         if (changed_parameters > 0 || return_type_changed)
             && !self.refresh_plan_after_source_constraints(
@@ -1076,8 +1125,12 @@ impl TypeWritebackAnalysis {
         ) {
             return Err(TypeWritebackAnalysisError::IncompatibleDecompileRoute);
         }
-        SourceOwnedFunctionFacts::seal(self.source, self.function_facts)
-            .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
+        SourceOwnedFunctionFacts::seal_with_callee_signatures(
+            self.source,
+            self.function_facts,
+            self.callee_signatures,
+        )
+        .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
     }
 
     fn refresh_plan_after_source_constraints(
@@ -1246,6 +1299,7 @@ pub enum TypeWritebackAnalysisError {
     DerivedSignatureMismatch,
     DerivedTypeFactsMismatch,
     SourceEnrichmentFailed,
+    DuplicateCalleeAddress,
 }
 
 #[derive(Debug, Clone)]
@@ -1254,6 +1308,7 @@ pub struct TypeWritebackAnalysisRequest {
     parsed_context: ParsedExternalContext,
     semantic_artifact: Option<r2sym::SemanticArtifact>,
     interproc_summary: Option<r2ssa::PreparedInterprocSummarySet>,
+    callee_signatures: BTreeMap<u64, crate::SourceOwnedCalleeSignature>,
 }
 
 impl TypeWritebackAnalysisRequest {
@@ -1269,6 +1324,7 @@ impl TypeWritebackAnalysisRequest {
             parsed_context,
             semantic_artifact: None,
             interproc_summary: None,
+            callee_signatures: BTreeMap::new(),
         })
     }
 
@@ -1291,6 +1347,22 @@ impl TypeWritebackAnalysisRequest {
             return Err(TypeWritebackAnalysisError::ForeignInterprocSummary);
         }
         self.interproc_summary = Some(interproc_summary);
+        Ok(self)
+    }
+
+    pub fn with_source_owned_callee_signatures(
+        mut self,
+        signatures: impl IntoIterator<Item = crate::SourceOwnedCalleeSignature>,
+    ) -> Result<Self, TypeWritebackAnalysisError> {
+        for signature in signatures {
+            if self
+                .callee_signatures
+                .insert(signature.address(), signature)
+                .is_some()
+            {
+                return Err(TypeWritebackAnalysisError::DuplicateCalleeAddress);
+            }
+        }
         Ok(self)
     }
 
@@ -4567,6 +4639,7 @@ pub fn build_source_owned_type_writeback_analysis(
         parsed_context,
         semantic_artifact,
         interproc_summary,
+        callee_signatures,
     } = request;
     if source.facts().assumptions != parsed_context.assumptions {
         return Err(TypeWritebackAnalysisError::AssumptionSetMismatch);
@@ -4661,6 +4734,7 @@ pub fn build_source_owned_type_writeback_analysis(
         source,
         function_facts,
         plan: derived.plan,
+        callee_signatures,
     };
     if !analysis.enrich_from_source_for_decompile() {
         return Err(TypeWritebackAnalysisError::SourceEnrichmentFailed);
@@ -11846,6 +11920,7 @@ mod tests {
                 global_type_links: Vec::new(),
                 diagnostics: TypeWritebackDiagnostics::default(),
             },
+            callee_signatures: BTreeMap::new(),
         }
     }
 
@@ -11923,6 +11998,7 @@ mod tests {
             source: Arc::clone(&source),
             function_facts: function_facts.clone(),
             plan: plan.clone(),
+            callee_signatures: BTreeMap::new(),
         };
         let budget = TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX);
         let policy = TypeWritebackApplyPolicy::balanced();

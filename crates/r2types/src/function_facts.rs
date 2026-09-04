@@ -872,6 +872,89 @@ pub(crate) fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64>
     }
 }
 
+/// The exact storage width a C declaration type describes.
+pub fn declaration_type_width_bits(ty: &CTypeLike, ptr_bits: u32) -> Option<u32> {
+    match ty {
+        CTypeLike::Int {
+            bits,
+            signedness: crate::Signedness::Signed | crate::Signedness::Unsigned,
+        }
+        | CTypeLike::Float(bits)
+            if *bits <= 128 =>
+        {
+            Some(*bits)
+        }
+        CTypeLike::Pointer(_) => Some(ptr_bits),
+        CTypeLike::Array(element, Some(count)) => {
+            declaration_type_width_bits(element, ptr_bits)?.checked_mul(u32::try_from(*count).ok()?)
+        }
+        CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+        CTypeLike::Typedef(name) => crate::parse_external_type_like_spec(name, ptr_bits)
+            .and_then(|parsed| parsed.bits(ptr_bits)),
+        _ => None,
+    }
+}
+
+/// Admit a logical type only where it describes this exact storage width.
+pub fn admit_declaration_type(ty: CTypeLike, width_bits: u32, ptr_bits: u32) -> CTypeLike {
+    let admissible = match &ty {
+        CTypeLike::Pointer(_) => width_bits == ptr_bits,
+        CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => *bits == width_bits,
+        CTypeLike::Typedef(name) => {
+            crate::parse_external_type_like_spec(name, ptr_bits)
+                .and_then(|parsed| parsed.bits(ptr_bits))
+                == Some(width_bits)
+        }
+        _ => false,
+    };
+    if admissible {
+        ty
+    } else {
+        CTypeLike::machine_bits(width_bits)
+    }
+}
+
+fn function_type_matches_source_interface(
+    signature: &crate::FunctionType,
+    interface: &r2ssa::SourceFunctionInterface,
+    ptr_bits: u32,
+) -> bool {
+    if ptr_bits == 0 || signature.params.len() != interface.parameters().len() {
+        return false;
+    }
+    let parameter_widths_match = signature.params.iter().enumerate().all(|(index, ty)| {
+        let Some(actual_bits) = declaration_type_width_bits(ty, ptr_bits).map(u64::from) else {
+            return false;
+        };
+        let expected_bits = interface
+            .parameter_logical_values()
+            .get(index)
+            .map(|logical| logical.carrier().size_bits())
+            .or_else(|| {
+                interface
+                    .parameters()
+                    .get(index)
+                    .map(|parameter| u64::from(parameter.storage().size) * 8)
+            });
+        expected_bits == Some(actual_bits)
+    });
+    if !parameter_widths_match {
+        return false;
+    }
+    match (interface.return_kind(), &signature.return_type) {
+        (r2ssa::SourceFunctionReturn::Void, CTypeLike::Void) => true,
+        (r2ssa::SourceFunctionReturn::Register { storage }, ty) => {
+            let actual_bits = declaration_type_width_bits(ty, ptr_bits).map(u64::from);
+            let expected_bits = interface
+                .return_logical_value()
+                .map(|logical| logical.carrier().size_bits())
+                .or_else(|| Some(u64::from(storage.size) * 8));
+            actual_bits == expected_bits
+        }
+        _ => false,
+    }
+}
+
 fn field_certificate_width_matches(
     cert: &crate::facts::FieldAccessCertificate,
     access_width: u32,
@@ -1517,10 +1600,59 @@ pub struct SourceOwnedFunctionFacts {
     source: Arc<r2ssa::SsaArtifact>,
     report: FunctionFacts,
     evidence_types: crate::EvidenceTypes,
+    _callee_signatures: BTreeMap<u64, SourceOwnedCalleeSignature>,
+}
+
+/// One C signature derived from the exact retained body that owns it.
+///
+/// Construction is crate-private: callers may transport this certificate, but
+/// cannot pair an arbitrary signature with an SSA body. The retained function
+/// interface also lets a caller prove that this is the same physical contract
+/// `r2ssa` admitted at its call site before consuming the logical C types.
+#[derive(Debug, Clone)]
+pub struct SourceOwnedCalleeSignature {
+    source: Arc<r2ssa::SsaArtifact>,
+    interface: r2ssa::SourceFunctionInterface,
+    signature: crate::FunctionType,
+}
+
+impl SourceOwnedCalleeSignature {
+    pub(crate) fn new(
+        source: Arc<r2ssa::SsaArtifact>,
+        signature: crate::FunctionType,
+    ) -> Option<Self> {
+        let interface = source.machine_context().function_interface()?.clone();
+        function_type_matches_source_interface(
+            &signature,
+            &interface,
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+        )
+        .then_some(Self {
+            source,
+            interface,
+            signature,
+        })
+    }
+
+    pub(crate) fn address(&self) -> u64 {
+        self.source.function().entry
+    }
 }
 
 impl SourceOwnedFunctionFacts {
-    pub(crate) fn seal(source: Arc<r2ssa::SsaArtifact>, mut report: FunctionFacts) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) fn seal(source: Arc<r2ssa::SsaArtifact>, report: FunctionFacts) -> Option<Self> {
+        Self::seal_with_callee_signatures(source, report, BTreeMap::new())
+    }
+
+    pub(crate) fn seal_with_callee_signatures(
+        source: Arc<r2ssa::SsaArtifact>,
+        mut report: FunctionFacts,
+        callee_signatures: BTreeMap<u64, SourceOwnedCalleeSignature>,
+    ) -> Option<Self> {
         // Canonicalization is part of sealing. Runtime consumers must observe
         // this exact report and may not clone then normalize it independently.
         report.canonicalize_type_facts();
@@ -1542,6 +1674,7 @@ impl SourceOwnedFunctionFacts {
         // type payload, then require exact equality before sealing.
         let mut expected = report.clone();
         Self::rebuild_source_owned_decompile_evidence(source.as_ref(), &mut expected);
+        expected.apply_source_owned_callee_signatures(source.as_ref(), &callee_signatures);
         if report.types != expected.types
             || report.callee_resolution != expected.callee_resolution
             || report.callsites != expected.callsites
@@ -1562,6 +1695,7 @@ impl SourceOwnedFunctionFacts {
             source,
             report,
             evidence_types,
+            _callee_signatures: callee_signatures,
         })
     }
 
@@ -1650,9 +1784,18 @@ impl SourceOwnedFunctionFacts {
     /// them have nothing to do; every other piece of evidence is still valid and
     /// is still attached. Returns the number of parameter declarations that
     /// changed and whether the return declaration changed in the final signature.
+    #[cfg(test)]
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
+    ) -> (usize, bool) {
+        Self::enrich_report_from_source_with_callee_signatures(source, report, &BTreeMap::new())
+    }
+
+    pub(crate) fn enrich_report_from_source_with_callee_signatures(
+        source: &r2ssa::SsaArtifact,
+        report: &mut FunctionFacts,
+        callee_signatures: &BTreeMap<u64, SourceOwnedCalleeSignature>,
     ) -> (usize, bool) {
         let prior_signature = report.types.merged_signature.clone();
         let mut enriched = report.clone();
@@ -1661,6 +1804,7 @@ impl SourceOwnedFunctionFacts {
         enriched.assumption_usage = usage;
         enriched.display_names.absorb(source.display_names());
         Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
+        enriched.apply_source_owned_callee_signatures(source, callee_signatures);
         let ptr_bits = source
             .machine_context()
             .memory_model()
@@ -1675,6 +1819,7 @@ impl SourceOwnedFunctionFacts {
         // once more so the sealed render projection is a pure function of the
         // final type facts and the exact retained source.
         Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
+        enriched.apply_source_owned_callee_signatures(source, callee_signatures);
         let final_signature = enriched.types.merged_signature.as_ref();
         let changed_parameters = final_signature.map_or(0, |signature| {
             signature
@@ -2004,6 +2149,31 @@ impl FunctionFacts {
 
     pub fn callsites(&self) -> Option<&FunctionCallsiteFacts> {
         (!self.callsites.is_empty()).then_some(&self.callsites)
+    }
+
+    fn apply_source_owned_callee_signatures(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        signatures: &BTreeMap<u64, SourceOwnedCalleeSignature>,
+    ) {
+        for arguments in self.callsites.by_callsite.values_mut() {
+            let Some(target) = arguments.direct_target else {
+                continue;
+            };
+            let Some(signature) = signatures.get(&target) else {
+                continue;
+            };
+            let same_interface = source
+                .machine_context()
+                .call_site_interface(arguments.call_site_id)
+                .and_then(r2ssa::SourceCallSiteInterface::exact_callee_interface)
+                .is_some_and(|interface| interface == &signature.interface);
+            if same_interface && signature.address() == target {
+                let mut logical_signature = signature.signature.clone();
+                logical_signature.variadic = arguments.variadic;
+                arguments.callee_signature = Some(logical_signature);
+            }
+        }
     }
 
     pub fn with_call_results(mut self, call_results: FunctionCallResultFacts) -> Self {
@@ -2931,7 +3101,10 @@ impl FunctionFacts {
         let mut conflicted = BTreeSet::new();
         for (callsite, arguments) in &self.callsites.by_callsite {
             let identity = self.callee_resolution.identity_for_callsite(*callsite);
-            let signature = identity.and_then(crate::CalleeIdentity::known_signature);
+            let signature = arguments
+                .callee_signature
+                .as_ref()
+                .or_else(|| identity.and_then(crate::CalleeIdentity::known_signature));
             let Some(signature) = signature else {
                 continue;
             };
@@ -3086,11 +3259,11 @@ impl FunctionFacts {
     fn callsite_signatures(&self) -> BTreeMap<r2ssa::CallSiteId, crate::FunctionType> {
         let mut signatures = BTreeMap::new();
         for (callsite, arguments) in &self.callsites.by_callsite {
-            let Some(signature) = self
-                .callee_resolution
-                .identity_for_callsite(*callsite)
-                .and_then(crate::CalleeIdentity::known_signature)
-            else {
+            let Some(signature) = arguments.callee_signature.as_ref().or_else(|| {
+                self.callee_resolution
+                    .identity_for_callsite(*callsite)
+                    .and_then(crate::CalleeIdentity::known_signature)
+            }) else {
                 continue;
             };
             signatures.insert(arguments.call_site_id, signature.clone());
@@ -3580,7 +3753,10 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                     argument_values,
                     variadic: cert.variadic,
                     fixed_argument_count: cert.fixed_argument_count,
-                    callee_signature: exact_callsite_callee_signature(prepared, cert.call_site),
+                    // Carrier widths alone do not prove C signedness. A
+                    // source-owned callee analysis fills this only after its
+                    // exact retained interface matches this call site.
+                    callee_signature: None,
                     register_argument_locations,
                     stack_argument_locations,
                 },
@@ -3588,39 +3764,6 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
         })
         .collect();
     FunctionCallsiteFacts { by_callsite }
-}
-
-fn exact_callsite_callee_signature(
-    prepared: &r2ssa::SsaArtifact,
-    call_site: r2ssa::CallSiteId,
-) -> Option<crate::FunctionType> {
-    let callee = prepared
-        .machine_context()
-        .call_site_interface(call_site)?
-        .exact_callee_interface()?;
-    let graph = callee.type_graph()?;
-    if callee.parameter_logical_values().len() != callee.parameters().len() {
-        return None;
-    }
-    let params = callee
-        .parameter_logical_values()
-        .iter()
-        .map(|logical| {
-            crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let return_type = match callee.return_kind() {
-        r2ssa::SourceFunctionReturn::Void => CTypeLike::Void,
-        r2ssa::SourceFunctionReturn::Register { .. } => {
-            let logical = callee.return_logical_value()?;
-            crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())?
-        }
-    };
-    Some(crate::FunctionType {
-        return_type,
-        params,
-        variadic: false,
-    })
 }
 
 fn prepared_call_result_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCallResultFacts {
@@ -6197,7 +6340,7 @@ mod tests {
             false,
             r2ssa::SourceCallResult::Void,
         )
-        .and_then(|interface| interface.with_exact_callee_interface(callee_interface))
+        .and_then(|interface| interface.with_exact_callee_interface(callee_interface.clone()))
         .expect("exact callee interface");
         let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
             &[block],
@@ -6232,11 +6375,40 @@ mod tests {
                 .callsites()
                 .and_then(|facts| facts.arguments_for_site(callsite))
                 .and_then(|facts| facts.callee_signature.as_ref()),
-            Some(&crate::FunctionType {
-                return_type: CTypeLike::Void,
-                params: vec![CTypeLike::u32()],
-                variadic: false,
-            })
+            None,
+            "an exact carrier interface does not prove the callee's C signedness"
+        );
+
+        let callee_source = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &[R2ILBlock::new(0x402000, 4)],
+                Some(&x86_stack_home_arch()),
+                callee_interface,
+            )
+            .expect("prepared callee owner"),
+        );
+        let signed_signature = crate::FunctionType {
+            return_type: CTypeLike::Void,
+            params: vec![CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            }],
+            variadic: false,
+        };
+        let source_owned_signature =
+            SourceOwnedCalleeSignature::new(callee_source, signed_signature.clone())
+                .expect("logical type fits the exact low-bit carrier");
+        facts.apply_source_owned_callee_signatures(
+            &prepared,
+            &BTreeMap::from([(0x402000, source_owned_signature)]),
+        );
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|facts| facts.arguments_for_site(callsite))
+                .and_then(|facts| facts.callee_signature.as_ref()),
+            Some(&signed_signature),
+            "only the retained callee body may add logical signedness"
         );
         facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
 
