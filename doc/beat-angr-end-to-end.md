@@ -81,11 +81,27 @@ chained reasons, and fixing any one alone changes zero bytes:
 3. Even a fired rule leaves the local, because the declaration is minted from
    the binding.
 
-**Decision taken:** break the circularity with **one fixed point** over the
-expansion policy and the binding partition together, so a rule firing can retract
-a binding. Needs a monotonicity argument and a termination bound. The staged
-alternative — rewrite fully expanded, then partition — was rejected because it
-fires rules on terms the renderer cannot honour.
+**Superseded by measurement — do not build the fixed point.** The decision to
+break the circularity with a fixed point rested on premise 1, which was already
+stale: `ValueDisposition::Inline` carries a `TermId`, not a machine id, and 18 of
+the 93 rules already fire and reach output. Measured over all 54 cells,
+`inline_today == inline_perm` in every one and `newly_inline` is zero
+everywhere, because `inlinable_core` consults the canonical roots only to ask
+whether the root is `Opaque`, and expansion never changes opacity. The proposed
+fixed point therefore converges in one step to today's answer: **the measured
+upper bound on its effect is zero changed renderings.** Building the plugin with
+`term_absorbs_producer -> true` confirmed it end to end — 53 of 54 cells stop
+rendering, and the survivor is byte-identical.
+
+**Do this instead, and it is far cheaper.** A value the plan *binds* has its
+assignment right-hand side rendered from the machine arena; its canonical term is
+computed and discarded. **421 distinct values have a rule firing today whose
+result never reaches output** for that reason alone — 234 `literal.compare`, 64
+`subscript.constant_stride`, 58 `literal.or`, 19 `identity.and_self`, and more.
+The proof is in the emitted C: `identity.and_self` fires on 19 bound values and
+the corpus contains exactly 19 occurrences of `X & X`. No policy change, no
+partition change, no fixed point — render a bound value's RHS from its canonical
+term.
 
 Also in this context, ordered by measured evidence rather than column size:
 
