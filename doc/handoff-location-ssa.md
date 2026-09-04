@@ -11674,3 +11674,44 @@ now refuses earlier at machine-projection authorization; and the mixed A+B
 placement but its section has three signatures.  Thus eight of the fifteen
 exclusively owned B/C/D/E cells currently produce a `generation=present`
 record: one old B cell, five old C cells, and both old D cells.
+
+## The effect ledger's three refusal tallies are separate
+
+`tests/coverage/coverage-baseline.json` records 26 functions under the old
+aggregate cause `N refused, N unaccounted, N conflicts`. That text did not say
+which I4 failure occurred. Worse, the ledger itself put an uncertified zero in
+the refused column and a non-exclusive duplicate in the refused column, even
+though those are respectively unaccounted and conflicting obligations. Native
+admission failed in all three cases, so the rendered behavior was safe, but the
+diagnostic could not direct a fix to the responsible path.
+
+The closed ledger now keeps those cases distinct without changing admission.
+An uncertified zero stays unattributed, and a duplicate keeps its one rendered
+owner while recording a conflict against the same canonical obligation. The
+typed effect audit carries the first canonical obligation in each nonzero tally,
+and the engine refusal prints its kind and instruction site. The existing
+`zero-occurrence-outcome` trace was extended with the function entry and
+`tally=unaccounted`; it still prints the graph instruction, output and complete
+input list rather than introducing a second probe.
+
+Measured with
+`R2DEC_TRACE_REFUSAL=1 R2SLEIGH_DEBUG_UNOWNED=1
+./tests/coverage/locked_coverage.sh` on the tree at this entry:
+
+| baseline population | functions | current tally and first site |
+| --- | ---: | --- |
+| already render on the merged branch | 22 | none |
+| `system_ls_a97c50d3::fcn.100003110` | 1 | 3 unaccounted `call-argument` obligations at `0x100003110:op:8` |
+| `system_ls_a97c50d3::fcn.100003250` | 1 | 1 unaccounted `call-argument` obligation at `0x100003250:op:8` |
+| `system_ls_a97c50d3::sym.func.1000038a4` | 1 | 1 unaccounted `call-argument` obligation at `0x1000038a4:op:8` |
+| `system_ls_a97c50d3::sym.func.100003cfc` | 1 | 2 conflicting `control-predicate` occurrences, first at `0x100003dc0:op:55` |
+
+So the 26 baseline functions split by nonzero tally as **0 refused, 3
+unaccounted, 1 conflicting, and 22 already rendered**. No function has more
+than one nonzero tally. One additional current function,
+`system_ls_a97c50d3::sym.func.100002524`, has 3 unaccounted call arguments but
+was a `RenderedValueRequired` refusal in the recorded baseline, so it is not
+part of this 26-function ownership slice.
+
+The sweep rendered 387 of 556 functions: pinned 76/107, compiled 281/313, and
+system 30/136. The coverage gate reported no regressions.

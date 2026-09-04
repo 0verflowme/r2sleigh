@@ -616,6 +616,32 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    /// Attach a composite statement's implicit effects without duplicating an
+    /// exact effect marker already carried by one of its child statements.
+    pub(crate) fn observe_composite_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_composite_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     /// O(1) origin lookup once the caller holds the normalized block's dense id.
     pub(crate) fn source_inst_for_normalized_site(
         &self,

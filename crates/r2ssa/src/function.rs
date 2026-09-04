@@ -311,7 +311,8 @@ impl SsaArtifact {
         control.poll()?;
         validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
         machine_context.remap_memory_sites_to_prepared(&function);
-        let graph = SsaGraph::from_function_with_storage(&function);
+        let mut graph = SsaGraph::from_function_with_storage(&function);
+        crate::semantic::ensure_source_formal_parameter_values(&mut graph, &machine_context);
         let formal_parameters =
             crate::semantic::collect_source_formal_parameter_facts(&graph, &machine_context);
         function.install_exact_formal_parameters(&graph, &formal_parameters);
@@ -1382,45 +1383,53 @@ impl TrustedSsaArtifact {
         let function_interface = match source.function_interface().cloned() {
             Some(interface) => Some(interface),
             None => 'recovered: {
-                let Some(preliminary) = SSAFunction::from_blocks_with_arch(&blocks, Some(&arch))
+                // Recover against the same decompile-normalized SSA shape the
+                // final artifact will use. The generic SSA constructor can
+                // number a call differently from decompile preparation after
+                // call-result and register-alias operations are inserted; an
+                // exact source callsite then fails to correlate in the
+                // provisional pass even though it correlates in the final one.
+                let provisional_machine_context =
+                    SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+                        blocks.as_slice(),
+                        Some(&arch),
+                        None,
+                        *source.machine_roles(),
+                        Some(source.convention_slots().clone()),
+                        correlated_call_sites.interfaces.clone(),
+                        correlated_call_sites.tail_calls.clone(),
+                    );
+                let Ok(preliminary) =
+                    SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+                        &blocks,
+                        Some(&arch),
+                        None,
+                        provisional_machine_context
+                            .machine_roles()
+                            .call_preserved_carriers(),
+                        provisional_machine_context.stack_pointer_carrier(),
+                        control,
+                    )
                 else {
                     r2il::refusal_evidence!(
                         "interface-recovery",
-                        "the preliminary SSA needed to read the ABI off the instructions \
-                         could not be built from {} blocks",
+                        "the decompile-normalized preliminary SSA needed to read the ABI off \
+                         the instructions could not be built from {} blocks",
                         blocks.len()
                     );
                     break 'recovered None;
                 };
-                // Only a source-correlated tail transfer changes interface
-                // recovery: it is the function's result boundary, so recovery
-                // must see the same exact call boundary as final preparation.
-                // Ordinary functions retain the context-free recovery path;
-                // exposing their call boundaries here would independently
-                // change call-argument identity, which is not a tail-transfer
-                // fact.
-                let recovered = if correlated_call_sites.tail_calls.is_empty() {
-                    crate::recover_interface::recover_interface(
-                        &preliminary,
-                        source.convention_slots(),
-                    )
-                } else {
-                    let provisional_machine_context =
-                        SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
-                            blocks.as_slice(),
-                            Some(&arch),
-                            None,
-                            *source.machine_roles(),
-                            Some(source.convention_slots().clone()),
-                            correlated_call_sites.interfaces.clone(),
-                            correlated_call_sites.tail_calls.clone(),
-                        );
-                    crate::recover_interface::recover_interface_with_context(
-                        &preliminary,
-                        source.convention_slots(),
-                        &provisional_machine_context,
-                    )
-                };
+                // Interface recovery must see the same exact call boundaries
+                // as final preparation. A source-correlated tail transfer owns
+                // the result boundary, and an ordinary call exposes an entry
+                // carrier handed straight to its callee. The latter is still
+                // a parameter even though implicit call reads leave no source
+                // operation behind.
+                let recovered = crate::recover_interface::recover_interface_with_context(
+                    &preliminary,
+                    source.convention_slots(),
+                    &provisional_machine_context,
+                );
                 let Some(recovered) = recovered else {
                     break 'recovered None;
                 };
@@ -5647,7 +5656,10 @@ mod tests {
     }
     use super::*;
     use crate::semantic::{CallArgumentLocation, SemanticId};
-    use crate::{CanonicalStorageSpace, SourceFunctionReturn, SourceStackSlotSpec, ValueId};
+    use crate::{
+        CallBoundarySlot, CanonicalStorageSpace, SourceAbiParameterSpec, SourceCallArgumentFact,
+        SourceCallArgumentValue, SourceFunctionReturn, SourceStackSlotSpec, ValueId,
+    };
     use r2il::{R2ILOp, RegisterDef, SpaceId, SwitchCase, SwitchInfo as R2ILSwitchInfo, Varnode};
     use std::cell::Cell;
     use std::collections::BTreeSet;
@@ -7765,6 +7777,124 @@ mod tests {
     #[test]
     fn a_fixed_callee_takes_only_the_arguments_its_prototype_names() {
         assert_eq!(variadic_tail_arity(4, false), (1, false, Some(1)));
+    }
+
+    #[test]
+    fn source_declared_entry_parameter_flows_into_an_implicit_call_read() {
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x4000, 8));
+        arch.add_register(RegisterDef::new("x30", 0x4100, 8));
+        arch.add_register(RegisterDef::new("sp", 0x4200, 8));
+        let argument_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x4000,
+            size: 8,
+        };
+        let return_address_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x4100,
+            size: 8,
+        };
+        let stack_pointer_storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Register,
+            offset: 0x4200,
+            size: 8,
+        };
+        let revision = b"preserved-entry-call-argument";
+        let target = make_const(0x401000, 8);
+        let blocks = [R2ILBlock {
+            addr: 0x1600,
+            size: 4,
+            ops: vec![R2ILOp::Call {
+                target: target.clone(),
+            }],
+            switch_info: None,
+            op_metadata: Default::default(),
+        }];
+        let function_interface = SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "aapcs64",
+            [SourceAbiParameterSpec::new(0, argument_storage)],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(return_address_storage))
+        .and_then(|interface| interface.with_stack_pointer_storage(stack_pointer_storage))
+        .expect("exact function interface");
+        let call_interface = SourceCallSiteInterface::new(
+            revision.to_vec(),
+            SourceCallSiteIdentity::new(0x1600, 0, CanonicalStorageId::from_varnode(&target)),
+            true,
+            "aapcs64",
+            [SourceCallArgumentSpec::new(0, argument_storage)],
+            false,
+            false,
+            SourceCallResult::Register {
+                storage: argument_storage,
+            },
+        )
+        .expect("exact callsite interface");
+
+        let prepared = SsaArtifact::for_decompile_with_interfaces(
+            &blocks,
+            Some(&arch),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("prepared SSA");
+        assert!(prepared.machine_context().abi_model().is_coherent());
+        let parameter = prepared
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("source formal parameter fact");
+        assert_eq!(parameter.graph_storage, argument_storage);
+        assert_eq!(prepared.graph().def_inst(parameter.value), None);
+        assert_eq!(
+            prepared
+                .function()
+                .decompile_prep_facts()
+                .and_then(|facts| {
+                    prepared
+                        .graph()
+                        .value(parameter.value)
+                        .and_then(|value| facts.formal_parameter_of(&value.var))
+                }),
+            Some(0),
+        );
+
+        let boundary = prepared
+            .facts()
+            .boundaries
+            .calls
+            .get(&CallSiteId(0))
+            .expect("source call boundary");
+        assert!(boundary.complete);
+        assert_eq!(
+            boundary.arguments.as_slice(),
+            [SourceCallArgumentFact {
+                slot: CallBoundarySlot::Register {
+                    index: 0,
+                    storage: argument_storage,
+                },
+                value: SourceCallArgumentValue::Value(parameter.value),
+            }]
+        );
+        let certificate = prepared
+            .callsite_certificate_for_op(0x1600, 0)
+            .expect("prepared callsite certificate");
+        assert_eq!(certificate.argument_values, [parameter.value]);
+        assert_eq!(certificate.argument_certificates.len(), 1);
+        assert_eq!(certificate.argument_certificates[0].value, parameter.value);
+        assert_eq!(certificate.argument_certificates[0].source_inst, None);
+        let obligation = prepared
+            .obligations()
+            .obligations_for_inst(certificate.at)
+            .find(|obligation| obligation.id.kind == crate::SemanticObligationKind::CallArgument)
+            .expect("call argument obligation");
+        assert_eq!(obligation.inputs, [parameter.value]);
     }
 
     #[test]

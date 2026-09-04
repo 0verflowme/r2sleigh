@@ -116,10 +116,13 @@ fn observed_entry_read_storages(
 ///
 /// A parameter is otherwise proven by an entry read, and a carrier the function
 /// only passes on is never read explicitly: a call takes its arguments
-/// implicitly, so no SSA value names it and the entry-read scan cannot see it.
+/// implicitly, so the ordinary observation scan cannot see it. Depending on
+/// register normalization, the boundary may retain that state as
+/// `PreservedEntry` or as a producerless version-zero graph value; both are the
+/// same exact entry carrier, while a value with a definition is not.
 /// The consequence was that the argument had no parameter to name, the call
 /// rendered with it dropped, and its obligation could never be discharged --
-/// four functions on `/bin/ls` refuse that way.
+/// the affected `/bin/ls` calls refuse that way.
 ///
 /// The evidence is the callee's, not a guess about this function. A boundary's
 /// arguments come from the callee's own interface, so the argument exists
@@ -128,16 +131,28 @@ fn observed_entry_read_storages(
 /// is what a parameter is.
 fn passed_through_entry_storages(
     boundaries: &crate::semantic::SourceBoundaryFacts,
+    graph: &SsaGraph,
 ) -> Vec<CanonicalStorageId> {
     let mut storages = Vec::new();
     for boundary in boundaries.calls.values() {
         for argument in &boundary.arguments {
-            let crate::semantic::SourceCallArgumentValue::PreservedEntry = argument.value else {
-                continue;
-            };
             let crate::semantic::CallBoundarySlot::Register { storage, .. } = argument.slot else {
                 continue;
             };
+            let is_entry = match argument.value {
+                crate::semantic::SourceCallArgumentValue::PreservedEntry => true,
+                crate::semantic::SourceCallArgumentValue::Value(value) => {
+                    graph.value(value).is_some_and(|graph_value| {
+                        graph.def_inst(value).is_none()
+                            && graph_value.var.version == 0
+                            && graph_value.var.size == storage.size
+                            && graph_value.canonical_storage == Some(storage)
+                    })
+                }
+            };
+            if !is_entry {
+                continue;
+            }
             if !storages.contains(&storage) {
                 storages.push(storage);
             }
@@ -257,17 +272,14 @@ fn recover_interface_inner(
     // A carrier passed straight to a call is read by that call, so it belongs
     // in the same evidence as an explicit entry read. The prefix rule below is
     // unchanged and still stops at the first candidate slot nothing observes.
-    // Context-free recovery historically has no exact call interfaces, but
-    // retain its boundary projection as a local analysis facility. Production
-    // contextual recovery uses the call boundary only for the tail result:
-    // making an implicit preserved argument into a formal parameter also
-    // requires every consumer to agree that its new graph value is spellable,
-    // which is a separate contract from terminal-transfer recovery.
-    if machine_context.is_none() {
-        for storage in passed_through_entry_storages(&facts.boundaries) {
-            if !reads.contains(&storage) {
-                reads.push(storage);
-            }
+    // Contextual recovery has the exact callsite interfaces production will
+    // use, while context-free recovery may still derive a local boundary. In
+    // either case a preserved carrier is a real entry read by the call. Final
+    // preparation materializes its source-declared boundary value so every
+    // consumer can use the same identity.
+    for storage in passed_through_entry_storages(&facts.boundaries, &graph) {
+        if !reads.contains(&storage) {
+            reads.push(storage);
         }
     }
     let mut parameters = Vec::new();
@@ -609,6 +621,15 @@ mod tests {
         boundaries
     }
 
+    fn graph_for(mut block: R2ILBlock) -> SsaGraph {
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let arch = arch();
+        let function = SSAFunction::from_blocks_with_arch(&[block], Some(&arch)).expect("ssa");
+        SsaGraph::from_function(&function)
+    }
+
     fn register_argument(
         index: u32,
         storage: CanonicalStorageId,
@@ -631,10 +652,82 @@ mod tests {
             register(0, 8),
             crate::semantic::SourceCallArgumentValue::PreservedEntry,
         )]);
+        let graph = graph_for(R2ILBlock::new(0x1000, 4));
         assert_eq!(
-            passed_through_entry_storages(&boundaries),
+            passed_through_entry_storages(&boundaries, &graph),
             vec![register(0, 8)]
         );
+    }
+
+    #[test]
+    fn a_producerless_boundary_value_is_the_same_passed_entry_carrier() {
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(8, 8),
+            src: Varnode::register(0, 8),
+        });
+        let graph = graph_for(block);
+        let entry = graph
+            .values
+            .iter()
+            .find(|value| {
+                value.canonical_storage == Some(register(0, 8))
+                    && graph.def_inst(value.id).is_none()
+            })
+            .expect("producerless x0 entry value")
+            .id;
+        let boundaries = call_boundary_with(vec![register_argument(
+            0,
+            register(0, 8),
+            crate::semantic::SourceCallArgumentValue::Value(entry),
+        )]);
+
+        assert_eq!(
+            passed_through_entry_storages(&boundaries, &graph),
+            vec![register(0, 8)]
+        );
+    }
+
+    #[test]
+    fn contextual_recovery_promotes_a_preserved_call_carrier() {
+        let arch = arch();
+        let target = Varnode::constant(0x401000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let blocks = [block];
+        let call_interface = SourceCallSiteInterface::new(
+            b"contextual-preserved-entry".to_vec(),
+            SourceCallSiteIdentity::new(0x1000, 0, CanonicalStorageId::from_varnode(&target)),
+            true,
+            "arm64",
+            [SourceCallArgumentSpec::new(0, register(0, 8))],
+            false,
+            false,
+            SourceCallResult::Register {
+                storage: register(0, 8),
+            },
+        )
+        .expect("exact callsite interface");
+        let machine_context = crate::SourceMachineContext::from_blocks_with_interfaces(
+            &blocks,
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(candidates()),
+            vec![call_interface],
+        );
+        let function = SSAFunction::from_blocks_for_decompile(&blocks, Some(&arch))
+            .expect("decompile-normalized ssa");
+        let recovered = recover_interface_with_context(&function, &candidates(), &machine_context)
+            .expect("contextual recovery");
+
+        assert_eq!(recovered.parameters().len(), 1);
+        assert_eq!(recovered.parameters()[0].slot(), register(0, 8));
     }
 
     #[test]
@@ -642,12 +735,23 @@ mod tests {
         // A value defined here already has a producer and an SSA value naming
         // it, so it needs no help from this rule and must not be reported as an
         // entry read: that would claim a parameter the function may not have.
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(7, 8),
+        });
+        let graph = graph_for(block);
+        let defined = graph
+            .inst_id_for_op_site(0x1000, 0)
+            .and_then(|inst| graph.inst(inst))
+            .and_then(|inst| inst.output)
+            .expect("defined x0 value");
         let boundaries = call_boundary_with(vec![register_argument(
             0,
             register(0, 8),
-            crate::semantic::SourceCallArgumentValue::Value(crate::graph::ValueId(3)),
+            crate::semantic::SourceCallArgumentValue::Value(defined),
         )]);
-        assert!(passed_through_entry_storages(&boundaries).is_empty());
+        assert!(passed_through_entry_storages(&boundaries, &graph).is_empty());
     }
 
     #[test]
