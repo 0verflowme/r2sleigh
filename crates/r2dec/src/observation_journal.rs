@@ -2474,12 +2474,7 @@ impl LegacyObservationJournal {
         let (expr, value, replaced, obligations, frame_address) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(
-            Some(value),
-            &replaced,
-            Some(&expr),
-            frame_address.is_some(),
-        )?);
+        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
 
         if let Some(frame_address) = frame_address {
             let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
@@ -2562,7 +2557,7 @@ impl LegacyObservationJournal {
         discharged: &[InstId],
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let targets = self.discharged_instruction_targets(None, discharged, None, false)?;
+        let targets = self.discharged_instruction_targets(None, discharged, None)?;
         let mut marked = stmt;
         for id in self.allocate_many(targets)? {
             marked = CStmt::observed(id, marked);
@@ -2577,16 +2572,17 @@ impl LegacyObservationJournal {
     /// expression standing in for the vanished statements. Both are absent when
     /// a *statement* discharges the instructions, and that absence is what
     /// distinguishes the two cases rather than a second copy of this walk. With
-    /// an expression there is no statement left to answer for the operands it
-    /// spells, so their value cells are filled here; with a statement the
-    /// statement's own markers already answer for them, and filling them again
-    /// would put two answers on one cell.
+    /// an expression there is no statement left to answer for a definitionless
+    /// inline operand, so its value cell is filled here unless a child marker
+    /// already owns it. Bound operands remain on exact symbol occurrences;
+    /// attaching them to the parent would infer identity from unrelated C
+    /// syntax. With a statement, its own markers already answer for operands,
+    /// and filling them again would put two answers on one cell.
     fn discharged_instruction_targets(
         &mut self,
         rendered: Option<ValueId>,
         discharged: &[InstId],
         expr: Option<&CExpr>,
-        abstracts_frame_base: bool,
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
@@ -2656,14 +2652,16 @@ impl LegacyObservationJournal {
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) && !represented_values.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
-                        // `&frame_object` semantically contains the frame base
-                        // and displacement without spelling either as a C
-                        // value. Their exact use cells are owned by this
-                        // replacement, but a bound value cell must remain on
-                        // an occurrence of its own symbol rather than being
-                        // misclassified as the frame-object binding.
-                        Some(ValueDisposition::Bound { .. }) if abstracts_frame_base => false,
-                        Some(ValueDisposition::Bound { .. }) => true,
+                        // A discharge owns this exact use, but it cannot claim
+                        // the bound value at the parent node. Canonical
+                        // rewriting may have absorbed the operand without
+                        // spelling its symbol at all; attaching its value cell
+                        // to whatever expression survived would then infer an
+                        // identity from unrelated C syntax. The value remains
+                        // owned by an exact child or another occurrence of its
+                        // own symbol, and the seal refuses it as unaccounted if
+                        // no such occurrence survives.
+                        Some(ValueDisposition::Bound { .. }) => false,
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>
                         {
@@ -6357,7 +6355,7 @@ mod tests {
     }
 
     #[test]
-    fn discharging_two_instructions_marks_every_cell_and_each_effect_once() {
+    fn discharging_two_instructions_marks_owned_cells_and_each_effect_once() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let graph = source.source().graph();
         // The fixture folds `u20 = u10 + 2` into its one reader,
@@ -6411,9 +6409,11 @@ mod tests {
             )
             .expect("a two-instruction discharge");
 
-        // Every cell both instructions owe, on the one occurrence: the value
+        // Every cell the replacement owns, on the one occurrence: the value
         // rendered, then for each instruction in canonical order its write,
-        // the value it produced, and every operand it read.
+        // the value it produced, every operand use, and only definitionless
+        // inline operand values. Bound operand values stay on exact symbol
+        // occurrences instead of this parent expression.
         let mut expected = vec![ObservationTarget::Value(value)];
         let mut represented_values = BTreeSet::from([value]);
         let mut order = [reader, folded_definition];
@@ -6464,7 +6464,13 @@ mod tests {
                     block,
                 });
                 let input = inst.inputs[input_idx];
-                if !produced.contains(&input) && represented_values.insert(input) {
+                if !produced.contains(&input)
+                    && !matches!(
+                        plan.disposition(input),
+                        Some(ValueDisposition::Bound { .. })
+                    )
+                    && represented_values.insert(input)
+                {
                     expected.push(ObservationTarget::Value(input));
                 }
             }
@@ -6487,7 +6493,7 @@ mod tests {
                 .filter(|target| matches!(target, ObservationTarget::Value(_)))
                 .count(),
             represented_values.len(),
-            "produced values and definitionless literals all have cells"
+            "replacement-owned values each have one target"
         );
 
         // The effects the two instructions answered for move with the
@@ -6511,8 +6517,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_replacement_reuses_inner_inline_and_bound_value_occurrences() {
-        let (source, plan, function, mut journal) = journal_fixture();
+    fn nested_replacement_reuses_inline_child_and_does_not_claim_bound_operand() {
+        let (source, plan, _function, mut journal) = journal_fixture();
         let graph = source.source().graph();
         let (folded, folded_definition) = graph
             .values
@@ -6535,29 +6541,19 @@ mod tests {
             .inst(reader)
             .and_then(|inst| inst.output)
             .expect("the reader defines a value");
-        let (bound, binding, bound_input_idx) = graph
+        let bound = graph
             .inst(reader)
             .expect("folded value reader")
             .inputs
             .iter()
             .copied()
-            .enumerate()
-            .find_map(|(input_idx, value)| match plan.disposition(value) {
-                Some(ValueDisposition::Bound { binding }) => Some((value, *binding, input_idx)),
-                _ => None,
+            .find(|value| {
+                matches!(
+                    plan.disposition(*value),
+                    Some(ValueDisposition::Bound { .. })
+                )
             })
             .expect("the folded reader also consumes a bound value");
-        let (block_addr, op_idx) = source
-            .source()
-            .inst_op_site(reader)
-            .expect("reader operation site");
-        let site = NormalizedOpSite {
-            block: graph
-                .block_id_for_addr(block_addr)
-                .expect("reader graph block"),
-            op_idx,
-        };
-        let bound_symbol = declare_legacy_symbol(&function, &plan, binding, "bound_input");
 
         assert!(
             matches!(
@@ -6588,19 +6584,11 @@ mod tests {
                 ),
             )
             .expect("the inner replacement owns the folded value occurrence");
-        let bound_occurrence = journal
-            .observe_normalized_input_value_expr(site, bound_input_idx, CExpr::Var(bound_symbol))
-            .expect("the child expression owns the bound value occurrence");
         let before_outer = journal.targets.len();
-        let bound_occurrences_before_outer = journal
-            .targets
-            .iter()
-            .filter(|target| **target == ObservationTarget::Value(bound))
-            .count();
         journal
             .observe_rendered_replacement_expr(
                 crate::fold::op_lower::RenderedReplacementContract::for_test(
-                    CExpr::binary(BinaryOp::Add, inner, bound_occurrence),
+                    CExpr::binary(BinaryOp::Add, inner, CExpr::IntLit(4)),
                     rendered,
                     vec![reader],
                     BTreeSet::new(),
@@ -6631,8 +6619,8 @@ mod tests {
                 .iter()
                 .filter(|target| **target == ObservationTarget::Value(bound))
                 .count(),
-            bound_occurrences_before_outer,
-            "the outer replacement adds no bound-value occurrence"
+            0,
+            "a bound value cell remains for an exact occurrence of its own symbol"
         );
     }
 
