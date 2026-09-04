@@ -3150,7 +3150,7 @@ impl FunctionFacts {
                 None => true,
                 Some(existing) => {
                     recovered_type_outranks(existing, candidate, ptr_bits, type_db)
-                        || recovered_scalar_signedness_outranks(existing, candidate)
+                        || recovered_scalar_signedness_outranks(existing, candidate, ptr_bits)
                 }
             };
             if replace {
@@ -3227,7 +3227,7 @@ impl FunctionFacts {
                 None => true,
                 Some(existing) => {
                     recovered_type_outranks(existing, ty, ptr_bits, type_db)
-                        || recovered_scalar_signedness_outranks(existing, ty)
+                        || recovered_scalar_signedness_outranks(existing, ty, ptr_bits)
                 }
             };
             if !replace {
@@ -3250,7 +3250,7 @@ impl FunctionFacts {
                     None => true,
                     Some(existing) => {
                         recovered_type_outranks(existing, &ty, ptr_bits, type_db)
-                            || recovered_scalar_signedness_outranks(existing, &ty)
+                            || recovered_scalar_signedness_outranks(existing, &ty, ptr_bits)
                     }
                 };
                 if replace {
@@ -3429,22 +3429,27 @@ fn recovered_type_is_evidence(ty: &CTypeLike, ptr_bits: u32) -> bool {
 }
 
 /// Operation-proven signedness refines a weak scalar of the same width.
-fn recovered_scalar_signedness_outranks(existing: &CTypeLike, recovered: &CTypeLike) -> bool {
-    matches!(
-        (existing, recovered),
-        (
-            CTypeLike::Int {
-                bits: existing_bits,
-                signedness: existing_signedness,
-            },
-            CTypeLike::Int {
-                bits: recovered_bits,
-                signedness: recovered_signedness,
-            }
-        ) if existing_bits == recovered_bits
-            && existing_signedness != recovered_signedness
-            && *recovered_signedness != crate::Signedness::Unknown
-    )
+fn recovered_scalar_signedness_outranks(
+    existing: &CTypeLike,
+    recovered: &CTypeLike,
+    ptr_bits: u32,
+) -> bool {
+    let scalar = |ty: &CTypeLike| match ty {
+        CTypeLike::Int { bits, signedness } => Some((*bits, *signedness)),
+        CTypeLike::Typedef(name) => match crate::parse_c_type_like(name, ptr_bits) {
+            Some(CTypeLike::Int { bits, signedness }) => Some((bits, signedness)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (Some((existing_bits, existing_signedness)), Some((recovered_bits, recovered_signedness))) =
+        (scalar(existing), scalar(recovered))
+    else {
+        return false;
+    };
+    existing_bits == recovered_bits
+        && existing_signedness != recovered_signedness
+        && recovered_signedness != crate::Signedness::Unknown
 }
 
 fn struct_name_from_pointer_type(ty: Option<&CTypeLike>) -> Option<&str> {

@@ -1492,10 +1492,7 @@ mod tests {
             "one scalar memory cell must carry the use-proven type both ways"
         );
 
-        let signed = CTypeLike::Int {
-            bits: 64,
-            signedness: Signedness::Signed,
-        };
+        let signed = CTypeLike::Typedef("int64_t".to_string());
         let signature = crate::FunctionSignatureSpec {
             ret_type: Some(CTypeLike::Void),
             params: vec![crate::FunctionParamSpec {
