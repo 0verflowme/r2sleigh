@@ -100,7 +100,22 @@ def main():
     failures = 0
     review = 0
 
-    def report(kind, both_had, ours_only, theirs_only):
+    def likely_rename(name, appeared):
+        """A name that vanished while a near-neighbour appeared is usually a rename.
+
+        Reporting a rename as a deletion is how a correct report gets dismissed
+        as noise: `verify_call_sites_are_single` became
+        `verify_call_sites_are_single_per_execution`, the audit said the first
+        was gone, and it was read as a regex failure rather than as the truth.
+        Prefix containment either way catches the common shapes -- a qualifier
+        added or dropped -- without pretending to be a similarity metric.
+        """
+        for other in appeared:
+            if other != name and (other.startswith(name) or name.startswith(other)):
+                return other
+        return None
+
+    def report(kind, both_had, ours_only, theirs_only, appeared=frozenset()):
         nonlocal failures, review
         if both_had:
             failures += 1
@@ -114,7 +129,8 @@ def main():
             print(f"  Legitimate only if {theirs} deleted them on purpose rather "
                   f"than by rewriting the file they live in.")
             for name in ours_only[:40]:
-                print(f"  {name}")
+                into = likely_rename(name, appeared)
+                print(f"  {name}" + (f"   (likely renamed to {into})" if into else ""))
             if len(ours_only) > 40:
                 print(f"  ... and {len(ours_only) - 40} more")
         if theirs_only:
@@ -122,18 +138,23 @@ def main():
             print(f"\nREVIEW: {len(theirs_only)} {kind}(s) on {theirs} that {ours} "
                   f"does not have, gone after the merge.")
             for name in theirs_only[:40]:
-                print(f"  {name}")
+                into = likely_rename(name, appeared)
+                print(f"  {name}" + (f"   (likely renamed to {into})" if into else ""))
             if len(theirs_only) > 40:
                 print(f"  ... and {len(theirs_only) - 40} more")
 
-    report("test", *classify(base_tests, ours_tests, theirs_tests, now_tests))
+    appeared_tests = now_tests - (ours_tests | theirs_tests)
+    appeared_fns = set(now_defs) - (set(ours_defs) | set(theirs_defs))
+    report("test", *classify(base_tests, ours_tests, theirs_tests, now_tests),
+           appeared=appeared_tests)
     t_both, t_ours, t_theirs = classify(base_tests, ours_tests, theirs_tests, now_tests)
     seen = set(t_both) | set(t_ours) | set(t_theirs)
     f_both, f_ours, f_theirs = classify(set(base_defs), set(ours_defs),
                                         set(theirs_defs), set(now_defs))
     report("function", [n for n in f_both if n not in seen],
            [n for n in f_ours if n not in seen],
-           [n for n in f_theirs if n not in seen])
+           [n for n in f_theirs if n not in seen],
+           appeared=appeared_fns)
 
     # A name defined in one file on each side and in two files after the merge
     # is the collision that reads as a clean merge and is not one.
