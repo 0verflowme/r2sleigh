@@ -622,7 +622,7 @@ fn normalized_signature_type(ty: &CTypeLike, ptr_bits: u32) -> CTypeLike {
 /// value. Plain C `int` is the exception: it is a language scalar spelling, not
 /// a typedef identity, and this model's canonical spelling for it is
 /// `int32_t`.
-fn resolve_builtin_typedefs(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
+pub(crate) fn resolve_builtin_typedefs(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
     match ty {
         CTypeLike::Typedef(name) => {
             let Some(parsed) = crate::convert::parse_c_type_like(&name, ptr_bits) else {
