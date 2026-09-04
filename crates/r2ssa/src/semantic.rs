@@ -3871,10 +3871,9 @@ struct ReachingAbiPolicy {
 ///
 /// A narrow logical result may be written directly to the low lane (`seta al`)
 /// without ever defining the full ABI carrier. Prefer that exact lane. A full
-/// definition remains admissible only as one value so
-/// `exact_logical_return_projection` can verify its explicit extension; a
-/// physical-carrier composition cannot stand for a separately declared logical
-/// lane.
+/// definition remains admissible as the existing exact value or composition;
+/// `exact_logical_return_projection` can verify an explicit extension when a
+/// single physical value carries it.
 #[allow(clippy::too_many_arguments)]
 fn reaching_source_return_register_in_block(
     function: &SSAFunction,
@@ -3900,7 +3899,7 @@ fn reaching_source_return_register_in_block(
     {
         return Some(ReachingAbiReturnRegister::Exact(value));
     }
-    match reaching_abi_return_register_in_block(
+    reaching_abi_return_register_in_block(
         function,
         graph,
         machine_context,
@@ -3909,15 +3908,7 @@ fn reaching_source_return_register_in_block(
         slot_index,
         storage,
         boundary_at,
-    ) {
-        exact @ Some(ReachingAbiReturnRegister::Exact(_)) => exact,
-        composition @ Some(ReachingAbiReturnRegister::Composition(_))
-            if logical_storage.is_none_or(|logical_storage| logical_storage == storage) =>
-        {
-            composition
-        }
-        Some(ReachingAbiReturnRegister::Composition(_)) | None => None,
-    }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
