@@ -321,7 +321,17 @@ def _write_refusal_census(
     # when it does not, a census that silently declines to write is a census that
     # is never there when it is wanted. Fall back to the binary's own directory,
     # which by construction exists and is inside the run being garbage-collected.
-    target = Path(output_dir) if output_dir is not None else binary_path.parent
+    # The benchmark builds each project in a temporary directory it deletes, so
+    # the binary's own parent does not outlive the run and the first fallback
+    # wrote a census nobody could read. The harness sets this to a directory
+    # inside the run it keeps.
+    override = os.environ.get("R2SLEIGH_REFUSAL_CENSUS_DIR")
+    if override:
+        target = Path(override)
+    elif output_dir is not None:
+        target = Path(output_dir)
+    else:
+        target = binary_path.parent
     try:
         counts: dict[str, int] = {}
         for cause in declined.values():
