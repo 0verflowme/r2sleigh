@@ -12228,3 +12228,32 @@ Two practical notes. Before trusting an ad-hoc trace, check that `r2 -v`'s birth
 line matches the fork's current HEAD. And do not `make install` the fork while
 sessions are running gates: they link against those libraries, and swapping them
 mid-run breaks a build that has nothing wrong with it.
+
+## Required step: cherry-pick the variadic fix onto the fork's working branch
+
+The misdetection that took ninety-four benchmark functions dark is fixed, and
+the fix is **not active**. It lives on `fix/amd64-variadic-al-clobber` in the
+radare2 fork as commit `4841188491`, *"Invalidate the AMD64 variadic marker
+through register aliases"* — `libr/anal/fcn.c` `+5/-1` plus 42 lines of unit
+test — and is raised upstream as **radareorg/radare2#26645**. The author's other
+open pull requests were checked first and none covered this case.
+
+The cause, stated exactly: radare2 clears `has_variadic_reg` when a non-compare
+operation writes the lowest subregister of `rax`, but not when a *register
+alias* writes it, so a `_Bool` return tested by its caller still reaches the
+`test al, al` arm and sets `fcn->is_variadic` on a function that is not.
+
+Measured with the fix: `BZ2_bzRead` renders, and the bzip2 sweep goes from
+**49 rendered / 90 refused to 58 / 81 — nine functions recovered, zero rendered
+regressions.** radare2's own unit tests pass 15 of 15 and r2r 74 with two
+known-broken.
+
+It is not on `anal/subregister-argument-spills`, the branch the plugin builds
+against, because `arch/r2-loc-audit` is bisecting that branch to find which
+snapshot field its pruning cost. **Cherry-pick `4841188491` onto the working
+branch once that bisection finishes.** Until then the nine functions stay dark
+and any sweep understates coverage by that much.
+
+The same applies to the libsla pattern already in `Cargo.toml`: a fix under
+upstream review is carried on the fork so the work that depends on it is not
+blocked behind someone else's merge queue.
