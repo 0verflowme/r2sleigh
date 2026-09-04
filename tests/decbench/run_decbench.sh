@@ -138,11 +138,10 @@ if [[ ! $shard_index =~ ^[0-9]+$ || ! $shard_count =~ ^[1-9][0-9]*$ ]] \
     exit 64
 fi
 if (( requested_opt_count == 0 )); then
-    requested_opts=(O0 O1 O2)
-else
-    for opt in "${requested_opts[@]}"; do
-        case $opt in O0|O1|O2) ;; *) echo "unsupported optimization: $opt" >&2; exit 64 ;; esac
-    done
+    # The levels every sailr project declares. O1 is deliberately not among them:
+    # no project configures it, so decbench has no source data to compare against
+    # and every function of every binary comes back unmatched.
+    requested_opts=(O0 O2)
 fi
 
 ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes)
@@ -280,6 +279,28 @@ echo "vj_ged     $vj_ged_source"
 echo "decbench   $decbench_commit"
 echo "reference  $reference_reason"
 echo "execution  one build/decompile/evaluate invocation per project for all selected opts"
+# Refuse a level the selected projects do not configure.
+#
+# decbench builds whatever level it is handed, but it only holds source CFGs for
+# the levels a project declares. Asking for another one produces a full cell of
+# functions that match nothing -- indistinguishable in the results from a
+# decompiler that refused every one of them. A whole night went into chasing
+# `zlib/O1` as a coverage defect before the config said O1 was never a level.
+for opt in "${requested_opts[@]}"; do
+    for project in "${projects[@]}"; do
+        configured=$(ssh "${ssh_keepalive[@]}" "$host" \
+            "grep -m1 optimization_levels /root/decbench/projects/sailr/$project.toml") || configured=""
+        case $configured in
+            *"\"$opt\""*) ;;
+            *)
+                echo "project $project does not configure $opt; it declares: $configured" >&2
+                echo "a level a project does not declare yields a cell of unmatched functions" >&2
+                exit 64
+                ;;
+        esac
+    done
+done
+
 if (( plan_only )); then
     exit 0
 fi
