@@ -104,18 +104,12 @@ impl<'a> FoldingContext<'a> {
         let CExpr::External { name, .. } = func_expr.unobserved() else {
             return Ok(());
         };
-        // The widths the call itself proves: the storage the result is defined
-        // at, and the storage each certified argument occupies.
-        //
-        // Deliberately not radare2's recorded prototype. A prototype has to
-        // describe the call as this rendering makes it, and the arguments this
-        // rendering passes are machine words. radare2 records `rotl32` as
-        // taking `int64_t`, so declaring that made every argument a
-        // signed-conversion error, and it also contradicts the callee's own
-        // rendering -- decompiling both into one translation unit is then a
-        // hard `conflicting types` error rather than a warning. Recorded types
-        // are also often absent, and an absent one spells `/* unknown */`,
-        // which does not parse at all.
+        // A callee body captured with this caller owns the strongest logical
+        // signature. `r2ssa` admitted it only after its physical carriers
+        // matched this exact call site, and `r2types` projected it here. Where
+        // no such cross-function fact exists, the declaration stays at the
+        // widths the call itself proves rather than trusting a name or an
+        // incomplete recorded prototype.
         let cert = self
             .certified_callsite_for_op(block_addr, op_idx)
             .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
@@ -131,23 +125,37 @@ impl<'a> FoldingContext<'a> {
         } else {
             args.values.len()
         };
-        let call_result_bits = self
-            .certified_call_result_value((block_addr, op_idx))
-            .and_then(|value| self.machine_value_width_bits(value));
-        let ret_type = callee_declaration_return_type(
-            render_fact.disposition,
-            self.inputs.function_return_type,
-            call_result_bits,
-        )
-        .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let (ret_type, params, variadic) = if let Some(signature) = &cert.callee_signature {
+            if signature.variadic || signature.params.len() != named {
+                return Err(OpLoweringRefusal::missing_machine_projection());
+            }
+            (
+                signature.return_type.clone(),
+                signature.params.clone(),
+                signature.variadic,
+            )
+        } else {
+            let call_result_bits = self
+                .certified_call_result_value((block_addr, op_idx))
+                .and_then(|value| self.machine_value_width_bits(value));
+            let ret_type = callee_declaration_return_type(
+                render_fact.disposition,
+                self.inputs.function_return_type,
+                call_result_bits,
+            )
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+            let params = args.values[..named]
+                .iter()
+                .map(|value| self.machine_value_width_bits(*value).map(CType::uint))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+            (ret_type, params, cert.variadic)
+        };
         let declaration = crate::ast::CExternDecl {
             name: name.clone(),
             ret_type,
-            params: args.values[..named]
-                .iter()
-                .map(|value| self.machine_value_width_bits(*value).map(CType::uint))
-                .collect::<Option<Vec<_>>>(),
-            variadic: cert.variadic,
+            params: Some(params),
+            variadic,
         };
         match self
             .callee_declarations
@@ -168,26 +176,40 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// An argument spelled as the machine word the declaration says it is.
+    /// An argument spelled as the type the declaration says it is.
     ///
     /// A call and the declaration it is made through have to agree, and the
-    /// declaration says machine words -- deliberately, for the reason above.
-    /// The rendering may still have typed the value something else: a string
-    /// literal's address is a `char *`, and passing one where the declaration
-    /// says `uint64_t` is a constraint violation that no strict compiler
-    /// accepts. The conversion is exact and says nothing new, because a
-    /// machine word is what the call passes either way.
+    /// declaration either carries the callee's exact logical type or falls
+    /// back to the call's certified machine word. The rendering may still
+    /// have typed the value something else, so the conversion has to be
+    /// explicit for strict C in either case.
     ///
     /// Only where the two differ, and that is the one emitter's answer. What
     /// the argument has is what a read of the value renders as, which the
     /// typed boundaries state; asking the rendered expression what type it
     /// looks like would be deciding a conversion from the text it is about
     /// to produce.
-    fn call_argument_as_machine_word(&self, value: r2ssa::ValueId, expr: CExpr) -> CExpr {
-        let Some(declared) = self.machine_value_width_bits(value).map(CType::uint) else {
+    fn call_argument_as_declared(
+        &self,
+        site: (u64, usize),
+        argument_index: usize,
+        value: r2ssa::ValueId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(declared) = self
+            .certified_callsite_for_op(site.0, site.1)
+            .and_then(|cert| cert.callee_signature.as_ref())
+            .and_then(|signature| signature.params.get(argument_index))
+            .cloned()
+            .or_else(|| self.machine_value_width_bits(value).map(CType::uint))
+        else {
             return expr;
         };
-        self.convert_from(expr, self.value_type(value).as_ref(), &declared)
+        let source = self
+            .value_declaration_type(value)
+            .map(CValue::Typed)
+            .or_else(|| self.value_type(value));
+        self.convert_from(expr, source.as_ref(), &declared)
     }
 
     /// The width a value occupies in machine storage, in bits.
@@ -391,7 +413,12 @@ impl<'a> FoldingContext<'a> {
                 object,
                 expr,
             ));
-            let declared = self.machine_value_width_bits(value).map(CType::uint)?;
+            let declared = self
+                .certified_callsite_for_op(site.0, site.1)
+                .and_then(|cert| cert.callee_signature.as_ref())
+                .and_then(|signature| signature.params.get(argument_index))
+                .cloned()
+                .or_else(|| self.machine_value_width_bits(value).map(CType::uint))?;
             return Some(self.convert_from(expr, Some(&CValue::Typed(ty)), &declared));
         }
 
@@ -411,10 +438,10 @@ impl<'a> FoldingContext<'a> {
                 .and_then(|names| names.disposition_for_value(value)),
             Some(crate::binding_plan::ValueDisposition::Bound { .. })
         ) {
-            return Some(self.call_argument_as_machine_word(value, expr));
+            return Some(self.call_argument_as_declared(site, argument_index, value, expr));
         }
         let expr = self.observe_certified_value_read_expr(value, call, expr);
-        Some(self.call_argument_as_machine_word(value, expr))
+        Some(self.call_argument_as_declared(site, argument_index, value, expr))
     }
 
     pub(super) fn known_signature_for_site(
@@ -422,8 +449,12 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
     ) -> Option<r2types::FunctionType> {
-        self.callee_identity_for_callsite(block_addr, op_idx)
-            .and_then(|identity| identity.known_signature().cloned())
+        self.certified_callsite_for_op(block_addr, op_idx)
+            .and_then(|cert| cert.callee_signature.clone())
+            .or_else(|| {
+                self.callee_identity_for_callsite(block_addr, op_idx)
+                    .and_then(|identity| identity.known_signature().cloned())
+            })
     }
 
     pub(super) fn resolve_call_target(&self, target: &SSAVar) -> OpLoweringResult<CExpr> {
@@ -492,6 +523,7 @@ mod indexed_argument_tests {
                     .collect(),
                 variadic: false,
                 fixed_argument_count: None,
+                callee_signature: None,
                 register_argument_locations: Vec::new(),
                 stack_argument_locations: Vec::new(),
             },

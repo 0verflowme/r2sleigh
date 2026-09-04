@@ -701,6 +701,7 @@ mod tests {
                             .collect(),
                         variadic: cert.variadic,
                         fixed_argument_count: cert.fixed_argument_count,
+                        callee_signature: None,
                         register_argument_locations,
                         stack_argument_locations,
                     },

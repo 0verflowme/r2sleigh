@@ -816,6 +816,7 @@ fn write_call_site_interface(
             writer.storage(storage);
         }
     }
+    write_function_interface(writer, interface.exact_callee_interface());
 }
 
 /// Unique register-space ranges the lifted body actually reads or writes.

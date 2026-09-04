@@ -1742,6 +1742,14 @@ pub struct SourceCallSiteInterface {
     variadic: bool,
     noreturn: bool,
     result: SourceCallResult,
+    /// Exact callee-owned interface recovered from a body in the same capture.
+    ///
+    /// This is a runtime projection rather than snapshot input, so it is
+    /// excluded from the source wire representation. The call-site carrier
+    /// contract above remains the admission gate; [`Self::with_exact_callee_interface`]
+    /// accepts this projection only when every carrier agrees.
+    #[serde(skip)]
+    exact_callee_interface: Option<Box<SourceFunctionInterface>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1753,6 +1761,7 @@ pub enum SourceCallSiteInterfaceError {
     InvalidRegisterStorage,
     OverlappingRegisterStorages,
     NoreturnWithResult,
+    IncompatibleCalleeInterface,
 }
 
 impl std::fmt::Display for SourceCallSiteInterfaceError {
@@ -1826,7 +1835,40 @@ impl SourceCallSiteInterface {
             variadic,
             noreturn,
             result,
+            exact_callee_interface: None,
         })
+    }
+
+    /// Attach a callee-owned logical interface when its physical call
+    /// contract is exactly this call site's contract.
+    pub fn with_exact_callee_interface(
+        mut self,
+        callee: SourceFunctionInterface,
+    ) -> Result<Self, SourceCallSiteInterfaceError> {
+        let expected_result = match callee.return_kind() {
+            SourceFunctionReturn::Void => SourceCallResult::Void,
+            SourceFunctionReturn::Register { storage } => SourceCallResult::Register { storage },
+        };
+        let carriers_match = self.complete
+            && !self.variadic
+            && !self.noreturn
+            && self.abi_class == callee.abi_class()
+            && self.revision_identity() == callee.revision_identity()
+            && self.result == expected_result
+            && self.arguments.len() == callee.parameters().len()
+            && self
+                .arguments
+                .iter()
+                .zip(callee.parameters())
+                .all(|(argument, parameter)| {
+                    argument.index() == parameter.index()
+                        && argument.storage() == parameter.storage()
+                });
+        if !carriers_match {
+            return Err(SourceCallSiteInterfaceError::IncompatibleCalleeInterface);
+        }
+        self.exact_callee_interface = Some(Box::new(callee));
+        Ok(self)
     }
 
     pub const fn schema_version(&self) -> u32 {
@@ -1867,6 +1909,10 @@ impl SourceCallSiteInterface {
 
     pub const fn result(&self) -> SourceCallResult {
         self.result
+    }
+
+    pub fn exact_callee_interface(&self) -> Option<&SourceFunctionInterface> {
+        self.exact_callee_interface.as_deref()
     }
 }
 

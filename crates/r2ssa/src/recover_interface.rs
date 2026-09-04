@@ -644,12 +644,14 @@ pub fn mint_recovered_call_site_interface(
         false,
         result,
     )
+    .and_then(|interface| interface.with_exact_callee_interface(callee.clone()))
     .ok()
 }
 
 #[cfg(test)]
 mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2source::SourceCallSiteInterfaceError;
 
     use super::*;
 
@@ -908,6 +910,39 @@ mod tests {
             [usize::try_from(logical.type_id()).expect("type index")];
         assert_eq!(source_type.kind(), SourceTypeKind::UnsignedInteger);
         assert_eq!(source_type.size_bits(), 32);
+
+        let callsite = mint_recovered_call_site_interface(
+            &interface,
+            SourceCallSiteIdentity::new(
+                0x2000,
+                3,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x4000,
+                    size: 8,
+                },
+            ),
+            b"narrow-return-revision",
+        )
+        .expect("callsite with recovered callee interface");
+        assert_eq!(callsite.exact_callee_interface(), Some(&interface));
+
+        let incompatible = SourceCallSiteInterface::new(
+            b"narrow-return-revision".to_vec(),
+            callsite.identity(),
+            true,
+            "aapcs64",
+            [],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("physically valid void callsite")
+        .with_exact_callee_interface(interface);
+        assert_eq!(
+            incompatible,
+            Err(SourceCallSiteInterfaceError::IncompatibleCalleeInterface)
+        );
     }
 
     #[test]

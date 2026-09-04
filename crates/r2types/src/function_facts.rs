@@ -1206,6 +1206,10 @@ pub struct CallsiteArgumentFacts {
     /// How many leading `argument_values` the callee's prototype names, where
     /// a prototype described the call. The rest are the variadic tail.
     pub fixed_argument_count: Option<usize>,
+    /// Exact logical signature projected from a callee body in the same
+    /// source-owned capture. Its carrier contract has already been checked
+    /// against this call site by `r2ssa`.
+    pub callee_signature: Option<crate::FunctionType>,
     pub register_argument_locations: Vec<RegisterCallArgumentLocationFact>,
     pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
 }
@@ -3565,6 +3569,7 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                     argument_values,
                     variadic: cert.variadic,
                     fixed_argument_count: cert.fixed_argument_count,
+                    callee_signature: exact_callsite_callee_signature(prepared, cert.call_site),
                     register_argument_locations,
                     stack_argument_locations,
                 },
@@ -3572,6 +3577,39 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
         })
         .collect();
     FunctionCallsiteFacts { by_callsite }
+}
+
+fn exact_callsite_callee_signature(
+    prepared: &r2ssa::SsaArtifact,
+    call_site: r2ssa::CallSiteId,
+) -> Option<crate::FunctionType> {
+    let callee = prepared
+        .machine_context()
+        .call_site_interface(call_site)?
+        .exact_callee_interface()?;
+    let graph = callee.type_graph()?;
+    if callee.parameter_logical_values().len() != callee.parameters().len() {
+        return None;
+    }
+    let params = callee
+        .parameter_logical_values()
+        .iter()
+        .map(|logical| {
+            crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let return_type = match callee.return_kind() {
+        r2ssa::SourceFunctionReturn::Void => CTypeLike::Void,
+        r2ssa::SourceFunctionReturn::Register { .. } => {
+            let logical = callee.return_logical_value()?;
+            crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())?
+        }
+    };
+    Some(crate::FunctionType {
+        return_type,
+        params,
+        variadic: false,
+    })
 }
 
 fn prepared_call_result_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCallResultFacts {
@@ -5532,6 +5570,7 @@ mod tests {
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
                     variadic: false,
                     fixed_argument_count: None,
+                    callee_signature: None,
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
@@ -5690,6 +5729,7 @@ mod tests {
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
                     variadic: false,
                     fixed_argument_count: None,
+                    callee_signature: None,
                     register_argument_locations: Vec::new(),
                     stack_argument_locations: Vec::new(),
                 },
@@ -5809,6 +5849,7 @@ mod tests {
             }],
             variadic: false,
             fixed_argument_count: None,
+            callee_signature: None,
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
@@ -6105,6 +6146,32 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(0x30)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x28)))
         .expect("exact caller interface");
+        let logical_parameter = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
+        );
+        let callee_interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            revision.clone(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter_storage)],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+            [logical_parameter],
+            None,
+            Some(
+                r2ssa::SourceTypeGraph::new(
+                    [r2ssa::SourceType::new(
+                        0,
+                        r2ssa::SourceTypeKind::UnsignedInteger,
+                        32,
+                        32,
+                    )],
+                    [],
+                )
+                .expect("callee type graph"),
+            ),
+        )
+        .expect("logical callee interface");
         let call_interface = r2ssa::SourceCallSiteInterface::new(
             revision,
             r2ssa::SourceCallSiteIdentity::new(
@@ -6119,6 +6186,7 @@ mod tests {
             false,
             r2ssa::SourceCallResult::Void,
         )
+        .and_then(|interface| interface.with_exact_callee_interface(callee_interface))
         .expect("exact callee interface");
         let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
             &[block],
@@ -6144,6 +6212,21 @@ mod tests {
 
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
+        let callsite = CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 0,
+        };
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|facts| facts.arguments_for_site(callsite))
+                .and_then(|facts| facts.callee_signature.as_ref()),
+            Some(&crate::FunctionType {
+                return_type: CTypeLike::Void,
+                params: vec![CTypeLike::u32()],
+                variadic: false,
+            })
+        );
         facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
 
         assert_eq!(
@@ -6180,6 +6263,7 @@ mod tests {
             }],
             variadic: false,
             fixed_argument_count: None,
+            callee_signature: None,
             register_argument_locations: Vec::new(),
             stack_argument_locations: Vec::new(),
         };

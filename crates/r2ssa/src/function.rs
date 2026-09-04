@@ -1265,18 +1265,12 @@ fn correlate_call_site_interfaces(
         ) {
             tail_calls.push(identity);
         }
-        // A prototype the source recovered, or -- where it recovered none and
-        // this capture carries the callee's own body -- the interface we
-        // derived from that body. radare2 reports no prototype for most local
-        // functions, because it correctly declines to assert a return type it
-        // never inferred, and the call site was then left with no interface at
-        // all. What the callee does is a stronger fact than what was declared
-        // about it, and it is already in hand.
-        let recovered = call
-            .prototype()
-            .is_none()
-            .then(|| callee_interfaces.get(&call.target_address()))
-            .flatten();
+        // A prototype the source recovered supplies the physical call
+        // contract. When this capture also carries the callee body, retain its
+        // recovered logical interface only after those physical carriers
+        // agree. radare2 reports no prototype for most local functions; in
+        // that case the callee-derived interface supplies both layers.
+        let recovered = callee_interfaces.get(&call.target_address());
         let Some(prototype) = call.prototype() else {
             let Some(callee) = recovered else {
                 continue;
@@ -1290,7 +1284,7 @@ fn correlate_call_site_interfaces(
             }
             continue;
         };
-        let Ok(interface) = SourceCallSiteInterface::new(
+        let Ok(mut interface) = SourceCallSiteInterface::new(
             source.source_revision_identity().to_vec(),
             identity,
             true,
@@ -1302,6 +1296,13 @@ fn correlate_call_site_interfaces(
         ) else {
             continue;
         };
+        if let Some(callee) = recovered
+            && let Ok(with_callee) = interface
+                .clone()
+                .with_exact_callee_interface(callee.clone())
+        {
+            interface = with_callee;
+        }
         interfaces.push(interface);
     }
     CorrelatedCallSites {
