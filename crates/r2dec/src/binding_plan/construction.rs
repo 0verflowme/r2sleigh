@@ -718,6 +718,7 @@ impl BindingPlan {
                     base,
                     offset,
                     size,
+                    array_layout,
                     source_slot,
                     callee_allocation,
                 } = entity
@@ -854,9 +855,17 @@ impl BindingPlan {
                     stack_objects.insert(*object, StackObjectDisposition::Bound { binding });
                     continue;
                 };
+                let recovered_array_size_matches = matches!(
+                    array_layout,
+                    r2ssa::StackArrayLayoutDisposition::Proven(layout)
+                        if layout.object == *object
+                            && u32::try_from(layout.extent).ok() == Some(size_bytes)
+                            && (source_slot.size_bytes() == size_bytes
+                                || source_slot.size_bytes() == layout.element_width)
+                );
                 if source_slot.base() != *base
                     || source_slot.offset() != *offset
-                    || size_bytes != source_slot.size_bytes()
+                    || size_bytes != source_slot.size_bytes() && !recovered_array_size_matches
                 {
                     stack_objects.insert(
                         *object,

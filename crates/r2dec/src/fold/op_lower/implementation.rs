@@ -1,3 +1,9 @@
+#[derive(Debug, Clone)]
+pub(crate) struct FoldedOpStmt {
+    pub(crate) site: crate::normalize::NormalizedOpSite,
+    pub(crate) stmt: CStmt,
+}
+
 impl<'a> FoldingContext<'a> {
     pub(super) fn certified_const_bits(&self, var: &SSAVar) -> Option<u64> {
         let value = var.constant_bits()?;
@@ -1238,6 +1244,15 @@ impl<'a> FoldingContext<'a> {
         block: &SSABlock,
         current_block_addr: u64,
     ) -> OpLoweringResult<Vec<CStmt>> {
+        self.fold_block_with_sites(block, current_block_addr)
+            .map(|stmts| stmts.into_iter().map(|stmt| stmt.stmt).collect())
+    }
+
+    pub(crate) fn fold_block_with_sites(
+        &self,
+        block: &SSABlock,
+        current_block_addr: u64,
+    ) -> OpLoweringResult<Vec<FoldedOpStmt>> {
         self.current_block_addr.set(Some(current_block_addr));
         self.current_block_id.set(
             self.inputs
@@ -1322,7 +1337,12 @@ impl<'a> FoldingContext<'a> {
                         op_idx,
                         &carried,
                     );
-                    stmts.push(self.observe_effect_stmt(&obligations, stmt));
+                    stmts.push(FoldedOpStmt {
+                        site: self
+                            .normalized_site(block.addr, op_idx)
+                            .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                        stmt: self.observe_effect_stmt(&obligations, stmt),
+                    });
                     break;
                 }
 
@@ -1381,7 +1401,12 @@ impl<'a> FoldingContext<'a> {
                     op_idx,
                     return_value,
                 );
-                stmts.push(self.observe_effect_stmt(&obligations, stmt));
+                stmts.push(FoldedOpStmt {
+                    site: self
+                        .normalized_site(block.addr, op_idx)
+                        .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                    stmt: self.observe_effect_stmt(&obligations, stmt),
+                });
 
                 break;
             }
@@ -1404,7 +1429,12 @@ impl<'a> FoldingContext<'a> {
 
             if let Some(stmt) = self.op_to_stmt_with_args(op, block.addr, op_idx)? {
                 let is_return = matches!(stmt.unobserved(), CStmt::Return(_));
-                stmts.push(stmt);
+                stmts.push(FoldedOpStmt {
+                    site: self
+                        .normalized_site(block.addr, op_idx)
+                        .ok_or_else(OpLoweringRefusal::missing_machine_projection)?,
+                    stmt,
+                });
                 if is_return {
                     break;
                 }

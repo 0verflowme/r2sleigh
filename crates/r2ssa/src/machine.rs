@@ -1085,11 +1085,10 @@ pub struct MachineProjection {
     /// absorbed, in the order the clearing chain consumed them. Empty for every
     /// write that speaks only for itself.
     absorbed_extensions: Box<[Box<[InstId]>]>,
-    /// Dense by `InstId`: for an absorbed extension, the write whose projection
-    /// stands for it. Where a chain nests -- a byte write widened twice, so the
-    /// first widening absorbs the second and the byte write absorbs both --
-    /// the outermost write answers, because it is the one with a statement.
-    absorbing_writes: Box<[Option<InstId>]>,
+    /// Dense by `InstId`: for an absorbed extension, the immediately preceding
+    /// write whose projection stands for it. A consumer can then stop at an
+    /// object boundary instead of skipping across it to the outermost write.
+    immediate_absorbing_writes: Box<[Option<InstId>]>,
     /// Values no read reaches outside of; see [`self_contained_values`].
     self_contained: BTreeSet<ValueId>,
     /// The subset of those a lane write actually defined; see
@@ -1173,7 +1172,7 @@ impl MachineProjection {
             write_dispositions[inst_index] = Some(decision.disposition);
             absorbed_extensions[inst_index] = decision.absorbed;
         }
-        let absorbing_writes = absorbing_writes(&absorbed_extensions);
+        let immediate_absorbing_writes = immediate_absorbing_writes(&absorbed_extensions);
 
         // Only a value a lane write actually defined is read as itself. A
         // sub-register the function merely reads is a window onto machine state
@@ -1207,7 +1206,7 @@ impl MachineProjection {
                 .map(Vec::into_boxed_slice)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            absorbing_writes: absorbing_writes.into_boxed_slice(),
+            immediate_absorbing_writes: immediate_absorbing_writes.into_boxed_slice(),
             self_contained,
             read_as_themselves,
         };
@@ -1280,13 +1279,14 @@ impl MachineProjection {
             .map_or(&[], Box::as_ref)
     }
 
-    /// The write whose projection absorbed this extension, if any.
+    /// The immediately preceding write whose projection absorbed this extension.
     ///
-    /// The outermost such write: where a byte write is widened twice, the
-    /// first widening absorbs the second and the byte write absorbs both, and
-    /// the byte write is the one with a statement.
-    pub fn absorbing_write(&self, inst: InstId) -> Option<InstId> {
-        self.absorbing_writes
+    /// Nested clearing chains retain every adjacency. Whether an outer write
+    /// also stands for this extension depends on whether all intervening
+    /// definitions denote one rendered object, which is a consumer policy and
+    /// not a machine-projection fact.
+    pub fn immediate_absorbing_write(&self, inst: InstId) -> Option<InstId> {
+        self.immediate_absorbing_writes
             .get(inst.0 as usize)
             .copied()
             .flatten()
@@ -1485,9 +1485,9 @@ impl MachineProjection {
                 return Err(MachineBuildError::WriteDispositionMismatch(inst.id));
             }
         }
-        if self.absorbing_writes.len() != graph.insts.len()
-            || self.absorbing_writes
-                != absorbing_writes(&self.absorbed_extensions).into_boxed_slice()
+        if self.immediate_absorbing_writes.len() != graph.insts.len()
+            || self.immediate_absorbing_writes
+                != immediate_absorbing_writes(&self.absorbed_extensions).into_boxed_slice()
         {
             return Err(MachineBuildError::TopologyMismatch);
         }
@@ -2197,28 +2197,23 @@ fn exact_adjacent_cleared_carrier_write(
     None
 }
 
-/// For each absorbed extension, the outermost write that absorbed it.
+/// For each absorbed extension, the immediately preceding write that absorbed it.
 ///
 /// Chains nest: a byte write widened twice is absorbed by the byte write, and
-/// the first widening absorbs the second on its own account. Only a write
-/// nothing else absorbed has a statement, so only such a write answers.
-fn absorbing_writes<T: AsRef<[InstId]>>(absorbed_extensions: &[T]) -> Vec<Option<InstId>> {
-    let absorbed_somewhere = absorbed_extensions
-        .iter()
-        .flat_map(|chain| chain.as_ref().iter().copied())
-        .collect::<BTreeSet<_>>();
+/// the first widening absorbs the second on its own account. Recording the
+/// first member of each chain retains those adjacencies in one O(n) build and
+/// gives consumers an O(1) reverse lookup without a whole-function scan.
+fn immediate_absorbing_writes<T: AsRef<[InstId]>>(
+    absorbed_extensions: &[T],
+) -> Vec<Option<InstId>> {
     let mut absorbing = vec![None; absorbed_extensions.len()];
     for (index, chain) in absorbed_extensions.iter().enumerate() {
         let head = InstId(index as u32);
-        if absorbed_somewhere.contains(&head) {
+        let Some(member) = chain.as_ref().first() else {
             continue;
-        }
-        for member in chain.as_ref() {
-            if let Some(slot) = absorbing.get_mut(member.0 as usize)
-                && slot.is_none()
-            {
-                *slot = Some(head);
-            }
+        };
+        if let Some(slot) = absorbing.get_mut(member.0 as usize) {
+            *slot = Some(head);
         }
     }
     absorbing
@@ -6420,7 +6415,7 @@ mod tests {
             &[extension]
         );
         assert_eq!(
-            clearing_projection.absorbing_write(extension),
+            clearing_projection.immediate_absorbing_write(extension),
             Some(narrow_write)
         );
         assert!(
@@ -6428,7 +6423,10 @@ mod tests {
                 .absorbed_extensions(extension)
                 .is_empty()
         );
-        assert_eq!(clearing_projection.absorbing_write(narrow_write), None);
+        assert_eq!(
+            clearing_projection.immediate_absorbing_write(narrow_write),
+            None
+        );
 
         // A byte written and widened twice: the byte write absorbs both
         // widenings, the first widening absorbs the second on its own
@@ -6472,8 +6470,15 @@ mod tests {
             &[at(1), at(2)]
         );
         assert_eq!(widened_projection.absorbed_extensions(at(1)), &[at(2)]);
-        assert_eq!(widened_projection.absorbing_write(at(1)), Some(at(0)));
-        assert_eq!(widened_projection.absorbing_write(at(2)), Some(at(0)));
+        assert_eq!(
+            widened_projection.immediate_absorbing_write(at(1)),
+            Some(at(0))
+        );
+        assert_eq!(
+            widened_projection.immediate_absorbing_write(at(2)),
+            Some(at(1)),
+            "the reverse index retains the nested boundary instead of skipping to the outer write"
+        );
 
         let high = artifact_with_arch(
             [R2ILOp::Copy {

@@ -459,6 +459,42 @@ impl SsaGraph {
         self.values.get(id.0 as usize)
     }
 
+    /// Materialize an exact source-declared value at function entry.
+    ///
+    /// Calls read their register arguments implicitly. A parameter handed
+    /// straight to a call therefore has no operation for graph construction to
+    /// discover, even though the source function interface proves that the
+    /// value exists. This adds that boundary value without inventing an
+    /// instruction or a graph use; the exact call boundary supplies the read.
+    pub(crate) fn ensure_entry_value(
+        &mut self,
+        var: SSAVar,
+        storage: CanonicalStorageId,
+    ) -> Option<ValueId> {
+        if var.version != 0
+            || var.size != storage.size
+            || storage.space != CanonicalStorageSpace::Register
+            || storage.size == 0
+        {
+            return None;
+        }
+        if let Some(id) = self.value_by_var.get(&var).copied() {
+            let value = self.value(id)?;
+            return (self.def_inst(id).is_none() && value.canonical_storage == Some(storage))
+                .then_some(id);
+        }
+        let id = ValueId(u32::try_from(self.values.len()).ok()?);
+        self.values.push(GraphValue {
+            id,
+            var: var.clone(),
+            canonical_storage: Some(storage),
+        });
+        self.value_by_var.insert(var, id);
+        self.def_of.push(None);
+        self.uses_of.push(Vec::new());
+        Some(id)
+    }
+
     pub fn def_inst(&self, id: ValueId) -> Option<InstId> {
         self.def_of.get(id.0 as usize).copied().flatten()
     }

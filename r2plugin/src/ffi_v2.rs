@@ -5035,6 +5035,9 @@ mod tests {
             refused: 0,
             unaccounted: 0,
             conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         let admitted_json = effect_obligations_json(Some(admitted));
         assert_eq!(admitted_json["schema_version"], 1);
@@ -5055,6 +5058,9 @@ mod tests {
             refused: 2,
             unaccounted: 1,
             conflicts: 1,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         let raw = response_diagnostics_json(
             &r2engine::EngineDiagnostics::default(),
@@ -5089,6 +5095,9 @@ mod tests {
             refused: 1,
             unaccounted: 0,
             conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
         };
         assert_eq!(
             response_outcome(

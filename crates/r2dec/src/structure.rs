@@ -199,11 +199,22 @@ pub(crate) struct ControlFlowStructurer<'a, 'o> {
     /// Exact side-entry domains that reach a labeled block through a certified
     /// noncanonical loop exit.
     transfer_target_domains: BTreeMap<u64, Vec<RenderedBlockDomain>>,
+    /// Counted loops whose exact initializer and update have been moved into
+    /// the header before region emission begins.
+    certified_for_regions: BTreeMap<u64, CertifiedForRegion>,
+    certified_for_header_sites: BTreeSet<crate::normalize::NormalizedOpSite>,
 }
 
 #[derive(Debug, Clone)]
 struct FoldedBlock {
-    stmts: Vec<CStmt>,
+    stmts: Vec<crate::fold::op_lower::FoldedOpStmt>,
+}
+
+#[derive(Debug, Clone)]
+struct CertifiedForRegion {
+    loop_id: LoopId,
+    init: CStmt,
+    update: CExpr,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -437,6 +448,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             structured_region_blocks: BTreeSet::new(),
             proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
+            certified_for_regions: BTreeMap::new(),
+            certified_for_header_sites: BTreeSet::new(),
         }
     }
 
@@ -470,6 +483,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             structured_region_blocks: BTreeSet::new(),
             proven_dead_blocks: std::cell::OnceCell::new(),
             transfer_target_domains: BTreeMap::new(),
+            certified_for_regions: BTreeMap::new(),
+            certified_for_header_sites: BTreeSet::new(),
         })
     }
 
@@ -784,7 +799,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             )
             .collect::<Vec<_>>();
         let obligations = self.exact_control_obligations(anchors.iter().copied());
-        self.fold_ctx.observe_effect_stmt(&obligations, stmt)
+        self.fold_ctx
+            .observe_composite_effect_stmt(&obligations, stmt)
     }
 
     fn record_switch_render_proof(
@@ -835,6 +851,159 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
         (latches.into_iter().collect(), exits.into_iter().collect())
+    }
+
+    fn collect_pre_test_loop_regions(region: &Region, loops: &mut Vec<(u64, BTreeSet<u64>)>) {
+        match region {
+            Region::Sequence(regions) => {
+                for child in regions {
+                    Self::collect_pre_test_loop_regions(child, loops);
+                }
+            }
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                Self::collect_pre_test_loop_regions(then_region, loops);
+                if let Some(else_region) = else_region {
+                    Self::collect_pre_test_loop_regions(else_region, loops);
+                }
+            }
+            Region::WhileLoop { header, body } => {
+                loops.push((*header, body.blocks().into_iter().collect()));
+                Self::collect_pre_test_loop_regions(body, loops);
+            }
+            Region::DoWhileLoop { body, .. } | Region::MultiExit { head: body, .. } => {
+                Self::collect_pre_test_loop_regions(body, loops);
+            }
+            Region::Switch { cases, default, .. } => {
+                for (_, case) in cases {
+                    Self::collect_pre_test_loop_regions(case, loops);
+                }
+                if let Some(default) = default {
+                    Self::collect_pre_test_loop_regions(default, loops);
+                }
+            }
+            Region::Block(_) | Region::Transfer { .. } | Region::Irreducible { .. } => {}
+        }
+    }
+
+    fn prepare_certified_for_regions(&mut self, region: &Region) -> ControlFlowStructureResult<()> {
+        self.certified_for_regions.clear();
+        self.certified_for_header_sites.clear();
+        let Some(prepared) = self.fold_ctx.inputs.prepared_ssa else {
+            return Ok(());
+        };
+        let Some(origins) = self.fold_ctx.inputs.normalization_origins else {
+            return Ok(());
+        };
+        let Some(control) = self.fold_ctx.control_facts() else {
+            return Ok(());
+        };
+        let Some(names) = self.fold_ctx.inputs.binding_names else {
+            return Ok(());
+        };
+        let mut region_loops = Vec::new();
+        Self::collect_pre_test_loop_regions(region, &mut region_loops);
+        region_loops.sort();
+        region_loops.dedup();
+        let mut seen_headers = BTreeSet::new();
+        for (header, body_blocks) in region_loops {
+            if !seen_headers.insert(header) {
+                continue;
+            }
+            let mut loops = control.loops_for_header(header).filter_map(|loop_fact| {
+                loop_fact
+                    .for_loop
+                    .as_ref()
+                    .map(|certificate| (loop_fact.loop_id, certificate))
+            });
+            let Some((loop_id, certificate)) = loops.next() else {
+                continue;
+            };
+            if loops.next().is_some() || !body_blocks.contains(&certificate.latch) {
+                continue;
+            }
+            let same_binding = match (
+                names.plan().disposition(certificate.induction_phi),
+                names.plan().disposition(certificate.induction_update),
+            ) {
+                (
+                    Some(crate::binding_plan::ValueDisposition::Bound { binding: left }),
+                    Some(crate::binding_plan::ValueDisposition::Bound { binding: right }),
+                ) => left == right,
+                _ => false,
+            };
+            if !same_binding {
+                continue;
+            }
+            let Some(sites) = origins.for_loop_sites(certificate, prepared) else {
+                continue;
+            };
+            let initializer_block = certificate.initializer.predecessor;
+            let Some(initializer_addr) = prepared
+                .graph()
+                .block(sites.initializer.block)
+                .map(|b| b.addr)
+            else {
+                continue;
+            };
+            let Some(update_addr) = prepared.graph().block(sites.update.block).map(|b| b.addr)
+            else {
+                continue;
+            };
+            if initializer_addr != initializer_block || update_addr != certificate.latch {
+                continue;
+            }
+            let Some(initializer_ssa) = self.func.get_block(initializer_addr) else {
+                continue;
+            };
+            let Some(update_ssa) = self.func.get_block(update_addr) else {
+                continue;
+            };
+            let mut initializer_entries =
+                self.folded_block_entries(initializer_ssa, initializer_addr)?;
+            let Some(initializer_index) = initializer_entries
+                .iter()
+                .position(|entry| entry.site == sites.initializer)
+            else {
+                continue;
+            };
+            if initializer_entries[initializer_index + 1..]
+                .iter()
+                .any(|entry| !matches!(entry.stmt.unobserved(), CStmt::Empty))
+            {
+                continue;
+            }
+            let initializer = initializer_entries.remove(initializer_index).stmt;
+            let update = self
+                .folded_block_entries(update_ssa, update_addr)?
+                .into_iter()
+                .find(|entry| entry.site == sites.update)
+                .and_then(|entry| {
+                    let (semantic, observations) = entry.stmt.into_semantic_with_observations();
+                    match semantic {
+                        CStmt::Expr(expr) => Some(observations.reapply_expr(expr)),
+                        _ => None,
+                    }
+                });
+            let Some(update) = update else {
+                continue;
+            };
+            let prior = self.certified_for_regions.insert(
+                header,
+                CertifiedForRegion {
+                    loop_id,
+                    init: initializer,
+                    update,
+                },
+            );
+            debug_assert!(prior.is_none(), "one candidate per counted-loop header");
+            self.certified_for_header_sites.insert(sites.initializer);
+            self.certified_for_header_sites.insert(sites.update);
+        }
+        Ok(())
     }
 
     /// Structure the function's control flow.
@@ -937,6 +1106,7 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         };
         self.structured_region_blocks = region.blocks().into_iter().collect();
+        self.prepare_certified_for_regions(&region)?;
         self.shared_joins = self.collect_shared_joins()?;
         // The jumps into a shared join need its label, and the jump back out
         // needs its successor's. Both have to exist before anything is written,
@@ -1074,6 +1244,71 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
+    fn structure_pre_test_loop(
+        &mut self,
+        header: u64,
+        body: &Region,
+        counted: Option<CertifiedForRegion>,
+    ) -> ControlFlowStructureResult<CStmt> {
+        let (cond, predicate, condition_value) = self.get_branch_condition_with_predicate(header);
+        let Some(mut cond) = cond else {
+            return Ok(CStmt::Block(vec![CStmt::comment(format!(
+                "r2dec residual: unresolved loop condition at 0x{header:x}"
+            ))]));
+        };
+        if self.loop_needs_condition_inversion(header, body) {
+            cond = Self::negate_condition(cond);
+        }
+        let loop_id = match self.exact_rendered_loop_id(header, predicate, condition_value, body) {
+            Ok(loop_id) => loop_id,
+            Err(reason) => {
+                self.safety_reason = Some(reason);
+                return Ok(CStmt::Empty);
+            }
+        };
+        self.record_loop_render_proof(header, predicate, condition_value, body);
+
+        let outer_domains = self.active_domains.clone();
+        self.push_active_loop(loop_id);
+        let prefix = self.structure_block_prefix_stmts(header)?;
+        let cond = match Self::combine_loop_condition_prefix(prefix, cond) {
+            Ok(cond) => cond,
+            Err(reason) => {
+                self.safety_reason = Some(format!(
+                    "loop header 0x{header:x} effects cannot be preserved: {reason}"
+                ));
+                self.active_domains = outer_domains;
+                return Ok(CStmt::Empty);
+            }
+        };
+        if let Err(reason) = self.push_exact_edge_guard(header, body.entry()) {
+            self.safety_reason = Some(format!(
+                "loop header 0x{header:x} cannot certify its body edge: {reason}"
+            ));
+            self.active_domains = outer_domains;
+            return Ok(CStmt::Empty);
+        }
+        let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body)?);
+        self.active_domains = outer_domains;
+        let loop_stmt = match counted {
+            Some(for_region) if for_region.loop_id == loop_id => CStmt::For {
+                init: Some(Box::new(for_region.init)),
+                cond: Some(cond),
+                update: Some(for_region.update),
+                body: Box::new(body_stmt),
+            },
+            Some(for_region) => {
+                self.safety_reason = Some(format!(
+                    "counted-loop certificate {:?} disagrees with rendered loop {:?} at 0x{header:x}",
+                    for_region.loop_id, loop_id
+                ));
+                return Ok(CStmt::Empty);
+            }
+            None => CStmt::while_loop(cond, body_stmt),
+        };
+        Ok(self.observe_loop_control_ownership(loop_id, header, loop_stmt))
+    }
+
     fn structure_region_in_active_domains(
         &mut self,
         region: &Region,
@@ -1194,53 +1429,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 }
             }
             Region::WhileLoop { header, body } => {
-                let (cond, predicate, condition_value) =
-                    self.get_branch_condition_with_predicate(*header);
-                let Some(mut cond) = cond else {
-                    return Ok(CStmt::Block(vec![CStmt::comment(format!(
-                        "r2dec residual: unresolved loop condition at 0x{header:x}"
-                    ))]));
-                };
-                if self.loop_needs_condition_inversion(*header, body) {
-                    cond = Self::negate_condition(cond);
-                }
-                let loop_id =
-                    match self.exact_rendered_loop_id(*header, predicate, condition_value, body) {
-                        Ok(loop_id) => loop_id,
-                        Err(reason) => {
-                            self.safety_reason = Some(reason);
-                            return Ok(CStmt::Empty);
-                        }
-                    };
-                self.record_loop_render_proof(*header, predicate, condition_value, body);
-
-                let outer_domains = self.active_domains.clone();
-                self.push_active_loop(loop_id);
-                let prefix = self.structure_block_prefix_stmts(*header)?;
-                let cond = match Self::combine_loop_condition_prefix(prefix, cond) {
-                    Ok(cond) => cond,
-                    Err(reason) => {
-                        self.safety_reason = Some(format!(
-                            "loop header 0x{header:x} effects cannot be preserved: {reason}"
-                        ));
-                        self.active_domains = outer_domains;
-                        return Ok(CStmt::Empty);
-                    }
-                };
-                if let Err(reason) = self.push_exact_edge_guard(*header, body.entry()) {
-                    self.safety_reason = Some(format!(
-                        "loop header 0x{header:x} cannot certify its body edge: {reason}"
-                    ));
-                    self.active_domains = outer_domains;
-                    return Ok(CStmt::Empty);
-                }
-                let body_stmt = Self::strip_trailing_continue(self.structure_loop_body(body)?);
-                self.active_domains = outer_domains;
-                self.observe_loop_control_ownership(
-                    loop_id,
-                    *header,
-                    CStmt::while_loop(cond, body_stmt),
-                )
+                let counted = self.certified_for_regions.remove(header);
+                self.structure_pre_test_loop(*header, body, counted)?
             }
             Region::DoWhileLoop { body, cond_block } => {
                 let (cond, predicate, condition_value) =
@@ -2652,24 +2842,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         addr: u64,
     ) -> ControlFlowStructureResult<Vec<CStmt>> {
         self.fold_ctx.folded_blocks.borrow_mut().insert(addr);
-        let stmts = if let Some(folded) = self.folded_block_cache.get(&addr) {
-            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
-                eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
-            }
-            self.fold_ctx.clone_cached_render_occurrence(&folded.stmts)
-        } else {
-            let stmts = self.fold_ctx.fold_block(block, addr)?;
-            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
-                eprintln!("FOLDCACHE miss block={addr:#x} stmts={}", stmts.len());
-            }
-            self.folded_block_cache.insert(
-                addr,
-                FoldedBlock {
-                    stmts: stmts.clone(),
-                },
-            );
-            stmts
-        };
+        let entries = self.folded_block_entries(block, addr)?;
+        let stmts = entries
+            .into_iter()
+            .filter(|entry| !self.certified_for_header_sites.contains(&entry.site))
+            .map(|entry| entry.stmt)
+            .collect::<Vec<_>>();
         self.validate_certified_block_domain(addr, &stmts);
         if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
             eprintln!("FOLDED block={addr:#x} stmts={}", stmts.len());
@@ -2701,6 +2879,44 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             }
         }
         Ok(stmts)
+    }
+
+    fn folded_block_entries(
+        &mut self,
+        block: &r2ssa::FunctionSSABlock,
+        addr: u64,
+    ) -> ControlFlowStructureResult<Vec<crate::fold::op_lower::FoldedOpStmt>> {
+        Ok(if let Some(folded) = self.folded_block_cache.get(&addr) {
+            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                eprintln!("FOLDCACHE hit block={addr:#x} stmts={}", folded.stmts.len());
+            }
+            let semantic = folded
+                .stmts
+                .iter()
+                .map(|entry| entry.stmt.clone())
+                .collect::<Vec<_>>();
+            self.fold_ctx
+                .clone_cached_render_occurrence(&semantic)
+                .into_iter()
+                .zip(&folded.stmts)
+                .map(|(stmt, original)| crate::fold::op_lower::FoldedOpStmt {
+                    site: original.site,
+                    stmt,
+                })
+                .collect()
+        } else {
+            let stmts = self.fold_ctx.fold_block_with_sites(block, addr)?;
+            if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+                eprintln!("FOLDCACHE miss block={addr:#x} stmts={}", stmts.len());
+            }
+            self.folded_block_cache.insert(
+                addr,
+                FoldedBlock {
+                    stmts: stmts.clone(),
+                },
+            );
+            stmts
+        })
     }
 
     fn validate_certified_block_domain(&mut self, block_addr: u64, _stmts: &[CStmt]) {
@@ -3220,13 +3436,12 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
                 let cleaned = Self::rewrite_guarded_switch_if_else(cleaned);
                 let cleaned = Self::rewrite_continue_tail_merges(symbols, cleaned);
                 let cleaned = Self::truncate_dead_straight_line_tail(cleaned);
-                let rewritten = Self::rewrite_block_loops_to_for(symbols, cleaned);
-                if rewritten.is_empty() {
+                if cleaned.is_empty() {
                     CStmt::Empty
-                } else if rewritten.len() == 1 {
-                    rewritten.into_iter().next().unwrap()
+                } else if cleaned.len() == 1 {
+                    cleaned.into_iter().next().unwrap()
                 } else {
-                    CStmt::Block(rewritten)
+                    CStmt::Block(cleaned)
                 }
             }
             CStmt::If {
@@ -4093,6 +4308,8 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         Self::stmt_is_self_update(symbols, &tail_stmt).then_some((stmts, tail_stmt))
     }
 
+    /// Drop the explicit body occurrence of the exact update a certified
+    /// `for` header now owns.
     fn strip_trailing_for_update(
         symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
         body: CStmt,
@@ -4401,236 +4618,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         }
     }
 
-    /// Rewrite adjacent `init; while (...) { ...; update; }` into `for (...)`.
-    fn rewrite_block_loops_to_for(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        stmts: Vec<CStmt>,
-    ) -> Vec<CStmt> {
-        let mut rewritten = Vec::with_capacity(stmts.len());
-        let mut i = 0;
-        while i < stmts.len() {
-            if i + 1 < stmts.len()
-                && let Some(mut for_stmts) = Self::try_rewrite_while_with_preheader_init(
-                    symbols,
-                    stmts[i].clone(),
-                    stmts[i + 1].clone(),
-                )
-            {
-                rewritten.append(&mut for_stmts);
-                i += 2;
-                continue;
-            }
-            rewritten.push(stmts[i].clone());
-            i += 1;
-        }
-        rewritten
-    }
-
-    fn try_rewrite_while_with_preheader_init(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        preheader_stmt: CStmt,
-        while_stmt: CStmt,
-    ) -> Option<Vec<CStmt>> {
-        let (prefix_stmts, init_stmt, induction_var) = Self::split_preheader_init(preheader_stmt)?;
-        let (while_semantic, while_observations) = while_stmt.into_semantic_with_observations();
-        let CStmt::While { cond, body } = while_semantic else {
-            return None;
-        };
-
-        let (loop_cond, loop_body) = match cond.unobserved() {
-            CExpr::IntLit(v) if *v != 0 => {
-                let (exit_cond, stripped_body) = Self::extract_guard_break_cond(*body)?;
-                (CExpr::unary(UnaryOp::Not, exit_cond), stripped_body)
-            }
-            _ => (cond, *body),
-        };
-
-        let cond_vars = Self::collect_expr_vars(&loop_cond);
-        let cond_reads_induction = cond_vars.contains(&induction_var);
-        let (update, body_without_update, update_links_cond) =
-            Self::extract_loop_update(symbols, induction_var, &cond_vars, loop_body)?;
-
-        if !cond_reads_induction && !update_links_cond {
-            return None;
-        }
-
-        let mut rewritten = prefix_stmts;
-        rewritten.push(while_observations.reapply(CStmt::For {
-            init: Some(Box::new(init_stmt)),
-            cond: Some(loop_cond),
-            update: Some(update),
-            body: Box::new(body_without_update),
-        }));
-        Some(rewritten)
-    }
-
-    fn extract_induction_var_from_init(init_stmt: &CStmt) -> Option<crate::symbol::SymbolId> {
-        match init_stmt.unobserved() {
-            CStmt::Expr(expr) => {
-                let CExpr::Binary {
-                    op: BinaryOp::Assign,
-                    left,
-                    ..
-                } = expr.unobserved()
-                else {
-                    return None;
-                };
-                match left.unobserved() {
-                    CExpr::Var(name) => Some(*name),
-                    _ => None,
-                }
-            }
-            CStmt::Decl {
-                name,
-                init: Some(_),
-                ..
-            } => Some(*name),
-            _ => None,
-        }
-    }
-
-    fn split_preheader_init(
-        preheader_stmt: CStmt,
-    ) -> Option<(Vec<CStmt>, CStmt, crate::symbol::SymbolId)> {
-        if let Some(var) = Self::extract_induction_var_from_init(&preheader_stmt) {
-            return Some((Vec::new(), preheader_stmt, var));
-        }
-
-        let (semantic, _block_observations) = preheader_stmt.into_semantic_with_observations();
-        let CStmt::Block(mut prefix) = semantic else {
-            return None;
-        };
-        while prefix
-            .last()
-            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty))
-        {
-            prefix.pop();
-        }
-        let init_stmt = prefix.pop()?;
-        let var = Self::extract_induction_var_from_init(&init_stmt)?;
-        Some((prefix, init_stmt, var))
-    }
-
-    fn extract_loop_update(
-        symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        var: SymbolId,
-        cond_vars: &HashSet<SymbolId>,
-        body: CStmt,
-    ) -> Option<(CExpr, CStmt, bool)> {
-        let stmts = Self::stmt_into_vec(body);
-        if stmts.is_empty() {
-            return None;
-        }
-
-        // Trim unreachable statements after the first unconditional transfer.
-        let mut effective = Vec::new();
-        for stmt in stmts {
-            let is_terminator = Self::stmt_is_unconditional_terminator(&stmt);
-            effective.push(stmt);
-            if is_terminator {
-                break;
-            }
-        }
-
-        while effective
-            .last()
-            .is_some_and(|stmt| matches!(stmt.unobserved(), CStmt::Empty | CStmt::Continue))
-        {
-            effective.pop();
-        }
-        if effective.is_empty() {
-            return None;
-        }
-
-        let update_idx = effective.len() - 1;
-        let prev_stmts = &effective[..update_idx];
-        let (update, update_links_cond) = Self::update_expr_from_stmt(
-            symbols,
-            var,
-            cond_vars,
-            prev_stmts,
-            &effective[update_idx],
-        )?;
-        Some((
-            update,
-            Self::stmt_from_vec(prev_stmts.to_vec()),
-            update_links_cond,
-        ))
-    }
-
-    fn extract_guard_break_cond(body: CStmt) -> Option<(CExpr, CStmt)> {
-        let mut stmts = Self::stmt_into_vec(body);
-        let first = stmts.first()?;
-        let break_cond = Self::is_if_break_without_else(first)?;
-        stmts.remove(0);
-        Some((break_cond, Self::stmt_from_vec(stmts)))
-    }
-
-    fn update_expr_from_stmt(
-        _symbols: &std::cell::RefCell<crate::symbol::SymbolTable>,
-        var: SymbolId,
-        cond_vars: &HashSet<SymbolId>,
-        prev_stmts: &[CStmt],
-        stmt: &CStmt,
-    ) -> Option<(CExpr, bool)> {
-        let CStmt::Expr(expr) = stmt.unobserved() else {
-            return None;
-        };
-        match expr.unobserved() {
-            CExpr::Unary { op, operand }
-                if matches!(
-                    op,
-                    UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
-                ) && matches!(operand.unobserved(), CExpr::Var(name) if *name == var) =>
-            {
-                Some((expr.clone(), false))
-            }
-            CExpr::Binary { op, left, right } if matches!(left.unobserved(), CExpr::Var(_)) => {
-                let CExpr::Var(left_name) = left.unobserved() else {
-                    return None;
-                };
-                let left_is_induction = *left_name == var;
-                let left_feeds_condition = cond_vars.contains(left_name);
-                if *op == BinaryOp::Assign {
-                    let rhs_vars = Self::collect_expr_vars(right);
-                    let links_cond_direct = !rhs_vars.is_disjoint(cond_vars);
-                    let reads_induction = rhs_vars.contains(&var);
-                    let links_cond_via_alias =
-                        Self::rhs_links_cond_via_alias(prev_stmts, &rhs_vars, cond_vars);
-                    if (left_is_induction && reads_induction)
-                        || (left_feeds_condition && (links_cond_direct || links_cond_via_alias))
-                    {
-                        return Some((expr.clone(), links_cond_direct || links_cond_via_alias));
-                    }
-                }
-                if Self::is_compound_assign_op(*op)
-                    && matches!(left.unobserved(), CExpr::Var(name) if *name == var)
-                {
-                    return Some((expr.clone(), false));
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn is_if_break_without_else(stmt: &CStmt) -> Option<CExpr> {
-        let CStmt::If {
-            cond,
-            then_body,
-            else_body: None,
-        } = stmt.unobserved()
-        else {
-            return None;
-        };
-        if matches!(then_body.unobserved(), CStmt::Break)
-            || matches!(then_body.unobserved(), CStmt::Block(v) if v.len() == 1 && Self::stmt_is_unconditional_break(&v[0]))
-        {
-            return Some(cond.clone());
-        }
-        None
-    }
-
     fn is_compound_assign_op(op: BinaryOp) -> bool {
         matches!(
             op,
@@ -4687,46 +4674,6 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
             1 => stmts.into_iter().next().unwrap(),
             _ => CStmt::Block(stmts),
         }
-    }
-
-    fn rhs_links_cond_via_alias(
-        prev_stmts: &[CStmt],
-        rhs_vars: &HashSet<SymbolId>,
-        cond_vars: &HashSet<SymbolId>,
-    ) -> bool {
-        let mut tracked = rhs_vars.clone();
-        for stmt in prev_stmts.iter().rev().take(2) {
-            let Some((def, prev_reads)) = Self::stmt_def_and_reads(stmt) else {
-                continue;
-            };
-            if !tracked.contains(&def) {
-                continue;
-            }
-            if !prev_reads.is_disjoint(cond_vars) {
-                return true;
-            }
-            tracked.remove(&def);
-            tracked.extend(prev_reads);
-        }
-        false
-    }
-
-    fn stmt_def_and_reads(stmt: &CStmt) -> Option<(SymbolId, HashSet<SymbolId>)> {
-        let CStmt::Expr(expr) = stmt.unobserved() else {
-            return None;
-        };
-        let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr.unobserved()
-        else {
-            return None;
-        };
-        let CExpr::Var(def) = left.unobserved() else {
-            return None;
-        };
-        Some((*def, Self::collect_expr_vars(right)))
     }
 
     fn collect_expr_vars(expr: &CExpr) -> HashSet<SymbolId> {
@@ -6144,147 +6091,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_canonical_while_to_for() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
-                CStmt::Block(vec![
-                    assign(
-                        &symbols,
-                        "sum",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
-                    ),
-                    assign(
-                        &symbols,
-                        "i",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } = cleaned
-        else {
-            panic!("Expected canonical loop rewrite to produce CStmt::For");
-        };
-        assert!(init.is_some(), "for-loop should keep init statement");
-        assert!(cond.is_some(), "for-loop should keep loop condition");
-        assert!(
-            update.is_some(),
-            "for-loop should extract update expression"
-        );
-        assert!(
-            !matches!(*body, CStmt::Empty),
-            "for-loop body should retain side-effect statements"
-        );
-    }
-
-    #[test]
-    fn rewrites_continue_tail_update_to_shared_for_latch() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            CStmt::Block(vec![
-                assign(&symbols, "count", CExpr::IntLit(0)),
-                assign(&symbols, "i", CExpr::IntLit(0)),
-            ]),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                CStmt::Block(vec![
-                    assign(
-                        &symbols,
-                        "c",
-                        CExpr::Subscript {
-                            base: Box::new(v(&symbols, "buf")),
-                            index: Box::new(v(&symbols, "i")),
-                        },
-                    ),
-                    CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Ne, v(&symbols, "c"), v(&symbols, "a")),
-                        CStmt::Block(vec![
-                            CStmt::if_stmt(
-                                CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b")),
-                                assign(
-                                    &symbols,
-                                    "count",
-                                    CExpr::binary(
-                                        BinaryOp::Add,
-                                        v(&symbols, "count"),
-                                        CExpr::IntLit(1),
-                                    ),
-                                ),
-                                None,
-                            ),
-                            assign(
-                                &symbols,
-                                "i",
-                                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-                            ),
-                            CStmt::Continue,
-                        ]),
-                        None,
-                    ),
-                    assign(
-                        &symbols,
-                        "count",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "count"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected count init plus for-loop block, got {cleaned:?}");
-        };
-        let CStmt::For {
-            update: Some(update),
-            body,
-            ..
-        } = stmts.get(1).expect("for-loop")
-        else {
-            panic!("Expected continue-tail loop rewrite to produce CStmt::For, got {stmts:?}");
-        };
-        assert_eq!(
-            update,
-            &CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(1))
-        );
-        let CStmt::Block(body_stmts) = body.as_ref() else {
-            panic!("Expected for body block, got {body:?}");
-        };
-        assert!(
-            !body_stmts
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Continue)),
-            "shared latch rewrite should remove synthetic continue"
-        );
-        assert_eq!(
-            body_stmts.get(1),
-            Some(&CStmt::if_stmt(
-                CExpr::binary(
-                    BinaryOp::Or,
-                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "a")),
-                    CExpr::binary(BinaryOp::Eq, v(&symbols, "c"), v(&symbols, "b"))
-                ),
-                CStmt::Expr(CExpr::binary(
-                    BinaryOp::AddAssign,
-                    v(&symbols, "count"),
-                    CExpr::IntLit(1),
-                )),
-                None
-            )),
-            "fallthrough suffix with duplicate effect should become a single OR guard"
-        );
-    }
-
-    #[test]
     fn rewrites_nested_else_duplicate_effect_to_or_condition() {
         let symbols = test_table();
         let increment = expr_stmt(CExpr::Unary {
@@ -6317,168 +6123,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
-        let symbols = test_table();
-        let hash_xor = assign(
-            &symbols,
-            "hash",
-            CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
-        );
-        let hash_mul = assign(
-            &symbols,
-            "hash",
-            CExpr::binary(
-                BinaryOp::Mul,
-                v(&symbols, "hash"),
-                CExpr::UIntLit(0x100000001b3),
-            ),
-        );
-        let i_update = assign(
-            &symbols,
-            "i",
-            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-        );
-        let lowercase_update = CStmt::Expr(CExpr::binary(
-            BinaryOp::AddAssign,
-            v(&symbols, "c"),
-            CExpr::IntLit(32),
-        ));
-
-        let input = CStmt::Block(vec![
-            assign(&symbols, "hash", CExpr::UIntLit(0x14650fb0739d0383)),
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                CStmt::Block(vec![
-                    assign(
-                        &symbols,
-                        "c",
-                        CExpr::Subscript {
-                            base: Box::new(v(&symbols, "buf")),
-                            index: Box::new(v(&symbols, "i")),
-                        },
-                    ),
-                    CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Gt, v(&symbols, "c"), CExpr::IntLit(64)),
-                        CStmt::Block(vec![
-                            CStmt::if_stmt(
-                                CExpr::binary(BinaryOp::Le, v(&symbols, "c"), CExpr::IntLit(90)),
-                                lowercase_update.clone(),
-                                None,
-                            ),
-                            hash_xor.clone(),
-                            hash_mul.clone(),
-                            i_update.clone(),
-                            CStmt::Continue,
-                        ]),
-                        None,
-                    ),
-                    hash_xor.clone(),
-                    hash_mul.clone(),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected hash init plus for-loop block, got {cleaned:?}");
-        };
-        let CStmt::For {
-            update: Some(update),
-            body,
-            ..
-        } = stmts.get(1).expect("for-loop")
-        else {
-            panic!("Expected loop rewrite to produce CStmt::For, got {stmts:?}");
-        };
-        assert_eq!(
-            update,
-            &CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(1))
-        );
-
-        let CStmt::Block(body_stmts) = body.as_ref() else {
-            panic!("Expected for body block, got {body:?}");
-        };
-        assert!(
-            !body_stmts
-                .iter()
-                .any(ControlFlowStructurer::stmt_contains_control_transfer),
-            "factored loop body should not keep synthetic continue"
-        );
-        assert_eq!(
-            body_stmts.get(1),
-            Some(&CStmt::if_stmt(
-                CExpr::binary(
-                    BinaryOp::And,
-                    CExpr::binary(BinaryOp::Gt, v(&symbols, "c"), CExpr::IntLit(64)),
-                    CExpr::binary(BinaryOp::Le, v(&symbols, "c"), CExpr::IntLit(90)),
-                ),
-                lowercase_update,
-                None
-            )),
-            "only the lowercase transform should remain guarded"
-        );
-        assert_eq!(
-            body_stmts.get(2),
-            Some(&CStmt::Expr(CExpr::binary(
-                BinaryOp::BitXorAssign,
-                v(&symbols, "hash"),
-                v(&symbols, "c")
-            )))
-        );
-        assert_eq!(
-            body_stmts.get(3),
-            Some(&CStmt::Expr(CExpr::binary(
-                BinaryOp::MulAssign,
-                v(&symbols, "hash"),
-                CExpr::UIntLit(0x100000001b3)
-            )))
-        );
-    }
-
-    #[test]
-    fn removes_duplicate_body_update_owned_by_for_latch() {
-        let symbols = test_table();
-        let i_update_expr = CExpr::binary(
-            BinaryOp::Assign,
-            v(&symbols, "i"),
-            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-        );
-        let hash_update = assign(
-            &symbols,
-            "hash",
-            CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
-        );
-        let input = CStmt::For {
-            init: Some(Box::new(assign(&symbols, "i", CExpr::IntLit(0)))),
-            cond: Some(CExpr::binary(
-                BinaryOp::Lt,
-                v(&symbols, "i"),
-                v(&symbols, "n"),
-            )),
-            update: Some(i_update_expr.clone()),
-            body: Box::new(CStmt::Block(vec![
-                hash_update.clone(),
-                CStmt::Expr(i_update_expr.clone()),
-            ])),
-        };
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::For { body, .. } = cleaned else {
-            panic!("Expected for-loop, got {cleaned:?}");
-        };
-        assert_eq!(
-            body.as_ref(),
-            &CStmt::Expr(CExpr::binary(
-                BinaryOp::BitXorAssign,
-                v(&symbols, "hash"),
-                v(&symbols, "c")
-            )),
-            "for latch update should own the duplicated trailing body update"
-        );
-    }
-
-    #[test]
     fn observed_rhs_still_rewrites_to_compound_assignment_once() {
         let symbols = test_table();
         let mut owner = RenderObservationOwner::new();
@@ -6507,15 +6151,6 @@ mod tests {
                 ),
             )
         );
-        assert_eq!(
-            ControlFlowStructurer::normalized_self_update_signature(&symbols, &rewritten),
-            Some((
-                crate::symbol::declare(&symbols, "value"),
-                BinaryOp::ShlAssign,
-                CExpr::IntLit(5),
-            ))
-        );
-
         let (plain, reachable) = strip_test_observations(&owner, CStmt::Expr(rewritten));
         assert!(reachable.contains(read_id));
         assert!(reachable.contains(retained_id));
@@ -6527,6 +6162,48 @@ mod tests {
                 v(&symbols, "value"),
                 CExpr::IntLit(5),
             ))
+        );
+    }
+
+    #[test]
+    fn removes_duplicate_body_update_owned_by_for_latch() {
+        let symbols = test_table();
+        let update = CExpr::assign(
+            v(&symbols, "i"),
+            CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
+        );
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::For {
+                init: Some(Box::new(assign(&symbols, "i", CExpr::IntLit(0)))),
+                cond: Some(CExpr::binary(
+                    BinaryOp::Lt,
+                    v(&symbols, "i"),
+                    v(&symbols, "n"),
+                )),
+                update: Some(update.clone()),
+                body: Box::new(CStmt::Block(vec![
+                    assign(
+                        &symbols,
+                        "hash",
+                        CExpr::binary(BinaryOp::BitXor, v(&symbols, "c"), v(&symbols, "hash")),
+                    ),
+                    CStmt::Expr(update),
+                ])),
+            },
+        );
+
+        let CStmt::For { body, .. } = cleaned else {
+            panic!("expected certified for-loop, got {cleaned:?}");
+        };
+        assert_eq!(
+            body.as_ref(),
+            &CStmt::Expr(CExpr::binary(
+                BinaryOp::BitXorAssign,
+                v(&symbols, "hash"),
+                v(&symbols, "c"),
+            )),
+            "the header owns the certified latch update exactly once"
         );
     }
 
@@ -6545,28 +6222,28 @@ mod tests {
             ))
             .expect("loop condition observation");
         let (update_id, update) = owner
-            .observe_expr(CExpr::binary(
-                BinaryOp::Assign,
+            .observe_expr(CExpr::assign(
                 v(&symbols, "i"),
                 CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
             ))
             .expect("loop update observation");
-        let input = CStmt::Block(vec![
-            init,
-            CStmt::while_loop(
-                cond,
-                CStmt::Block(vec![
-                    assign(&symbols, "sum", v(&symbols, "i")),
-                    CStmt::Expr(update),
-                ]),
-            ),
-        ]);
+        let cleaned = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::For {
+                init: Some(Box::new(init)),
+                cond: Some(cond),
+                update: Some(update),
+                body: Box::new(assign(&symbols, "sum", v(&symbols, "i"))),
+            },
+        );
 
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
         let (plain, reachable) = strip_test_observations(&owner, cleaned);
-        assert!(reachable.contains(init_id));
-        assert!(reachable.contains(cond_id));
-        assert!(reachable.contains(update_id));
+        for id in [init_id, cond_id, update_id] {
+            assert!(
+                reachable.contains(id),
+                "certified header occurrence was lost"
+            );
+        }
         assert!(matches!(plain, CStmt::For { .. }));
     }
 
@@ -6581,52 +6258,53 @@ mod tests {
             v(&symbols, "i"),
             CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
         );
-        let plain = ControlFlowStructurer::rewrite_block_loops_to_for(
+        let plain = ControlFlowStructurer::cleanup(
             &symbols,
-            vec![
-                CStmt::Block(vec![prefix.clone(), init.clone()]),
-                CStmt::while_loop(
-                    cond.clone(),
-                    CStmt::Block(vec![work.clone(), CStmt::Expr(update.clone())]),
-                ),
-            ],
+            CStmt::Block(vec![
+                prefix.clone(),
+                CStmt::For {
+                    init: Some(Box::new(init.clone())),
+                    cond: Some(cond.clone()),
+                    update: Some(update.clone()),
+                    body: Box::new(CStmt::Block(vec![
+                        work.clone(),
+                        CStmt::Expr(update.clone()),
+                    ])),
+                },
+            ]),
         );
 
         let mut owner = RenderObservationOwner::new();
         let (prefix_id, prefix) = owner.observe_stmt(prefix).expect("prefix observation");
         let (init_id, init) = owner.observe_stmt(init).expect("init observation");
-        let (preheader_id, preheader) = owner
-            .observe_stmt(CStmt::Block(vec![prefix, init]))
-            .expect("preheader block observation");
         let (cond_id, cond) = owner.observe_expr(cond).expect("condition observation");
         let (work_id, work) = owner.observe_stmt(work).expect("body observation");
         let (update_id, update) = owner.observe_expr(update).expect("update observation");
         let (body_id, body) = owner
-            .observe_stmt(CStmt::Block(vec![work, CStmt::Expr(update)]))
+            .observe_stmt(CStmt::Block(vec![work, CStmt::Expr(update.clone())]))
             .expect("body block observation");
-        let (while_id, while_stmt) = owner
-            .observe_stmt(CStmt::while_loop(cond, body))
-            .expect("while observation");
-        let marked = ControlFlowStructurer::rewrite_block_loops_to_for(
-            &symbols,
-            vec![preheader, while_stmt],
-        );
-        let (stripped, reachable) = strip_test_observations(&owner, CStmt::Block(marked));
+        let (for_id, for_stmt) = owner
+            .observe_stmt(CStmt::For {
+                init: Some(Box::new(init)),
+                cond: Some(cond),
+                update: Some(update),
+                body: Box::new(body),
+            })
+            .expect("certified loop observation");
+        let marked = ControlFlowStructurer::cleanup(&symbols, CStmt::Block(vec![prefix, for_stmt]));
+        let (stripped, reachable) = strip_test_observations(&owner, marked);
 
-        for id in [prefix_id, init_id, cond_id, work_id, update_id] {
-            assert!(reachable.contains(id), "exact child occurrence was lost");
-        }
-        assert!(
-            reachable.contains(while_id),
-            "the for-loop must retain the observation owned by the equivalent while-loop"
-        );
-        for id in [preheader_id, body_id] {
+        for id in [prefix_id, init_id, cond_id, work_id, update_id, for_id] {
             assert!(
-                !reachable.contains(id),
-                "an eliminated aggregate wrapper was relocated onto a different occurrence"
+                reachable.contains(id),
+                "exact certified-loop occurrence was lost"
             );
         }
-        assert_eq!(stripped, CStmt::Block(plain));
+        assert!(
+            !reachable.contains(body_id),
+            "a body wrapper eliminated with the duplicate latch update cannot move"
+        );
+        assert_eq!(stripped, plain);
     }
 
     #[test]
@@ -6639,31 +6317,33 @@ mod tests {
         let first_work = assign(&symbols, "sum", v(&symbols, "i"));
         let second_work = assign(&symbols, "hash", v(&symbols, "byte"));
         let trailing_assignment = assign(&symbols, "tmp:dead", CExpr::IntLit(9));
-        let plain_input = CStmt::Block(vec![
-            CStmt::For {
-                init: None,
-                cond: Some(CExpr::binary(
-                    BinaryOp::Lt,
-                    v(&symbols, "i"),
-                    v(&symbols, "n"),
-                )),
-                update: Some(update.clone()),
-                body: Box::new(CStmt::Block(vec![
-                    first_work.clone(),
-                    CStmt::Expr(update.clone()),
-                ])),
-            },
-            CStmt::For {
-                init: None,
-                cond: Some(v(&symbols, "keep_going")),
-                update: None,
-                body: Box::new(CStmt::Block(vec![
-                    second_work.clone(),
-                    trailing_assignment.clone(),
-                ])),
-            },
-        ]);
-        let plain = ControlFlowStructurer::cleanup(&symbols, plain_input);
+        let plain = ControlFlowStructurer::cleanup(
+            &symbols,
+            CStmt::Block(vec![
+                CStmt::For {
+                    init: None,
+                    cond: Some(CExpr::binary(
+                        BinaryOp::Lt,
+                        v(&symbols, "i"),
+                        v(&symbols, "n"),
+                    )),
+                    update: Some(update.clone()),
+                    body: Box::new(CStmt::Block(vec![
+                        first_work.clone(),
+                        CStmt::Expr(update.clone()),
+                    ])),
+                },
+                CStmt::For {
+                    init: None,
+                    cond: Some(v(&symbols, "keep_going")),
+                    update: None,
+                    body: Box::new(CStmt::Block(vec![
+                        second_work.clone(),
+                        trailing_assignment.clone(),
+                    ])),
+                },
+            ]),
+        );
 
         let mut owner = RenderObservationOwner::new();
         let (first_work_id, first_work) = owner
@@ -6718,13 +6398,10 @@ mod tests {
         for id in [first_body_inner_id, first_body_outer_id] {
             assert!(
                 !reachable.contains(id),
-                "a body split to remove the explicit for-update has no exact child occurrence that can inherit its wrapper"
+                "the split that removes the duplicate update has no surviving wrapper"
             );
         }
-        assert_eq!(
-            stripped, plain,
-            "statement decomposition must be transparent to for-body cleanup"
-        );
+        assert_eq!(stripped, plain);
     }
 
     #[test]
@@ -6946,210 +6623,6 @@ mod tests {
         };
         assert_eq!(cases[0].body, vec![CStmt::Return(Some(CExpr::IntLit(1)))]);
         assert_eq!(default, Some(vec![CStmt::Return(Some(CExpr::IntLit(3)))]));
-    }
-
-    #[test]
-    fn rewrites_guard_break_while1_to_for() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::IntLit(1),
-                CStmt::Block(vec![
-                    CStmt::if_stmt(
-                        CExpr::binary(BinaryOp::Ge, v(&symbols, "i"), v(&symbols, "n")),
-                        CStmt::Break,
-                        None,
-                    ),
-                    assign(
-                        &symbols,
-                        "sum",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
-                    ),
-                    expr_stmt(CExpr::Unary {
-                        op: UnaryOp::PostInc,
-                        operand: Box::new(v(&symbols, "i")),
-                    }),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::For {
-            cond: Some(cond),
-            update: Some(update),
-            ..
-        } = cleaned
-        else {
-            panic!("Expected guarded while(1) rewrite to produce CStmt::For");
-        };
-        assert!(
-            matches!(
-                cond,
-                CExpr::Unary {
-                    op: UnaryOp::Not,
-                    ..
-                }
-            ),
-            "guard-break form should negate break condition for for-loop cond"
-        );
-        assert!(
-            matches!(
-                update,
-                CExpr::Unary {
-                    op: UnaryOp::PostInc,
-                    ..
-                }
-            ),
-            "guard-break form should preserve update expression"
-        );
-    }
-
-    #[test]
-    fn does_not_rewrite_without_tail_update() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
-                    &symbols,
-                    "sum",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected unmatched loop to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "loop without a recognized update should remain while-loop"
-        );
-    }
-
-    #[test]
-    fn does_not_rewrite_when_cond_var_mismatch() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "j"), CExpr::IntLit(10)),
-                CStmt::Block(vec![assign(
-                    &symbols,
-                    "i",
-                    CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-                )]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected unmatched condition var to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "condition must reference same induction variable as init/update"
-        );
-    }
-
-    #[test]
-    fn accepts_self_assign_update_forms() {
-        let symbols = test_table();
-        let updates = vec![
-            CExpr::binary(
-                BinaryOp::Assign,
-                v(&symbols, "i"),
-                CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(2)),
-            ),
-            CExpr::binary(BinaryOp::AddAssign, v(&symbols, "i"), CExpr::IntLit(2)),
-            CExpr::binary(
-                BinaryOp::Assign,
-                v(&symbols, "i"),
-                CExpr::call(
-                    v(&symbols, "next_i"),
-                    vec![v(&symbols, "i"), v(&symbols, "x")],
-                ),
-            ),
-        ];
-
-        for update_expr in updates {
-            let input = CStmt::Block(vec![
-                assign(&symbols, "i", CExpr::IntLit(0)),
-                CStmt::while_loop(
-                    CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                    CStmt::Block(vec![
-                        assign(
-                            &symbols,
-                            "sum",
-                            CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
-                        ),
-                        expr_stmt(update_expr.clone()),
-                    ]),
-                ),
-            ]);
-
-            let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-            let CStmt::For {
-                update: Some(update),
-                ..
-            } = cleaned
-            else {
-                panic!("Expected loop rewrite for accepted self-assign update form");
-            };
-            assert!(
-                ControlFlowStructurer::expr_matches_for_update(&symbols, &update, &update_expr),
-                "Expected canonical loop update {update:?} to match source update {update_expr:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn keeps_while_when_unproven_trailing_assignment_follows_update() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            CStmt::Block(vec![
-                assign(&symbols, "sum", CExpr::IntLit(0)),
-                assign(&symbols, "i", CExpr::IntLit(0)),
-            ]),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "len")),
-                CStmt::Block(vec![
-                    CStmt::Expr(CExpr::binary(
-                        BinaryOp::AddAssign,
-                        v(&symbols, "sum"),
-                        CExpr::Subscript {
-                            base: Box::new(v(&symbols, "arr")),
-                            index: Box::new(v(&symbols, "i")),
-                        },
-                    )),
-                    CStmt::Expr(CExpr::Unary {
-                        op: UnaryOp::PostInc,
-                        operand: Box::new(v(&symbols, "i")),
-                    }),
-                    CStmt::Decl {
-                        name: crate::symbol::declare(&symbols, "tmp:11f00_4"),
-                        ty: CType::i32(),
-                        init: Some(CExpr::Deref(Box::new(CExpr::binary(
-                            BinaryOp::Add,
-                            v(&symbols, "arr"),
-                            CExpr::binary(BinaryOp::Mul, v(&symbols, "i"), CExpr::IntLit(4)),
-                        )))),
-                    },
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected block with sum init and while-loop, got {cleaned:?}");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "an unproven trailing assignment must prevent a for-loop rewrite: {stmts:?}"
-        );
     }
 
     #[test]
@@ -7489,121 +6962,5 @@ mod tests {
                 CStmt::ret(Some(CExpr::IntLit(0))),
             ])
         );
-    }
-
-    #[test]
-    fn rewrites_while_to_for_when_condition_uses_addrof_induction_var() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(
-                    BinaryOp::Lt,
-                    CExpr::AddrOf(Box::new(v(&symbols, "i"))),
-                    v(&symbols, "n"),
-                ),
-                CStmt::Block(vec![
-                    assign(
-                        &symbols,
-                        "sum",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "sum"), v(&symbols, "i")),
-                    ),
-                    assign(
-                        &symbols,
-                        "i",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "i"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert!(
-            matches!(cleaned, CStmt::For { .. }),
-            "Address-wrapped induction variable should still allow for-loop rewrite"
-        );
-    }
-
-    #[test]
-    fn rewrites_while_to_for_with_two_step_alias_update_chain() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                CStmt::Block(vec![
-                    assign(&symbols, "tmp1", v(&symbols, "i")),
-                    assign(&symbols, "tmp2", v(&symbols, "tmp1")),
-                    assign(
-                        &symbols,
-                        "i",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "tmp2"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        assert!(
-            matches!(cleaned, CStmt::For { .. }),
-            "Two-step alias chain should be enough to connect update with loop condition"
-        );
-    }
-
-    #[test]
-    fn does_not_rewrite_while_to_for_when_alias_chain_is_too_long() {
-        let symbols = test_table();
-        let input = CStmt::Block(vec![
-            assign(&symbols, "i", CExpr::IntLit(0)),
-            CStmt::while_loop(
-                CExpr::binary(BinaryOp::Lt, v(&symbols, "i"), v(&symbols, "n")),
-                CStmt::Block(vec![
-                    assign(&symbols, "tmp1", v(&symbols, "i")),
-                    assign(&symbols, "tmp2", v(&symbols, "tmp1")),
-                    assign(&symbols, "tmp3", v(&symbols, "tmp2")),
-                    assign(
-                        &symbols,
-                        "i",
-                        CExpr::binary(BinaryOp::Add, v(&symbols, "tmp3"), CExpr::IntLit(1)),
-                    ),
-                ]),
-            ),
-        ]);
-
-        let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-        let CStmt::Block(stmts) = cleaned else {
-            panic!("Expected long alias-chain loop to remain a block");
-        };
-        assert!(
-            matches!(stmts.get(1), Some(CStmt::While { .. })),
-            "Alias chain beyond bounded lookback should not rewrite to for-loop"
-        );
-    }
-
-    #[test]
-    fn distinct_suffix_and_case_var_symbols_do_not_merge_for_rewrite() {
-        for (init_name, cond_name) in [("local_4", "local"), ("Index", "index")] {
-            let symbols = test_table();
-            let input = CStmt::Block(vec![
-                assign(&symbols, init_name, CExpr::IntLit(0)),
-                CStmt::while_loop(
-                    CExpr::binary(BinaryOp::Lt, v(&symbols, cond_name), v(&symbols, "n")),
-                    CStmt::Block(vec![assign(
-                        &symbols,
-                        init_name,
-                        CExpr::binary(BinaryOp::Add, v(&symbols, init_name), CExpr::IntLit(1)),
-                    )]),
-                ),
-            ]);
-
-            let cleaned = ControlFlowStructurer::cleanup(&symbols, input);
-            let CStmt::Block(stmts) = cleaned else {
-                panic!("distinct symbols must retain the while form");
-            };
-            assert!(
-                matches!(stmts.get(1), Some(CStmt::While { .. })),
-                "{init_name:?} and {cond_name:?} are distinct SymbolIds"
-            );
-        }
     }
 }

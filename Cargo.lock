@@ -642,7 +642,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libsla"
 version = "1.2.0"
-source = "git+https://github.com/0verflowme/libsla.git?branch=user-op-names#7b28c9327351458fdeb798656154883a32f37efd"
+source = "git+https://github.com/0verflowme/libsla.git?branch=user-op-names-clear-cache#2167bfed01426b1dc00ff13b2724327e2bec9ca5"
 dependencies = [
  "libsla-sys",
  "thiserror 2.0.17",
@@ -651,7 +651,7 @@ dependencies = [
 [[package]]
 name = "libsla-sys"
 version = "0.1.5"
-source = "git+https://github.com/0verflowme/libsla-sys.git?branch=expose-user-op-names#a0aa34df668ce1442f0a4762b05115add3deaf50"
+source = "git+https://github.com/0verflowme/libsla-sys.git?branch=expose-user-op-names-clear-cache#3ef61aadfec09652d82366b9bfa22ec6a55afc35"
 dependencies = [
  "cxx",
  "cxx-build",

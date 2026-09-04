@@ -166,9 +166,7 @@ impl CodeGenerator {
             if i > 0 {
                 self.output.push_str(", ");
             }
-            self.emit_type(&param.ty);
-            self.output.push(' ');
-            self.output.push_str(self.symbols.name(param.name));
+            self.emit_named_declaration(&param.ty, param.name);
         }
 
         if func.params.is_empty() {
@@ -309,9 +307,7 @@ impl CodeGenerator {
             }
             CStmt::Decl { ty, name, init } => {
                 self.emit_indent();
-                self.emit_type(ty);
-                self.output.push(' ');
-                self.output.push_str(self.symbols.name(*name));
+                self.emit_named_declaration(ty, *name);
                 if let Some(init_expr) = init {
                     self.output.push_str(" = ");
                     self.emit_expr(init_expr, 0);
@@ -515,9 +511,7 @@ impl CodeGenerator {
                 }
             }
             CStmt::Decl { ty, name, init } => {
-                self.emit_type(ty);
-                self.output.push(' ');
-                self.output.push_str(self.symbols.name(*name));
+                self.emit_named_declaration(ty, *name);
                 if let Some(init_expr) = init {
                     self.output.push_str(" = ");
                     self.emit_expr(init_expr, 0);
@@ -760,23 +754,28 @@ impl CodeGenerator {
     /// Emit the declarator for a data object. Arrays put their extent after
     /// the name; the ordinary type renderer has no identifier to place there.
     fn emit_object_declaration(&mut self, ty: &CType, name: &str) {
-        match ty {
-            CType::Array(element, len) => {
-                self.emit_type(element);
-                self.output.push(' ');
-                self.output.push_str(name);
-                self.output.push('[');
-                if let Some(len) = len {
-                    self.output.push_str(&len.to_string());
-                }
-                self.output.push(']');
-            }
-            _ => {
-                self.emit_type(ty);
-                self.output.push(' ');
-                self.output.push_str(name);
-            }
+        let mut element = ty;
+        let mut extents = Vec::new();
+        while let CType::Array(inner, extent) = element {
+            extents.push(*extent);
+            element = inner;
         }
+        self.emit_type(element);
+        self.output.push(' ');
+        self.output.push_str(name);
+        for extent in extents {
+            self.output.push('[');
+            if let Some(extent) = extent {
+                self.output.push_str(&extent.to_string());
+            }
+            self.output.push(']');
+        }
+    }
+
+    /// Emit a type together with the identifier it declares.
+    fn emit_named_declaration(&mut self, ty: &CType, name: crate::symbol::SymbolId) {
+        let name = self.symbols.name(name).to_owned();
+        self.emit_object_declaration(ty, &name);
     }
 
     /// Emit indentation.
@@ -1183,6 +1182,31 @@ mod tests {
         let code = generate(&func);
         assert!(code.contains("int32_t add(int32_t a, int32_t b)"));
         assert!(code.contains("return a + b;"));
+    }
+
+    #[test]
+    fn named_array_declaration_places_extent_after_identifier() {
+        let symbols = test_table();
+        let buffer = crate::symbol::declare(&symbols, "stack_m32");
+        let func = CFunction {
+            externs: Vec::new(),
+            extern_objects: Vec::new(),
+            name: "uses_stack_buffer".to_string(),
+            ret_type: CType::Void,
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: vec![CStmt::Decl {
+                ty: CType::Array(Box::new(CType::u8()), Some(16)),
+                name: buffer,
+                init: None,
+            }],
+            params_known: true,
+            symbols: std::rc::Rc::new(symbols),
+        };
+
+        let code = generate(&func);
+        assert!(code.contains("uint8_t stack_m32[16];"), "{code}");
+        assert!(!code.contains("uint8_t[16] stack_m32"), "{code}");
     }
 
     /// One declaration has to serve every call to the callee, and two calls to

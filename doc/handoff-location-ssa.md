@@ -11573,3 +11573,145 @@ The post-repair traced sweep is 397 of 556 rendered: pinned 77 of 107, compiled
 All 111 import thunks remain, plus the four non-import shapes in the table. Of
 the historical 119 members, 109 still reproduce with this label; the other six
 current members are later population/cause drift already enumerated above.
+
+## DecBench's `type_match` strips qualifiers, and that removes two blockers
+
+Read from `/root/decbench/decbench/metrics/type_match.py` on the benchmark host
+rather than assumed. Two facts change what the type work has to do.
+
+**`const` is stripped before comparison.** The metric holds
+
+    QUALIFIERS = ["unsigned", "signed", "const", "volatile", "register", "static", "extern"]
+
+and removes each one from both the decompiled spelling and the DWARF spelling
+before matching. So `uint8_t*` against a ground truth of `const uint8_t *` is a
+**match** on this metric. Adding a qualifier variant to `CTypeLike` was recorded
+here as a prerequisite for type recovery; it is not one for the benchmark. It
+remains a prerequisite for the corpus `typed_recovery` column, which compares
+spellings as raw strings — and that is a difference between our column and the
+thing we are trying to beat, not a difference in the renderer.
+
+**`size_t` and `uint64_t` normalise to the same thing.** `TYPE_MAP` sends both
+`size_t` and `uint64_t` to `long long`, along with `ssize_t`, `ulong` and plain
+`long` under LP64. So minting `size_t` — which `admit_declaration`'s `_ => false`
+arm refuses anyway, and which the owner's standing decision on unplaceable type
+spellings would independently forbid — buys nothing on this metric either.
+
+What the metric *does* separate is width and pointer-ness: `uint64_t` maps to
+`long long` and `uint32_t` to `int`, so declaring a 32-bit value 64-bit is a
+miss, and a pointer declared as an integer is a miss. That is exactly the pair
+the parameter work targets, and it means the honest reading of `type_match 0.083`
+is that we get widths and pointers wrong, not that we spell types unfashionably.
+
+The practical consequence for reading progress: the corpus column is **stricter**
+than the benchmark, so a change can move `type_match` while leaving
+`parameters_match` at zero. Report both, and do not treat the corpus column's
+zero as evidence that the benchmark did not move.
+
+## Declaration placement re-measured after the expression-engine merges
+
+This is the delta from the thirty-cell classification above, not a replacement
+for it.  At `424aec21207d3611f008723e76b66406b6838ace`, the command
+
+```bash
+R2DEC_TRACE_REFUSAL=1 \
+  ./tests/corpus/locked_shapes.sh --gate shapes-measurement
+```
+
+again rendered all thirteen shapes on all six configurations.  The six dumps
+were split at every `R2SLEIGH_CORPUS_BEGIN__*` / `END__*` pair before reading
+the `placement-decision` and `binding-symbol-observed` evidence.  The matrix now
+reports `placement_audit: pass=34, refused=12, not_run=32`: declaration
+placement refusals shrank from thirty cells to twelve.
+
+### The current twelve cells
+
+| cell | refusal | cause | binding(s) named |
+| --- | --- | --- | --- |
+| x64_O0/shape_variadic | missing_definition | A | stack_m184, stack_m183, stack_m182, stack_m181 |
+| x64_O0/shape_struct_value | missing_definition | B | RDX_1 |
+| x64_O0/shape_multiword_return | missing_definition | B | RDX_1, RDX_2 |
+| x64_O1/shape_variadic | missing_definition | A | stack_m216, stack_m215, stack_m214, stack_m213 |
+| x64_O2/shape_variadic | missing_definition | A | stack_m216, stack_m215, stack_m214, stack_m213 |
+| x64_O2/shape_call_chain | missing_definition | A | stack_m72, stack_m64, stack_m56 |
+| arm64_O0/shape_variadic | missing_definition | A | stack_m200, stack_m199, stack_m198, stack_m197 |
+| arm64_O0/shape_struct_value | missing_definition | B | X1_2 |
+| arm64_O0/shape_multiword_return | missing_definition | B | X1_2, X1_4 |
+| arm64_O1/shape_variadic | missing_definition | A | stack_m264, stack_m263, stack_m262, stack_m261 |
+| arm64_O2/shape_variadic | missing_definition | A | stack_m264, stack_m263, stack_m262, stack_m261 |
+| arm64_O2/shape_call_chain | missing_definition | A | stack_m88, stack_m80, stack_m72 |
+
+Eight are Cause A and remain outside the marker-loss work.  Four are Cause B,
+but none is one of the four cells previously classified B: all four were Cause
+C cells in the earlier run.  In each, transporting the stack-object write
+marker removed the first refusal and exposed a register read with no definition
+for the call's second result (`RDX_*` or `X1_*`).
+
+### Exact delta by cause
+
+| cause | before | now | delta |
+| --- | ---: | ---: | --- |
+| A | 15 cells including the mixed A+B cell | 8 | Seven cells left placement; this work still does not own them. |
+| B | 4 cells | 4, all different | The old four left placement; four former C cells moved to B. |
+| C | 9 cells | 0 | Five now render and pass placement; four moved to B. |
+| D | 2 cells | 0 | Both now render and pass placement. |
+| E | 1 cell | 0 | `Occurrence::self_defined` makes placement pass. |
+
+The four `C -> B` movements are
+`x64_O0/shape_struct_value`, `x64_O0/shape_multiword_return`,
+`arm64_O0/shape_struct_value`, and `arm64_O0/shape_multiword_return`.
+The five Cause C cells that now render are both O0 `shape_call_chain` cells,
+both O0 `shape_recurse_mutual` cells, and
+`x64_O1/shape_pointer_to_pointer`.  The two Cause D
+`shape_pointer_to_pointer` cells also render.
+
+The old Cause B cells did not all become green.  `x64_O1/shape_function_pointer`
+renders and passes placement; `arm64_O0/shape_recurse_direct` passes placement
+but the corpus sees three signatures in its section; `x64_O0/shape_function_pointer`
+now refuses earlier at machine-projection authorization; and the mixed A+B
+`x64_O2/shape_function_pointer` now refuses earlier at
+`ExactUseRequiresRenderedOccurrence`.  Similarly, the old Cause E cell passes
+placement but its section has three signatures.  Thus eight of the fifteen
+exclusively owned B/C/D/E cells currently produce a `generation=present`
+record: one old B cell, five old C cells, and both old D cells.
+
+## The effect ledger's three refusal tallies are separate
+
+`tests/coverage/coverage-baseline.json` records 26 functions under the old
+aggregate cause `N refused, N unaccounted, N conflicts`. That text did not say
+which I4 failure occurred. Worse, the ledger itself put an uncertified zero in
+the refused column and a non-exclusive duplicate in the refused column, even
+though those are respectively unaccounted and conflicting obligations. Native
+admission failed in all three cases, so the rendered behavior was safe, but the
+diagnostic could not direct a fix to the responsible path.
+
+The closed ledger now keeps those cases distinct without changing admission.
+An uncertified zero stays unattributed, and a duplicate keeps its one rendered
+owner while recording a conflict against the same canonical obligation. The
+typed effect audit carries the first canonical obligation in each nonzero tally,
+and the engine refusal prints its kind and instruction site. The existing
+`zero-occurrence-outcome` trace was extended with the function entry and
+`tally=unaccounted`; it still prints the graph instruction, output and complete
+input list rather than introducing a second probe.
+
+Measured with
+`R2DEC_TRACE_REFUSAL=1 R2SLEIGH_DEBUG_UNOWNED=1
+./tests/coverage/locked_coverage.sh` on the tree at this entry:
+
+| baseline population | functions | current tally and first site |
+| --- | ---: | --- |
+| already render on the merged branch | 22 | none |
+| `system_ls_a97c50d3::fcn.100003110` | 1 | 3 unaccounted `call-argument` obligations at `0x100003110:op:8` |
+| `system_ls_a97c50d3::fcn.100003250` | 1 | 1 unaccounted `call-argument` obligation at `0x100003250:op:8` |
+| `system_ls_a97c50d3::sym.func.1000038a4` | 1 | 1 unaccounted `call-argument` obligation at `0x1000038a4:op:8` |
+| `system_ls_a97c50d3::sym.func.100003cfc` | 1 | 2 conflicting `control-predicate` occurrences, first at `0x100003dc0:op:55` |
+
+So the 26 baseline functions split by nonzero tally as **0 refused, 3
+unaccounted, 1 conflicting, and 22 already rendered**. No function has more
+than one nonzero tally. One additional current function,
+`system_ls_a97c50d3::sym.func.100002524`, has 3 unaccounted call arguments but
+was a `RenderedValueRequired` refusal in the recorded baseline, so it is not
+part of this 26-function ownership slice.
+
+The sweep rendered 387 of 556 functions: pinned 76/107, compiled 281/313, and
+system 30/136. The coverage gate reported no regressions.

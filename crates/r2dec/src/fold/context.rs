@@ -416,6 +416,44 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
+    pub(crate) fn observe_certified_array_index_expr(
+        &self,
+        access: r2ssa::StructuredAccessId,
+        value: r2ssa::ValueId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedAddressReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_array_index_expr(access, value, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
     /// Wrap one exact normalized definition that survives as a statement.
     pub(crate) fn observe_normalized_output_stmt(
         &self,
@@ -446,11 +484,12 @@ impl<'a> FoldingContext<'a> {
     /// [`Self::absorbed_extensions_discharged_by`], asked from the other side,
     /// so the two cannot disagree.
     pub(crate) fn write_is_discharged_by_absorbing_write(&self, inst: r2ssa::InstId) -> bool {
-        let Some(head) = self
-            .inputs
-            .binding_names
-            .and_then(|names| names.plan().machine_projection().absorbing_write(inst))
-        else {
+        let Some(head) = self.inputs.binding_names.and_then(|names| {
+            names
+                .plan()
+                .machine_projection()
+                .immediate_absorbing_write(inst)
+        }) else {
             return false;
         };
         self.absorbed_extensions_discharged_by(head).contains(&inst)
@@ -568,6 +607,32 @@ impl<'a> FoldingContext<'a> {
         match journal
             .borrow_mut()
             .observe_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Attach a composite statement's implicit effects without duplicating an
+    /// exact effect marker already carried by one of its child statements.
+    pub(crate) fn observe_composite_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_composite_effect_stmt(obligation_ids, stmt)
         {
             Ok(marked) => marked,
             Err(error) => {

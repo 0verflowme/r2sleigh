@@ -918,6 +918,7 @@ impl BindingPlan {
                     base,
                     offset,
                     size,
+                    array_layout,
                     source_slot,
                     callee_allocation,
                 } => Some((
@@ -926,6 +927,7 @@ impl BindingPlan {
                     *base,
                     *offset,
                     *size,
+                    array_layout.clone(),
                     *source_slot,
                     callee_allocation.clone(),
                 )),
@@ -941,7 +943,7 @@ impl BindingPlan {
                 },
             ));
         }
-        for (entity, object, base, offset, size, source_slot, callee_allocation) in
+        for (entity, object, base, offset, size, array_layout, source_slot, callee_allocation) in
             expected_stack_objects
         {
             let exact_certificate = source.certificates().stack_slots.get(&object);
@@ -950,6 +952,7 @@ impl BindingPlan {
                     || certificate.base != base
                     || certificate.offset != offset
                     || certificate.size != size
+                    || certificate.array_layout != array_layout
                     || certificate.source_slot != source_slot
                     || certificate.callee_allocation != callee_allocation
             }) {
@@ -1094,14 +1097,23 @@ impl BindingPlan {
                 (Some(source_slot), None)
                     if source_slot.base() != base
                         || source_slot.offset() != offset
-                        || size != Some(source_slot.size_bytes()) =>
+                        || size != Some(source_slot.size_bytes())
+                            && !matches!(
+                                &array_layout,
+                                r2ssa::StackArrayLayoutDisposition::Proven(layout)
+                                    if layout.object == object
+                                        && u32::try_from(layout.extent).ok() == size
+                                        && (source_slot.size_bytes()
+                                            == layout.element_width
+                                            || Some(source_slot.size_bytes()) == size)
+                            ) =>
                 {
                     StackObjectDisposition::Refused {
                         reason: StackObjectRefusal::MissingSourceIdentity { object },
                     }
                 }
                 (Some(source_slot), None) => {
-                    let size_bytes = source_slot.size_bytes();
+                    let size_bytes = size.expect("source stack object has certified geometry");
                     let Some(width_bits) = size_bytes.checked_mul(8).filter(|width| *width > 0)
                     else {
                         let expected = StackObjectDisposition::Refused {
