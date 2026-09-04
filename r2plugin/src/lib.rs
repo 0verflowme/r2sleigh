@@ -1997,17 +1997,29 @@ struct SleighLanguage {
     /// so ARM32 stays "ARM" across all four A32/Thumb x LE/BE languages; the
     /// language actually chosen is reported by its selector key instead.
     name: &'static str,
+    /// The canonical thread-owned profile when this exact bundle is trusted.
+    shared_profile: Option<TrustedSleighProfile>,
 }
 
 impl SleighLanguage {
-    fn from_profile(profile: TrustedSleighProfile) -> Self {
+    fn shared(profile: TrustedSleighProfile) -> Self {
         let (sla, pspec, name) = profile.specification();
-        Self { sla, pspec, name }
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: Some(profile),
+        }
     }
 
     #[cfg(any(feature = "arm", feature = "mips"))]
     fn analysis_only(sla: &'static [u8], pspec: &'static str, name: &'static str) -> Self {
-        Self { sla, pspec, name }
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: None,
+        }
     }
 }
 
@@ -2021,20 +2033,16 @@ fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
     let language = match arch {
         #[cfg(feature = "x86")]
         "x86-64" | "x86_64" | "x64" | "amd64" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::X86_64)
+            SleighLanguage::shared(TrustedSleighProfile::X86_64)
         }
         #[cfg(feature = "x86")]
-        "x86" | "x86-32" | "i386" | "i686" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::X86)
-        }
+        "x86" | "x86-32" | "i386" | "i686" => SleighLanguage::shared(TrustedSleighProfile::X86),
         // ARM32. `ARMt.pspec` sets TMode=0 (A32) and `ARMtTHUMB.pspec` sets
         // TMode=1 (Thumb); `ARMCortex.pspec` also sets TMode=1 and plants a
         // Cortex-M vector table over ram:0x0-0x40, so it is only ever right for
         // a Cortex-M image and never for Linux/Android userland.
         #[cfg(feature = "arm")]
-        "arm" | "arm32" | "arm-le" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::ArmCortexLe)
-        }
+        "arm" | "arm32" | "arm-le" => SleighLanguage::shared(TrustedSleighProfile::ArmCortexLe),
         #[cfg(feature = "arm")]
         "armbe" | "arm-be" | "armeb" => SleighLanguage::analysis_only(
             sleigh_config::processor_arm::SLA_ARM8_BE,
@@ -2055,7 +2063,7 @@ fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
         ),
         #[cfg(feature = "arm")]
         "arm64" | "arm64e" | "aarch64" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::Aarch64AppleSilicon)
+            SleighLanguage::shared(TrustedSleighProfile::Aarch64AppleSilicon)
         }
         #[cfg(feature = "arm")]
         "arm64be" | "aarch64be" | "aarch64_be" => SleighLanguage::analysis_only(
@@ -2065,11 +2073,11 @@ fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
         ),
         #[cfg(feature = "mips")]
         "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::Mips32Be)
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Be)
         }
         #[cfg(feature = "mips")]
         "mipsel" | "mips32le" | "mips32el" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::Mips32Le)
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Le)
         }
         // MIPS Release 6 dropped and re-encoded instructions the pre-R6
         // languages still accept, so R6 needs its own slaspec.
@@ -2086,17 +2094,13 @@ fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
             "mips32r6le",
         ),
         #[cfg(feature = "mips")]
-        "mips64" | "mips64be" => SleighLanguage::from_profile(TrustedSleighProfile::Mips64Be),
+        "mips64" | "mips64be" => SleighLanguage::shared(TrustedSleighProfile::Mips64Be),
         #[cfg(feature = "mips")]
-        "mips64el" | "mips64le" => SleighLanguage::from_profile(TrustedSleighProfile::Mips64Le),
+        "mips64el" | "mips64le" => SleighLanguage::shared(TrustedSleighProfile::Mips64Le),
         #[cfg(feature = "riscv")]
-        "riscv64" | "rv64" | "rv64gc" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::RiscV64Gc)
-        }
+        "riscv64" | "rv64" | "rv64gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV64Gc),
         #[cfg(feature = "riscv")]
-        "riscv32" | "rv32" | "rv32gc" => {
-            SleighLanguage::from_profile(TrustedSleighProfile::RiscV32Gc)
-        }
+        "riscv32" | "rv32" | "rv32gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV32Gc),
         _ => return None,
     };
     Some(language)
@@ -2140,19 +2144,15 @@ fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), 
             )
         });
     };
-    // Both from one parse. These were two separate loads of the same compiled
-    // `.sla` -- `build_arch_spec` parsed it for the architecture and `from_sla`
-    // parsed it again for the disassembler -- and the trusted lift path parsed
-    // it a third time. At 58 to 91 milliseconds a parse that was most of what
-    // creating an `R2ILContext` cost.
-    // Both from one load. These were two separate parses of the same compiled
-    // `.sla` -- `build_arch_spec` for the architecture and `from_sla` for the
-    // disassembler -- at 84 to 295 milliseconds each, which was most of what
-    // creating an `R2ILContext` cost. One load handed to one caller is safe
-    // where sharing an instance between callers is not: nothing else can see a
-    // decode this one caches.
-    r2sleigh_lift::embedded_arch_and_disassembler(lang.sla, lang.pspec, lang.name)
-        .map_err(|e| e.to_string())
+    // Trusted embedded profiles have one thread-owned parse shared with the
+    // certifying lift path. Analysis-only language variants still get one cold
+    // load for their architecture and disassembler pair. Both paths retain the
+    // processor spec's exact program-counter declaration.
+    match lang.shared_profile {
+        Some(profile) => Disassembler::shared_arch_and_disassembler(profile),
+        None => r2sleigh_lift::embedded_arch_and_disassembler(lang.sla, lang.pspec, lang.name),
+    }
+    .map_err(|e| e.to_string())
 }
 
 // Symbolic execution and CFG surfaces are implemented under r2plugin/src/analysis/.
@@ -6855,6 +6855,72 @@ mod integration_tests {
 
         drop_test_ffi_string(profile_ptr);
         drop_test_context(ctx_ptr);
+    }
+
+    #[test]
+    #[cfg(feature = "x86")]
+    fn context_and_trusted_lift_share_one_profile_in_either_order() {
+        for context_first in [true, false] {
+            std::thread::spawn(move || {
+                let arch = CString::new("x86-64").expect("architecture name");
+                let (ctx_ptr, trusted) = if context_first {
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile after context");
+                    (ctx_ptr, trusted)
+                } else {
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile before context");
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    (ctx_ptr, trusted)
+                };
+
+                assert!(!ctx_ptr.is_null(), "context must initialize");
+                let context = unsafe { &*ctx_ptr };
+                let analysis = context.disasm.as_ref().expect("analysis disassembler");
+                assert!(
+                    analysis.shares_loaded_specification(&trusted),
+                    "both initialization orders must reach the same parsed profile"
+                );
+
+                let mut bytes = vec![0x90];
+                bytes.resize(16, 0);
+                assert!(
+                    analysis.lift_genuine_block(&bytes, 0x1000, 1).is_err(),
+                    "the C context must remain non-certifying"
+                );
+                assert!(
+                    trusted.lift_genuine_block(&bytes, 0x1000, 1).is_ok(),
+                    "the source-owned view must retain certifying authority"
+                );
+                drop_test_context(ctx_ptr);
+            })
+            .join()
+            .expect("profile ownership test thread");
+        }
+    }
+
+    /// Records cold and repeated `R2ILContext` construction separately. The
+    /// wall clock is evidence for profile sharing, not a CI bound.
+    #[test]
+    #[cfg(feature = "x86")]
+    #[ignore = "measurement, not a gate"]
+    fn r2il_context_creation_cost() {
+        let arch = CString::new("x86-64").expect("architecture name");
+        for round in 0..6 {
+            let started = std::time::Instant::now();
+            let context = r2il_arch_init(arch.as_ptr());
+            let elapsed = started.elapsed();
+            assert!(!context.is_null());
+            assert_eq!(r2il_is_loaded(context), 1);
+            eprintln!(
+                "round {round}: R2ILContext creation = {}us",
+                elapsed.as_micros()
+            );
+            drop_test_context(context);
+        }
     }
 
     #[test]

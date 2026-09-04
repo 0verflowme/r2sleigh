@@ -67,12 +67,17 @@ codegen-units = 1
 #                           names, which `SleighBase` already keeps and nothing
 #                           reached.
 #   mnemonikr/libsla#18     the safe passthrough over it.
+#   mnemonikr/libsla-sys#9  resets the address-keyed parser cache while keeping
+#                           the decoded Sleigh specification.
+#   mnemonikr/libsla#19     the safe passthrough over that reset.
 #
 # A `CALLOTHER` carries only the index of the operation it invokes, and that
 # index is assigned by the compiled specification and moves with it, so nothing
-# here can identify an operation without those names. Both branches are the
-# exact diffs on those pull requests. Drop this block for the released crates
-# once they land.
+# here can identify an operation without those names. A parsed instruction is
+# cached only by address, so sharing one loaded specification is correct only
+# when that cache is reset before another byte source can be observed. Both
+# branches combine the exact diffs on those pull requests. Drop this block for
+# the released crates once they land.
 [patch.crates-io]
-libsla = { git = "https://github.com/0verflowme/libsla.git", branch = "user-op-names" }
-libsla-sys = { git = "https://github.com/0verflowme/libsla-sys.git", branch = "expose-user-op-names" }
+libsla = { git = "https://github.com/0verflowme/libsla.git", branch = "user-op-names-clear-cache" }
+libsla-sys = { git = "https://github.com/0verflowme/libsla-sys.git", branch = "expose-user-op-names-clear-cache" }
