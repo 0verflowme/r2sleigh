@@ -5060,9 +5060,11 @@ impl Decompiler {
         );
         c_function.extern_objects = used_objects.into_inner().into_values().collect();
 
-        if let Err(error) =
-            single_evaluation::bind_each_call_site_once(&mut c_function, &binding_names)
-        {
+        if let Err(error) = single_evaluation::bind_each_call_site_once(
+            &mut c_function,
+            &binding_names,
+            structured_regions.as_ref(),
+        ) {
             debug_log_render_contract_error(prepared, "single-evaluation", &error);
             let refusal = DecompileRenderRefusal::MissingProgramVariableAuthorization;
             return Ok(InternalBuildProduct::refused(
