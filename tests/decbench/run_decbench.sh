@@ -511,6 +511,16 @@ export RUSTUP_HOME=/root/.rustup
 # temporary directory it deletes, so the binary's own parent does not survive.
 export R2SLEIGH_REFUSAL_CENSUS_DIR="$REMOTE/results"
 mkdir -p "$REMOTE/results"
+# Deploy this tree's decompiler adapter over the installed one. decbench
+# resolves `-d r2sleigh` through its own package, not through the tree we sync,
+# so without this the benchmark measures whatever copy was last placed there by
+# hand -- and it silently kept running a four-day-old adapter while every change
+# to it in this repository appeared to do nothing at all.
+adapter=/root/decbench/decbench/decompilers/raw/r2sleigh_raw.py
+if ! cmp -s "$REMOTE/tree/tests/decbench/r2sleigh_raw.py" "$adapter"; then
+    cp "$REMOTE/tree/tests/decbench/r2sleigh_raw.py" "$adapter"
+    echo "deployed this tree's r2sleigh adapter"
+fi
 cd /root/decbench
 cmd=(./venv/bin/python "$REMOTE/tree/tests/decbench/decbench_cli.py" run "projects/sailr/$PROJECT.toml")
 for opt in "${opts[@]}"; do cmd+=(-O "$opt"); done
