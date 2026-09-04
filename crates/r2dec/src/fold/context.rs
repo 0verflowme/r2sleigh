@@ -118,16 +118,6 @@ pub(crate) struct FoldingContext<'a> {
     /// answers every question about that block, and it is rebuilt when the walk
     /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
-    /// Set while an operation is lowered to stand as an expression at the place
-    /// its result is read, rather than as its own statement.
-    ///
-    /// Statement lowering spells a left-hand side before it builds the
-    /// right-hand side, and an inlined value has no left-hand side to spell --
-    /// the binding plan gave it no symbol precisely because it is written
-    /// nowhere. Under this flag the left-hand side is not asked for and the
-    /// assignment collapses to the expression alone, so both forms come out of
-    /// one body and cannot drift apart.
-    pub(crate) inlined_definition: Cell<bool>,
     /// What the right-hand side of the assignment being lowered has.
     ///
     /// The operation's lowering states it when it spells the assignment,
@@ -205,7 +195,6 @@ impl<'a> FoldingContext<'a> {
             current_block_addr: Cell::new(None),
             current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
-            inlined_definition: Cell::new(false),
             pending_assignment_type: Cell::new(None),
             #[cfg(test)]
             inlined_renderings: std::cell::RefCell::new(HashMap::new()),

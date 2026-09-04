@@ -4,7 +4,7 @@ mod fixture;
 
 use fixture::{RAX, RDI, RSI, artifact, konst, projection, reg, tmp, value_named};
 use r2il::R2ILOp;
-use r2rewrite::{Multiplicity, TermKind, canonicalize};
+use r2rewrite::{Multiplicity, TermKind, canonicalize, canonicalize_with};
 
 fn ret() -> R2ILOp {
     R2ILOp::Return {
@@ -321,7 +321,26 @@ fn a_signed_branch_on_flags_becomes_a_comparison_through_the_difference_by_name(
         ret(),
     ]);
     let projection = projection(&artifact);
-    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+    // Production admits expansion by membership in the binding plan's settled
+    // inline set. In particular the sign and borrow flags have to be admitted
+    // together before this rule can see the machine comparison shape; the
+    // default policy would expand their single-reader definitions regardless
+    // and would not exercise that contract.
+    let inlinable = [
+        "tmp:200_1",
+        "tmp:300_1",
+        "tmp:400_1",
+        "tmp:500_1",
+        "tmp:600_1",
+        "tmp:700_1",
+    ]
+    .into_iter()
+    .map(|name| value_named(&artifact, name))
+    .collect::<std::collections::BTreeSet<_>>();
+    let roots = canonicalize_with(&artifact, &projection, &|query| {
+        inlinable.contains(&query.value)
+    })
+    .expect("canonical roots under the production expansion policy");
     let difference = roots
         .value(value_named(&artifact, "tmp:100_1"))
         .expect("difference");

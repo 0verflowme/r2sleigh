@@ -1864,12 +1864,9 @@ fn binding_observation_journal_failure_json(
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
             cause.insert("instruction_id".to_string(), serde_json::json!(at.0));
         }
-        Failure::InvalidPlannedInline { value, expr_index } => {
+        Failure::InvalidPlannedInline { value, term_index } => {
             cause.insert("value_id".to_string(), serde_json::json!(value.0));
-            cause.insert(
-                "expression_index".to_string(),
-                serde_json::json!(expr_index),
-            );
+            cause.insert("term_index".to_string(), serde_json::json!(term_index));
         }
         Failure::InvalidUse { site }
         | Failure::RefusedRenderedUse { site }
@@ -4326,7 +4323,7 @@ mod tests {
             Failure::MissingPlannedValue { value },
             Failure::InvalidPlannedInline {
                 value,
-                expr_index: 66,
+                term_index: 66,
             },
             Failure::ExactUseRequiresRenderedOccurrence { site },
             Failure::ExactWriteRequiresRenderedOccurrence { inst },
@@ -4783,7 +4780,7 @@ mod tests {
             (
                 Failure::InvalidPlannedInline {
                     value: r2ssa::ValueId(35),
-                    expr_index: 36,
+                    term_index: 36,
                 },
                 "invalid_planned_inline",
             ),

@@ -186,6 +186,34 @@ fn a_constant_operand_is_a_literal_and_a_division_is_opaque() {
 }
 
 #[test]
+fn a_definitionless_constant_has_a_canonical_value_term() {
+    let artifact = artifact(vec![R2ILOp::Return {
+        target: konst(0xfeed, 8),
+    }]);
+    let projection = projection(&artifact);
+    let graph = artifact.graph();
+    let inst = graph
+        .inst_id_for_op_site(0x1000, 0)
+        .expect("return instruction");
+    let constant = graph.inst(inst).expect("return graph instruction").inputs[0];
+    let roots = canonicalize(&artifact, &projection).expect("canonical roots");
+
+    assert!(
+        roots.import().value(constant).is_none(),
+        "a value without a defining entity is not an imported root"
+    );
+    let canonical = roots
+        .value(constant)
+        .expect("the dense value table still owns its canonical literal");
+    let TermKind::Literal(bits) = roots.arena().term(canonical.canonical).kind else {
+        panic!("definitionless constant must canonicalise as a literal");
+    };
+    assert_eq!(bits.bits(), 0xfeed);
+    assert_eq!(canonical.multiplicity, Multiplicity::Any);
+    assert!(canonical.discharges.is_empty());
+}
+
+#[test]
 fn canonicalisation_is_deterministic() {
     let artifact = artifact(vec![
         R2ILOp::IntAdd {

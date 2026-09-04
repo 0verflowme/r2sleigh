@@ -9,9 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::CType;
 use r2ssa::span::SpanId;
 use r2ssa::{
-    InstId, MachineExprId, MachineExprKind, MachineProjection, MachineUseDisposition,
-    MachineWriteDisposition, MachineWriteProjection, SemanticId, SsaArtifactAuthority, UseSite,
-    ValueId,
+    InstId, MachineExprKind, MachineProjection, MachineUseDisposition, MachineWriteDisposition,
+    MachineWriteProjection, SemanticId, SsaArtifactAuthority, UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -105,7 +104,7 @@ impl Binding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InlineProof {
     authority: SsaArtifactAuthority,
-    literal: MachineExprId,
+    term: r2rewrite::TermId,
 }
 
 /// Proof that an exact upstream fact authorizes a value to have no rendered C
@@ -162,7 +161,7 @@ pub(crate) enum ValueDisposition {
         binding: BindingId,
     },
     Inline {
-        expr: MachineExprId,
+        term: r2rewrite::TermId,
         proof: InlineProof,
     },
     Elided {
@@ -1263,9 +1262,9 @@ impl r2rewrite::RenderTypes for BindingPlan {
         }
     }
 
-    fn inline_root(&self, value: ValueId) -> Option<MachineExprId> {
+    fn inline_root(&self, value: ValueId) -> Option<r2rewrite::TermId> {
         match self.disposition(value)? {
-            ValueDisposition::Inline { expr, .. } => Some(*expr),
+            ValueDisposition::Inline { term, .. } => Some(*term),
             _ => None,
         }
     }
@@ -1275,8 +1274,9 @@ impl BindingPlan {
     /// What every rendered expression has and what every operator requires
     /// of its operands, from the projection and this plan's declarations.
     pub(crate) fn typed_boundaries(&self) -> &r2rewrite::TypedBoundaries {
-        self.typed
-            .get_or_init(|| r2rewrite::typed_boundaries(&self.machine_projection, self))
+        self.typed.get_or_init(|| {
+            r2rewrite::typed_boundaries(&self.machine_projection, self.canonical.arena(), self)
+        })
     }
 }
 

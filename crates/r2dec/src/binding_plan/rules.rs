@@ -199,12 +199,12 @@ pub(super) fn parameter_width(
 /// obligation ledger records as structurally unused, and the target of a direct
 /// call, which the call expression spells as the callee's name. A binding for
 /// one of those would be a second answer about the same value.
+#[cfg(test)]
 pub(super) fn component_eligible_values(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
 ) -> Result<Vec<bool>, BindingPlanBuildError> {
-    let inlinable = inlinable_values(source_owned, projection);
-    component_eligible_with(source_owned, projection, &inlinable)
+    Ok(rewrite_inlining_partition(source_owned, projection)?.component_eligible)
 }
 
 /// The same answer from a stated inlining decision.
@@ -633,10 +633,27 @@ pub(super) fn set_outlives_a_redefinition(graph: &SsaGraph, members: &BTreeSet<V
 /// That was seventy-two per cent of a render on `xxhash32`. The projection is
 /// derived from the artifact and is the same object either way; deriving it
 /// again is not a second opinion, only the same answer at a cost.
-pub(super) fn inlinable_values(
+pub(super) struct RewriteInliningPartition {
+    pub(super) canonical: r2rewrite::CanonicalRoots,
+    pub(super) inlinable: BTreeSet<ValueId>,
+    pub(super) component_eligible: Vec<bool>,
+}
+
+/// Compute producer expansion, expression inlining, and binding membership as
+/// one bounded fixed point.
+///
+/// Pass one imports without absorbing producers. That is enough to decide
+/// whether each value's own canonical root has a C form, without feeding a
+/// binding decision back into the rewriter. The existing conservative
+/// singleton partition then admits only bound literals that cannot orphan a
+/// coalesced object. Pass two canonicalises once with that settled inlining set
+/// as the expansion policy and derives the final component eligibility from the
+/// same set. Every lookup is indexed; each pass is linear in the machine and
+/// term arenas apart from the existing ordered component lookups.
+pub(super) fn rewrite_inlining_partition(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
-) -> BTreeSet<ValueId> {
+) -> Result<RewriteInliningPartition, BindingPlanBuildError> {
     // Two passes, in a stated order, and no iteration.
     //
     // The gate below turns away a literal that lives in a register because
@@ -664,24 +681,36 @@ pub(super) fn inlinable_values(
     // is also unsound: excluding a value removes it from the member set
     // `merge_would_interfere` reads, so it can remove the interference
     // blocking a merge and make a component *grow*.
-    let conservative = inlinable_core(source_owned, projection, &BTreeSet::new());
-    let Ok(eligible) = component_eligible_with(source_owned, projection, &conservative) else {
-        return conservative;
-    };
-    let Ok(components) = super::construction::binding_components_with(source_owned, &eligible)
-    else {
-        return conservative;
-    };
+    let source = source_owned.source();
+    let seed_canonical = r2rewrite::canonicalize_with(source, projection, &|_| false)
+        .map_err(BindingPlanBuildError::Canonicalisation)?;
+    let conservative = inlinable_core(source_owned, projection, &seed_canonical, &BTreeSet::new());
+    let eligible = component_eligible_with(source_owned, projection, &conservative)?;
+    let components = super::construction::binding_components_with(source_owned, &eligible)?;
     let alone = components
         .iter()
         .filter(|component| component.members.len() == 1)
         .filter_map(|component| component.members.first().copied())
         .collect::<BTreeSet<_>>();
     let admitted = duplicable_bound_literals(projection, source_owned, &alone);
-    if admitted.is_empty() {
-        return conservative;
-    }
-    inlinable_core(source_owned, projection, &admitted)
+    let inlinable = if admitted.is_empty() {
+        conservative
+    } else {
+        inlinable_core(source_owned, projection, &seed_canonical, &admitted)
+    };
+    let component_eligible = component_eligible_with(source_owned, projection, &inlinable)?;
+    let canonical =
+        r2rewrite::canonicalize_with(source, projection, &|query: &r2rewrite::ExpansionQuery<
+            '_,
+        >| {
+            term_absorbs_producer(&inlinable, query)
+        })
+        .map_err(BindingPlanBuildError::Canonicalisation)?;
+    Ok(RewriteInliningPartition {
+        canonical,
+        inlinable,
+        component_eligible,
+    })
 }
 
 /// Whether a reader's term may absorb the producer of `value`.
@@ -823,6 +852,7 @@ fn frame_object_address_replacement(
 fn inlinable_core(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
+    canonical: &r2rewrite::CanonicalRoots,
     admitted: &BTreeSet<ValueId>,
 ) -> BTreeSet<ValueId> {
     let source = source_owned.source();
@@ -960,7 +990,10 @@ fn inlinable_core(
         let renderable = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
-            .is_some_and(|expr| expression_renders_inline(expr.kind()));
+            .is_some_and(|expr| expression_renders_inline(expr.kind()))
+            && canonical.value(value.id).is_some_and(|value| {
+                term_renders_inline(&canonical.arena().term(value.canonical).kind)
+            });
         if !renderable {
             rejected(&format!(
                 "expression kind does not render inline: {root_kind}"
@@ -1176,6 +1209,37 @@ fn expression_renders_inline(kind: &r2ssa::MachineExprKind) -> bool {
             | Kind::Negate { .. }
             | Kind::Select { .. }
             | Kind::Shift { .. }
+            | Kind::Cast { .. }
+            | Kind::Extract { .. }
+            | Kind::Concat { .. }
+            | Kind::ArithmeticFlag { .. }
+    )
+}
+
+/// The canonical forms admitted by `expression_renders_inline`.
+///
+/// Keep this list identical to `materialize_term`. A machine `Copy` imports as
+/// its child and the three unary machine kinds import as the corresponding
+/// unary term kinds, so the two enums do not have identical spellings.
+fn term_renders_inline(kind: &r2rewrite::TermKind) -> bool {
+    use r2rewrite::TermKind as Kind;
+    matches!(
+        kind,
+        Kind::Leaf(_)
+            | Kind::Literal(_)
+            | Kind::Arithmetic { .. }
+            | Kind::Negate(_)
+            | Kind::Bitwise { .. }
+            | Kind::BitwiseNot(_)
+            | Kind::Boolean { .. }
+            | Kind::BooleanNot(_)
+            | Kind::Compare { .. }
+            | Kind::Cast { .. }
+            | Kind::Extract { .. }
+            | Kind::Concat { .. }
+            | Kind::Select { .. }
+            | Kind::Shift { .. }
+            | Kind::Flag { .. }
     )
 }
 

@@ -68,7 +68,35 @@ impl<'a> FoldingContext<'a> {
         let (replaced, frame_address) = match source {
             ReplacementSource::RenderedValue => (Vec::new(), None),
             ReplacementSource::PlannedInline => {
-                (prepared.graph().def_inst(value).into_iter().collect(), None)
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(rewrite) = names.plan().canonical().value(value) else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let mut replaced = prepared
+                    .graph()
+                    .def_inst(value)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                for id in &rewrite.discharges {
+                    let Some(inst) = (match id.site {
+                        r2ssa::CanonicalInstructionSite::Op(ordinal) => {
+                            usize::try_from(ordinal).ok().and_then(|op_idx| {
+                                prepared.graph().inst_id_for_op_site(id.block_addr, op_idx)
+                            })
+                        }
+                        r2ssa::CanonicalInstructionSite::Phi(_)
+                        | r2ssa::CanonicalInstructionSite::NativeSpan { .. } => None,
+                    }) else {
+                        self.retain_first_observation_error(invalid());
+                        return expr;
+                    };
+                    replaced.insert(inst);
+                }
+                (replaced.into_iter().collect(), None)
             }
             ReplacementSource::CanonicalAccess(access) => {
                 let Some(names) = self.inputs.binding_names else {
@@ -389,57 +417,6 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    /// Render a machine expression as the C expression it stands for.
-    ///
-    /// A value the plan marks inline is rendered where it is read rather than in
-    /// a statement of its own, and until this existed the only expression that
-    /// could be was a literal. Everything else answered `InvalidPlannedInline`,
-    /// which is why a comparison's flag reached the reader as
-    /// `ZF_1 = (a - b) == 0; if (!ZF_1)` and why a chain of machine temporaries
-    /// each got a name.
-    ///
-    /// A `Source` leaf is where the recursion leaves the machine and re-enters
-    /// the plan: it names another value, and what that value renders as is the
-    /// plan's answer, not this function's. Anything the plan has not settled, or
-    /// an expression deeper than a rendered expression has any business being,
-    /// refuses rather than guesses.
-    /// The expression the operation lowering itself produces for a value's
-    /// definition, so that a folded value renders exactly as it would have
-    /// rendered in its own statement.
-    ///
-    /// Deriving the expression a second time over the machine arena was the
-    /// earlier approach, and it disagreed with this one about signedness: the
-    /// arena's `interpretation` records how a value is later read, not how the
-    /// defining operation computes it, so a signed comparison came back
-    /// unsigned and folded into a test that is never true.
-    ///
-    /// Lowering in expression mode at the definition's own site also gives the
-    /// operands their ordinary observations, which is what authorises reads
-    /// that now sit nested inside another statement.
-    fn inlined_definition_expr(&self, definition: r2ssa::InstId) -> Option<CExpr> {
-        let prepared = self.inputs.prepared_ssa?;
-        let (block_addr, op_idx) = prepared.inst_op_site(definition)?;
-        // The operation being lowered right now cannot render itself: asking
-        // for its own output as an expression is how a statement spells its
-        // left-hand side, and re-entering would observe its operands twice.
-        if self.current_block_addr.get() == Some(block_addr)
-            && self.current_op_idx.get() == Some(op_idx)
-        {
-            return None;
-        }
-        let site = self.normalized_site(block_addr, op_idx)?;
-        let op = prepared.function().get_block(block_addr)?.ops.get(op_idx)?;
-        let previous_block = self.current_block_addr.replace(Some(block_addr));
-        let previous_op = self.current_op_idx.replace(Some(op_idx));
-        let frame = super::LowerFrame::for_observed_expr(Some(site));
-        let previous_inlined = self.inlined_definition.replace(true);
-        let lowered = self.op_to_expr_impl(op, &frame);
-        self.inlined_definition.set(previous_inlined);
-        self.current_block_addr.set(previous_block);
-        self.current_op_idx.set(previous_op);
-        lowered.ok().flatten()
-    }
-
     /// The type the plan declares for a value, if it declares one.
     pub(super) fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
         let names = self.inputs.binding_names?;
@@ -455,6 +432,7 @@ impl<'a> FoldingContext<'a> {
         &self,
         names: &crate::binding_plan::BindingNameResolution,
         value: ValueId,
+        term: r2rewrite::TermId,
         expr: r2ssa::MachineExprId,
         depth: u32,
     ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
@@ -462,12 +440,12 @@ impl<'a> FoldingContext<'a> {
         let invalid =
             || crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
                 value,
-                expr,
+                term,
             };
-        if depth > 16 {
+        if depth as usize > names.plan().machine_projection().arena().len() {
             return Err(invalid());
         }
-        let Some(machine_expr) = names.inline_expr(expr) else {
+        let Some(machine_expr) = names.plan().machine_projection().expr(expr) else {
             return Err(invalid());
         };
         // Every operand crosses the boundary its operator states for it,
@@ -480,7 +458,7 @@ impl<'a> FoldingContext<'a> {
             CExpr,
             crate::observation_journal::LegacyObservationJournalError,
         > {
-            let rendered = self.materialize_machine_expr(names, value, id, depth + 1)?;
+            let rendered = self.materialize_machine_expr(names, value, term, id, depth + 1)?;
             Ok(match typed.required(expr, index) {
                 Some(required) => self.convert_from(rendered, typed.produced(id), required),
                 None => rendered,
@@ -597,6 +575,203 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
+    /// Render the rewriter's canonical term for one planned inline value.
+    ///
+    /// This is deliberately paired with `expression_renders_inline`: every
+    /// admitted modeled machine kind imports to one of these arms. A leaf is
+    /// the only escape back to the machine arena, where the existing value path
+    /// accounts for the exact source value it names.
+    fn materialize_term(
+        &self,
+        names: &crate::binding_plan::BindingNameResolution,
+        value: ValueId,
+        term: r2rewrite::TermId,
+        depth: u32,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        use r2rewrite::TermKind as Kind;
+        let invalid =
+            || crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                value,
+                term,
+            };
+        let canonical = names.plan().canonical();
+        let arena = canonical.arena();
+        if depth as usize > arena.len() {
+            return Err(invalid());
+        }
+        let node = arena.term(term);
+        let typed = names.plan().typed_boundaries();
+        let child = |index: usize,
+                     id: r2rewrite::TermId|
+         -> Result<
+            CExpr,
+            crate::observation_journal::LegacyObservationJournalError,
+        > {
+            let rendered = self.materialize_term(names, value, id, depth + 1)?;
+            Ok(match typed.term_required(term, index) {
+                Some(required) => self.convert_from(rendered, typed.term_produced(id), required),
+                None => rendered,
+            })
+        };
+        let literal = |bits: u64| {
+            if bits > i64::MAX as u64 {
+                CExpr::UIntLit(bits)
+            } else {
+                CExpr::IntLit(bits as i64)
+            }
+        };
+        Ok(match node.kind {
+            Kind::Leaf(expr) => {
+                self.materialize_machine_expr(names, value, term, expr, depth + 1)?
+            }
+            Kind::Literal(bits) => literal(bits.bits()),
+            Kind::Arithmetic { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineArithmeticOp::Add => BinaryOp::Add,
+                    r2ssa::MachineArithmeticOp::Subtract => BinaryOp::Sub,
+                    r2ssa::MachineArithmeticOp::Multiply => BinaryOp::Mul,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::Negate(input) => CExpr::unary(UnaryOp::Neg, child(0, input)?),
+            Kind::Bitwise { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBitwiseOp::And => BinaryOp::BitAnd,
+                    r2ssa::MachineBitwiseOp::Or => BinaryOp::BitOr,
+                    r2ssa::MachineBitwiseOp::Xor => BinaryOp::BitXor,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::BitwiseNot(input) => CExpr::unary(UnaryOp::BitNot, child(0, input)?),
+            Kind::Boolean { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBooleanOp::And => BinaryOp::And,
+                    r2ssa::MachineBooleanOp::Or => BinaryOp::Or,
+                    r2ssa::MachineBooleanOp::Xor => BinaryOp::Ne,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::BooleanNot(input) => CExpr::unary(UnaryOp::Not, child(0, input)?),
+            Kind::Compare {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineComparisonOp::Equal => BinaryOp::Eq,
+                    r2ssa::MachineComparisonOp::NotEqual => BinaryOp::Ne,
+                    r2ssa::MachineComparisonOp::LessThan => BinaryOp::Lt,
+                    r2ssa::MachineComparisonOp::LessThanOrEqual => BinaryOp::Le,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::Cast { input, .. } => {
+                let rendered = child(0, input)?;
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                else {
+                    return Err(invalid());
+                };
+                let from = typed
+                    .term_required(term, 0)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                self.convert_from(rendered, from.as_ref(), produced)
+            }
+            Kind::Extract { input, lsb_bits } => {
+                let rendered = child(0, input)?;
+                let shifted = if lsb_bits == 0 {
+                    rendered
+                } else {
+                    CExpr::binary(BinaryOp::Shr, rendered, CExpr::IntLit(i64::from(lsb_bits)))
+                };
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                else {
+                    return Err(invalid());
+                };
+                CExpr::cast(produced.clone(), shifted)
+            }
+            Kind::Concat { high, low } => {
+                let low_width = arena.term(low).width_bits();
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                    .cloned()
+                else {
+                    return Err(invalid());
+                };
+                let high_required = typed
+                    .term_required(term, 0)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                let low_required = typed
+                    .term_required(term, 1)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                let high = self.convert_from(child(0, high)?, high_required.as_ref(), &produced);
+                let low = self.convert_from(child(1, low)?, low_required.as_ref(), &produced);
+                CExpr::binary(
+                    BinaryOp::BitOr,
+                    CExpr::binary(BinaryOp::Shl, high, CExpr::IntLit(i64::from(low_width))),
+                    low,
+                )
+            }
+            Kind::Select {
+                condition,
+                if_true,
+                if_false,
+            } => CExpr::Ternary {
+                cond: Box::new(child(0, condition)?),
+                then_expr: Box::new(child(1, if_true)?),
+                else_expr: Box::new(child(2, if_false)?),
+            },
+            Kind::Shift {
+                kind,
+                value: shifted,
+                count,
+                ..
+            } => CExpr::binary(
+                match kind {
+                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                    r2ssa::MachineShiftKind::LogicalRight
+                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                },
+                child(0, shifted)?,
+                child(1, count)?,
+            ),
+            Kind::Flag { op, left, right } => {
+                let width = arena.term(left).width_bits();
+                if arena.term(right).width_bits() != width
+                    || !matches!(width, 8 | 16 | 32 | 64 | 128)
+                {
+                    return Err(invalid());
+                }
+                let operation = match op {
+                    r2ssa::MachineArithmeticFlagOp::UnsignedCarry => "carry",
+                    r2ssa::MachineArithmeticFlagOp::SignedCarry => "scarry",
+                    r2ssa::MachineArithmeticFlagOp::SignedBorrow => "sborrow",
+                };
+                CExpr::call(
+                    CExpr::External {
+                        name: format!("r2sleigh_int_{operation}_{width}"),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    },
+                    vec![child(0, left)?, child(1, right)?],
+                )
+            }
+            Kind::Opaque(_)
+            | Kind::Variable(_)
+            | Kind::Load { .. }
+            | Kind::Subscript { .. }
+            | Kind::ObjectAddress(_) => return Err(invalid()),
+        })
+    }
+
     pub(crate) fn planned_value_expr(
         &self,
         value: ValueId,
@@ -617,77 +792,21 @@ impl<'a> FoldingContext<'a> {
                     CExpr::Var(symbol),
                 )))
             }
-            Ok(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => {
-                let Some(machine_expr) = names.inline_expr(expr) else {
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(term)) => {
+                let valid = names
+                    .plan()
+                    .canonical()
+                    .value(value)
+                    .is_some_and(|canonical| canonical.canonical == term);
+                if !valid {
                     return Err(
                         crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
                             value,
-                            expr,
+                            term,
                         },
                     );
-                };
-                // A literal still owes its cells. Returning it straight to the
-                // caller skipped every observation the value and its defining
-                // instruction owe, so a copy of a constant -- `tmp = 0xcc9e2d51`
-                // in `murmur3_32` -- folded into its use and left the effect it
-                // answered for with no rendered occurrence anywhere.
-                let literal = match machine_expr.kind() {
-                    r2ssa::MachineExprKind::Constant { binding, value: literal } => {
-                        if binding.value() != value {
-                            return Err(
-                                crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
-                                    value,
-                                    expr,
-                                },
-                            );
-                        }
-                        let bits = literal.bits();
-                        Some(if bits > i64::MAX as u64 {
-                            CExpr::UIntLit(bits)
-                        } else {
-                            CExpr::IntLit(bits as i64)
-                        })
-                    }
-                    _ => None,
-                };
-                // A value defined by an operation renders as the expression
-                // that operation's own lowering produces, moved to where the
-                // value is read. Deriving it a second time over the machine
-                // arena was the earlier approach and disagreed about
-                // signedness: the arena's `interpretation` records how a value
-                // is later read, not how the defining operation computes it, so
-                // a signed comparison came back unsigned and folded into a test
-                // that is never true.
-                //
-                // A value with no operation behind it -- a live-in register, a
-                // merge -- has no lowering to move, and the arena still answers
-                // for it.
-                let definition = self
-                    .prepared_ssa()
-                    .and_then(|prepared| prepared.graph().def_inst(value));
-                let rendered = match literal {
-                    Some(literal) => literal,
-                    None => match definition
-                        .and_then(|definition| self.inlined_definition_expr(definition))
-                    {
-                        Some(rendered) => {
-                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
-                                eprintln!(
-                                    "inline value {value:?} uses definition lowering {definition:?}"
-                                );
-                            }
-                            rendered
-                        }
-                        None => {
-                            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
-                                eprintln!(
-                                    "inline value {value:?} uses machine expression {expr:?}; definition={definition:?}"
-                                );
-                            }
-                            self.materialize_machine_expr(names, value, expr, 0)?
-                        }
-                    },
-                };
+                }
+                let rendered = self.materialize_term(names, value, term, 0)?;
                 Ok(self.finish_replacement_expr(PendingReplacementExpr::planned_inline(
                     value, rendered,
                 )))
@@ -1012,10 +1131,10 @@ impl<'a> FoldingContext<'a> {
             Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
                 Ok(Some(CExpr::Var(symbol)))
             }
-            Ok(crate::binding_plan::PlannedValueSymbol::Inline(expr)) => Err(
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(term)) => Err(
                 crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
                     value,
-                    expr,
+                    term,
                 },
             ),
             // An attempted lowering is not a rendered occurrence. Keep the

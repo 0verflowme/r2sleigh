@@ -345,8 +345,8 @@ fn shadow_plan_groups_spans_and_inlines_only_upstream_literals() {
     {
         assert!(matches!(
             plan.disposition(constant.id),
-            Some(ValueDisposition::Inline { expr, proof })
-                if expr == &proof.literal && proof.authority == *source.authority()
+            Some(ValueDisposition::Inline { term, proof })
+                if term == &proof.term && proof.authority == *source.authority()
         ));
     }
     assert_eq!(plan.validate_source(source), Ok(()));

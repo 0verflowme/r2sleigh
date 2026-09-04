@@ -306,6 +306,18 @@ pub fn canonicalize_with(
     }
     let mut arena = TermArena::new();
     let import = import_with(artifact, projection, &mut arena, policy);
+    // Definitionless constants have no machine entity and therefore no
+    // `ImportedValue`, but the binding plan still renders them inline. Give
+    // them a stable canonical term in the same dense value table as defined
+    // values so every inline disposition can name a `TermId`.
+    let mut literal_terms = BTreeMap::<ValueId, (MachineExprId, TermId)>::new();
+    for (expr, node) in projection.arena().iter() {
+        let MachineExprKind::Constant { binding, value } = node.kind() else {
+            continue;
+        };
+        let term = arena.intern(*node.ty(), TermKind::Literal(*value));
+        literal_terms.entry(binding.value()).or_insert((expr, term));
+    }
     let imported_len = arena.len();
     let mut driver = Driver {
         arena: &mut arena,
@@ -361,6 +373,23 @@ pub fn canonicalize_with(
                 multiplicity,
             });
         }
+    }
+    for (value, (base_root, term)) in literal_terms {
+        let Some(cell) = values.get_mut(value.0 as usize) else {
+            continue;
+        };
+        if cell.is_some() {
+            continue;
+        }
+        let canonical_term = canonical.get(&term).copied().unwrap_or(term);
+        *cell = Some(CanonicalValue {
+            value,
+            base_root,
+            canonical: canonical_term,
+            trace: Box::new([]),
+            discharges: BTreeSet::new(),
+            multiplicity: Multiplicity::Any,
+        });
     }
     let mut accesses = BTreeMap::new();
     for imported in import.accesses() {

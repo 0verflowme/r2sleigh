@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use r2ssa::{
-    InstId, MachineExprId, MachineUseDisposition, MachineUseRefusal, MachineWriteDisposition,
-    MachineWriteRefusal, ObjectId, SsaArtifactAuthority, UseSite, ValueId,
+    InstId, MachineUseDisposition, MachineUseRefusal, MachineWriteDisposition, MachineWriteRefusal,
+    ObjectId, SsaArtifactAuthority, UseSite, ValueId,
 };
 use r2types::SourceOwnedFunctionFacts;
 
@@ -21,7 +21,7 @@ use crate::symbol::{SymbolId, SymbolRole, SymbolTable};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedValueSymbol {
     Bound(SymbolId),
-    Inline(MachineExprId),
+    Inline(r2rewrite::TermId),
     Elided(r2ssa::ledger::ElisionReason),
     Refused(ValueRefusal),
     Absent,
@@ -326,11 +326,6 @@ impl BindingNameResolution {
         self.plan.binding_is_entry_declared(binding)
     }
 
-    /// Resolve one plan-owned inline expression without exposing the plan.
-    pub(crate) fn inline_expr(&self, expr: MachineExprId) -> Option<&r2ssa::MachineExpr> {
-        self.plan.machine_projection().expr(expr)
-    }
-
     /// Require the exact sealed answer for one SSA value.
     ///
     /// Inline and elided values are successful answers: neither authorizes a C
@@ -345,7 +340,7 @@ impl BindingNameResolution {
                 .symbol_for_binding(*binding)
                 .map(PlannedValueSymbol::Bound)
                 .ok_or(RenderedIdentityRefusal::MissingBinding { binding: *binding }),
-            Some(ValueDisposition::Inline { expr, .. }) => Ok(PlannedValueSymbol::Inline(*expr)),
+            Some(ValueDisposition::Inline { term, .. }) => Ok(PlannedValueSymbol::Inline(*term)),
             Some(ValueDisposition::Elided { reason, .. }) => {
                 Ok(PlannedValueSymbol::Elided(*reason))
             }
@@ -459,7 +454,7 @@ impl BindingNameResolution {
             Some(ValueDisposition::Bound { binding }) => self
                 .symbol_for_binding(*binding)
                 .map_or(PlannedValueSymbol::Absent, PlannedValueSymbol::Bound),
-            Some(ValueDisposition::Inline { expr, .. }) => PlannedValueSymbol::Inline(*expr),
+            Some(ValueDisposition::Inline { term, .. }) => PlannedValueSymbol::Inline(*term),
             Some(ValueDisposition::Elided { reason, .. }) => PlannedValueSymbol::Elided(*reason),
             Some(ValueDisposition::Refused { reason }) => PlannedValueSymbol::Refused(*reason),
             None => PlannedValueSymbol::Absent,
@@ -894,7 +889,7 @@ mod tests {
             .values
             .iter()
             .find_map(|value| match plan.disposition(value.id) {
-                Some(ValueDisposition::Inline { expr, .. }) => Some((value.id, *expr)),
+                Some(ValueDisposition::Inline { term, .. }) => Some((value.id, *term)),
                 _ => None,
             })
             .expect("inline value");

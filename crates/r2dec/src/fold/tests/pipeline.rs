@@ -1137,8 +1137,8 @@ mod tests {
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(R2ILOp::IntSBorrow {
             dst: Varnode::unique(0x100, 1),
-            a: Varnode::constant(i64::MAX as u64, 8),
-            b: Varnode::constant(u64::MAX, 8),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::register(0x18, 8),
         });
         entry.push(R2ILOp::IntZExt {
             dst: Varnode::unique(0x108, 8),
@@ -1162,15 +1162,104 @@ mod tests {
         let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
         let (_plan, _names, _journal) = install_observed_lowering(&mut ctx, &prepared);
 
-        enter_exact_test_site(&ctx, block.addr, 0);
+        // The flag producer is now absorbed into this bound widening reader.
+        // Lower the reader so the assertion exercises the canonical Flag term,
+        // rather than requiring the deliberately inlined producer to mint an
+        // assignment of its own.
+        enter_exact_test_site(&ctx, block.addr, 1);
         let stmt = ctx
-            .op_to_stmt_with_args(&block.ops[0], block.addr, 0)
-            .expect("signed borrow has exact scalar lowering")
-            .expect("signed borrow definition");
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("signed borrow reader has exact scalar lowering")
+            .expect("signed borrow reader definition");
         let rendered = format!("{stmt:?}");
         assert!(
             rendered.contains("r2sleigh_int_sborrow_64"),
             "signed borrow must use the external width-safe helper: {rendered}"
+        );
+        assert_eq!(*ctx.observation_error.borrow(), None);
+    }
+
+    #[test]
+    fn canonical_literal_rule_is_the_expression_rendered_at_its_reader() {
+        let arch = make_test_arch_x86_64();
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntSBorrow {
+            dst: Varnode::unique(0x100, 1),
+            a: Varnode::constant(i64::MAX as u64, 8),
+            b: Varnode::constant(u64::MAX, 8),
+        });
+        entry.push(R2ILOp::IntZExt {
+            dst: Varnode::unique(0x108, 8),
+            src: Varnode::unique(0x100, 1),
+        });
+        // Two live readers keep the widening bound, giving the canonical flag
+        // expression a concrete assignment in which it must be rendered.
+        for (offset, address) in [(0x110, 0x2000), (0x118, 0x2008)] {
+            entry.push(R2ILOp::IntAdd {
+                dst: Varnode::unique(offset, 8),
+                a: Varnode::unique(0x108, 8),
+                b: Varnode::constant(1, 8),
+            });
+            entry.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(address, 8),
+                val: Varnode::unique(offset, 8),
+            });
+        }
+        let prepared = prepared_from_r2il_blocks(&[entry], &arch)
+            .with_name("canonical_literal_rule_rendering");
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let SSAOp::IntSBorrow { dst: flag, .. } = &block.ops[0] else {
+            panic!("fixture must begin with signed borrow");
+        };
+        let SSAOp::IntZExt { dst: widened, .. } = &block.ops[1] else {
+            panic!("fixture must widen the signed-borrow flag");
+        };
+        let mut ctx = make_x86_64_ctx_with_prepared(&prepared);
+        let (plan, _names, _journal) = install_observed_lowering(&mut ctx, &prepared);
+        let flag = prepared
+            .graph()
+            .value_id_for_var(flag)
+            .expect("signed-borrow value");
+        let widened = prepared
+            .graph()
+            .value_id_for_var(widened)
+            .expect("widened value");
+        let canonical = plan
+            .canonical()
+            .value(flag)
+            .expect("signed-borrow canonical term");
+        assert!(
+            canonical
+                .trace
+                .iter()
+                .any(|rewrite| rewrite.rule == "literal.flag"),
+            "the proof-backed literal rule must fire: {:?}",
+            canonical.trace
+        );
+        assert!(matches!(
+            plan.disposition(flag),
+            Some(crate::binding_plan::ValueDisposition::Inline { term, .. })
+                if *term == canonical.canonical
+        ));
+        assert!(matches!(
+            plan.disposition(widened),
+            Some(crate::binding_plan::ValueDisposition::Bound { .. })
+        ));
+
+        enter_exact_test_site(&ctx, block.addr, 1);
+        let stmt = ctx
+            .op_to_stmt_with_args(&block.ops[1], block.addr, 1)
+            .expect("canonical literal has exact scalar lowering")
+            .expect("bound widening definition");
+        let rendered = format!("{stmt:?}");
+        assert!(
+            rendered.contains("IntLit(1)"),
+            "the canonical literal must be the rendered expression: {rendered}"
+        );
+        assert!(
+            !rendered.contains("r2sleigh_int_sborrow_64"),
+            "rendering must not re-lower the original machine flag: {rendered}"
         );
         assert_eq!(*ctx.observation_error.borrow(), None);
     }
