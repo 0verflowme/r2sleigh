@@ -125,11 +125,14 @@ produce a claim about signedness the evidence does not support.
 
 ## Cross-cutting, do in any context
 
-- **Delete the inert CFG guard fields.** `cfg_guard_reason`,
-  `summary_probe_needed` and `summary_probe_skipped_large_cfg` have no non-test
-  readers; only `op_count` is consulted. Deleting them removes the last SSA build
-  from the probe path and lets the size gate move ahead of the probe. Keep their
-  facts as tests.
+- ~~Delete the inert CFG guard fields.~~ **Done** (`51f5aab`). The cascade ran
+  deeper than the three fields: the probe, the preprobe risk summary and its two
+  helpers, and `cfg_guard_reason` with its controlled variant were all
+  unreachable — 291 lines. The size gate now refuses after one pass over the
+  block vector. `cfg_guard_reason_from_summary` stays; type routing uses it.
+  Note for whoever is next: `CFG::risk_summary()` is now reached only by tests,
+  and `SSAFunction::from_blocks_raw_with_control`'s control parameter has no
+  caller passing anything but `UncheckedSsaWorkControl`.
 - **Bless the snapshot baseline.** `--gate differential` also enforces a snapshot
   ratchet that is red because `tests/corpus/raw-baseline-sha256.json` predates
   the type work. The correctness half passes 54/54; this is an unblessed
