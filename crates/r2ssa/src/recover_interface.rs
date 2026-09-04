@@ -213,6 +213,16 @@ fn recovered_result(
         if storage.location() != slot.location() || storage.size == 0 || storage.size > slot.size {
             return None;
         }
+        let observed_size = if storage == slot {
+            narrow_zero_extend_input_size(graph, value).unwrap_or(storage.size)
+        } else {
+            storage.size
+        };
+        let storage = CanonicalStorageId {
+            space: slot.space,
+            offset: slot.offset,
+            size: observed_size,
+        };
         if observed.is_none_or(|current: CanonicalStorageId| storage.size > current.size) {
             observed = Some(storage);
         }
@@ -221,6 +231,29 @@ fn recovered_result(
         slot,
         observed: observed?,
     })
+}
+
+/// The narrow value a full result definition zero-extends.
+///
+/// Lifters make implicit carrier clearing explicit: returning a value through
+/// `eax`/`w0` is represented by a narrow definition followed by `rax`/`x0 =
+/// zext(...)`. The live-out is consequently the full carrier, while the input
+/// of that exact defining operation is the width the machine observed. Other
+/// full-width definitions remain full width; no register name or architecture
+/// convention is guessed here.
+fn narrow_zero_extend_input_size(graph: &SsaGraph, value: crate::ValueId) -> Option<u32> {
+    let definition = graph.def_inst(value).and_then(|inst| graph.inst(inst))?;
+    let crate::graph::InstPayload::Op(crate::SSAOp::IntZExt { .. }) = &definition.payload else {
+        return None;
+    };
+    let [input] = definition.inputs.as_slice() else {
+        return None;
+    };
+    let input = graph.value(*input)?;
+    let output = graph.value(value)?;
+    let input_size = input.var.size;
+    let output_size = output.var.size;
+    (input_size > 0 && input_size < output_size).then_some(input_size)
 }
 
 /// Recover what the machine code proves about this function's interface.
@@ -845,6 +878,10 @@ mod tests {
         block.push(R2ILOp::Copy {
             dst: Varnode::register(0, 4),
             src: Varnode::constant(7, 4),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0, 8),
+            src: Varnode::register(0, 4),
         });
         let recovered = recovered(block);
         let result = recovered.result().expect("recovered narrow result");

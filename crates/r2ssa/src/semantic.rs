@@ -1692,7 +1692,8 @@ impl PreparedFunctionFacts {
             },
         );
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
-        let obligations = SemanticObligationInventory::collect(graph, &structured, &boundaries);
+        let obligations =
+            SemanticObligationInventory::collect(graph, &structured, &boundaries, machine_context);
         // A lifted body merges every storage live across a join, so the graph
         // records uses that carry no program observation. `DeadPhis` names
         // exactly those, and the merges stay in the function by design, so a
@@ -6804,7 +6805,7 @@ fn composed_return_certificate(
     })
 }
 
-fn exact_logical_return_projection(
+pub(crate) fn exact_logical_return_projection(
     graph: &SsaGraph,
     machine_context: Option<&SourceMachineContext>,
     boundary: &CallBoundaryValueFact,
@@ -6859,11 +6860,6 @@ fn exact_logical_return_projection(
                 ) =>
         {
             let logical_width = u32::try_from(projection.size_bits() / 8).ok()?;
-            let logical_storage = CanonicalStorageId {
-                space: storage.space,
-                offset: storage.offset,
-                size: logical_width,
-            };
             let producer = graph
                 .def_inst(boundary.value)
                 .and_then(|id| graph.inst(id))?;
@@ -6879,9 +6875,8 @@ fn exact_logical_return_projection(
             (producer.output == Some(boundary.value)
                 && *dst == physical_value.var
                 && *src == logical_value.var
-                && logical_value.var.size == logical_width
-                && logical_value.canonical_storage == Some(logical_storage))
-            .then_some((*input, logical_width, Some(logical)))
+                && logical_value.var.size == logical_width)
+                .then_some((*input, logical_width, Some(logical)))
         }
         _ => None,
     }
@@ -12018,6 +12013,13 @@ mod tests {
                     value.var.size == 4 && value.canonical_storage == Some(register_storage(0, 4))
                 })
         );
+        let return_value_obligations = artifact
+            .obligations()
+            .obligations_for_inst(boundary.at)
+            .filter(|obligation| obligation.id.kind == crate::SemanticObligationKind::ReturnValue)
+            .collect::<Vec<_>>();
+        assert_eq!(return_value_obligations.len(), 1);
+        assert_eq!(return_value_obligations[0].inputs, [certificate.value]);
     }
 
     #[test]

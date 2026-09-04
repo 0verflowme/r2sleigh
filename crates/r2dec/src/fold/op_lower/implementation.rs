@@ -1391,6 +1391,24 @@ impl<'a> FoldingContext<'a> {
                             certificate.at,
                             expr,
                         );
+                        // The certificate names the logical value returned,
+                        // while the binding plan may deliberately retain the
+                        // full machine carrier as its declared object. C
+                        // types the expression by that declaration, so make
+                        // the exact source-owned return type conversion
+                        // explicit instead of relying on an implicit
+                        // narrowing or signedness change.
+                        let expr = match (
+                            self.value_declaration_type(certified.value),
+                            self.inputs.function_return_type,
+                        ) {
+                            (Some(declared), Some(return_type)) => self.convert_from(
+                                expr,
+                                Some(&CValue::Typed(declared)),
+                                return_type,
+                            ),
+                            _ => expr,
+                        };
                         (Some(certified.value), CStmt::Return(Some(expr)))
                     }
                     _ => return Err(OpLoweringRefusal::missing_machine_projection()),

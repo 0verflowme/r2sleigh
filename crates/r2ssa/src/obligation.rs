@@ -352,6 +352,7 @@ impl SemanticObligationInventory {
         graph: &SsaGraph,
         structured: &StructuredDataflowFacts,
         boundaries: &SourceBoundaryFacts,
+        machine_context: Option<&crate::SourceMachineContext>,
     ) -> Self {
         let (canonical_ids, mut construction_failures) = collect_canonical_instruction_ids(graph);
         let mut required = BTreeMap::<
@@ -449,18 +450,21 @@ impl SemanticObligationInventory {
                 &mut required,
             );
             for value in &boundary.values {
+                let logical_value =
+                    crate::semantic::exact_logical_return_projection(graph, machine_context, value)
+                        .map_or(value.value, |(logical, _, _)| logical);
                 seed_instruction_with_inputs(
                     boundary.at,
                     SemanticObligationKind::ReturnValue,
                     boundary_component(value.slot),
-                    vec![value.value],
+                    vec![logical_value],
                     &mut required,
                     &mut explicit_inputs,
                     &mut duplicate_seeds,
                 );
                 seed_value_definition(
                     graph,
-                    value.value,
+                    logical_value,
                     SemanticObligationKind::LiveValueProducer,
                     &mut required,
                 );
@@ -2379,7 +2383,7 @@ mod tests {
             },
         );
         let inventory =
-            SemanticObligationInventory::collect(graph, artifact.structured(), &boundaries);
+            SemanticObligationInventory::collect(graph, artifact.structured(), &boundaries, None);
 
         assert!(!inventory.is_complete());
         assert!(inventory.construction_failures().iter().any(|failure| {
@@ -2493,6 +2497,7 @@ mod tests {
             &graph,
             artifact.structured(),
             &artifact.facts().boundaries,
+            None,
         );
         assert!(!inventory.is_complete());
         assert!(inventory.construction_failures.iter().any(|failure| {
@@ -2535,6 +2540,7 @@ mod tests {
             &graph,
             artifact.structured(),
             &artifact.facts().boundaries,
+            None,
         );
         assert_eq!(inventory.source_instruction_count(), 0);
         assert!(!inventory.unstructured_cycle_blocks().is_empty());
@@ -2617,6 +2623,7 @@ mod tests {
             artifact.graph(),
             &structured,
             &artifact.facts().boundaries,
+            None,
         );
         assert!(
             inventory
