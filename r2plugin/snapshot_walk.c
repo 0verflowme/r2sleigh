@@ -671,7 +671,6 @@ static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 	}
 	r2sleigh_wire_u8 (writer, base_tag);
 	RAnalSnapshotRegisterStorageView base_storage = {
-		.name_length = view.base_name_length,
 		.offset = view.base_offset,
 		.size = view.base_size,
 	};
@@ -692,7 +691,6 @@ static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 		r2sleigh_wire_u8 (writer, WALK_ROLE_PARAMETER_HOME);
 		r2sleigh_wire_u32 (writer, (uint32_t)view.arg_index);
 		RAnalSnapshotRegisterStorageView home = {
-			.name_length = view.home_reg_length,
 			.offset = view.home_reg_offset,
 			.size = view.home_reg_size,
 		};

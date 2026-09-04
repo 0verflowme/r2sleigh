@@ -11715,3 +11715,212 @@ part of this 26-function ownership slice.
 
 The sweep rendered 387 of 556 functions: pinned 76/107, compiled 281/313, and
 system 30/136. The coverage gate reported no regressions.
+
+## The radare2 fork surface, measured before another redesign
+
+This audit used radare2 `8bb9137247d88b549cb3a8a1c483b4440ae7fe87`
+and r2sleigh `340630969650f6c0981a044d359a7e83770a45b8` as its
+pre-change points, with current upstream radare2
+`da9fe53d19212e76c80708e00f29dd2c1e0f7206` as the comparison base.  A
+"plugin read" below means that `r2plugin/snapshot_walk.c` serializes the fact
+and `crates/r2source/src/snapshot_wire.rs` decodes it into a validated typed
+contract.  A radare2-only read includes collection-time validation, revision
+hashing, core decompiler use, or a radare2 unit test.  Definition-only fields
+have neither kind of read.
+
+The search covered `libr/`, `binr/`, and `test/` in radare2 and `r2plugin/`
+plus `crates/r2source/` in r2sleigh.  It followed a field through its public
+view or copy accessor rather than counting a view initializer as a consumer.
+This distinction matters: thirty view members appeared to be used because
+radare2 filled them, while no caller ever read them.
+
+### The sixteen definition-only public APIs
+
+All sixteen names had no call outside their own definition.  They are gone in
+radare2 commit `32ee0a91064099e78f2f98ff752307c975a0b942`:
+
+```
+r_anal_function_set_assumption
+r_anal_function_set_assumptions
+r_anal_function_get_assumption
+r_anal_function_list_assumptions
+r_anal_function_delete_assumption
+r_anal_function_assumption_free
+r_anal_function_context_collect
+r_anal_function_context_free
+r_anal_function_has_signature_current
+r_anal_function_snapshot_parameter_storage_name
+r_anal_function_snapshot_call_argument_storage_name
+r_anal_function_snapshot_call_site_result_storage_name
+r_anal_types_baselist
+r_anal_xrefs_owned_clear_all
+r_anal_cc_has_fpargs
+r_bin_get_reloc_at
+```
+
+That commit is `+5/-552`, or **547 net source lines recovered**.  Two facts
+survive under their real owners: relocation lookup remains as the private
+`RBinBind.get_reloc_at` adapter used while collecting pointer tables, and the
+bounded base-type collector retains its private list helper.  The user/project
+assumption payload also remains, deliberately, as the three live opaque-JSON
+operations used by `afAj`, project persistence, and r2sleigh.  What disappeared
+was the unused parsed-assumption object subsystem and its unused snapshot copy,
+not the live JSON fact.
+
+### The public snapshot entry points
+
+The pre-audit surface had 45 public snapshot walkers.  These are the **42 exact
+entry points called by the C walker**, and all remain:
+
+```
+r_anal_function_snapshot_aggregate_member_name
+r_anal_function_snapshot_aggregate_member_view
+r_anal_function_snapshot_aggregate_name
+r_anal_function_snapshot_aggregate_view
+r_anal_function_snapshot_arch_id
+r_anal_function_snapshot_block_bytes
+r_anal_function_snapshot_block_view
+r_anal_function_snapshot_call_argument_view
+r_anal_function_snapshot_call_site_calling_convention
+r_anal_function_snapshot_call_site_signature_string
+r_anal_function_snapshot_call_site_signature_view
+r_anal_function_snapshot_call_site_target_name
+r_anal_function_snapshot_call_site_transfer
+r_anal_function_snapshot_call_site_view
+r_anal_function_snapshot_callee_snapshot
+r_anal_function_snapshot_code_pointer_table_target
+r_anal_function_snapshot_code_pointer_table_view
+r_anal_function_snapshot_convention_argument_slot
+r_anal_function_snapshot_cpu_id
+r_anal_function_snapshot_data_symbol_name
+r_anal_function_snapshot_data_symbol_type_name
+r_anal_function_snapshot_data_symbol_view
+r_anal_function_snapshot_external_exit
+r_anal_function_snapshot_function_name
+r_anal_function_snapshot_interface_calling_convention
+r_anal_function_snapshot_interface_frame_pointer_storage
+r_anal_function_snapshot_interface_return_mechanism
+r_anal_function_snapshot_interface_stack_allocation_contract
+r_anal_function_snapshot_interface_storage_name
+r_anal_function_snapshot_interface_view
+r_anal_function_snapshot_parameter_name
+r_anal_function_snapshot_parameter_view
+r_anal_function_snapshot_signature_string
+r_anal_function_snapshot_signature_view
+r_anal_function_snapshot_stack_slot_string
+r_anal_function_snapshot_stack_slot_view
+r_anal_function_snapshot_string_literal_text
+r_anal_function_snapshot_string_literal_view
+r_anal_function_snapshot_successor_view
+r_anal_function_snapshot_type_graph_view
+r_anal_function_snapshot_type_view
+r_anal_function_snapshot_view
+```
+
+The other three were the storage-name functions in the sixteen-name list.
+They returned heap-copied register labels for interface, call-argument, and
+call-result locations, but the wire has always identified those values by
+canonical offset and size.  Role registers are different: RA, SP, and FP names
+cross the wire because radare2 and Sleigh use different register arenas.  Their
+one generic `interface_storage_name` accessor remains load-bearing.
+
+### Owned-field census
+
+Every owned field is accounted for here.  Braces mean the listed classification
+applies to every member of the nested structure or array.
+
+| Owner | Read by r2sleigh | Read only by radare2 | No reader at the baseline and disposition |
+| --- | --- | --- | --- |
+| `RAnalFunctionSnapshot` | `capabilities`, `function_addr`, `bits`, `endian`, `arch_id`, `cpu_id`, `function_name`, `function_interface`, `return_mechanism`, `frame_pointer_storage`, `stack_allocation_contract`, `call_site_interfaces`, `num_call_site_interfaces`, `revision_identity`, `content_identity`, `type_graph`, `image`, `callee_snapshots`, `num_callee_snapshots` | `schema_version`, `struct_size`, `function_size`, `maxstack`, `base_types`, `type_context_hash`; the base-type clone is the stable input used to build and recheck the reachable graph | none after the removals below |
+| `RAnalFcnContext` | `signature`, `fcn_slots`, and `callees` feed presentation, callsites, and nested callee snapshots | `function_dirty_epoch`, `type_dirty_epoch` bind the revision and detect a capture race | `reg_args`, the snapshot copy of `assumptions_json`, and `context_hash` removed |
+| `RAnalFunctionSignature` and each parameter | `ret_type`, `callconv`, `noreturn`, parameter `name` and `type` | the pre-rendered `signature` string remains revision-hash input | none |
+| `RAnalFcnCallee` | `call_addr`, `addr`, `name`, `signature`, `transfer` | `linkage` participates in source selection and revision hashing | none |
+| `RAnalFcnSlot` | `name`, `type`, `base`, `base_offset`, `base_size`, `offset`, `size`, `offset_valid`, `role`, `arg_index`, `home_reg_offset`, `home_reg_size` | `base_name` and `home_reg` validate that the numeric role coordinates were derived from the exact carrier | duplicate `arg_name` removed; presentation already comes from the signature |
+| `RAnalFunctionInterfaceSnapshot` | `calling_convention`, `parameters`, `num_parameters`, `return_kind`, return/RA/SP storage coordinates, RA/SP names, `return_type_id`, `return_carrier`, both preservation flags, convention-slot coordinates/count/result and `convention_slots_known` | `variadic`, `noreturn`, `stack_resources_complete`, `stack_slot_roles_complete`, `complete`, and `logical_types_complete` decide capabilities and revision identity; parameter storage names validate exact DWARF homes | heap names on `return_storage`, every `convention_argument_slot`, and `convention_result_slot` are no longer copied |
+| each function-interface parameter | `index`, presentation `name`, storage `offset`/`size`, `logical_type_id`, and all carrier fields | `storage.name` is used only to validate exact parameter-home provenance | none |
+| `RAnalCallSiteInterfaceSnapshot` | `instruction_addr`, `target_addr`, `target_name`, `calling_convention`, argument count, result kind/coordinates, `variadic`, `noreturn`, `complete`, and `transfer` | none beyond validation and hashing of the same facts | heap names on every argument storage and `result_storage` are no longer copied |
+| each call argument | `index` and storage `offset`/`size` | the invalid logical-type sentinel and empty carrier are hashed as part of the generic parameter representation | generic `name` is never populated or copied: zero collection lines, so splitting a second argument type would add rather than remove code |
+| `RAnalSnapshotTypeGraph` | `types`, `num_types`, `aggregates`, `num_aggregates`, `complete` | none | none |
+| each `RAnalSnapshotType` | `id`, `kind`, `size_bits`, `align_bits`, `target_type_id` for pointers, `aggregate_id` for structs | none | none |
+| each aggregate and member | aggregate `id`, `type_id`, `size_bits`, `align_bits`, `name`, `members`, `num_members`, `complete`; member `member_id`, `type_id`, `offset_bits`, `size_bits`, `name` | none | member `count` removed after its exact extent was folded into `size_bits`; constant-true `c_layout_compatible` removed |
+| `RAnalFunctionImageSnapshot` | `entry_addr`, `blocks`, `num_blocks`, `external_exits`, `num_external_exits`, `string_literals`, `num_string_literals`, `data_symbols`, `num_data_symbols`, `code_pointer_tables`, `num_code_pointer_tables`, `total_source_bytes` | none | none |
+| each block and successor | block `addr`, `size`, `bytes`, `successors`, `num_successors`, `switch_addr`; successor `kind`, `target_addr`, `case_value`, `external` | none | none |
+| each image leaf | string `addr`/`text`; data symbol `addr`/`name`/`type_name`; pointer table `addr`/`entry_size`/`targets`/`num_targets` | none | none |
+
+The fields in the radare2-only column are not claims that they should live in
+this contract forever.  They explain why this measurement did not delete them:
+removing the stable type-resolver input or capture epochs, for example, changes
+the capture proof rather than merely shrinking a copy.  That would be a design
+change, which this audit was explicitly asked not to make.
+
+### Public-view census
+
+The C walker reads every scalar still present in a view except the small set in
+the radare2-only column.  All baseline definition-only projections are named in
+the last column; no unnamed remainder exists.
+
+| View | Plugin-read fields retained | Radare2-only fields retained | Definition-only baseline fields removed |
+| --- | --- | --- | --- |
+| `RAnalFunctionSnapshotView` | `capabilities`, `function_addr`, `bits`, `endian`, callsite/stack/image/callee counts, `revision_identity`, `content_identity`, `total_source_bytes` | `arch_id_length`, `cpu_id_length`, `function_name_length` are used by the core decompiler adapter tests | `schema_version`, `struct_size`, `function_size`, `maxstack`, `num_base_types`, `type_context_hash`, duplicate `num_types`, duplicate `num_aggregates` |
+| block/successor | every field | none | none |
+| string/data/table | string `addr`; data `addr` and `type_name_length`; every pointer-table field | data `name_length` is asserted by radare2 | string `text_length` |
+| register/parameter | register `offset`/`size`; parameter `index`, storage, logical type and carrier | parameter `name_length` is asserted by radare2 | register `name_length` |
+| function interface | every retained field | none; `calling_convention_length` is also read by the optional r2sleigh merge diagnostic and core adapter tests | `variadic`, `noreturn`, `stack_resources_complete`, `stack_slot_roles_complete`, `complete`, `logical_types_complete` |
+| callsite | every retained field | none | `target_name_length`, `calling_convention_length` |
+| type graph/type | every field | none | duplicate top-view counts listed above |
+| aggregate/member | every retained field | none | aggregate `name_length`, `c_layout_compatible`; member `count`, `name_length` |
+| stack slot | every retained field | none | `name_length`, `type_length`, `base_name_length`, `home_reg_length` |
+| signature | `num_parameters`, `noreturn` | none | `return_type_length`, `calling_convention_length` |
+
+### Cost of the unconsumed fields
+
+The line counts below are baseline **direct collection/storage/projection LOC**.
+Shared helpers are counted once with the group that owns them; assigning a
+fictional fraction of one collector to five fields would make the numbers look
+more precise and less true.  The rightmost column gives the exact coherent
+source delta, which includes declarations, cleanup, validation, budgets, and
+hashing but excludes tests.
+
+| Unconsumed baseline field set | Direct LOC cost | Exact source delta |
+| --- | ---: | ---: |
+| `RAnalFcnContext.reg_args` and `RAnalFcnRegArg.{name,type,reg,arg_index}` | 110 collector/destructor/sort/hash/budget/declaration LOC | shared total in the fourth row |
+| `RAnalFcnSlot.arg_name` | 21 copy/accessor/hash/budget/declaration LOC | shared total in the fourth row |
+| snapshot `RAnalFcnContext.assumptions_json` copy and its limit/capability | 20 copy/preflight/hash/budget/declaration LOC | shared total in the fourth row |
+| `RAnalFcnContext.context_hash` duplicate | 2 assignment/declaration LOC | the four rows together are **152 net source LOC**, commit `99b0de938f` |
+| 26 unused public-view scalar/length projections (all names in the preceding table, excluding the two aggregate fields counted next) | 52 declaration/initializer LOC | shared total in the third row |
+| aggregate member `count` and aggregate `c_layout_compatible` | 10 declaration/collection/hash/view/comment LOC; exact array extent remains in `size_bits` | shared total in the third row |
+| heap names for function result, convention arguments/result, call arguments/result | one shared `strdup` path plus 11 dedicated string-budget LOC and one allocation per populated storage | the three rows together are **70 net source LOC**, commit `527cbf4f17` |
+| call-argument generic `name` | 0; calloc leaves it null and no code copies it | retained only because parameters and arguments share a struct |
+
+The two snapshot-pruning commits are `+61/-297` across source and tests, or 236
+net lines.  With the dead APIs, the audit removes **783 net lines**.  Against
+upstream the fork is now `+20,136/-942`: 14,571 source insertions and 5,565 test
+insertions.  Compared with the measured starting point, added PR surface fell
+by 703 lines (702 source, one test); tests were changed to assert retained
+canonical coordinates and extents rather than deleted duplicate names/counts.
+
+### The seven large non-snapshot files
+
+The request called this an eight-file list but named seven files; all seven are
+covered below.  The current open author PRs `#26629`, `#26630`, `#26632`,
+`#26641`, `#26642`, `#26643`, and `#26644` were checked on 2026-09-04.  None
+touches these seven files, so none silently carries a separable slice of this
+integration work.
+
+| File and current upstream delta | What the added code owns | Standalone verdict |
+| --- | --- | --- |
+| `libr/core/canal_artifacts.c` `+1340/-0` | atomic replacement, persistence, and revision publication for provider-owned comments, flags, and xrefs | r2sleigh integration seam; its only production entry is the new artifact path in `canal.c`/project loading |
+| `libr/anal/anal.c` `+536/-0` | exact DWARF formal, function-link, and frame-pointer authority stores used to decide snapshot capabilities | r2sleigh integration proof state; not an independently observable upstream fix |
+| `libr/anal/xrefs.c` `+740/-77` | owner-keyed prepare/swap/publish shadows used by `canal_artifacts.c` | integration-only remainder.  The independent purge/teardown bug was already extracted and merged upstream as PR #26473 / `6b32cbbfc2a` |
+| `libr/flag/flag.c` `+482/-7` | a transactional flag shadow used by `canal_artifacts.c` | integration-only remainder.  The independent metadata-string lifetime fix was already extracted and merged upstream as PR #26472 / `609df801c6c` |
+| `libr/anal/type.c` `+545/-26` | bounded immutable type snapshots, dirty epochs/context hashes, and expression links consumed by snapshot/DWARF authority | integration-only as presently written.  The tempting composite-DWARF commit depends on the fork's exact data-object authority; upstream already constructs its parser context per compilation unit, and an expression-link API alone would be definition-only |
+| `libr/anal/anplugs.c` `+350/-25` | deterministic multi-provider data-reference batches and locking for function-image capture | integration seam; its sole production consumer is the new `canal.c` capture path |
+| `libr/anal/meta.c` `+324/-40` | transactional comment shadow used by `canal_artifacts.c` and snapshot-safe locking | integration-only remainder; no separately testable upstream behavior was found |
+
+There is therefore **no unmerged standalone change to branch** from these seven
+files.  Two credible general fixes had already gone through the small-PR path
+and are in `da9fe53d1921`; recreating branches for them produced an empty diff,
+so the temporary audit branches were deleted.  No PR was opened.  The remaining
+4,317 insertions in these files form the r2sleigh capture/publication mechanism
+and should be judged or redesigned as that mechanism, not advertised as seven
+unrelated radare2 improvements.
