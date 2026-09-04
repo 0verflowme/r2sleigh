@@ -1456,15 +1456,24 @@ impl SealedNativeFunction {
 }
 
 impl LegacyObservationJournal {
-    fn expr_has_value_observation(&self, expr: &CExpr, value: ValueId) -> bool {
-        let mut found = false;
+    fn expr_value_observations(&self, expr: &CExpr) -> BTreeSet<ValueId> {
+        let mut values = BTreeSet::new();
         expr.visit_render_observations(&mut |id| {
-            found |= matches!(
-                self.targets.get(id.index() as usize),
-                Some(ObservationTarget::Value(observed)) if *observed == value
-            );
+            if let Some(ObservationTarget::Value(value)) = self.targets.get(id.index() as usize) {
+                values.insert(*value);
+            }
         });
-        found
+        values
+    }
+
+    fn expr_symbols(expr: &CExpr) -> BTreeSet<SymbolId> {
+        let mut symbols = BTreeSet::new();
+        expr.visit(&mut |node| {
+            if let CExpr::Var(symbol) = node {
+                symbols.insert(*symbol);
+            }
+        });
+        symbols
     }
 
     /// Consume placement's complete removal report as one cell contract.
@@ -2466,7 +2475,8 @@ impl LegacyObservationJournal {
     /// can never occur in `replaced`, but it is still an operand of one of
     /// those instructions and has no other occurrence after replacement. Its
     /// value cell is therefore part of this same contract, deduplicated with
-    /// the root and produced values.
+    /// the root, produced values, and exact child markers already carried by
+    /// the expression.
     pub(crate) fn observe_rendered_replacement_expr(
         &mut self,
         contract: crate::fold::op_lower::RenderedReplacementContract,
@@ -2474,12 +2484,7 @@ impl LegacyObservationJournal {
         let (expr, value, replaced, obligations, frame_address) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(
-            Some(value),
-            &replaced,
-            Some(&expr),
-            frame_address.is_some(),
-        )?);
+        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
 
         if let Some(frame_address) = frame_address {
             let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
@@ -2562,7 +2567,7 @@ impl LegacyObservationJournal {
         discharged: &[InstId],
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let targets = self.discharged_instruction_targets(None, discharged, None, false)?;
+        let targets = self.discharged_instruction_targets(None, discharged, None)?;
         let mut marked = stmt;
         for id in self.allocate_many(targets)? {
             marked = CStmt::observed(id, marked);
@@ -2577,19 +2582,25 @@ impl LegacyObservationJournal {
     /// expression standing in for the vanished statements. Both are absent when
     /// a *statement* discharges the instructions, and that absence is what
     /// distinguishes the two cases rather than a second copy of this walk. With
-    /// an expression there is no statement left to answer for the operands it
-    /// spells, so their value cells are filled here; with a statement the
-    /// statement's own markers already answer for them, and filling them again
+    /// an expression there is no statement left to answer for a definitionless
+    /// inline operand, so its value cell is filled here unless a child marker
+    /// already owns it. Bound operands are claimed only when the expression
+    /// still names their exact planned symbol; otherwise attaching them to the
+    /// parent would infer identity from unrelated C syntax. With a statement,
+    /// its own markers already answer for operands, and filling them again
     /// would put two answers on one cell.
     fn discharged_instruction_targets(
         &mut self,
         rendered: Option<ValueId>,
         discharged: &[InstId],
         expr: Option<&CExpr>,
-        abstracts_frame_base: bool,
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
+        if let Some(expr) = expr {
+            represented_values.extend(self.expr_value_observations(expr));
+        }
+        let rendered_symbols = expr.map_or_else(BTreeSet::new, Self::expr_symbols);
         let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
@@ -2647,29 +2658,26 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                let Some(expr) = expr else {
+                let Some(_expr) = expr else {
                     continue;
                 };
                 let input = inst.inputs[input_idx];
-                if !produced.contains(&input) {
+                if !produced.contains(&input) && !represented_values.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
-                        // `&frame_object` semantically contains the frame base
-                        // and displacement without spelling either as a C
-                        // value. Their exact use cells are owned by this
-                        // replacement, but a bound value cell must remain on
-                        // an occurrence of its own symbol rather than being
-                        // misclassified as the frame-object binding.
-                        Some(ValueDisposition::Bound { .. }) if abstracts_frame_base => false,
-                        Some(ValueDisposition::Bound { .. }) => true,
+                        // A discharge owns this exact use, but it can claim the
+                        // bound value only when the surviving expression still
+                        // names that binding's exact symbol. Canonical
+                        // rewriting may absorb the operand entirely; attaching
+                        // its value cell to whatever unrelated syntax survived
+                        // would then fabricate a second identity answer.
+                        Some(ValueDisposition::Bound { binding }) => self
+                            .names
+                            .symbol_for_binding(*binding)
+                            .is_some_and(|symbol| rendered_symbols.contains(&symbol)),
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>
                         {
                             true
-                        }
-                        Some(ValueDisposition::Inline { .. })
-                            if self.expr_has_value_observation(expr, input) =>
-                        {
-                            false
                         }
                         Some(ValueDisposition::Inline { .. })
                         | Some(ValueDisposition::Elided { .. })
@@ -3768,9 +3776,23 @@ impl LegacyObservationJournal {
                             names.symbol_for_value(value),
                         )
                         .and_then(|observation| {
-                            record_same(&mut values[value.0 as usize], observation).map_err(|()| {
-                                LegacyObservationJournalError::ConflictingValue(value)
-                            })
+                            let slot = &mut values[value.0 as usize];
+                            if record_same(slot, observation).is_err() {
+                                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                                    eprintln!(
+                                        "conflicting value {value:?}: recorded {slot:?}, rendered \
+                                         {observation:?}, disposition={:?}, node={}",
+                                        plan.disposition(value),
+                                        format!("{node:?}")
+                                            .chars()
+                                            .take(180)
+                                            .collect::<String>()
+                                    );
+                                }
+                                Err(LegacyObservationJournalError::ConflictingValue(value))
+                            } else {
+                                Ok(())
+                            }
                         })
                     }
                     ObservationTarget::Use {
@@ -6345,7 +6367,7 @@ mod tests {
     }
 
     #[test]
-    fn discharging_two_instructions_marks_every_cell_and_each_effect_once() {
+    fn discharging_two_instructions_marks_owned_cells_and_each_effect_once() {
         let (source, plan, mut function, mut journal) = journal_fixture();
         let graph = source.source().graph();
         // The fixture folds `u20 = u10 + 2` into its one reader,
@@ -6399,9 +6421,11 @@ mod tests {
             )
             .expect("a two-instruction discharge");
 
-        // Every cell both instructions owe, on the one occurrence: the value
+        // Every cell the replacement owns, on the one occurrence: the value
         // rendered, then for each instruction in canonical order its write,
-        // the value it produced, and every operand it read.
+        // the value it produced, every operand use, and only definitionless
+        // inline operand values. Bound operand values stay on exact symbol
+        // occurrences instead of this parent expression.
         let mut expected = vec![ObservationTarget::Value(value)];
         let mut represented_values = BTreeSet::from([value]);
         let mut order = [reader, folded_definition];
@@ -6452,7 +6476,13 @@ mod tests {
                     block,
                 });
                 let input = inst.inputs[input_idx];
-                if !produced.contains(&input) && represented_values.insert(input) {
+                if !produced.contains(&input)
+                    && !matches!(
+                        plan.disposition(input),
+                        Some(ValueDisposition::Bound { .. })
+                    )
+                    && represented_values.insert(input)
+                {
                     expected.push(ObservationTarget::Value(input));
                 }
             }
@@ -6475,7 +6505,7 @@ mod tests {
                 .filter(|target| matches!(target, ObservationTarget::Value(_)))
                 .count(),
             represented_values.len(),
-            "produced values and definitionless literals all have cells"
+            "replacement-owned values each have one target"
         );
 
         // The effects the two instructions answered for move with the
@@ -6499,7 +6529,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_replacement_requires_and_reuses_the_inner_value_occurrence() {
+    fn nested_replacement_reuses_inline_child_and_does_not_claim_bound_operand() {
         let (source, plan, _function, mut journal) = journal_fixture();
         let graph = source.source().graph();
         let (folded, folded_definition) = graph
@@ -6523,6 +6553,19 @@ mod tests {
             .inst(reader)
             .and_then(|inst| inst.output)
             .expect("the reader defines a value");
+        let bound = graph
+            .inst(reader)
+            .expect("folded value reader")
+            .inputs
+            .iter()
+            .copied()
+            .find(|value| {
+                matches!(
+                    plan.disposition(*value),
+                    Some(ValueDisposition::Bound { .. })
+                )
+            })
+            .expect("the folded reader also consumes a bound value");
 
         assert!(
             matches!(
@@ -6577,6 +6620,66 @@ mod tests {
                 .count(),
             1,
             "the nested expression carries exactly one folded-value occurrence"
+        );
+        assert!(
+            !journal.targets[before_outer..].contains(&ObservationTarget::Value(bound)),
+            "the outer replacement must not claim a bound value its child already names"
+        );
+        assert_eq!(
+            journal
+                .targets
+                .iter()
+                .filter(|target| **target == ObservationTarget::Value(bound))
+                .count(),
+            0,
+            "a bound value cell remains for an exact occurrence of its own symbol"
+        );
+    }
+
+    #[test]
+    fn replacement_claims_bound_operand_only_when_its_exact_symbol_survives() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let (rendered, definition, bound, binding) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                ) {
+                    return None;
+                }
+                let definition = graph.def_inst(value.id)?;
+                let (bound, binding) = graph.inst(definition)?.inputs.iter().find_map(|input| {
+                    match plan.disposition(*input) {
+                        Some(ValueDisposition::Bound { binding }) => Some((*input, *binding)),
+                        _ => None,
+                    }
+                })?;
+                Some((value.id, definition, bound, binding))
+            })
+            .expect("fixture has an inline definition with a bound operand");
+        let symbol = journal
+            .names
+            .symbol_for_binding(binding)
+            .expect("the bound operand has its planned symbol");
+        let before = journal.targets.len();
+
+        journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::Var(symbol), CExpr::IntLit(2)),
+                    rendered,
+                    vec![definition],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the exact bound symbol remains in the replacement");
+
+        assert!(
+            journal.targets[before..].contains(&ObservationTarget::Value(bound)),
+            "the surviving exact symbol owns its bound value cell"
         );
     }
 
