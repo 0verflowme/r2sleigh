@@ -754,6 +754,72 @@ fn duplicable_bound_literals(
     literal_candidates.iter().copied().collect()
 }
 
+/// The frame object base whose exact call-boundary readers may replace this value.
+///
+/// This is deliberately narrower than a generic multi-reader exception.  The
+/// graph readers must all be certified load/store address cells for the same
+/// object, and every graphless boundary reader must contain the value in an
+/// exact call-argument cell. Repeating a pure frame address across calls does
+/// not repeat a program effect; each occurrence carries the same value/use/write
+/// classification, while the effect ledger still rejects any duplicated live
+/// obligation.
+fn frame_object_address_replacement(
+    source: &r2ssa::SsaArtifact,
+    projection: &r2ssa::MachineProjection,
+    value: ValueId,
+    use_sites: &[UseSite],
+    boundary_readers: &[InstId],
+) -> Option<r2ssa::ObjectId> {
+    if boundary_readers.is_empty() {
+        return None;
+    }
+    let mut object = None;
+    for call in boundary_readers {
+        let call_site = source.certificates().callsites_by_inst.get(call)?;
+        let certificate = source.certificates().callsites.get(call_site)?;
+        let mut matched = false;
+        for (argument_index, argument) in certificate.argument_values.iter().enumerate() {
+            if *argument != value {
+                continue;
+            }
+            let candidate =
+                super::certified_frame_object_call_argument(source, *call, argument_index, value)?;
+            if object.is_some_and(|object| object != candidate) {
+                return None;
+            }
+            object = Some(candidate);
+            matched = true;
+        }
+        if !matched {
+            return None;
+        }
+    }
+    let object = object?;
+    use_sites
+        .iter()
+        .all(|site| {
+            let Some(r2ssa::MachineUseDisposition::MemoryAddress(address)) =
+                projection.use_disposition(*site)
+            else {
+                return false;
+            };
+            let Some(access) = address.memory_access() else {
+                return false;
+            };
+            source
+                .certificates()
+                .memory_accesses
+                .get(&access)
+                .is_some_and(|memory| {
+                    memory.access == access
+                        && memory.address == value
+                        && memory.object == object
+                        && source.objects().object_for_value(value, memory.space) == Some(object)
+                })
+        })
+        .then_some(object)
+}
+
 fn inlinable_core(
     source_owned: &SourceOwnedFunctionFacts,
     projection: &r2ssa::MachineProjection,
@@ -856,6 +922,13 @@ fn inlinable_core(
             && (value.canonical_storage.is_none_or(|storage| {
                 matches!(storage.space, r2ssa::CanonicalStorageSpace::Unique)
             }) || admitted.contains(&value.id));
+        let frame_address_replacement = frame_object_address_replacement(
+            source,
+            projection,
+            value.id,
+            use_sites,
+            boundary_readers,
+        );
         let root_kind = expr_by_value
             .get(&value.id)
             .and_then(|root| projection.expr(*root))
@@ -872,7 +945,7 @@ fn inlinable_core(
         // accumulator after the byte load has overwritten it, and computes a
         // wrong hash under a proof line claiming nothing was refused. Three
         // corpus cells do this and five more refuse. See the handoff.
-        if !literal_only && reader_count != 1 {
+        if !literal_only && frame_address_replacement.is_none() && reader_count != 1 {
             rejected(&format!(
                 "{reader_count} readers ({} of them certified boundary reads), of which {} sit in a \
                  certificate-elided instruction; root {root_kind}",
@@ -952,6 +1025,13 @@ fn inlinable_core(
                 .any(|inst| elided_reads.contains(inst))
         {
             rejected("a reader sits in a certificate-elided instruction");
+            continue;
+        }
+        if frame_address_replacement.is_some() {
+            // The memory-address cells remain owned by their load/store
+            // renderings.  The sole call-boundary replacement owns the
+            // producer expression and spells the canonical object's address.
+            inlinable.insert(value.id);
             continue;
         }
         if literal_only {

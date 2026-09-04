@@ -111,6 +111,17 @@ enum ObservationTarget {
         symbol: SymbolId,
         is_write: bool,
     },
+    /// One call-boundary occurrence of a certified frame object's base
+    /// address. This authorizes the program-object spelling and tells
+    /// placement that the object's declaration is its storage definition.
+    EscapedStackAddress {
+        call: InstId,
+        argument_index: usize,
+        value: ValueId,
+        object: r2ssa::ObjectId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+    },
     /// One exact cell from the source-owned semantic obligation inventory.
     ///
     /// Unlike the legacy fold-side proof vector, this target belongs to one
@@ -977,6 +988,14 @@ fn placement_refusal(
         },
         Private::ReadBeforeAssignment {
             binding,
+            read: crate::binding_plan::PlacementRead::EscapedStackAddress { call, value },
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: call.0,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
             read:
                 crate::binding_plan::PlacementRead::StackAccess(access)
                 | crate::binding_plan::PlacementRead::IndexedStackAccess(access),
@@ -1170,6 +1189,7 @@ impl MarkedNativeDraft {
                 None => return Err(NativePlacementFailure::MissingBindingRole { binding }),
             }
         }
+        entry_declared.extend(occurrences.escaped_stack_bindings().iter().copied());
         let decisions = crate::placement::derive_placement_decisions(
             &placement.regions,
             source.source().function(),
@@ -1580,6 +1600,23 @@ impl LegacyObservationJournal {
                 symbol: *symbol,
                 is_write: *is_write,
             }),
+            ObservationTarget::EscapedStackAddress {
+                call,
+                argument_index,
+                value,
+                object,
+                binding,
+                symbol,
+            } => Some(
+                crate::placement::PlacementObservationTarget::EscapedStackAddress {
+                    call: *call,
+                    argument_index: *argument_index,
+                    value: *value,
+                    object: *object,
+                    binding: *binding,
+                    symbol: *symbol,
+                },
+            ),
             ObservationTarget::Value(_) | ObservationTarget::Effect(_) => {
                 Some(crate::placement::PlacementObservationTarget::Other)
             }
@@ -2434,10 +2471,60 @@ impl LegacyObservationJournal {
         &mut self,
         contract: crate::fold::op_lower::RenderedReplacementContract,
     ) -> Result<CExpr, LegacyObservationJournalError> {
-        let (expr, value, replaced, obligations) = contract.into_parts();
+        let (expr, value, replaced, obligations, frame_address) = contract.into_parts();
         self.value_slot(value)?;
         let mut targets = vec![ObservationTarget::Value(value)];
-        targets.extend(self.discharged_instruction_targets(Some(value), &replaced, Some(&expr))?);
+        targets.extend(self.discharged_instruction_targets(
+            Some(value),
+            &replaced,
+            Some(&expr),
+            frame_address.is_some(),
+        )?);
+
+        if let Some(frame_address) = frame_address {
+            let Some(object) = crate::binding_plan::certified_frame_object_call_argument(
+                &self.source,
+                frame_address.call,
+                frame_address.argument_index,
+                value,
+            ) else {
+                return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                    value,
+                    at: frame_address.call,
+                });
+            };
+            let Some(StackObjectDisposition::Bound { binding }) =
+                self.plan.stack_object_disposition(object)
+            else {
+                return Err(LegacyObservationJournalError::MissingPlannedValue(value));
+            };
+            let symbol = self
+                .names
+                .symbol_for_binding(binding)
+                .ok_or(LegacyObservationJournalError::MissingPlannedValue(value))?;
+            if object != frame_address.object
+                || !crate::placement::frame_object_address_expr_matches(
+                    &expr,
+                    symbol,
+                    self.plan.binding(binding).is_some_and(|binding| {
+                        matches!(binding.declaration_type(), crate::ast::CType::Array(_, _))
+                    }),
+                )
+            {
+                return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                    value,
+                    at: frame_address.call,
+                });
+            }
+            targets.push(ObservationTarget::EscapedStackAddress {
+                call: frame_address.call,
+                argument_index: frame_address.argument_index,
+                value,
+                object,
+                binding,
+                symbol,
+            });
+        }
 
         for obligation in obligations {
             if !self.effect_occurrences.contains_key(&obligation) {
@@ -2475,7 +2562,7 @@ impl LegacyObservationJournal {
         discharged: &[InstId],
         stmt: CStmt,
     ) -> Result<CStmt, LegacyObservationJournalError> {
-        let targets = self.discharged_instruction_targets(None, discharged, None)?;
+        let targets = self.discharged_instruction_targets(None, discharged, None, false)?;
         let mut marked = stmt;
         for id in self.allocate_many(targets)? {
             marked = CStmt::observed(id, marked);
@@ -2499,6 +2586,7 @@ impl LegacyObservationJournal {
         rendered: Option<ValueId>,
         discharged: &[InstId],
         expr: Option<&CExpr>,
+        abstracts_frame_base: bool,
     ) -> Result<Vec<ObservationTarget>, LegacyObservationJournalError> {
         let mut targets = Vec::new();
         let mut represented_values: BTreeSet<ValueId> = rendered.into_iter().collect();
@@ -2565,6 +2653,13 @@ impl LegacyObservationJournal {
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
+                        // `&frame_object` semantically contains the frame base
+                        // and displacement without spelling either as a C
+                        // value. Their exact use cells are owned by this
+                        // replacement, but a bound value cell must remain on
+                        // an occurrence of its own symbol rather than being
+                        // misclassified as the frame-object binding.
+                        Some(ValueDisposition::Bound { .. }) if abstracts_frame_base => false,
                         Some(ValueDisposition::Bound { .. }) => true,
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>
@@ -3032,7 +3127,8 @@ impl LegacyObservationJournal {
                 }
                 ObservationTarget::StackAccess { .. }
                 | ObservationTarget::CertifiedValueRead { .. }
-                | ObservationTarget::CertifiedArrayIndexRead { .. } => {}
+                | ObservationTarget::CertifiedArrayIndexRead { .. }
+                | ObservationTarget::EscapedStackAddress { .. } => {}
             }
         }
 
@@ -3671,7 +3767,8 @@ impl LegacyObservationJournal {
                         inst, observation, ..
                     } => record_same(&mut writes[inst.0 as usize], observation)
                         .map_err(|()| LegacyObservationJournalError::ConflictingWrite(inst)),
-                    ObservationTarget::StackAccess { .. } => Ok(()),
+                    ObservationTarget::StackAccess { .. }
+                    | ObservationTarget::EscapedStackAddress { .. } => Ok(()),
                     ObservationTarget::Effect(effect) => {
                         let occurrences = effect_occurrences.get_mut(&effect).ok_or(
                             LegacyObservationJournalError::InvalidEffectObligation(effect),
