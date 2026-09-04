@@ -85,6 +85,12 @@ enum ObservationTarget {
         binding: crate::binding_plan::BindingId,
         symbol: SymbolId,
     },
+    CertifiedArrayIndexRead {
+        access: r2ssa::StructuredAccessId,
+        value: ValueId,
+        binding: crate::binding_plan::BindingId,
+        symbol: SymbolId,
+    },
     Use {
         site: UseSite,
         observation: LegacyUseObservation,
@@ -963,6 +969,14 @@ fn placement_refusal(
         },
         Private::ReadBeforeAssignment {
             binding,
+            read: crate::binding_plan::PlacementRead::ArrayIndex { access, value },
+        } => Public::CertifiedValueReadBeforeAssignment {
+            binding_index: binding.index(),
+            value_id: value.0,
+            instruction_id: access.inst.0,
+        },
+        Private::ReadBeforeAssignment {
+            binding,
             read:
                 crate::binding_plan::PlacementRead::StackAccess(access)
                 | crate::binding_plan::PlacementRead::IndexedStackAccess(access),
@@ -1498,6 +1512,19 @@ impl LegacyObservationJournal {
                     symbol: *symbol,
                 },
             ),
+            ObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding,
+                symbol,
+            } => Some(
+                crate::placement::PlacementObservationTarget::CertifiedArrayIndexRead {
+                    access: *access,
+                    value: *value,
+                    binding: *binding,
+                    symbol: *symbol,
+                },
+            ),
             ObservationTarget::Use { site, block, .. } => Some(
                 self.source
                     .graph()
@@ -1779,15 +1806,38 @@ impl LegacyObservationJournal {
                         input.value, dispositions.0, output.value, dispositions.1
                     );
                 }
-                if matches!(
+                let same_binding = matches!(
                     dispositions,
                     (
                         Some(ValueDisposition::Bound { binding: input }),
                         Some(ValueDisposition::Bound { binding: output }),
                     ) if input == output
-                ) {
+                );
+                // A preserved carrier whose restored value has no reader is
+                // the other exact no-op shape. There is deliberately no
+                // output object to coalesce in that case: the binding plan's
+                // authority-bound elision proves the restored value is unused,
+                // while `boundary_restores_carrier` proves the call did not
+                // change the carrier. Together those facts answer the source
+                // operand read without inventing a C assignment.
+                let unused_boundary_restore = matches!(
+                    (
+                        op,
+                        plan.disposition(input.value),
+                        plan.disposition(output.value)
+                    ),
+                    (
+                        r2ssa::SSAOp::CallRestore { .. },
+                        Some(ValueDisposition::Bound { .. }),
+                        Some(ValueDisposition::Elided {
+                            reason: r2ssa::ledger::ElisionReason::UnusedStructuralValue,
+                            ..
+                        }),
+                    )
+                );
+                if same_binding || unused_boundary_restore {
                     coalesced_carrier_copy_sites.insert(site);
-                    if let Some(inst) = program_copy {
+                    if same_binding && let Some(inst) = program_copy {
                         coalesced_copy_outputs.insert(output.value);
                         coalesced_copy_writes.insert(inst);
                     }
@@ -2628,6 +2678,63 @@ impl LegacyObservationJournal {
         Ok(CExpr::observed(read_id, CExpr::observed(value_id, expr)))
     }
 
+    /// Mark the exact value a certified stack-array subscript uses as its
+    /// element index.
+    ///
+    /// The machine store reads the completed address, not this earlier SSA
+    /// value directly. Replacing that address with `array[index]` introduces a
+    /// C read of the index binding, so the array element certificate is the
+    /// authority for that replacement occurrence. The ordinary value marker
+    /// installed while the term is rendered still fills the value cell; this
+    /// target supplies the placement read.
+    pub(crate) fn observe_certified_array_index_expr(
+        &mut self,
+        access: r2ssa::StructuredAccessId,
+        value: ValueId,
+        symbol: SymbolId,
+        expr: CExpr,
+    ) -> Result<CExpr, LegacyObservationJournalError> {
+        self.value_slot(value)?;
+        let Some(ValueDisposition::Bound { binding }) = self.plan.disposition(value) else {
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadDispositionNotBound,
+                self.plan.disposition(value),
+            ));
+        };
+        if !crate::placement::certified_array_index_read_matches(
+            &self.source,
+            &self.names,
+            access,
+            value,
+            *binding,
+            symbol,
+        ) {
+            return Err(LegacyObservationJournalError::InvalidCertifiedValueRead {
+                value,
+                at: access.inst,
+            });
+        }
+        if !crate::placement::expr_reads_symbol(&expr, symbol) {
+            return Err(LegacyObservationJournalError::rendered_value_required(
+                value,
+                RenderedValueRequirementCause::CertifiedReadExpressionMissingSymbol,
+                self.plan.disposition(value),
+            ));
+        }
+        let read_id = self
+            .allocate_many(vec![ObservationTarget::CertifiedArrayIndexRead {
+                access,
+                value,
+                binding: *binding,
+                symbol,
+            }])?
+            .into_iter()
+            .next()
+            .ok_or(LegacyObservationJournalError::TooManyObservations)?;
+        Ok(CExpr::observed(read_id, expr))
+    }
+
     /// Mark one exact rendered access to a source-owned stack-object binding.
     ///
     /// The structured access owns the object, the binding plan owns the
@@ -2924,7 +3031,8 @@ impl LegacyObservationJournal {
                     self.placement_elided_effects.insert(obligation);
                 }
                 ObservationTarget::StackAccess { .. }
-                | ObservationTarget::CertifiedValueRead { .. } => {}
+                | ObservationTarget::CertifiedValueRead { .. }
+                | ObservationTarget::CertifiedArrayIndexRead { .. } => {}
             }
         }
 
@@ -3497,6 +3605,7 @@ impl LegacyObservationJournal {
                     // value or use slot of its own, and the placement audit is
                     // what it exists to answer.
                     ObservationTarget::CertifiedValueRead { .. } => Ok(()),
+                    ObservationTarget::CertifiedArrayIndexRead { .. } => Ok(()),
                     ObservationTarget::Value(value) => {
                         match plan.disposition(value) {
                             Some(ValueDisposition::Elided { reason, .. }) => {

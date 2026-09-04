@@ -1137,6 +1137,20 @@ pub struct LoopCertificate {
     pub body: Vec<u64>,
     pub exits: Vec<u64>,
     pub condition: Option<PredicateId>,
+    /// Counted-loop construction, present only when the condition reads this
+    /// exact induction phi and one renderable entry member dominates it.
+    pub for_loop: Option<ForLoopCertificate>,
+}
+
+/// Name-free certificate for moving a loop carrier's dominating entry and
+/// latch update into a C `for` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForLoopCertificate {
+    pub induction_phi: ValueId,
+    pub induction_init: ValueId,
+    pub induction_update: ValueId,
+    pub latch: u64,
+    pub initializer: LoopCarrierEdgeValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1185,6 +1199,13 @@ pub struct StackSlotCertificate {
     pub base: StackAddressBase,
     pub offset: i64,
     pub size: Option<u32>,
+    /// Aggregate geometry for an object reached through a computed index.
+    ///
+    /// This is a disposition rather than an optional array: an indexed object
+    /// that failed the proof must remain distinguishable from an ordinary
+    /// scalar object, so no consumer can retry the inference from address
+    /// spelling.
+    pub array_layout: StackArrayLayoutDisposition,
     /// Exact source slot identity when the immutable function interface owns a
     /// unique slot at this base and offset. Absence grants no local or
     /// parameter-home role downstream.
@@ -1194,6 +1215,55 @@ pub struct StackSlotCertificate {
     /// source slot: compiler-created spills and temporaries are real machine
     /// objects without becoming source variables.
     pub callee_allocation: Option<CalleeStackAllocationCertificate>,
+}
+
+/// Upstream decision for declaring one indexed stack object as an array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StackArrayLayoutDisposition {
+    /// No prepared access reaches this object through an indexed address.
+    NotIndexed,
+    /// Every access agrees on the element width and the index graph contains
+    /// an exact non-negative constant establishing the last byte offset.
+    Proven(StackArrayLayoutCertificate),
+    /// The object is indexed, but the exact geometry required by C was absent.
+    Refused(StackArrayLayoutRefusal),
+}
+
+/// Exact byte geometry of one indexed stack object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackArrayLayoutCertificate {
+    pub object: ObjectId,
+    pub element_width: u32,
+    pub stride: u32,
+    pub maximum_constant_offset: u64,
+    pub extent: u64,
+    /// The complete stable set of indexed addresses reaching this object and
+    /// the exact element index, when the byte scale can be removed without an
+    /// invented expression.
+    pub indexed_elements: Box<[StackArrayElementCertificate]>,
+}
+
+/// Exact index spelling for one access to a certified stack array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackArrayElementCertificate {
+    pub address: ValueId,
+    pub byte_offset: ValueId,
+    pub element_index: Option<StackArrayElementIndex>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackArrayElementIndex {
+    Value(ValueId),
+    Constant(u64),
+}
+
+/// Why an indexed stack object deliberately remained scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackArrayLayoutRefusal {
+    IncompleteAccessProvenance,
+    ConflictingAccessWidths,
+    MissingConstantOffset,
+    InvalidExtent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4454,6 +4524,7 @@ fn collect_callee_stack_allocation_certificates(
     objects: &ObjectModel,
     structured: &StructuredDataflowFacts,
     exact_stack_slots: &BTreeMap<(StackAddressBase, i64), SourceStackSlotSpec>,
+    array_layouts: &BTreeMap<ObjectId, StackArrayLayoutDisposition>,
 ) -> BTreeMap<ObjectId, CalleeStackAllocationCertificate> {
     let Some(machine_context) = machine_context else {
         return BTreeMap::new();
@@ -4512,16 +4583,27 @@ fn collect_callee_stack_allocation_certificates(
         let Some(first) = accesses.first() else {
             continue;
         };
-        let size_bytes = first.width;
-        if size_bytes == 0
+        let element_width = first.width;
+        if element_width == 0
             || accesses.iter().any(|access| {
-                access.width != size_bytes
+                access.width != element_width
                     || !access.provenance_complete
                     || !ram_memory_access_matches_source(function, graph, objects, access)
             })
         {
             continue;
         }
+        let size_bytes = match array_layouts.get(object) {
+            Some(StackArrayLayoutDisposition::Proven(layout)) => {
+                let Ok(extent) = u32::try_from(layout.extent) else {
+                    continue;
+                };
+                extent
+            }
+            Some(StackArrayLayoutDisposition::NotIndexed)
+            | Some(StackArrayLayoutDisposition::Refused(_))
+            | None => element_width,
+        };
 
         let mut active_sp_offsets = BTreeSet::new();
         let mut uses_implicit_area = false;
@@ -4582,9 +4664,20 @@ fn collect_callee_stack_allocation_certificates(
             };
             let other_size = match other_fact.kind {
                 ObjectKind::StackSlot { base, offset, .. }
-                | ObjectKind::FrameObject { base, offset, .. } => exact_stack_slots
-                    .get(&(base, offset))
-                    .map(SourceStackSlotSpec::size_bytes)
+                | ObjectKind::FrameObject { base, offset, .. } => {
+                    match array_layouts.get(other_object) {
+                        Some(StackArrayLayoutDisposition::Proven(layout)) => {
+                            u32::try_from(layout.extent).ok()
+                        }
+                        Some(StackArrayLayoutDisposition::NotIndexed)
+                        | Some(StackArrayLayoutDisposition::Refused(_))
+                        | None => None,
+                    }
+                    .or_else(|| {
+                        exact_stack_slots
+                            .get(&(base, offset))
+                            .map(SourceStackSlotSpec::size_bytes)
+                    })
                     .or_else(|| {
                         let widths = structured
                             .memory_accesses
@@ -4593,7 +4686,8 @@ fn collect_callee_stack_allocation_certificates(
                             .map(|access| access.width)
                             .collect::<BTreeSet<_>>();
                         (widths.len() == 1).then(|| *widths.first().expect("one width"))
-                    }),
+                    })
+                }
                 ObjectKind::Parameter { .. }
                 | ObjectKind::Global { .. }
                 | ObjectKind::HeapAlloc { .. }
@@ -5394,6 +5488,195 @@ fn accessed_object_width(structured: &StructuredDataflowFacts, object: ObjectId)
     width
 }
 
+/// Exact unsigned byte bound carried by one index computation.
+///
+/// This is deliberately a small algebra, not a general range guess. Constants,
+/// masks, remainders, and checked compositions of already-bounded values have
+/// an exact finite upper bound. A merge, load, subtraction, or unsupported
+/// operation has none. The visited set is sized by the data it clears, so a
+/// cyclic graph refuses without an arbitrary depth constant.
+fn indexed_offset_upper_bound(
+    graph: &SsaGraph,
+    value: ValueId,
+    memo: &mut BTreeMap<ValueId, Option<u64>>,
+    visiting: &mut BTreeSet<ValueId>,
+) -> Option<u64> {
+    if let Some(bound) = memo.get(&value) {
+        return *bound;
+    }
+    if let Some(constant) = graph.value(value)?.var.constant_bits() {
+        memo.insert(value, Some(constant));
+        return Some(constant);
+    }
+    if !visiting.insert(value) {
+        return None;
+    }
+    let bound = (|| {
+        let inst = graph.inst(graph.def_inst(value)?)?;
+        let InstPayload::Op(op) = &inst.payload else {
+            return None;
+        };
+        let input = |index: usize| inst.inputs.get(index).copied();
+        let constant =
+            |index: usize| input(index).and_then(|value| graph.value(value)?.var.constant_bits());
+        let mut bound_of =
+            |index: usize| indexed_offset_upper_bound(graph, input(index)?, memo, visiting);
+        match op {
+            SSAOp::Copy { .. } | SSAOp::New { .. } | SSAOp::Cast { .. } | SSAOp::IntZExt { .. } => {
+                bound_of(0)
+            }
+            SSAOp::IntAdd { .. } => bound_of(0)?.checked_add(bound_of(1)?),
+            SSAOp::IntMult { .. } => bound_of(0)?.checked_mul(bound_of(1)?),
+            SSAOp::IntAnd { .. } => match (constant(0), constant(1)) {
+                (Some(mask), _) | (_, Some(mask)) => Some(mask),
+                (None, None) => Some(bound_of(0)?.min(bound_of(1)?)),
+            },
+            SSAOp::IntRem { .. } => constant(1)?.checked_sub(1),
+            SSAOp::IntLeft { .. } => {
+                let shift = u32::try_from(constant(1)?).ok()?;
+                bound_of(0)?.checked_shl(shift)
+            }
+            SSAOp::IntRight { .. } => {
+                let shift = u32::try_from(constant(1)?).ok()?;
+                bound_of(0)?.checked_shr(shift)
+            }
+            _ => None,
+        }
+    })();
+    visiting.remove(&value);
+    memo.insert(value, bound);
+    bound
+}
+
+/// Remove the certified byte stride from one offset without manufacturing a
+/// value. More involved affine expressions remain valid array geometry but do
+/// not get a direct element spelling here; the general rewrite rules may still
+/// prove those accesses independently.
+fn stack_array_element_index(
+    graph: &SsaGraph,
+    byte_offset: ValueId,
+    stride: u32,
+) -> Option<StackArrayElementIndex> {
+    let stride = u64::from(stride);
+    if stride == 0 {
+        return None;
+    }
+    if let Some(constant) = graph.value(byte_offset)?.var.constant_bits() {
+        return constant
+            .is_multiple_of(stride)
+            .then_some(StackArrayElementIndex::Constant(constant / stride));
+    }
+    if stride == 1 {
+        return Some(StackArrayElementIndex::Value(byte_offset));
+    }
+    let inst = graph.inst(graph.def_inst(byte_offset)?)?;
+    let InstPayload::Op(op) = &inst.payload else {
+        return None;
+    };
+    let input = |index: usize| inst.inputs.get(index).copied();
+    let constant =
+        |index: usize| input(index).and_then(|value| graph.value(value)?.var.constant_bits());
+    match op {
+        SSAOp::Copy { .. } | SSAOp::New { .. } | SSAOp::Cast { .. } | SSAOp::IntZExt { .. } => {
+            stack_array_element_index(graph, input(0)?, stride as u32)
+        }
+        SSAOp::IntMult { .. } => match (constant(0), constant(1)) {
+            (Some(scale), _) if scale == stride => Some(StackArrayElementIndex::Value(input(1)?)),
+            (_, Some(scale)) if scale == stride => Some(StackArrayElementIndex::Value(input(0)?)),
+            _ => None,
+        },
+        SSAOp::IntLeft { .. } if stride.is_power_of_two() => (constant(1)?
+            == u64::from(stride.trailing_zeros()))
+        .then_some(StackArrayElementIndex::Value(input(0)?)),
+        _ => None,
+    }
+}
+
+/// Decide array geometry once, beside the object and memory facts that own it.
+fn stack_array_layout(
+    graph: &SsaGraph,
+    objects: &ObjectModel,
+    structured: &StructuredDataflowFacts,
+    object: ObjectId,
+) -> StackArrayLayoutDisposition {
+    let indexed_addresses = structured
+        .memory_accesses
+        .values()
+        .filter(|access| access.object == object && objects.address_is_indexed(access.address))
+        .map(|access| access.address)
+        .collect::<BTreeSet<_>>();
+    if indexed_addresses.is_empty() {
+        return StackArrayLayoutDisposition::NotIndexed;
+    }
+
+    let mut element_width = None;
+    for access in structured
+        .memory_accesses
+        .values()
+        .filter(|access| access.object == object)
+    {
+        if !access.provenance_complete || access.width == 0 {
+            return StackArrayLayoutDisposition::Refused(
+                StackArrayLayoutRefusal::IncompleteAccessProvenance,
+            );
+        }
+        match element_width {
+            None => element_width = Some(access.width),
+            Some(width) if width == access.width => {}
+            Some(_) => {
+                return StackArrayLayoutDisposition::Refused(
+                    StackArrayLayoutRefusal::ConflictingAccessWidths,
+                );
+            }
+        }
+    }
+    let Some(element_width) = element_width else {
+        return StackArrayLayoutDisposition::Refused(
+            StackArrayLayoutRefusal::IncompleteAccessProvenance,
+        );
+    };
+
+    let mut memo = BTreeMap::new();
+    let mut maximum_constant_offset = None;
+    let mut indexed_elements = Vec::with_capacity(indexed_addresses.len());
+    for address in &indexed_addresses {
+        let Some(byte_offset) = objects.index_for_address(*address) else {
+            continue;
+        };
+        if let Some(bound) =
+            indexed_offset_upper_bound(graph, byte_offset, &mut memo, &mut BTreeSet::new())
+        {
+            maximum_constant_offset =
+                Some(maximum_constant_offset.map_or(bound, |old: u64| old.max(bound)));
+        }
+        indexed_elements.push(StackArrayElementCertificate {
+            address: *address,
+            byte_offset,
+            element_index: stack_array_element_index(graph, byte_offset, element_width),
+        });
+    }
+    let Some(maximum_constant_offset) = maximum_constant_offset else {
+        return StackArrayLayoutDisposition::Refused(
+            StackArrayLayoutRefusal::MissingConstantOffset,
+        );
+    };
+    let stride = element_width;
+    let Some(extent) = maximum_constant_offset.checked_add(u64::from(stride)) else {
+        return StackArrayLayoutDisposition::Refused(StackArrayLayoutRefusal::InvalidExtent);
+    };
+    if extent == 0 || !extent.is_multiple_of(u64::from(element_width)) {
+        return StackArrayLayoutDisposition::Refused(StackArrayLayoutRefusal::InvalidExtent);
+    }
+    StackArrayLayoutDisposition::Proven(StackArrayLayoutCertificate {
+        object,
+        element_width,
+        stride,
+        maximum_constant_offset,
+        extent,
+        indexed_elements: indexed_elements.into_boxed_slice(),
+    })
+}
+
 /// The one entry-relative position a storage holds, if it holds exactly one.
 ///
 /// A frame pointer established once has a single position for the whole body.
@@ -5423,6 +5706,116 @@ fn unique_stack_root_for_storage(
         }
     }
     found
+}
+
+fn counted_for_loop_certificate(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    predicates: &PredicateFacts,
+    structured: &StructuredDataflowFacts,
+    loop_fact: &StructuredLoopFact,
+) -> Option<ForLoopCertificate> {
+    let phi = loop_fact.induction_phi?;
+    let induction = structured.inductions.get(&phi)?;
+    if induction.loop_id != loop_fact.id
+        || induction.header != loop_fact.header
+        || loop_fact.latches.as_slice() != [induction.latch]
+        || loop_fact.induction_init != Some(induction.init)
+        || loop_fact.induction_update != Some(induction.update)
+        || !induction.validate(graph)
+    {
+        return None;
+    }
+    let comparison = predicates
+        .predicates
+        .get(&loop_fact.condition?)?
+        .comparison
+        .as_ref()?;
+    let lhs_reads_phi = value_depends_on(graph, comparison.lhs, phi);
+    let rhs_reads_phi = value_depends_on(graph, comparison.rhs, phi);
+    if lhs_reads_phi == rhs_reads_phi {
+        return None;
+    }
+    let carrier = loop_fact
+        .carriers
+        .iter()
+        .find(|carrier| carrier.phi == phi)?;
+    let mut initializers = carrier.entries.iter().filter(|entry| {
+        entry.value == induction.init
+            && function.dominates(entry.predecessor, loop_fact.header)
+            && graph
+                .def_inst(entry.value)
+                .and_then(|inst| graph.inst(inst))
+                .is_some_and(|inst| {
+                    matches!(inst.payload, InstPayload::Op(_))
+                        && graph.block(inst.block).map(|block| block.addr)
+                            == Some(entry.predecessor)
+                })
+    });
+    let initializer = initializers.next()?;
+    if initializers.next().is_some() {
+        return None;
+    }
+    if !initializer.validate(graph) {
+        return None;
+    }
+    if !movable_for_clause_value(
+        function,
+        graph,
+        initializer.value,
+        initializer.predecessor,
+        loop_fact.header,
+    ) || !movable_for_clause_value(
+        function,
+        graph,
+        induction.update,
+        induction.latch,
+        loop_fact.header,
+    ) {
+        return None;
+    }
+    Some(ForLoopCertificate {
+        induction_phi: phi,
+        induction_init: induction.init,
+        induction_update: induction.update,
+        latch: induction.latch,
+        initializer: *initializer,
+    })
+}
+
+/// Whether moving one definition into a `for` clause preserves its block order.
+///
+/// The defining block must flow only to the loop header, and only inert or
+/// control operations may follow the definition. This walks at most the two
+/// clause-owning block suffixes per loop; it never rescans the function.
+fn movable_for_clause_value(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    value: ValueId,
+    block_addr: u64,
+    loop_header: u64,
+) -> bool {
+    if function.successors(block_addr).as_slice() != [loop_header] {
+        return false;
+    }
+    let Some((definition_block, op_index)) = graph
+        .def_inst(value)
+        .and_then(|inst| graph.op_site_for_inst(inst))
+    else {
+        return false;
+    };
+    definition_block == block_addr
+        && function.get_block(block_addr).is_some_and(|block| {
+            let Some(suffix) = op_index
+                .checked_add(1)
+                .and_then(|start| block.ops.get(start..))
+            else {
+                return false;
+            };
+            suffix
+                .iter()
+                .all(|op| matches!(op, SSAOp::Branch { .. } | SSAOp::Nop))
+        })
 }
 
 #[expect(
@@ -5493,6 +5886,9 @@ fn collect_prepared_function_certificates(
                     body: fact.body.clone(),
                     exits: fact.exits.clone(),
                     condition: fact.condition,
+                    for_loop: counted_for_loop_certificate(
+                        function, graph, predicates, structured, fact,
+                    ),
                 },
             )
         })
@@ -5581,6 +5977,17 @@ fn collect_prepared_function_certificates(
         })
         .collect();
 
+    let stack_array_layouts = objects
+        .objects
+        .keys()
+        .copied()
+        .map(|object| {
+            (
+                object,
+                stack_array_layout(graph, objects, structured, object),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let callee_stack_allocations = collect_callee_stack_allocation_certificates(
         function,
         graph,
@@ -5588,6 +5995,7 @@ fn collect_prepared_function_certificates(
         objects,
         structured,
         &exact_stack_slots,
+        &stack_array_layouts,
     );
     let (stack_frame_round_trips, stack_frame_round_trip_by_inst) =
         collect_stack_frame_round_trip_certificates(
@@ -5642,15 +6050,30 @@ fn collect_prepared_function_certificates(
                     // for most of these: it reports no stack variables at all
                     // for `murmur3_32`, which has fourteen of them.
                     //
-                    size: exact_stack_slots
-                        .get(&(base, offset))
-                        .map(SourceStackSlotSpec::size_bytes)
+                    size: stack_array_layouts
+                        .get(object)
+                        .and_then(|layout| match layout {
+                            StackArrayLayoutDisposition::Proven(layout) => {
+                                u32::try_from(layout.extent).ok()
+                            }
+                            StackArrayLayoutDisposition::NotIndexed
+                            | StackArrayLayoutDisposition::Refused(_) => None,
+                        })
+                        .or_else(|| {
+                            exact_stack_slots
+                                .get(&(base, offset))
+                                .map(SourceStackSlotSpec::size_bytes)
+                        })
                         .or_else(|| {
                             callee_stack_allocations
                                 .get(object)
                                 .map(|certificate| certificate.size_bytes)
                         })
                         .or_else(|| accessed_object_width(structured, *object)),
+                    array_layout: stack_array_layouts
+                        .get(object)
+                        .cloned()
+                        .unwrap_or(StackArrayLayoutDisposition::NotIndexed),
                     source_slot: exact_stack_slots.get(&(base, offset)).copied(),
                     callee_allocation: callee_stack_allocations.get(object).cloned(),
                 },
@@ -9646,12 +10069,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        CallBoundarySlot, ControlGuard, GlobalObjectKey, MemoryDefFact, MemoryLocation,
-        MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact, ObjectId, ObjectKind,
-        ObjectModel, ObjectModelBuilder, ObjectSpaceId, RelativeMemoryAddress, ReturnCarrier,
+        CallBoundarySlot, ControlGuard, ForLoopCertificate, GlobalObjectKey, InductionStep,
+        LoopCertificate, MemoryDefFact, MemoryLocation, MemorySSAFacts, MemoryUseFact,
+        MemoryVersion, ObjectFact, ObjectId, ObjectKind, ObjectModel, ObjectModelBuilder,
+        ObjectSpaceId, RelativeMemoryAddress, ReturnCarrier,
         SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SourceReturnRegisterCompositionFact,
         SourceReturnRegisterDefinitionFact, StackReloadSourceCertificate, StructuredAccessId,
-        memory_locations_may_alias,
+        StructuredLoopKind, memory_locations_may_alias,
     };
     use crate::{
         AddressProvenanceFacts, AnalysisAssumption, AssumptionProvenance, AssumptionScope,
@@ -11877,6 +12301,282 @@ mod tests {
             .expect("induction loop artifact")
     }
 
+    /// A pre-test counted loop whose comparison and latch are in distinct
+    /// blocks, matching the region shape a renderer may turn into `for`.
+    fn counted_loop_artifact(condition_reads_counter: bool) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let compared = if condition_reads_counter {
+            counter.clone()
+        } else {
+            Varnode::register(48, 8)
+        };
+        let condition = Varnode::unique(0x7200, 1);
+
+        let mut entry = R2ILBlock::new(0x7100, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7110, 4);
+        header.push(R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: compared,
+            b: Varnode::constant(10, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7140, 8),
+            cond: condition,
+        });
+
+        let mut body = R2ILBlock::new(0x7114, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7120, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x7120, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter.clone(),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x7140, 4);
+        exit.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x9000, 8),
+            val: counter,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        SsaArtifact::for_decompile(
+            &[entry, header, body, latch, exit],
+            Some(&return_boundary_arch()),
+        )
+        .expect("counted loop artifact")
+    }
+
+    #[derive(Clone, Copy)]
+    enum CountedTestStep {
+        Add(u64),
+        Sub(u64),
+        UnsupportedXor(u64),
+    }
+
+    /// The same pre-test loop with optional copy projections on the compared
+    /// phi and latch update. These are graph identities, not symbol aliases.
+    fn counted_loop_with_aliases(
+        condition_aliases: usize,
+        update_aliases: usize,
+        step: CountedTestStep,
+        trailing_latch_effect: bool,
+    ) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let condition = Varnode::unique(0x75f0, 1);
+
+        let mut entry = R2ILBlock::new(0x7500, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7510, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7510, 4);
+        let mut compared = counter.clone();
+        for index in 0..condition_aliases {
+            let alias = Varnode::unique(0x7600 + index as u64 * 8, 8);
+            header.push(R2ILOp::Copy {
+                dst: alias.clone(),
+                src: compared,
+            });
+            compared = alias;
+        }
+        header.push(R2ILOp::IntLess {
+            dst: condition.clone(),
+            a: compared,
+            b: Varnode::constant(10, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7540, 8),
+            cond: condition,
+        });
+
+        let mut body = R2ILBlock::new(0x7514, 4);
+        body.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7520, 8),
+        });
+
+        let mut latch = R2ILBlock::new(0x7520, 4);
+        let mut update_input = counter.clone();
+        for index in 0..update_aliases {
+            let alias = Varnode::unique(0x7700 + index as u64 * 8, 8);
+            latch.push(R2ILOp::Copy {
+                dst: alias.clone(),
+                src: update_input,
+            });
+            update_input = alias;
+        }
+        match step {
+            CountedTestStep::Add(step) => latch.push(R2ILOp::IntAdd {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(step, 8),
+            }),
+            CountedTestStep::Sub(step) => latch.push(R2ILOp::IntSub {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(step, 8),
+            }),
+            CountedTestStep::UnsupportedXor(mask) => latch.push(R2ILOp::IntXor {
+                dst: counter.clone(),
+                a: update_input,
+                b: Varnode::constant(mask, 8),
+            }),
+        }
+        if trailing_latch_effect {
+            latch.push(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x9010, 8),
+                val: counter.clone(),
+            });
+        }
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7510, 8),
+        });
+
+        let mut exit = R2ILBlock::new(0x7540, 4);
+        exit.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x9000, 8),
+            val: counter,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+
+        SsaArtifact::for_decompile(
+            &[entry, header, body, latch, exit],
+            Some(&return_boundary_arch()),
+        )
+        .expect("counted loop with graph aliases")
+    }
+
+    /// A loop with two body paths converging either at the update itself or at
+    /// a common suffix immediately before it. Both shapes have one real latch.
+    fn counted_loop_with_shared_latch_artifact(common_suffix: bool) -> SsaArtifact {
+        let counter = Varnode::register(40, 8);
+        let loop_condition = Varnode::unique(0x7800, 1);
+        let branch_condition = Varnode::register(56, 1);
+
+        let mut entry = R2ILBlock::new(0x7100, 4);
+        entry.push(R2ILOp::Copy {
+            dst: counter.clone(),
+            src: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+
+        let mut header = R2ILBlock::new(0x7110, 4);
+        header.push(R2ILOp::IntLess {
+            dst: loop_condition.clone(),
+            a: counter.clone(),
+            b: Varnode::constant(10, 8),
+        });
+        header.push(R2ILOp::CBranch {
+            target: Varnode::ram(0x7140, 8),
+            cond: loop_condition,
+        });
+
+        let mut branch = R2ILBlock::new(0x7114, 4);
+        branch.push(R2ILOp::CBranch {
+            target: Varnode::ram(if common_suffix { 0x711c } else { 0x7120 }, 8),
+            cond: branch_condition,
+        });
+
+        let mut fallthrough = R2ILBlock::new(0x7118, 4);
+        fallthrough.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x7810, 8),
+            src: counter.clone(),
+        });
+        fallthrough.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7120, 8),
+        });
+
+        let mut blocks = vec![entry, header, branch, fallthrough];
+        let latch_addr = if common_suffix {
+            let mut alternate = R2ILBlock::new(0x711c, 4);
+            alternate.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x7818, 8),
+                src: counter.clone(),
+            });
+            alternate.push(R2ILOp::Branch {
+                target: Varnode::ram(0x7120, 8),
+            });
+            let mut suffix = R2ILBlock::new(0x7120, 4);
+            suffix.push(R2ILOp::Copy {
+                dst: Varnode::unique(0x7820, 8),
+                src: counter.clone(),
+            });
+            suffix.push(R2ILOp::Branch {
+                target: Varnode::ram(0x7130, 8),
+            });
+            blocks.extend([alternate, suffix]);
+            0x7130
+        } else {
+            0x7120
+        };
+
+        let mut latch = R2ILBlock::new(latch_addr, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: counter.clone(),
+            a: counter.clone(),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::ram(0x7110, 8),
+        });
+        blocks.push(latch);
+
+        let mut exit = R2ILBlock::new(0x7140, 4);
+        exit.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: Varnode::constant(0x9000, 8),
+            val: counter,
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        blocks.push(exit);
+
+        SsaArtifact::for_decompile(&blocks, Some(&return_boundary_arch()))
+            .expect("counted loop with shared latch")
+    }
+
+    fn for_certificate(artifact: &SsaArtifact) -> Option<(&LoopCertificate, &ForLoopCertificate)> {
+        artifact
+            .facts()
+            .certificates
+            .loops
+            .values()
+            .find_map(|loop_fact| {
+                loop_fact
+                    .for_loop
+                    .as_ref()
+                    .map(|certificate| (loop_fact, certificate))
+            })
+    }
+
     fn recovered_induction_step(artifact: &SsaArtifact) -> Option<super::InductionStep> {
         artifact
             .facts()
@@ -12002,11 +12702,368 @@ mod tests {
     }
 
     #[test]
+    fn counted_for_certificate_joins_condition_phi_initializer_and_latch_by_identity() {
+        let artifact = counted_loop_artifact(true);
+        let graph = artifact.graph();
+        let certificate = artifact
+            .facts()
+            .certificates
+            .loops
+            .values()
+            .find_map(|loop_fact| loop_fact.for_loop.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "counted loop certificate: structured={:#?} prepared={:#?} predicates={:#?}",
+                    artifact.facts().structured.loops,
+                    artifact.facts().certificates.loops,
+                    artifact.facts().predicates,
+                )
+            });
+        let induction = artifact
+            .facts()
+            .structured
+            .inductions
+            .get(&certificate.induction_phi)
+            .expect("certificate induction fact");
+
+        assert_eq!(certificate.induction_init, induction.init);
+        assert_eq!(certificate.induction_update, induction.update);
+        assert_eq!(certificate.latch, induction.latch);
+        assert_eq!(certificate.initializer.value, induction.init);
+        assert!(certificate.initializer.validate(graph));
+        assert!(induction.validate(graph));
+
+        let unrelated = counted_loop_artifact(false);
+        assert!(
+            unrelated
+                .facts()
+                .certificates
+                .loops
+                .values()
+                .all(|loop_fact| loop_fact.for_loop.is_none()),
+            "an induction step does not license `for` when the condition reads another value"
+        );
+    }
+
+    // These seven names retain the behavior facts from the deleted
+    // presentation-level recognizer. Eligibility is now asserted at its one
+    // owner, before any C symbols or statement cleanup exist.
+    #[test]
+    fn rewrites_canonical_while_to_for() {
+        let artifact = counted_loop_artifact(true);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("canonical counted certificate");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("certificate loop fact");
+
+        assert_eq!(loop_fact.kind, StructuredLoopKind::Natural);
+        assert_eq!(loop_fact.latches.as_slice(), [certificate.latch]);
+        assert!(loop_fact.condition.is_some());
+    }
+
+    #[test]
+    fn rewrites_continue_tail_update_to_shared_for_latch() {
+        let artifact = counted_loop_with_shared_latch_artifact(false);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("shared latch certificate");
+        assert_eq!(certificate.latch, 0x7120);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("shared latch loop fact");
+        assert!(loop_fact.body.contains(&0x7114));
+        assert!(loop_fact.body.contains(&0x7118));
+    }
+
+    #[test]
+    fn rewrites_continue_tail_with_common_suffix_before_shared_latch() {
+        let artifact = counted_loop_with_shared_latch_artifact(true);
+        let (prepared_loop, certificate) =
+            for_certificate(&artifact).expect("common-suffix latch certificate");
+        assert_eq!(certificate.latch, 0x7130);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("common-suffix loop fact");
+        for block in [0x7118, 0x711c, 0x7120, 0x7130] {
+            assert!(
+                loop_fact.body.contains(&block),
+                "missing body block {block:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_guard_break_while1_to_for() {
+        let artifact = counted_loop_artifact(true);
+        let (prepared_loop, _certificate) =
+            for_certificate(&artifact).expect("guard-exit counted certificate");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("guard-exit loop fact");
+        let predicate = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("guard predicate"))
+            .expect("guard predicate fact");
+        assert!(predicate.comparison.is_some());
+        assert_eq!(loop_fact.exits.as_slice(), [0x7140]);
+    }
+
+    #[test]
+    fn accepts_self_assign_update_forms() {
+        let add = counted_loop_with_aliases(0, 0, CountedTestStep::Add(2), false);
+        let sub = counted_loop_with_aliases(0, 0, CountedTestStep::Sub(1), false);
+        assert!(for_certificate(&add).is_some());
+        assert!(for_certificate(&sub).is_some());
+
+        let unsupported =
+            counted_loop_with_aliases(0, 0, CountedTestStep::UnsupportedXor(0x55), false);
+        assert!(
+            for_certificate(&unsupported).is_none(),
+            "a self-assignment with no exact induction algebra must remain uncertified"
+        );
+    }
+
+    #[test]
+    fn rewrites_while_to_for_when_condition_uses_addrof_induction_var() {
+        let artifact = counted_loop_with_aliases(1, 0, CountedTestStep::Add(1), false);
+        let (prepared_loop, certificate) = for_certificate(&artifact)
+            .expect("an identity projection around the compared phi remains certified");
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .get(&prepared_loop.loop_id)
+            .expect("projected-condition loop fact");
+        let comparison = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("condition"))
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("comparison");
+        assert_eq!(
+            comparison.lhs, certificate.induction_phi,
+            "identity projections are normalized before certification, so an address-style presentation wrapper cannot become a second loop identity"
+        );
+    }
+
+    #[test]
+    fn rewrites_while_to_for_with_two_step_alias_update_chain() {
+        let artifact = counted_loop_with_aliases(0, 2, CountedTestStep::Add(1), false);
+        let (_, certificate) =
+            for_certificate(&artifact).expect("two exact update projections remain certified");
+        let induction = artifact
+            .facts()
+            .structured
+            .inductions
+            .get(&certificate.induction_phi)
+            .expect("aliased induction fact");
+        assert_eq!(induction.step, InductionStep::AddConst(1));
+        assert!(induction.validate(artifact.graph()));
+    }
+
+    #[test]
+    fn loop_without_exact_induction_update_has_no_for_certificate() {
+        let artifact =
+            counted_loop_with_aliases(0, 0, CountedTestStep::UnsupportedXor(0xaa), false);
+        assert!(for_certificate(&artifact).is_none());
+    }
+
+    #[test]
+    fn unrelated_condition_value_has_no_for_certificate() {
+        let artifact = counted_loop_artifact(false);
+        assert!(
+            artifact
+                .facts()
+                .structured
+                .loops
+                .values()
+                .any(|loop_fact| loop_fact.induction_phi.is_some()),
+            "the refusal fixture must still contain an induction"
+        );
+        assert!(for_certificate(&artifact).is_none());
+    }
+
+    #[test]
+    fn update_followed_by_observable_effect_has_no_for_certificate() {
+        let artifact = counted_loop_with_aliases(0, 0, CountedTestStep::Add(1), true);
+        assert!(
+            !artifact.facts().structured.inductions.is_empty(),
+            "the loop still has an exact induction update"
+        );
+        assert!(
+            for_certificate(&artifact).is_none(),
+            "moving the update after a later store would reverse their order"
+        );
+    }
+
+    #[test]
+    fn exact_update_projection_chain_is_not_bounded_by_presentation_lookback() {
+        let artifact = counted_loop_with_aliases(0, 5, CountedTestStep::Add(1), false);
+        assert!(
+            for_certificate(&artifact).is_some(),
+            "five exact graph identities are proof, not a symbol lookback heuristic"
+        );
+    }
+
+    #[test]
+    fn distinct_value_identities_never_merge_for_certificate_by_name() {
+        let artifact = counted_loop_artifact(false);
+        let loop_fact = artifact
+            .facts()
+            .structured
+            .loops
+            .values()
+            .find(|loop_fact| loop_fact.induction_phi.is_some())
+            .expect("loop induction");
+        let phi = loop_fact.induction_phi.expect("induction phi");
+        let comparison = artifact
+            .facts()
+            .predicates
+            .predicates
+            .get(&loop_fact.condition.expect("loop condition"))
+            .and_then(|predicate| predicate.comparison.as_ref())
+            .expect("loop comparison");
+        assert!(!super::value_depends_on(
+            artifact.graph(),
+            comparison.lhs,
+            phi
+        ));
+        assert!(!super::value_depends_on(
+            artifact.graph(),
+            comparison.rhs,
+            phi
+        ));
+        assert!(for_certificate(&artifact).is_none());
+    }
+
+    #[test]
     fn a_step_applies_at_the_width_the_machine_used() {
         let step = super::InductionStep::AddConst(1);
         assert_eq!(step.apply(0xff, 8), 0, "an eight-bit counter wraps");
         assert_eq!(step.apply(0xff, 64), 0x100, "a sixty-four bit one does not");
         assert_eq!(super::InductionStep::SubConst(1).apply(0, 8), 0xff);
+    }
+
+    fn indexed_stack_artifact(mask: Option<u64>, conflicting_width: bool) -> SsaArtifact {
+        let sp = Varnode::register(32, 8);
+        let input = Varnode::register(8, 8);
+        let index = Varnode::unique(0x7200, 8);
+        let address = Varnode::unique(0x7208, 8);
+        let mut block = R2ILBlock::new(0x7200, 4);
+        block.push(R2ILOp::IntSub {
+            dst: sp.clone(),
+            a: sp.clone(),
+            b: Varnode::constant(16, 8),
+        });
+        if let Some(mask) = mask {
+            block.push(R2ILOp::IntAnd {
+                dst: index.clone(),
+                a: input.clone(),
+                b: Varnode::constant(mask, 8),
+            });
+        } else {
+            block.push(R2ILOp::Copy {
+                dst: index.clone(),
+                src: input,
+            });
+        }
+        block.push(R2ILOp::IntAdd {
+            dst: address.clone(),
+            a: sp,
+            b: index,
+        });
+        block.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: address.clone(),
+            val: Varnode::constant(7, 1),
+        });
+        if conflicting_width {
+            block.push(R2ILOp::Load {
+                dst: Varnode::unique(0x7210, 2),
+                space: SpaceId::Ram,
+                addr: address,
+            });
+        }
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let roles =
+            SourceMachineRoles::new(Some(register_storage(16, 8)), Some(register_storage(32, 8)))
+                .and_then(|roles| {
+                    roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                        SourceStackGrowth::LowerAddresses,
+                    ))
+                })
+                .expect("indexed stack machine roles");
+        SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &[block],
+            Some(&return_boundary_arch()),
+            Some(preserved_stack_interface()),
+            roles,
+            Vec::new(),
+        )
+        .expect("indexed stack artifact")
+    }
+
+    fn indexed_stack_layout(artifact: &SsaArtifact) -> &super::StackArrayLayoutDisposition {
+        let access = artifact
+            .facts()
+            .structured
+            .memory_accesses
+            .values()
+            .find(|access| artifact.objects().address_is_indexed(access.address))
+            .expect("indexed stack access");
+        &artifact
+            .certificates()
+            .stack_slots
+            .get(&access.object)
+            .expect("indexed stack slot certificate")
+            .array_layout
+    }
+
+    #[test]
+    fn indexed_stack_array_geometry_is_certified_or_refused_at_its_owner() {
+        let proven = indexed_stack_artifact(Some(15), false);
+        assert!(matches!(
+            indexed_stack_layout(&proven),
+            super::StackArrayLayoutDisposition::Proven(layout)
+                if layout.element_width == 1
+                    && layout.stride == 1
+                    && layout.maximum_constant_offset == 15
+                    && layout.extent == 16
+                    && layout.indexed_elements.len() == 1
+        ));
+
+        let conflicting = indexed_stack_artifact(Some(15), true);
+        assert_eq!(
+            indexed_stack_layout(&conflicting),
+            &super::StackArrayLayoutDisposition::Refused(
+                super::StackArrayLayoutRefusal::ConflictingAccessWidths,
+            )
+        );
+
+        let unbounded = indexed_stack_artifact(None, false);
+        assert_eq!(
+            indexed_stack_layout(&unbounded),
+            &super::StackArrayLayoutDisposition::Refused(
+                super::StackArrayLayoutRefusal::MissingConstantOffset,
+            )
+        );
     }
 
     #[test]

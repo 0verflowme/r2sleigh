@@ -368,6 +368,40 @@ pub(super) fn declaration_type_for_stack_object(
 ) -> r2types::CTypeLike {
     let machine = r2types::CTypeLike::machine_bits(width_bits);
     let source = source_owned.source();
+    let array_layout = source
+        .certificates()
+        .stack_slots
+        .get(&object)
+        .map(|certificate| &certificate.array_layout);
+    match array_layout {
+        Some(r2ssa::StackArrayLayoutDisposition::Proven(layout)) => {
+            if layout.object == object
+                && layout.element_width == layout.stride
+                && layout.element_width > 0
+                && layout
+                    .extent
+                    .is_multiple_of(u64::from(layout.element_width))
+                && layout.extent.checked_mul(8) == Some(u64::from(width_bits))
+                && let Ok(count) = usize::try_from(layout.extent / u64::from(layout.element_width))
+                && let Some(element_bits) = layout.element_width.checked_mul(8)
+            {
+                return r2types::CTypeLike::Array(
+                    Box::new(r2types::CTypeLike::machine_bits(element_bits)),
+                    Some(count),
+                );
+            }
+            // A malformed aggregate certificate cannot be retried from type
+            // evidence: that would give the object a second geometry owner.
+            return machine;
+        }
+        Some(r2ssa::StackArrayLayoutDisposition::Refused(_)) => {
+            // Refusal is authoritative. In particular, conflicting access
+            // widths and a missing constant bound must remain scalar even if
+            // advisory type evidence happens to resemble an array.
+            return machine;
+        }
+        Some(r2ssa::StackArrayLayoutDisposition::NotIndexed) | None => {}
+    }
     let Some(fact) = source.objects().object(object) else {
         return machine;
     };
@@ -433,6 +467,9 @@ pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> 
         } if *bits <= 128 => Some(*bits),
         r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
         r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+        r2types::CTypeLike::Array(element, Some(count)) => {
+            declaration_type_width(element, ptr_bits)?.checked_mul(u32::try_from(*count).ok()?)
+        }
         r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
         _ => None,
     }

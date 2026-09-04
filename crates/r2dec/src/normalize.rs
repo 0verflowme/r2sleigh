@@ -80,6 +80,12 @@ pub(crate) struct NormalizedOpSite {
     pub(crate) op_idx: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForLoopNormalizedSites {
+    pub(crate) initializer: NormalizedOpSite,
+    pub(crate) update: NormalizedOpSite,
+}
+
 /// One normalized operand and the exact original graph uses it represents.
 ///
 /// A synthetic preservation operand has an empty `uses` slice. A relocated
@@ -266,6 +272,54 @@ impl NormalizationOrigins {
             .get(site.block.0 as usize)?
             .rows
             .get(site.op_idx)
+    }
+
+    /// Locate both operations a counted-loop certificate moves into a C
+    /// header in one traversal of the sealed origin rows.
+    pub(crate) fn for_loop_sites(
+        &self,
+        certificate: &r2ssa::ForLoopCertificate,
+        prepared: &r2ssa::SsaArtifact,
+    ) -> Option<ForLoopNormalizedSites> {
+        if self.authority.as_ref() != Some(prepared.authority())
+            || !certificate.initializer.validate(prepared.graph())
+        {
+            return None;
+        }
+        let initializer_inst = prepared.graph().def_inst(certificate.induction_init)?;
+        let update_inst = prepared.graph().def_inst(certificate.induction_update)?;
+        let mut initializer = None;
+        let mut update = None;
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            for (op_idx, origin) in block.rows.iter().enumerate() {
+                let site = NormalizedOpSite {
+                    block: BlockId(u32::try_from(block_index).ok()?),
+                    op_idx,
+                };
+                match origin {
+                    NormalizedOpOrigin::Original(inst)
+                        if *inst == initializer_inst
+                            && block.address == certificate.initializer.predecessor =>
+                    {
+                        if initializer.replace(site).is_some() {
+                            return None;
+                        }
+                    }
+                    NormalizedOpOrigin::Original(inst)
+                        if *inst == update_inst && block.address == certificate.latch =>
+                    {
+                        if update.replace(site).is_some() {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(ForLoopNormalizedSites {
+            initializer: initializer?,
+            update: update?,
+        })
     }
 
     /// Project one validated normalized row onto its original dense V/U/W keys.
