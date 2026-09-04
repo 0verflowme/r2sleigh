@@ -494,6 +494,11 @@ started=$(date -u +%s)
 export HOME="$PRIVATE_HOME"
 export CARGO_HOME=/root/.cargo
 export RUSTUP_HOME=/root/.rustup
+# The decompiler adapter records why each function refused. It has to write
+# somewhere that outlives the run: the benchmark builds each project in a
+# temporary directory it deletes, so the binary's own parent does not survive.
+export R2SLEIGH_REFUSAL_CENSUS_DIR="$REMOTE/results"
+mkdir -p "$REMOTE/results"
 cd /root/decbench
 cmd=(./venv/bin/python "$REMOTE/tree/tests/decbench/decbench_cli.py" run "projects/sailr/$PROJECT.toml")
 for opt in "${opts[@]}"; do cmd+=(-O "$opt"); done
