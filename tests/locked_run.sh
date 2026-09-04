@@ -65,6 +65,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# The plugin compiles against the radare2 fork's headers and then loads into a
+# radare2 built from them. Nothing here rebuilds radare2, so a fork whose headers
+# moved since its libraries were built produces a plugin that reads snapshot
+# fields at the wrong offsets. That is not a build error and not a refusal: it is
+# EXC_BAD_ACCESS inside the capture callback, which reads as a plugin bug.
+#
+# It happened while a session was bisecting the fork -- headers rewritten at
+# 15:12, libraries last built at 14:01, plugin compiled at 15:18 -- and every
+# gate run in that window was scoring a mismatched ABI. Refuse instead, because
+# a crash is a worse answer than a stopped run and a silent wrong answer is worse
+# than both.
+fork=${R2SLEIGH_R2_FORK:-$(cd "$root/.." && pwd)/radare2}
+if [[ -d $fork ]]; then
+    newest_header=$(find "$fork/libr/include" -name '*.h' -newer "$fork/libr/anal/libr_anal.dylib" -print -quit 2>/dev/null || true)
+    if [[ -n $newest_header ]]; then
+        echo "radare2 fork headers are newer than its built libraries:" >&2
+        echo "  $newest_header" >&2
+        echo "  rebuild the fork (make -C $fork) before gating; the plugin would" >&2
+        echo "  otherwise read snapshot fields at offsets the loaded library does" >&2
+        echo "  not agree with." >&2
+        exit 75
+    fi
+fi
+
 echo "building $root without the lock" >&2
 set -m
 cargo build --release --features all-archs -p r2sleigh-plugin \
