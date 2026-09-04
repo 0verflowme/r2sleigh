@@ -11715,3 +11715,152 @@ part of this 26-function ownership slice.
 
 The sweep rendered 387 of 556 functions: pinned 76/107, compiled 281/313, and
 system 30/136. The coverage gate reported no regressions.
+
+## A gate can be green against a plugin the tree did not build
+
+The C half of the plugin stopped compiling and the corpus gates kept returning
+results for hours, because they were scoring an `anal_sleigh.dylib` installed
+before the break. The Rust half rebuilt and reinstalled on every run; the C half
+failed, `make` reported the error, the install step copied what was already
+there, and nothing downstream noticed.
+
+The cause was in the radare2 fork rather than here. A merge of `upstream/master`
+into the snapshot branch resolved every conflicted file to upstream's side. For
+`libr/include/r_anal.h` and `libr/anal/function.c` that traded **5,366 lines of
+the fork's own work for 3 lines of upstream's**, and across the tree it deleted
+23 files' worth of the immutable function-snapshot API, the analysis-artifact
+set and the flag store shadow, `libr/anal/function_snapshot.h` among them. The
+plugin's `r2plugin/snapshot_walk.c` names `RAnalFunctionSnapshotView`, which no
+longer existed.
+
+The restore keeps both sides. Every file the merge touched that upstream never
+touched went back to the pre-merge content -- 23 of the 167 changed files. For
+the four upstream did touch, `canal.c`, `cmd_print.inc.c`, `r_anal.h` and
+`flag.c`, the fork's version was restored and upstream's own diff re-applied on
+top, so all 145 files of genuine upstream work the merge brought in survive.
+Two adaptations were needed where upstream had moved the ground: `RIOBind` no
+longer carries `nread_at`, because upstream folded the counted read into
+`read_at` which now returns the byte count, so the image collector's two call
+sites use that; and upstream's three calling-convention register-slot defines
+are kept.
+
+**Three things to take from this beyond the fix.**
+
+The first is that a build failure in a component the gate does not rebuild from
+scratch is indistinguishable from success. The install step should refuse when
+its inputs did not build, and the gate should record the identity of every
+artifact it scored, not only the Rust one. The DecBench harness already does
+exactly this with its witness string, which is why the remote sweeps were never
+in doubt; the local gates have no equivalent.
+
+The second is that this is the same defect class as the three collisions the
+plugin-side integration produced, in a second repository. `tests/merge_audit.py`
+exists because a textual merge here is not evidence that the merge is safe, and
+the radare2 fork has no such check. A merge that removes a whole header and
+five thousand lines while reporting no conflict is precisely what it would have
+caught.
+
+The third is about reading a measurement. Every gate result taken between the
+merge and this restore was measuring a stale C plugin and does not count. The
+differential number reported in that window should be disregarded rather than
+compared against.
+
+## The radare2 fork is 20,839 lines, and most of it is not the integration
+
+Measured against upstream `da9fe53d1921`: **50 files, 20,839 insertions, 862
+deletions** — 15,273 lines of source and 5,566 of tests. Of the **109 public
+APIs** the fork adds:
+
+| | count |
+| --- | ---: |
+| called by r2sleigh | 46 |
+| used only inside radare2 or its own tests | 47 |
+| referenced nowhere outside their own definition | **16** |
+
+**Forty-two of the forty-six used APIs are the function-snapshot API.** So the
+integration has exactly one seam, which is the right shape; what surrounds it is
+not integration at all. The sixteen with no caller anywhere include an entire
+assumptions subsystem — about 170 mentions across `libr/anal` — along with
+`r_anal_function_context_collect`/`_free`, three snapshot storage-name helpers,
+`r_anal_types_baselist`, `r_anal_xrefs_owned_clear_all`, `r_anal_cc_has_fpargs`
+and `r_bin_get_reloc_at`.
+
+The size has a visible consequence upstream. The whole fork is
+**radareorg/radare2#25929**, `+19,816/-680 across 47 files`, still a draft,
+opened 2026-05-07 and with **zero review comments** as of 2026-09-04. Against
+that, **twenty** of the same author's radare2 pull requests are merged, and every
+one is small and single-purpose: `Take DW_AT_count as the extent it already is`,
+`Fix dwo_id truncation in the DWARF5 unit header`, `Free all flag metadata
+strings`, `Fix xref cleanup ordering and purge`. The integration PR is not
+stalled *and* large; it is stalled *because* it is large.
+
+Mapping the fork against those pull requests shows the DWARF and
+calling-convention work is already raised — #26644, #26643, #26642, #26641,
+#26632, #26630 and #26629 cover `dwarf_process.c`, `var.c`, `canal.c`, `cc.c`,
+`fcn.c` and `cconfig.c`. What is in **no** pull request other than #25929 is
+about **4,359 lines**: `canal_artifacts.c` (1,340), `xrefs.c` (778),
+`type.c` (549), `anal.c` (536), `flag.c` (482), `anplugs.c` (350) and
+`meta.c` (324).
+
+One closed pull request is worth remembering rather than re-attempting.
+**#26508, "Report exact byte counts through RIOBind.nread_at", was closed** —
+upstream declined that API and solved the same problem by making `read_at`
+return the count. The fork's restored image collector now uses `read_at`, which
+matches upstream's decision instead of fighting it, and `nread_at` should not be
+reintroduced.
+
+**The owner's standing constraint**, given while this was being measured: every
+line added to radare2 must be an absolute must, because the r2 side is
+approaching a size that is hard to carry. Two practices follow. Check the
+existing open pull requests before proposing new ones, because most genuine
+radare2 fixes here have already been raised. And when a piece of the integration
+is large, measure what is actually consumed before redesigning it — asked whether
+to keep, shrink or split the 6,128-line snapshot API, the owner chose to find out
+which entry points and which *fields* the decompiler actually reads and delete
+what is copied but never consumed.
+
+### `type_match` needs variables to align, not better type spellings
+
+The 2026-09-04 sweep printed its own diagnosis for every cell that scored zero:
+
+    bzip2: type_match scored 0 for all matched functions
+      (gt_funcs=9, gt_vars=58, gt_stack_vars=5). Likely causes:
+      (a) the decompiler produced no structured variables (arguments/stack vars)
+          to align positionally or by offset;
+      (b) variable names/offsets/types did not align between DWARF and the
+          decompiler output.
+
+This changes the ordering of the type work. The metric aligns *variables* against
+DWARF and then compares their types; with nothing alignable it scores zero
+whatever the types say. Ground truth carries 58 variables and 5 stack variables
+per binary here, and the rendering offers `stack_m40`-style slot names and
+register-named locals, which align with neither an offset nor a name.
+
+So the parameter and return work is necessary and not sufficient. Recovering
+return widths took the corpus column from 6 of 54 to 32 of 54 and is real, but on
+this metric it cannot show until the same functions also emit variables the
+aligner can match. The handoff already recorded the symptom from the other side --
+"the ground truth for `bzip2recover` has 39 stack variables and we align none" --
+and this is the metric confirming it is the binding constraint rather than a
+secondary one.
+
+**Read the diagnostic as evidence, not as a specification.** The paragraphs above
+were first written the wrong way round -- as "emit alignable variables so the
+metric can score", and, from the earlier finding that DecBench strips `const`, as
+"do not spend on qualifiers because the scorer ignores them". Both are reasoning
+from the harness, and the owner's standing position is that correct output is the
+goal and a score is a consequence of it.
+
+Stated correctly: a decompiler should recover named, typed variables with real
+offsets because that is what a reader needs and what the original source had.
+That the aligner then finds them is confirmation, not motivation. And whether a
+pointer the function never stores through should render `const` is a question
+about the honesty of the declaration; the scorer's indifference to it is not an
+argument on either side, and it should be decided on whether the claim is proven
+and useful.
+
+What the diagnostic legitimately tells us is narrower and still valuable: our
+variable recovery is weak enough that an external aligner cannot match a single
+one of 58, which is independent evidence that `stack_m40` and register-named
+locals are not adequate output. That was already suspected from the other
+direction and is now measured.

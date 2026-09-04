@@ -368,7 +368,29 @@ trap cleanup_marker EXIT
 # the host checkout's unrelated .git HEAD.
 fork_local=${R2SLEIGH_R2_FORK:-$(cd "$root/.." && pwd)/radare2}
 if [[ -d $fork_local/.git ]]; then
-    want=$(git -C "$fork_local" rev-parse HEAD)
+    # Refuse a fork that is mid-merge. What gets copied below is the *working
+    # tree*, not HEAD, so an unresolved conflict is rsynced verbatim and the
+    # host compiles a file with conflict markers in it. That happened once: the
+    # sweep synced a fork while another session was resolving `flag.c`, the
+    # remote build died on "version control conflict marker in file", and the
+    # run was lost after the projects had already been built.
+    if ! git -C "$fork_local" diff --quiet --diff-filter=U 2>/dev/null \
+        || [[ -n $(git -C "$fork_local" ls-files --unmerged) ]]; then
+        echo "radare2 fork has unresolved paths; refusing to sync:" >&2
+        git -C "$fork_local" diff --name-only --diff-filter=U >&2
+        exit 75
+    fi
+    # The stamp has to describe the content that is copied, not HEAD. Copying a
+    # dirty tree while stamping it with a clean HEAD makes the next run believe
+    # the host already has this content and skip the sync entirely. This is the
+    # same fingerprint `tests/locked_run.sh` keeps for the same reason.
+    want=$(
+        {
+            git -C "$fork_local" rev-parse HEAD
+            git -C "$fork_local" diff HEAD
+            git -C "$fork_local" ls-files --others --exclude-standard
+        } 2>/dev/null | shasum -a 256 | cut -d' ' -f1
+    )
     have=$(ssh "${ssh_keepalive[@]}" "$host" \
         "cat '$fork_remote/.r2sleigh-synced-from' 2>/dev/null" || true)
     if [[ $want != "$have" ]]; then
