@@ -2382,7 +2382,21 @@ impl SSAFunction {
     /// 3. Place phi nodes
     /// 4. Rename variables
     pub fn from_blocks_raw(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        Self::from_blocks_raw_with_policy(blocks, arch, None)
+        Self::from_blocks_raw_with_control(blocks, arch, &UncheckedSsaWorkControl).ok()
+    }
+
+    /// Build raw SSA while polling the caller's cancellation and deadline.
+    ///
+    /// Renaming a whole function is not work a caller can abandon once it has
+    /// started, so a preflight that builds raw SSA only to inspect it needs
+    /// this seam: without it the poll-free builder runs to completion past a
+    /// deadline the request has already missed.
+    pub fn from_blocks_raw_with_control<C: SsaWorkControl + ?Sized>(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        control: &C,
+    ) -> Result<Self, SsaPrepareError> {
+        Self::from_blocks_raw_with_policy_and_control(blocks, arch, None, control)
     }
 
     /// Build raw SSA prepared with decompiler-safe call boundaries.
@@ -2412,20 +2426,6 @@ impl SSAFunction {
     ) -> Result<Self, SsaPrepareError> {
         let policy = decompile_call_boundary_config(arch, stack_pointer_restored_by_callee);
         Self::from_blocks_raw_with_policy_and_control(blocks, arch, policy.as_ref(), control)
-    }
-
-    fn from_blocks_raw_with_policy(
-        blocks: &[R2ILBlock],
-        arch: Option<&ArchSpec>,
-        call_boundaries: Option<&CallBoundaryConfig>,
-    ) -> Option<Self> {
-        Self::from_blocks_raw_with_policy_and_control(
-            blocks,
-            arch,
-            call_boundaries,
-            &UncheckedSsaWorkControl,
-        )
-        .ok()
     }
 
     fn from_blocks_raw_with_policy_and_control<C: SsaWorkControl + ?Sized>(
@@ -2640,7 +2640,7 @@ impl SSAFunction {
     /// This is intentionally query-only: it reports structure, but does not encode
     /// fallback policy or mutate SSA state.
     pub fn cfg_risk_summary(&self) -> CFGRiskSummary {
-        let back_edges = self.collect_back_edges();
+        let back_edges = self.cfg.collect_back_edges();
         let back_edge_count = back_edges.values().map(Vec::len).sum();
         let loop_count = back_edges.len();
         let mut switch_block_count = 0usize;
@@ -3942,57 +3942,6 @@ impl SSAFunction {
         }
 
         out
-    }
-
-    fn collect_back_edges(&self) -> HashMap<u64, Vec<u64>> {
-        let mut visited = HashSet::new();
-        let mut in_stack = HashSet::new();
-        let mut back_edges = HashMap::new();
-        self.dfs_back_edges(self.entry, &mut visited, &mut in_stack, &mut back_edges);
-        back_edges
-    }
-
-    fn dfs_back_edges(
-        &self,
-        block: u64,
-        visited: &mut HashSet<u64>,
-        in_stack: &mut HashSet<u64>,
-        back_edges: &mut HashMap<u64, Vec<u64>>,
-    ) {
-        enum DfsStep {
-            Enter(u64),
-            ExamineEdge { from: u64, to: u64 },
-            Exit(u64),
-        }
-
-        let mut stack = vec![DfsStep::Enter(block)];
-        while let Some(step) = stack.pop() {
-            match step {
-                DfsStep::Enter(block) => {
-                    if !visited.insert(block) {
-                        continue;
-                    }
-                    in_stack.insert(block);
-                    stack.push(DfsStep::Exit(block));
-                    for succ in self.successors(block).into_iter().rev() {
-                        stack.push(DfsStep::ExamineEdge {
-                            from: block,
-                            to: succ,
-                        });
-                    }
-                }
-                DfsStep::ExamineEdge { from, to } => {
-                    if in_stack.contains(&to) {
-                        back_edges.entry(to).or_default().push(from);
-                    } else {
-                        stack.push(DfsStep::Enter(to));
-                    }
-                }
-                DfsStep::Exit(block) => {
-                    in_stack.remove(&block);
-                }
-            }
-        }
     }
 }
 
@@ -10021,6 +9970,14 @@ mod tests {
         );
         assert_eq!(summary.switch_block_count, 1);
         assert_eq!(summary.max_switch_cases, 3);
+
+        assert_eq!(
+            CFG::from_blocks(&blocks)
+                .expect("cfg should build")
+                .risk_summary(),
+            summary,
+            "a caller that has only the graph must read the same risk as a caller holding SSA"
+        );
     }
 
     #[test]
@@ -10113,7 +10070,10 @@ mod tests {
         assert_eq!(risk.block_count, BLOCK_COUNT);
         assert_eq!(risk.loop_count, 1);
         assert_eq!(risk.back_edge_count, 1);
-        assert_eq!(function.collect_back_edges().get(&BASE), Some(&vec![latch]));
+        assert_eq!(
+            function.cfg().collect_back_edges().get(&BASE),
+            Some(&vec![latch])
+        );
     }
 
     #[test]

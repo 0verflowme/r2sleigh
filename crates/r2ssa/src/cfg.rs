@@ -11,6 +11,8 @@ use petgraph::visit::EdgeRef;
 use r2il::{R2ILBlock, R2ILOp, SwitchInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::function::CFGRiskSummary;
+
 /// A basic block in the control flow graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicBlock {
@@ -661,6 +663,92 @@ impl CFG {
             for succ_addr in self.successors(self.graph[node].addr).into_iter().rev() {
                 if let Some(succ) = self.get_node(succ_addr) {
                     stack.push((succ, false));
+                }
+            }
+        }
+    }
+
+    /// Summarize the control-flow features a decompiler preflight consults.
+    ///
+    /// Every field here is a property of the graph alone, so a caller deciding
+    /// whether a function is worth preparing can ask before paying for the
+    /// preparation. Reading the same numbers off renamed SSA would make the
+    /// question cost more than the answer can save.
+    pub fn risk_summary(&self) -> CFGRiskSummary {
+        let back_edges = self.collect_back_edges();
+        let mut switch_block_count = 0usize;
+        let mut max_switch_cases = 0usize;
+
+        // Only blocks the entry can reach are counted, because that is the
+        // domain the back-edge walk above already reports over and the domain
+        // SSA preparation retains.
+        for addr in self.reverse_postorder() {
+            let Some(block) = self.get_block(addr) else {
+                continue;
+            };
+            let BlockTerminator::Switch { cases, default } = &block.terminator else {
+                continue;
+            };
+            switch_block_count += 1;
+            max_switch_cases = max_switch_cases.max(cases.len() + usize::from(default.is_some()));
+        }
+
+        CFGRiskSummary {
+            block_count: self.num_blocks(),
+            loop_count: back_edges.len(),
+            back_edge_count: back_edges.values().map(Vec::len).sum(),
+            switch_block_count,
+            max_switch_cases,
+        }
+    }
+
+    /// Group every back edge under the loop header it re-enters.
+    pub(crate) fn collect_back_edges(&self) -> HashMap<u64, Vec<u64>> {
+        let mut visited = HashSet::new();
+        let mut in_stack = HashSet::new();
+        let mut back_edges = HashMap::new();
+        self.dfs_back_edges(self.entry, &mut visited, &mut in_stack, &mut back_edges);
+        back_edges
+    }
+
+    fn dfs_back_edges(
+        &self,
+        block: u64,
+        visited: &mut HashSet<u64>,
+        in_stack: &mut HashSet<u64>,
+        back_edges: &mut HashMap<u64, Vec<u64>>,
+    ) {
+        enum DfsStep {
+            Enter(u64),
+            ExamineEdge { from: u64, to: u64 },
+            Exit(u64),
+        }
+
+        let mut stack = vec![DfsStep::Enter(block)];
+        while let Some(step) = stack.pop() {
+            match step {
+                DfsStep::Enter(block) => {
+                    if !visited.insert(block) {
+                        continue;
+                    }
+                    in_stack.insert(block);
+                    stack.push(DfsStep::Exit(block));
+                    for succ in self.successors(block).into_iter().rev() {
+                        stack.push(DfsStep::ExamineEdge {
+                            from: block,
+                            to: succ,
+                        });
+                    }
+                }
+                DfsStep::ExamineEdge { from, to } => {
+                    if in_stack.contains(&to) {
+                        back_edges.entry(to).or_default().push(from);
+                    } else {
+                        stack.push(DfsStep::Enter(to));
+                    }
+                }
+                DfsStep::Exit(block) => {
+                    in_stack.remove(&block);
                 }
             }
         }

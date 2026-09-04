@@ -333,8 +333,11 @@ fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
     matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
 }
 
-pub(crate) fn decompile_probe_decision(blocks: &[R2ILBlock]) -> DecompileProbeDecision {
-    let cfg_guard_reason = cfg_guard_reason(blocks);
+pub(crate) fn decompile_probe_decision<C: r2ssa::SsaWorkControl + ?Sized>(
+    blocks: &[R2ILBlock],
+    control: &C,
+) -> DecompileProbeDecision {
+    let cfg_guard_reason = cfg_guard_reason_with_control(blocks, control);
     let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
     let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
     let small_structural_worker_probe = raw_cfg.block_count > 0
@@ -611,8 +614,26 @@ pub(crate) fn semantic_route_reason(route: &r2types::DecompileRouteFacts) -> Opt
 }
 
 pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
-    let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
-    cfg_guard_reason_from_summary(&ssa_func.cfg_risk_summary())
+    cfg_guard_reason_with_control(blocks, &r2ssa::SsaExecutionControl::default())
+}
+
+/// The same guard, answering to the caller's cancellation and deadline.
+pub(crate) fn cfg_guard_reason_with_control<C: r2ssa::SsaWorkControl + ?Sized>(
+    blocks: &[R2ILBlock],
+    control: &C,
+) -> Option<String> {
+    // Every threshold below reads graph shape alone, so the control-flow graph
+    // already settles whether any of them can trip. Asking it first is what
+    // keeps this preflight from renaming an entire function to learn that
+    // nothing was going to fire.
+    let cfg = r2ssa::CFG::from_blocks(blocks)?;
+    let reason = cfg_guard_reason_from_summary(&cfg.risk_summary())?;
+    // Blocks whose raw SSA will not form have never been guarded here; they
+    // are refused further in, by the SSA phase, under its own malformed-input
+    // reason. Confirming the build before claiming a guard keeps that division
+    // exactly where it was, at the cost of one build per guarded function.
+    SSAFunction::from_blocks_raw_with_control(blocks, None, control).ok()?;
+    Some(reason)
 }
 
 pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String> {

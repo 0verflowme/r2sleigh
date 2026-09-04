@@ -2944,7 +2944,8 @@ impl EngineSession {
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
-        let probe = decompile_probe_decision(&analysis_request.blocks);
+        let probe =
+            decompile_probe_decision(&analysis_request.blocks, &execution.ssa_execution_control());
         if actual_lifted_blocks > ENGINE_DECOMPILE_MAX_BLOCKS
             || probe.op_count > ENGINE_DECOMPILE_MAX_OPS
         {
@@ -6217,6 +6218,73 @@ mod tests {
         assert_eq!(summary.max_switch_cases, 2);
     }
 
+    fn self_looping_blocks(base: u64, loop_count: usize) -> Vec<R2ILBlock> {
+        let mut blocks = Vec::with_capacity(loop_count + 1);
+        for index in 0..loop_count {
+            let addr = base + (index as u64) * 4;
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(r2il::R2ILOp::CBranch {
+                target: r2il::Varnode::constant(addr, 8),
+                cond: r2il::Varnode::constant(1, 1),
+            });
+            blocks.push(block);
+        }
+        let mut exit = R2ILBlock::new(base + (loop_count as u64) * 4, 4);
+        exit.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        blocks.push(exit);
+        blocks
+    }
+
+    #[test]
+    fn cfg_guard_reason_reads_the_same_counters_the_ssa_summary_reports() {
+        let blocks = self_looping_blocks(0x3000, 9);
+        let prepared =
+            r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+
+        assert_eq!(
+            r2ssa::CFG::from_blocks(&blocks)
+                .expect("cfg should build")
+                .risk_summary(),
+            prepared.cfg_risk_summary(),
+            "the guard's cheap derivation must report what renamed SSA reports"
+        );
+        assert_eq!(
+            cfg_guard_reason(&blocks),
+            cfg_guard_reason_from_summary(&prepared.cfg_risk_summary()),
+        );
+        assert!(cfg_guard_reason(&blocks).is_some());
+    }
+
+    #[test]
+    fn cfg_guard_reason_stays_silent_when_raw_ssa_will_not_form() {
+        // An unreachable block that jumps into the entry leaves a predecessor
+        // outside the domain SSA retains, so preparation refuses the input.
+        let mut blocks = self_looping_blocks(0x4000, 9);
+        let mut orphan = R2ILBlock::new(0x4100, 4);
+        orphan.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::constant(0x4000, 8),
+        });
+        blocks.push(orphan);
+
+        assert!(r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).is_none());
+        assert!(
+            cfg_guard_reason_from_summary(
+                &r2ssa::CFG::from_blocks(&blocks)
+                    .expect("cfg should build")
+                    .risk_summary()
+            )
+            .is_some(),
+            "the CFG alone is complex enough to trip the guard"
+        );
+        assert_eq!(
+            cfg_guard_reason(&blocks),
+            None,
+            "input whose SSA cannot form is refused by the SSA phase, not claimed by this guard"
+        );
+    }
+
     #[test]
     fn analyze_reports_planning_time() {
         let session = EngineSession::new();
@@ -7203,7 +7271,7 @@ mod tests {
         for idx in 0..210 {
             blocks.push(R2ILBlock::new(0x5000 + idx, 1));
         }
-        let decision = decompile_probe_decision(&blocks);
+        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
 
         assert!(decision.summary_probe_needed);
         assert!(decision.summary_probe_skipped_large_cfg);
@@ -7221,7 +7289,7 @@ mod tests {
             });
         }
 
-        let decision = decompile_probe_decision(&blocks);
+        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
 
         assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
@@ -7237,7 +7305,7 @@ mod tests {
             });
         }
 
-        let decision = decompile_probe_decision(&blocks);
+        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
 
         assert!(decision.summary_probe_needed);
         assert!(decision.summary_probe_skipped_large_cfg);
@@ -7252,8 +7320,10 @@ mod tests {
             .map(|idx| R2ILBlock::new(0x8000 + idx, 1))
             .collect::<Vec<_>>();
 
-        let at_limit = decompile_probe_decision(&exactly_limit);
-        let over_limit = decompile_probe_decision(&over_limit);
+        let at_limit =
+            decompile_probe_decision(&exactly_limit, &r2ssa::SsaExecutionControl::default());
+        let over_limit =
+            decompile_probe_decision(&over_limit, &r2ssa::SsaExecutionControl::default());
 
         assert!(!at_limit.summary_probe_skipped_large_cfg);
         assert!(over_limit.summary_probe_skipped_large_cfg);
@@ -7278,8 +7348,10 @@ mod tests {
             src: r2il::Varnode::constant(0x900, 8),
         });
 
-        let at_limit = decompile_probe_decision(&[exactly_limit]);
-        let over_limit = decompile_probe_decision(&[over_limit]);
+        let at_limit =
+            decompile_probe_decision(&[exactly_limit], &r2ssa::SsaExecutionControl::default());
+        let over_limit =
+            decompile_probe_decision(&[over_limit], &r2ssa::SsaExecutionControl::default());
 
         assert!(!at_limit.summary_probe_skipped_large_cfg);
         assert!(over_limit.summary_probe_skipped_large_cfg);
@@ -7359,7 +7431,7 @@ mod tests {
         });
         let blocks = vec![switch_block, R2ILBlock::new(0xb010, 1)];
 
-        let decision = decompile_probe_decision(&blocks);
+        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
 
         assert!(!decision.summary_probe_skipped_large_cfg);
         assert!(decision.summary_probe_needed);
@@ -7447,7 +7519,7 @@ mod tests {
         let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry.clone()], None)
             .expect("loop ssa")
             .with_name("dbg.flag_expanded_loop_worker");
-        let decision = decompile_probe_decision(&[entry]);
+        let decision = decompile_probe_decision(&[entry], &r2ssa::SsaExecutionControl::default());
 
         assert!(should_probe_native_worker_summary_before_full_semantics(
             &loop_ssa, None
@@ -7458,7 +7530,7 @@ mod tests {
     #[test]
     fn prefer_full_named_workers_need_evidence_before_decompile_preprobe() {
         let blocks = const_return_blocks(0x401000, 0);
-        let decision = decompile_probe_decision(&blocks);
+        let decision = decompile_probe_decision(&blocks, &r2ssa::SsaExecutionControl::default());
 
         assert!(!decision.summary_probe_needed);
         assert!(!decision.summary_probe_skipped_large_cfg);
