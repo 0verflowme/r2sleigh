@@ -175,6 +175,9 @@ fn respell_literal(expr: CExpr, signed: bool, bits: u32) -> CExpr {
         CExpr::Observed { id, expr } => CExpr::observed(id, respell_literal(*expr, signed, bits)),
         CExpr::Paren(inner) => CExpr::Paren(Box::new(respell_literal(*inner, signed, bits))),
         CExpr::UIntLit(value) if signed => crate::typed_integer_literal_expr(value, signed, bits),
+        CExpr::IntLit(value) if signed && value >= 0 => {
+            crate::typed_integer_literal_expr(value as u64, signed, bits)
+        }
         other => other,
     }
 }
@@ -439,6 +442,15 @@ mod tests {
                 64
             ),
             CExpr::IntLit(-1)
+        );
+        assert_eq!(
+            convert(
+                CExpr::IntLit(0x811c_9dc5),
+                &CValue::Constant,
+                &CType::i32(),
+                64
+            ),
+            CExpr::IntLit(-2_128_831_035)
         );
         // A negative literal read as an unsigned type keeps the spelling a
         // reader wants and states the type, because `-1` alone is an `int`.
