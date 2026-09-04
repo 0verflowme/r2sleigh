@@ -16,6 +16,7 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 #include "snapshot_wire.h"
+#include "snapshot_capture.h"
 
 /* Support is decided by whether radare2 exposes the function-snapshot API, and
  * by nothing else. Pinning a number -- the ABI number or the schema number --
@@ -685,7 +686,7 @@ static void sleigh_callback_report(void) {
 
 /* One function's snapshot, taken once and read by everything that needs it.
  *
- * `r_core_function_snapshot_at` collects the function, its blocks, its bytes,
+ * `r2sleigh_function_snapshot_take` collects the function, its blocks, its bytes,
  * its type graph and the bodies of everything it calls. Three separate places
  * asked for one per function and each threw away all but the part it wanted:
  * `sleigh_artifact_plan_init` walked the whole thing to read one 64-bit
@@ -716,35 +717,6 @@ typedef struct {
 
 static SleighFunctionCapture sleigh_held_capture;
 
-typedef struct {
-	bool captured;
-	ut64 revision;
-	uint8_t *wire;
-	size_t wire_len;
-} SleighCaptureRequest;
-
-static bool sleigh_function_capture_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
-	SleighCaptureRequest *request = user;
-	RAnalFunctionSnapshotView view = {0};
-	if (!r_anal_function_snapshot_view (snapshot, &view)) {
-		return false;
-	}
-	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
-	if (!writer) {
-		return false;
-	}
-	if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
-		request->wire = r2sleigh_wire_writer_finish (writer, &request->wire_len);
-	}
-	r2sleigh_wire_writer_free (writer);
-	if (!request->wire) {
-		return false;
-	}
-	request->revision = view.revision_identity;
-	request->captured = true;
-	return true;
-}
-
 static void sleigh_function_capture_release(void) {
 	free (sleigh_held_capture.wire);
 	memset (&sleigh_held_capture, 0, sizeof (sleigh_held_capture));
@@ -773,24 +745,36 @@ static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFu
 		return held;
 	}
 	sleigh_function_capture_release ();
-	SleighCaptureRequest request = {0};
 	const ut64 walk_started = sleigh_callback_start ();
-	const bool walked = r_core_function_snapshot_at (core, fcn->addr,
-		sleigh_function_capture_cb, &request, NULL);
+	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (core, fcn->addr, NULL);
+	uint8_t *wire = NULL;
+	size_t wire_len = 0;
+	ut64 revision = 0;
+	if (snapshot) {
+		revision = snapshot->revision_identity;
+		R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+		if (writer) {
+			if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
+				wire = r2sleigh_wire_writer_finish (writer, &wire_len);
+			}
+			r2sleigh_wire_writer_free (writer);
+		}
+		r2sleigh_function_snapshot_free (snapshot);
+	}
 	sleigh_callback_end (SLEIGH_CB_SNAPSHOT_WALK, walk_started);
-	if (!walked || !request.captured || !request.revision
+	if (!wire || !revision
 			|| r_anal_function_dirty_epoch (fcn) != function_epoch
 			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
-		free (request.wire);
+		free (wire);
 		return NULL;
 	}
 	held->valid = true;
 	held->addr = fcn->addr;
 	held->function_epoch = function_epoch;
 	held->type_epoch = type_epoch;
-	held->revision = request.revision;
-	held->wire = request.wire;
-	held->wire_len = request.wire_len;
+	held->revision = revision;
+	held->wire = wire;
+	held->wire_len = wire_len;
 	return held;
 }
 
@@ -3739,34 +3723,29 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 		: NULL;
 }
 
-static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
-	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
-	/* Serialize once and hand the engine one buffer. The accessor table stays
-	 * wired as the fallback while the two paths are compared; when it goes, so
-	 * do its callbacks and their size handshakes. */
-	size_t buffer_len = 0;
-	uint8_t *buffer = NULL;
-	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
-	if (writer) {
-		if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
-			buffer = r2sleigh_wire_writer_finish (writer, &buffer_len);
-		}
-		r2sleigh_wire_writer_free (writer);
+static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
+	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
+	const SleighFunctionCapture *held = sleigh_function_capture (anal, fcn);
+	if (!held || !held->wire) {
+		R_LOG_ERROR ("r2sleigh: cannot capture '%s'", r_str_get (fcn->name));
+		return NULL;
 	}
+	/* The buffer comes from the held capture rather than a walk of this
+	 * function's own: the proof path has usually taken one already, and
+	 * walking twice for the same bytes is pure cost. */
 	const R2SleighEngineRequestPayloadV2 payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
 		.struct_size = sizeof (payload),
 		.timeout_us = 0,
-		.snapshot_buffer = buffer,
-		.snapshot_buffer_len = buffer_len,
+		.snapshot_buffer = held->wire,
+		.snapshot_buffer_len = held->wire_len,
 	};
 	char *result = sleigh_engine_execute_v2 (
 		R2SLEIGH_REQUEST_DECOMPILE_V2,
 		R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2,
 		&payload);
-	free (buffer);
 	if (!result) {
-		R_LOG_ERROR ("r2sleigh: borrowed snapshot decompilation was refused");
+		R_LOG_ERROR ("r2sleigh: decompilation was refused");
 		return NULL;
 	}
 	RCodeMeta *metadata = r_codemeta_new (result);

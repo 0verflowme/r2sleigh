@@ -20,10 +20,9 @@
 
 #include <r_anal.h>
 /* The walker reads the snapshot's fields rather than calling an accessor per
- * field, so it needs the struct itself. radare2 keeps it in a private header
- * for now; when the capture move lands this becomes "snapshot_capture.h",
- * which carries the same definitions on the plugin's side of the boundary. */
-#include "function_snapshot.h"
+ * field, so it needs the struct itself. It comes from the capture that now
+ * lives here, on the plugin's side of the boundary. */
+#include "snapshot_capture.h"
 
 /* radare2 reports byte order with these two tags rather than a boolean. */
 #define WALK_ENDIAN_LITTLE 0x4321u

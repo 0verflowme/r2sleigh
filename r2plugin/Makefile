@@ -69,8 +69,7 @@ ifeq ($(wildcard $(LOCAL_R2_INCLUDE)/r_anal.h)$(wildcard $(LOCAL_R2_ANAL_LIB)),)
 R2_CFLAGS := $(shell pkg-config --cflags r_anal r_arch r_core 2>/dev/null || echo "-I/usr/include/libr")
 R2_LDFLAGS := $(shell pkg-config --libs r_anal r_arch r_core 2>/dev/null || echo "-lr_core -lr_anal -lr_arch -lr_util -lr_io")
 else
-LOCAL_R2_ANAL_SRC := $(LOCAL_R2_ABS)/libr/anal
-R2_CFLAGS := -I$(LOCAL_R2_INCLUDE) -I$(LOCAL_R2_SDB_INCLUDE) -I$(LOCAL_R2_ANAL_SRC)
+R2_CFLAGS := -I$(LOCAL_R2_INCLUDE) -I$(LOCAL_R2_SDB_INCLUDE)
 R2_LDFLAGS := $(LOCAL_R2_LIB_FLAGS)
 endif
 R2_PLUGIN_DIR := $(shell r2 -H R2_USER_PLUGINS 2>/dev/null || echo "$(HOME)/.local/share/radare2/plugins")
@@ -94,8 +93,8 @@ RUST_BUILD_PREREQS := $(RUST_MANIFESTS) $(RUST_SOURCES)
 all: $(RUST_LIB_LOCAL) $(ANAL_PLUGIN_SO) $(ARCH_PLUGIN_SO)
 
 # Build the analysis plugin shared object
-$(ANAL_PLUGIN_SO): r_anal_sleigh.c snapshot_wire.c snapshot_walk.c snapshot_wire.h $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
-	$(CC) $(CFLAGS_SO) -o $@ r_anal_sleigh.c snapshot_wire.c snapshot_walk.c $(LDFLAGS)
+$(ANAL_PLUGIN_SO): r_anal_sleigh.c snapshot_wire.c snapshot_walk.c snapshot_capture.c snapshot_wire.h snapshot_capture.h $(RUST_BUILD_DIR)/$(RUST_LIB).$(RUST_LIB_EXT)
+	$(CC) $(CFLAGS_SO) -o $@ r_anal_sleigh.c snapshot_wire.c snapshot_walk.c snapshot_capture.c $(LDFLAGS)
 ifeq ($(UNAME),Darwin)
 	@for from in "$(RUST_LINK_TARGET)" "@loader_path/$(RUST_LIB).$(RUST_LIB_EXT)"; do \
 		if otool -L $@ | grep -Fq "$$from"; then \
@@ -106,12 +105,13 @@ ifeq ($(UNAME),Darwin)
 endif
 
 # Build the architecture plugin shared object
-ARCH_PLUGIN_OBJS = arch_sleigh.o r_anal_sleigh_arch.o snapshot_wire.o snapshot_walk.o
+ARCH_PLUGIN_OBJS = arch_sleigh.o r_anal_sleigh_arch.o snapshot_wire.o snapshot_walk.o snapshot_capture.o
 
 snapshot_wire.o: snapshot_wire.c snapshot_wire.h
 	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
 
-snapshot_walk.o: snapshot_walk.c snapshot_wire.h
+snapshot_walk.o: snapshot_walk.c snapshot_wire.h snapshot_capture.h
+snapshot_capture.o: snapshot_capture.c snapshot_capture.h
 	$(CC) $(CFLAGS_OBJ) -c -o $@ $<
 
 arch_sleigh.o: arch_sleigh.c
