@@ -125,8 +125,10 @@ impl FunctionPresentation {
 ///
 /// The interface says where each value lives; this says what it is called and
 /// what it is called *as*, which is the only place a spelling like `size_t`
-/// survives. It is presentation: nothing here may decide semantics, and its
-/// arity is the source's own, independent of the ABI interface.
+/// survives. It remains presentation unless trusted snapshot preparation
+/// promotes one uniquely named `format` parameter into the exact callsite
+/// interface. That narrow promotion is recorded as radare2 provenance; the
+/// presentation's arity remains independent of the ABI interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSignaturePresentation {
     return_type: Option<Box<str>>,

@@ -125,8 +125,18 @@ impl<'a> FoldingContext<'a> {
         // Only the named parameters go in the list. The tail this call passes
         // is what differs between call sites, and the ellipsis stands for it.
         let named = if cert.variadic {
+            let evidence = cert
+                .variadic_argument_count_evidence
+                .filter(|evidence| evidence.total_argument_count == args.values.len())
+                .ok_or_else(|| {
+                    OpLoweringRefusal::variadic_callsite_argument_count(
+                        cert.variadic_argument_count_refusal.unwrap_or(
+                            r2ssa::VariadicCallsiteArgumentCountRefusal::MissingFormatParameter,
+                        ),
+                    )
+                })?;
             cert.fixed_argument_count
-                .filter(|count| *count <= args.values.len())
+                .filter(|count| *count <= evidence.total_argument_count)
                 .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?
         } else {
             args.values.len()
@@ -287,6 +297,14 @@ impl<'a> FoldingContext<'a> {
             block_addr,
             op_index: op_idx,
         };
+        if render_fact.disposition == r2types::CallsiteRenderDisposition::Residualized
+            && cert.variadic
+        {
+            return Err(OpLoweringRefusal::variadic_callsite_argument_count(
+                cert.variadic_argument_count_refusal
+                    .unwrap_or(r2ssa::VariadicCallsiteArgumentCountRefusal::MissingFormatParameter),
+            ));
+        }
         if cert.callsite != expected_site
             || render_fact.callsite != expected_site
             || render_fact.target != Some(cert.target)
@@ -492,6 +510,8 @@ mod indexed_argument_tests {
                     .collect(),
                 variadic: false,
                 fixed_argument_count: None,
+                variadic_argument_count_evidence: None,
+                variadic_argument_count_refusal: None,
                 register_argument_locations: Vec::new(),
                 stack_argument_locations: Vec::new(),
             },

@@ -1423,7 +1423,11 @@ impl SealedNativeFunction {
     /// The public audit retains the tuple even when admission fails. Refused
     /// output is comment-only: keeping the executable body beside a refusal
     /// would still expose unproven semantics to ordinary decompile callers.
-    pub(crate) fn finalize_effect_ledger(&mut self, ledger: &r2ssa::ledger::ObligationLedger) {
+    pub(crate) fn finalize_effect_ledger(
+        &mut self,
+        ledger: &r2ssa::ledger::ObligationLedger,
+        radare2_variadic_format_counts: usize,
+    ) {
         self.effect_audit = crate::EffectObligationAudit::from_ledger(ledger);
         if !self.effect_audit.is_admitted() {
             let function_name = self.ready.function().name.clone();
@@ -1438,7 +1442,11 @@ impl SealedNativeFunction {
             );
         }
         let mut function = self.ready.function().clone();
-        crate::note_unproven_constructs(&mut function, Some(ledger));
+        crate::note_unproven_constructs(
+            &mut function,
+            Some(ledger),
+            radare2_variadic_format_counts,
+        );
         self.ready = prepare_function_for_emission(&function);
     }
 

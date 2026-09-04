@@ -1206,6 +1206,10 @@ pub struct CallsiteArgumentFacts {
     /// How many leading `argument_values` the callee's prototype names, where
     /// a prototype described the call. The rest are the variadic tail.
     pub fixed_argument_count: Option<usize>,
+    /// Per-callsite argument-count proof for a variadic call. This is absent
+    /// for fixed calls and never inferred from live argument registers.
+    pub variadic_argument_count_evidence: Option<r2ssa::VariadicCallsiteArgumentCountEvidence>,
+    pub variadic_argument_count_refusal: Option<r2ssa::VariadicCallsiteArgumentCountRefusal>,
     pub register_argument_locations: Vec<RegisterCallArgumentLocationFact>,
     pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
 }
@@ -3477,6 +3481,8 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                     argument_values,
                     variadic: cert.variadic,
                     fixed_argument_count: cert.fixed_argument_count,
+                    variadic_argument_count_evidence: cert.variadic_argument_count_evidence,
+                    variadic_argument_count_refusal: cert.variadic_argument_count_refusal,
                     register_argument_locations,
                     stack_argument_locations,
                 },
@@ -3538,7 +3544,18 @@ fn prepared_call_render_facts(
             // the disposition said side effect while the owner lookup named a
             // value, so the call rendered as a bare statement *and* as its
             // definition's right-hand side, and one site was evaluated twice.
-            let disposition = if cert.transfer == r2ssa::CallSiteTransfer::TailCall {
+            let count_refusal = if cert.variadic {
+                cert.variadic_argument_count_refusal.or_else(|| {
+                    cert.variadic_argument_count_evidence.is_none().then_some(
+                        r2ssa::VariadicCallsiteArgumentCountRefusal::MissingFormatParameter,
+                    )
+                })
+            } else {
+                None
+            };
+            let disposition = if count_refusal.is_some() {
+                CallsiteRenderDisposition::Residualized
+            } else if cert.transfer == r2ssa::CallSiteTransfer::TailCall {
                 match prepared
                     .facts()
                     .boundaries
@@ -3567,7 +3584,8 @@ fn prepared_call_render_facts(
                     target: Some(cert.target),
                     disposition,
                     proof_values: cert.argument_values.clone(),
-                    residual_reason: None,
+                    residual_reason: count_refusal
+                        .map(|refusal| format!("variadic callsite: {}", refusal.kind())),
                 },
             )
         })
@@ -5200,6 +5218,8 @@ mod tests {
             argument_values: Vec::new(),
             variadic: false,
             fixed_argument_count: Some(0),
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             stack_argument_values: Vec::new(),
             argument_certificates: Vec::new(),
         };
@@ -5212,6 +5232,8 @@ mod tests {
             result_kind: Some(r2ssa::SourceCallResult::Register { storage }),
             arguments: Vec::new(),
             fixed_argument_count: Some(0),
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             results: Vec::new(),
             complete: true,
         };
@@ -5444,6 +5466,8 @@ mod tests {
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
                     variadic: false,
                     fixed_argument_count: None,
+                    variadic_argument_count_evidence: None,
+                    variadic_argument_count_refusal: None,
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
@@ -5602,6 +5626,8 @@ mod tests {
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
                     variadic: false,
                     fixed_argument_count: None,
+                    variadic_argument_count_evidence: None,
+                    variadic_argument_count_refusal: None,
                     register_argument_locations: Vec::new(),
                     stack_argument_locations: Vec::new(),
                 },
@@ -5721,6 +5747,8 @@ mod tests {
             }],
             variadic: false,
             fixed_argument_count: None,
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
@@ -6092,6 +6120,8 @@ mod tests {
             }],
             variadic: false,
             fixed_argument_count: None,
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             register_argument_locations: Vec::new(),
             stack_argument_locations: Vec::new(),
         };

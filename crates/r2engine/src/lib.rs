@@ -3367,6 +3367,10 @@ fn render_refusal_reason(refusal: DecompileRenderRefusal) -> String {
         DecompileRenderRefusal::MissingProgramVariableAuthorization => {
             "native rendering refused: missing program-variable authorization".to_string()
         }
+        DecompileRenderRefusal::VariadicCallsiteArgumentCount(refusal) => format!(
+            "native rendering refused: variadic callsite argument count: {}",
+            refusal.kind()
+        ),
         DecompileRenderRefusal::ObservationJournal(failure) => {
             format!(
                 "native rendering refused: observation journal: {}",
@@ -6816,6 +6820,17 @@ mod tests {
         );
         assert!(response.output.starts_with("/* r2dec fallback:"));
         assert!(!response.output.contains("() {"));
+    }
+
+    #[test]
+    fn variadic_count_refusal_names_the_missing_callsite_evidence() {
+        let reason = render_refusal_reason(DecompileRenderRefusal::VariadicCallsiteArgumentCount(
+            r2ssa::VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral,
+        ));
+        assert_eq!(
+            reason,
+            "native rendering refused: variadic callsite argument count: format_argument_not_literal"
+        );
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
