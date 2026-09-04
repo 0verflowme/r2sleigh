@@ -1466,6 +1466,16 @@ impl LegacyObservationJournal {
         values
     }
 
+    fn expr_symbols(expr: &CExpr) -> BTreeSet<SymbolId> {
+        let mut symbols = BTreeSet::new();
+        expr.visit(&mut |node| {
+            if let CExpr::Var(symbol) = node {
+                symbols.insert(*symbol);
+            }
+        });
+        symbols
+    }
+
     /// Consume placement's complete removal report as one cell contract.
     ///
     /// The removed binding identifies every defining instruction whose
@@ -2574,10 +2584,11 @@ impl LegacyObservationJournal {
     /// distinguishes the two cases rather than a second copy of this walk. With
     /// an expression there is no statement left to answer for a definitionless
     /// inline operand, so its value cell is filled here unless a child marker
-    /// already owns it. Bound operands remain on exact symbol occurrences;
-    /// attaching them to the parent would infer identity from unrelated C
-    /// syntax. With a statement, its own markers already answer for operands,
-    /// and filling them again would put two answers on one cell.
+    /// already owns it. Bound operands are claimed only when the expression
+    /// still names their exact planned symbol; otherwise attaching them to the
+    /// parent would infer identity from unrelated C syntax. With a statement,
+    /// its own markers already answer for operands, and filling them again
+    /// would put two answers on one cell.
     fn discharged_instruction_targets(
         &mut self,
         rendered: Option<ValueId>,
@@ -2589,6 +2600,7 @@ impl LegacyObservationJournal {
         if let Some(expr) = expr {
             represented_values.extend(self.expr_value_observations(expr));
         }
+        let rendered_symbols = expr.map_or_else(BTreeSet::new, Self::expr_symbols);
         let mut order = discharged.to_vec();
         order.sort_unstable();
         order.dedup();
@@ -2646,22 +2658,22 @@ impl LegacyObservationJournal {
                     observation,
                     block,
                 });
-                if expr.is_none() {
+                let Some(_expr) = expr else {
                     continue;
-                }
+                };
                 let input = inst.inputs[input_idx];
                 if !produced.contains(&input) && !represented_values.contains(&input) {
                     let needs_value_target = match self.plan.disposition(input) {
-                        // A discharge owns this exact use, but it cannot claim
-                        // the bound value at the parent node. Canonical
-                        // rewriting may have absorbed the operand without
-                        // spelling its symbol at all; attaching its value cell
-                        // to whatever expression survived would then infer an
-                        // identity from unrelated C syntax. The value remains
-                        // owned by an exact child or another occurrence of its
-                        // own symbol, and the seal refuses it as unaccounted if
-                        // no such occurrence survives.
-                        Some(ValueDisposition::Bound { .. }) => false,
+                        // A discharge owns this exact use, but it can claim the
+                        // bound value only when the surviving expression still
+                        // names that binding's exact symbol. Canonical
+                        // rewriting may absorb the operand entirely; attaching
+                        // its value cell to whatever unrelated syntax survived
+                        // would then fabricate a second identity answer.
+                        Some(ValueDisposition::Bound { binding }) => self
+                            .names
+                            .symbol_for_binding(*binding)
+                            .is_some_and(|symbol| rendered_symbols.contains(&symbol)),
                         Some(ValueDisposition::Inline { .. })
                             if self.source.graph().def_inst(input).is_none() =>
                         {
@@ -6621,6 +6633,53 @@ mod tests {
                 .count(),
             0,
             "a bound value cell remains for an exact occurrence of its own symbol"
+        );
+    }
+
+    #[test]
+    fn replacement_claims_bound_operand_only_when_its_exact_symbol_survives() {
+        let (source, plan, _function, mut journal) = journal_fixture();
+        let graph = source.source().graph();
+        let (rendered, definition, bound, binding) = graph
+            .values
+            .iter()
+            .find_map(|value| {
+                if !matches!(
+                    plan.disposition(value.id),
+                    Some(ValueDisposition::Inline { .. })
+                ) {
+                    return None;
+                }
+                let definition = graph.def_inst(value.id)?;
+                let (bound, binding) = graph.inst(definition)?.inputs.iter().find_map(|input| {
+                    match plan.disposition(*input) {
+                        Some(ValueDisposition::Bound { binding }) => Some((*input, *binding)),
+                        _ => None,
+                    }
+                })?;
+                Some((value.id, definition, bound, binding))
+            })
+            .expect("fixture has an inline definition with a bound operand");
+        let symbol = journal
+            .names
+            .symbol_for_binding(binding)
+            .expect("the bound operand has its planned symbol");
+        let before = journal.targets.len();
+
+        journal
+            .observe_rendered_replacement_expr(
+                crate::fold::op_lower::RenderedReplacementContract::for_test(
+                    CExpr::binary(BinaryOp::Add, CExpr::Var(symbol), CExpr::IntLit(2)),
+                    rendered,
+                    vec![definition],
+                    BTreeSet::new(),
+                ),
+            )
+            .expect("the exact bound symbol remains in the replacement");
+
+        assert!(
+            journal.targets[before..].contains(&ObservationTarget::Value(bound)),
+            "the surviving exact symbol owns its bound value cell"
         );
     }
 
