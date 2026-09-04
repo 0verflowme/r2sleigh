@@ -26,7 +26,7 @@
  * that actually hold are the linker, which cannot resolve an accessor that is
  * not there, and the wire conformance test, which compares writer against
  * reader byte for byte. */
-#ifndef R_ANAL_FUNCTION_SNAPSHOT_API
+#ifndef R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
 #error "r2sleigh requires a radare2 exposing the immutable function-snapshot API"
 #endif
 
@@ -1857,17 +1857,34 @@ typedef struct {
 	size_t capacity;
 } TaintSummaryMap;
 
+/* One published annotation. These used to be radare2's artifact records; they
+ * are the plugin's own now, because what reaches radare2 is an ordinary comment
+ * or flag in the plugin's space. */
+typedef struct {
+	ut64 addr;
+	const char *prefix;
+	const char *text;
+} SleighArtifactComment;
+
+typedef struct {
+	const char *name;
+	ut64 addr;
+	ut64 size;
+} SleighArtifactFlag;
+
 typedef struct {
 	RCore *core;
 	const char *domain_id;
+	char *space_name;
 	ut64 scope_id;
+	ut64 scope_min;
+	ut64 scope_max;
 	ut64 function_epoch;
 	ut64 type_epoch;
-	ut64 snapshot_revision;
-	RCoreAnalArtifactComment *comments;
+	SleighArtifactComment *comments;
 	size_t comment_count;
 	size_t comment_capacity;
-	RCoreAnalArtifactFlag *flags;
+	SleighArtifactFlag *flags;
 	size_t flag_count;
 	size_t flag_capacity;
 	RAnalRef *xrefs;
@@ -1886,16 +1903,20 @@ static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 	if (!core) {
 		return false;
 	}
-	const SleighFunctionCapture *capture = sleigh_function_capture (anal, fcn);
-	if (!capture) {
+	/* One space per domain, so clearing what this run publishes cannot touch
+	 * another domain's annotations or a user's own. */
+	char *space_name = r_str_newf ("sla.%s", domain_id);
+	if (!space_name) {
 		return false;
 	}
 	plan->core = core;
 	plan->domain_id = domain_id;
+	plan->space_name = space_name;
 	plan->scope_id = fcn->addr;
-	plan->function_epoch = capture->function_epoch;
-	plan->type_epoch = capture->type_epoch;
-	plan->snapshot_revision = capture->revision;
+	plan->scope_min = r_anal_function_min_addr (fcn);
+	plan->scope_max = r_anal_function_max_addr (fcn);
+	plan->function_epoch = r_anal_function_dirty_epoch (fcn);
+	plan->type_epoch = r_anal_types_dirty_epoch (anal);
 	return true;
 }
 
@@ -1936,7 +1957,7 @@ static bool sleigh_artifact_plan_add_comment(SleighArtifactPlan *plan, ut64 addr
 	}
 	size_t i;
 	for (i = 0; i < plan->comment_count; i++) {
-		RCoreAnalArtifactComment *comment = &plan->comments[i];
+		SleighArtifactComment *comment = &plan->comments[i];
 		if (comment->addr == addr && !strcmp (comment->prefix, prefix)) {
 			char *replacement = strdup (text);
 			if (!replacement) {
@@ -1958,7 +1979,7 @@ static bool sleigh_artifact_plan_add_comment(SleighArtifactPlan *plan, ut64 addr
 		plan->failed = true;
 		return false;
 	}
-	plan->comments[plan->comment_count++] = (RCoreAnalArtifactComment) {
+	plan->comments[plan->comment_count++] = (SleighArtifactComment) {
 		.addr = addr,
 		.prefix = owned_prefix,
 		.text = owned_text,
@@ -1976,7 +1997,7 @@ static bool sleigh_artifact_plan_add_flag(SleighArtifactPlan *plan, const char *
 	}
 	size_t i;
 	for (i = 0; i < plan->flag_count; i++) {
-		RCoreAnalArtifactFlag *flag = &plan->flags[i];
+		SleighArtifactFlag *flag = &plan->flags[i];
 		if (!strcmp (flag->name, name)) {
 			if (flag->addr != addr || flag->size != size) {
 				plan->failed = true;
@@ -1993,7 +2014,7 @@ static bool sleigh_artifact_plan_add_flag(SleighArtifactPlan *plan, const char *
 		plan->failed = true;
 		return false;
 	}
-	plan->flags[plan->flag_count++] = (RCoreAnalArtifactFlag) {
+	plan->flags[plan->flag_count++] = (SleighArtifactFlag) {
 		.name = owned_name,
 		.addr = addr,
 		.size = size,
@@ -2034,29 +2055,67 @@ static bool sleigh_artifact_plan_add_xref(SleighArtifactPlan *plan, ut64 from,
 }
 
 static bool sleigh_artifact_plan_submit(SleighArtifactPlan *plan) {
-	if (!plan || plan->failed || !plan->core || !plan->domain_id) {
+	if (!plan || plan->failed || !plan->core || !plan->space_name) {
 		return false;
 	}
-	RCoreAnalArtifactReplacement replacement = {
-		.provider_id = "sla",
-		.domain_id = plan->domain_id,
-		.scope_id = plan->scope_id,
-		.expected_function_epoch = plan->function_epoch,
-		.expected_type_epoch = plan->type_epoch,
-		.expected_snapshot_revision = plan->snapshot_revision,
-		.comments = plan->comments,
-		.comment_count = plan->comment_count,
-		.flags = plan->flags,
-		.flag_count = plan->flag_count,
-		.xrefs = plan->xrefs,
-		.xref_count = plan->xref_count,
-	};
-	RCoreAnalArtifactReplaceResult result = r_core_anal_artifacts_replace (
-		plan->core, &replacement, 1);
-	if (result.status != R_CORE_ANAL_ARTIFACT_REPLACE_OK) {
-		R_LOG_WARN ("r2sleigh: cannot replace %s artifacts at 0x%08"PFMT64x": %u",
-			plan->domain_id, plan->scope_id, result.status);
+	RCore *core = plan->core;
+	RAnal *anal = core->anal;
+	RAnalFunction *fcn = r_anal_get_function_at (anal, plan->scope_id);
+	/* The epochs were read when the plan opened. If either moved, the analysis
+	 * this describes is not the analysis on screen, and publishing it would
+	 * annotate a function that has since changed. */
+	if (!fcn || r_anal_function_dirty_epoch (fcn) != plan->function_epoch
+			|| r_anal_types_dirty_epoch (anal) != plan->type_epoch) {
 		return false;
+	}
+	/* Comments go in the plugin's meta space. Clearing that space over the
+	 * function's own range first is what makes a re-run a replacement: an
+	 * annotation this run no longer produces does not survive it, and nothing
+	 * outside the space is touched. */
+	RSpace *previous = r_spaces_current (&anal->meta_spaces);
+	const char *previous_name = previous? previous->name: NULL;
+	char *restore = previous_name? strdup (previous_name): NULL;
+	if (previous_name && !restore) {
+		return false;
+	}
+	bool ok = r_spaces_set (&anal->meta_spaces, plan->space_name) != NULL;
+	if (ok && plan->scope_max > plan->scope_min) {
+		r_meta_del (anal, R_META_TYPE_COMMENT, plan->scope_min,
+			plan->scope_max - plan->scope_min);
+	}
+	size_t i;
+	for (i = 0; ok && i < plan->comment_count; i++) {
+		const SleighArtifactComment *comment = &plan->comments[i];
+		ok = r_meta_set_string (anal, R_META_TYPE_COMMENT, comment->addr, comment->text);
+	}
+	r_spaces_set (&anal->meta_spaces, restore);
+	free (restore);
+	if (!ok) {
+		R_LOG_WARN ("r2sleigh: cannot publish %s comments at 0x%08"PFMT64x,
+			plan->domain_id, plan->scope_id);
+		return false;
+	}
+	/* Flags carry their own space, so they need no current-space juggling. A
+	 * name this run reuses is replaced in place; one it drops is left, since a
+	 * flag is addressed by name rather than by range. */
+	for (i = 0; i < plan->flag_count; i++) {
+		const SleighArtifactFlag *flag = &plan->flags[i];
+		if (!r_flag_set_inspace (core->flags, plan->space_name, flag->name,
+				flag->addr, (ut32)flag->size)) {
+			R_LOG_WARN ("r2sleigh: cannot publish %s flag %s", plan->domain_id, flag->name);
+			return false;
+		}
+	}
+	/* Xrefs have no space to own them. Setting one is keyed on (from, to), so
+	 * a re-run replaces rather than accumulates; an edge this run no longer
+	 * finds is the one thing that outlives it. */
+	for (i = 0; i < plan->xref_count; i++) {
+		const RAnalRef *xref = &plan->xrefs[i];
+		if (!r_anal_xrefs_set (anal, xref->at, xref->addr, xref->type)) {
+			R_LOG_WARN ("r2sleigh: cannot publish %s xref 0x%08"PFMT64x" -> 0x%08"PFMT64x,
+				plan->domain_id, xref->at, xref->addr);
+			return false;
+		}
 	}
 	return true;
 }
@@ -2076,6 +2135,7 @@ static void sleigh_artifact_plan_fini(SleighArtifactPlan *plan) {
 	free (plan->comments);
 	free (plan->flags);
 	free (plan->xrefs);
+	free (plan->space_name);
 	memset (plan, 0, sizeof (*plan));
 }
 
@@ -4657,6 +4717,10 @@ static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RV
 		return false;
 	}
 	*refs = NULL;
+	if (!refs) {
+		return false;
+	}
+	*refs = NULL;
 	if (!fcn || !anal) {
 		return false;
 	}
@@ -4678,7 +4742,7 @@ static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RV
 		return false;
 	}
 
-	bool success = false;
+	RVecAnalRef *found = NULL;
 	RVecAnalRef *result = NULL;
 	R2SleighAnalysisResultV2 *typed_refs = NULL;
 	R2SleighAnalysisResultViewV2 typed_view = {0};
@@ -4690,7 +4754,6 @@ static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RV
 	}
 	size_t typed_count = typed_view.primary_count;
 	if (!typed_count) {
-		success = true;
 		goto beach;
 	}
 	const R2SleighDataRef *typed_items = (const R2SleighDataRef *)typed_view.primary;
@@ -4703,7 +4766,6 @@ static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RV
 		goto beach;
 	}
 	if (!ref_count) {
-		success = true;
 		goto beach;
 	}
 	result = RVecAnalRef_new ();
@@ -4716,14 +4778,14 @@ static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RV
 			|| written != ref_count) {
 		goto beach;
 	}
-	*refs = result;
+	found = result;
 	result = NULL;
-	success = true;
 beach:
 	RVecAnalRef_free (result);
 	(void)sleigh_v2_analysis_result_release (&typed_refs);
 	block_array_free (&blocks);
-	return success;
+	*refs = found;
+	return found != NULL;
 }
 
 typedef struct {

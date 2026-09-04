@@ -1,10 +1,16 @@
-/* Serializes a borrowed radare2 function snapshot into the flat wire format.
+/* Serializes an owned radare2 function snapshot into the flat wire format.
  *
- * This replaces the accessor table: instead of radare2 exposing a callback per
- * field so r2source can walk the snapshot lazily, the snapshot is read once
- * here and handed over as one buffer. The reads themselves are the same ones the
- * accessors performed, so this is a re-shaping of existing logic rather than new
- * interpretation of the snapshot.
+ * radare2 used to publish the snapshot as an opaque handle behind an accessor
+ * per field, and this file called them. It now publishes the struct itself, so
+ * the reads below are field reads. Nothing about the wire format changed: the
+ * same values are written in the same order, including where the old accessors
+ * had a contract worth preserving rather than tidying.
+ *
+ * The one such contract is string absence. Every accessor copied through
+ * r_str_get, so a NULL string arrived as an empty one and returned success;
+ * only a string too long for the caller's buffer was a refusal. walk_bounded
+ * keeps exactly that distinction, because the reader asserts this format byte
+ * for byte and would notice an absent string that used to be an empty one.
  *
  * Field order must match r2source::snapshot_wire::encode_snapshot exactly. That
  * order is asserted by decoding what this writes, so a mismatch fails a test
@@ -13,6 +19,11 @@
 #include "snapshot_wire.h"
 
 #include <r_anal.h>
+/* The walker reads the snapshot's fields rather than calling an accessor per
+ * field, so it needs the struct itself. radare2 keeps it in a private header
+ * for now; when the capture move lands this becomes "snapshot_capture.h",
+ * which carries the same definitions on the plugin's side of the boundary. */
+#include "function_snapshot.h"
 
 /* radare2 reports byte order with these two tags rather than a boolean. */
 #define WALK_ENDIAN_LITTLE 0x4321u
@@ -39,27 +50,46 @@
  * decode into a different entity. */
 #define WALK_NAME_MAX 512
 
-static bool walk_string(R2SleighWireWriter *writer, bool (*get)(const RAnalFunctionSnapshot *,
-		char *, size_t), const RAnalFunctionSnapshot *snapshot) {
-	char name[WALK_NAME_MAX];
-	if (!get (snapshot, name, sizeof (name))) {
+/* An absent string is an empty one; an over-long string is a refusal. */
+static const char *walk_bounded(const char *string) {
+	const char *text = r_str_get (string);
+	return strlen (text) < WALK_NAME_MAX? text: NULL;
+}
+
+static bool walk_string(R2SleighWireWriter *writer, const char *string) {
+	const char *text = walk_bounded (string);
+	if (!text) {
 		return false;
 	}
-	r2sleigh_wire_string (writer, name);
+	r2sleigh_wire_string (writer, text);
 	return true;
 }
 
+static size_t walk_num_stack_slots(const RAnalFunctionSnapshot *snapshot) {
+	return snapshot->context.fcn_slots
+		? (size_t)r_list_length (snapshot->context.fcn_slots): 0;
+}
+
+static const RAnalFcnSlot *walk_stack_slot_at(const RAnalFunctionSnapshot *snapshot,
+		size_t index) {
+	if (!snapshot->context.fcn_slots || index > INT_MAX
+		|| index >= (size_t)r_list_length (snapshot->context.fcn_slots)) {
+		return NULL;
+	}
+	return r_list_get_n (snapshot->context.fcn_slots, (int)index);
+}
+
 static bool walk_machine_profile(R2SleighWireWriter *writer,
-		const RAnalFunctionSnapshot *snapshot, const RAnalFunctionSnapshotView *view) {
-	if (!walk_string (writer, r_anal_function_snapshot_arch_id, snapshot)
-		|| !walk_string (writer, r_anal_function_snapshot_cpu_id, snapshot)) {
+		const RAnalFunctionSnapshot *snapshot) {
+	if (!walk_string (writer, snapshot->arch_id)
+		|| !walk_string (writer, snapshot->cpu_id)) {
 		return false;
 	}
-	if (view->bits < 0) {
+	if (snapshot->bits < 0) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->bits);
-	switch (view->endian) {
+	r2sleigh_wire_u32 (writer, (uint32_t)snapshot->bits);
+	switch (snapshot->endian) {
 	case WALK_ENDIAN_LITTLE:
 		r2sleigh_wire_u8 (writer, WALK_WIRE_ENDIAN_LITTLE);
 		break;
@@ -74,15 +104,10 @@ static bool walk_machine_profile(R2SleighWireWriter *writer,
 	return true;
 }
 
-static bool walk_successor(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		size_t block_index, size_t successor_index) {
-	RAnalSnapshotSuccessorView view = {0};
-	if (!r_anal_function_snapshot_successor_view (snapshot, block_index, successor_index,
-			&view)) {
-		return false;
-	}
+static bool walk_successor(R2SleighWireWriter *writer,
+		const RAnalSnapshotSuccessor *successor) {
 	uint8_t kind;
-	switch (view.kind) {
+	switch (successor->kind) {
 	case R_ANAL_SNAPSHOT_SUCCESSOR_DIRECT:
 		kind = WALK_SUCCESSOR_DIRECT;
 		break;
@@ -100,154 +125,120 @@ static bool walk_successor(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	}
 	/* The reference capture refuses a case value on any kind but a labelled
 	 * case, so a stray one is a disagreement rather than something to drop. */
-	if (kind != WALK_SUCCESSOR_SWITCH_CASE && view.case_value != 0) {
+	if (kind != WALK_SUCCESSOR_SWITCH_CASE && successor->case_value != 0) {
 		return false;
 	}
 	r2sleigh_wire_u8 (writer, kind);
-	r2sleigh_wire_u64 (writer, view.target_addr);
+	r2sleigh_wire_u64 (writer, successor->target_addr);
 	/* A case value belongs to a labelled case and to nothing else, so presence
 	 * follows the kind rather than being reported separately. */
 	if (kind == WALK_SUCCESSOR_SWITCH_CASE) {
 		r2sleigh_wire_bool (writer, true);
-		r2sleigh_wire_u64 (writer, view.case_value);
+		r2sleigh_wire_u64 (writer, successor->case_value);
 	} else {
 		r2sleigh_wire_bool (writer, false);
 	}
-	r2sleigh_wire_bool (writer, view.external? true: false);
+	r2sleigh_wire_bool (writer, successor->external? true: false);
 	return true;
 }
 
-static bool walk_block(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		size_t index) {
-	RAnalSnapshotBlockView view = {0};
-	if (!r_anal_function_snapshot_block_view (snapshot, index, &view)) {
+static bool walk_block(R2SleighWireWriter *writer, const RAnalSnapshotBlock *block) {
+	r2sleigh_wire_u64 (writer, block->addr);
+	if (block->size == 0 || block->size > WALK_BLOCK_BYTES_MAX || !block->bytes) {
 		return false;
 	}
-	r2sleigh_wire_u64 (writer, view.addr);
-	if (view.size == 0 || view.size > WALK_BLOCK_BYTES_MAX) {
+	/* The snapshot owns these bytes, so they are written from where they sit. */
+	r2sleigh_wire_bytes (writer, block->bytes, (size_t)block->size);
+	if (block->num_successors > UINT32_MAX) {
 		return false;
 	}
-	ut8 *bytes = malloc ((size_t)view.size);
-	if (!bytes) {
-		return false;
-	}
-	if (!r_anal_function_snapshot_block_bytes (snapshot, index, 0, bytes, (size_t)view.size)) {
-		free (bytes);
-		return false;
-	}
-	r2sleigh_wire_bytes (writer, bytes, (size_t)view.size);
-	free (bytes);
-	if (view.num_successors > UINT32_MAX) {
-		return false;
-	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view.num_successors);
-	for (size_t i = 0; i < view.num_successors; i++) {
-		if (!walk_successor (writer, snapshot, index, i)) {
+	r2sleigh_wire_u32 (writer, (uint32_t)block->num_successors);
+	for (size_t i = 0; i < block->num_successors; i++) {
+		if (!walk_successor (writer, &block->successors[i])) {
 			return false;
 		}
 	}
 	/* Absence of a switch is UT64_MAX, not zero: zero is a legitimate address
 	 * and treating the sentinel as present made every block claim a dispatch it
 	 * does not have. A present address must also fall inside the block. */
-	if (view.switch_addr == UT64_MAX) {
+	if (block->switch_addr == UT64_MAX) {
 		r2sleigh_wire_bool (writer, false);
 	} else {
-		if (view.switch_addr < view.addr || view.switch_addr >= view.addr + view.size) {
+		if (block->switch_addr < block->addr
+			|| block->switch_addr >= block->addr + block->size) {
 			return false;
 		}
 		r2sleigh_wire_bool (writer, true);
-		r2sleigh_wire_u64 (writer, view.switch_addr);
+		r2sleigh_wire_u64 (writer, block->switch_addr);
 	}
 	return true;
 }
 
-static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		const RAnalFunctionSnapshotView *view) {
-	r2sleigh_wire_u64 (writer, view->function_addr);
-	if (view->num_blocks == 0 || view->num_blocks > UINT32_MAX) {
+static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot) {
+	const RAnalFunctionImageSnapshot *image = &snapshot->image;
+	r2sleigh_wire_u64 (writer, snapshot->function_addr);
+	if (image->num_blocks == 0 || image->num_blocks > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_blocks);
-	for (size_t i = 0; i < view->num_blocks; i++) {
-		if (!walk_block (writer, snapshot, i)) {
+	r2sleigh_wire_u32 (writer, (uint32_t)image->num_blocks);
+	for (size_t i = 0; i < image->num_blocks; i++) {
+		if (!walk_block (writer, &image->blocks[i])) {
 			return false;
 		}
 	}
-	if (view->num_external_exits > UINT32_MAX) {
+	if (image->num_external_exits > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_external_exits);
-	for (size_t i = 0; i < view->num_external_exits; i++) {
-		ut64 target = 0;
-		if (!r_anal_function_snapshot_external_exit (snapshot, i, &target)) {
-			return false;
-		}
-		r2sleigh_wire_u64 (writer, target);
+	r2sleigh_wire_u32 (writer, (uint32_t)image->num_external_exits);
+	for (size_t i = 0; i < image->num_external_exits; i++) {
+		r2sleigh_wire_u64 (writer, image->external_exits[i]);
 	}
-	if (view->num_string_literals > UINT32_MAX) {
+	if (image->num_string_literals > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_string_literals);
-	for (size_t i = 0; i < view->num_string_literals; i++) {
-		RAnalSnapshotStringLiteralView literal = {0};
-		if (!r_anal_function_snapshot_string_literal_view (snapshot, i, &literal)) {
+	r2sleigh_wire_u32 (writer, (uint32_t)image->num_string_literals);
+	for (size_t i = 0; i < image->num_string_literals; i++) {
+		const RAnalSnapshotStringLiteral *literal = &image->string_literals[i];
+		const char *text = walk_bounded (literal->text);
+		if (!text) {
 			return false;
 		}
-		char text[WALK_NAME_MAX];
-		if (!r_anal_function_snapshot_string_literal_text (snapshot, i, text, sizeof (text))) {
-			return false;
-		}
-		r2sleigh_wire_u64 (writer, literal.addr);
+		r2sleigh_wire_u64 (writer, literal->addr);
 		r2sleigh_wire_string (writer, text);
 	}
-	if (view->num_data_symbols > UINT32_MAX) {
+	if (image->num_data_symbols > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_data_symbols);
-	for (size_t i = 0; i < view->num_data_symbols; i++) {
-		RAnalSnapshotDataSymbolView symbol = {0};
-		if (!r_anal_function_snapshot_data_symbol_view (snapshot, i, &symbol)) {
+	r2sleigh_wire_u32 (writer, (uint32_t)image->num_data_symbols);
+	for (size_t i = 0; i < image->num_data_symbols; i++) {
+		const RAnalSnapshotDataSymbol *symbol = &image->data_symbols[i];
+		const char *name = walk_bounded (symbol->name);
+		if (!name) {
 			return false;
 		}
-		char name[WALK_NAME_MAX];
-		if (!r_anal_function_snapshot_data_symbol_name (snapshot, i, name, sizeof (name))) {
-			return false;
-		}
-		r2sleigh_wire_u64 (writer, symbol.addr);
+		r2sleigh_wire_u64 (writer, symbol->addr);
 		r2sleigh_wire_string (writer, name);
-		if (symbol.type_name_length) {
-			char type_name[WALK_NAME_MAX];
-			if (!r_anal_function_snapshot_data_symbol_type_name (
-					snapshot, i, type_name, sizeof (type_name))) {
-				return false;
-			}
-			r2sleigh_wire_optional_string (writer, type_name);
-		} else {
-			r2sleigh_wire_optional_string (writer, NULL);
-		}
+		/* Absent and empty are different facts about a symbol's type, so
+		 * the optional form carries NULL through rather than "". */
+		r2sleigh_wire_optional_string (writer, symbol->type_name);
 	}
-	if (view->num_code_pointer_tables > UINT32_MAX) {
+	if (image->num_code_pointer_tables > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_code_pointer_tables);
-	for (size_t i = 0; i < view->num_code_pointer_tables; i++) {
-		RAnalSnapshotCodePointerTableView table = {0};
-		if (!r_anal_function_snapshot_code_pointer_table_view (snapshot, i, &table)
-			|| table.num_targets > UINT32_MAX) {
+	r2sleigh_wire_u32 (writer, (uint32_t)image->num_code_pointer_tables);
+	for (size_t i = 0; i < image->num_code_pointer_tables; i++) {
+		const RAnalSnapshotCodePointerTable *table = &image->code_pointer_tables[i];
+		if (table->num_targets > UINT32_MAX) {
 			return false;
 		}
-		r2sleigh_wire_u64 (writer, table.addr);
-		r2sleigh_wire_u32 (writer, table.entry_size);
-		r2sleigh_wire_u32 (writer, (uint32_t)table.num_targets);
-		for (size_t t = 0; t < table.num_targets; t++) {
-			uint64_t target = 0;
-			if (!r_anal_function_snapshot_code_pointer_table_target (snapshot, i, t, &target)) {
-				return false;
-			}
-			r2sleigh_wire_u64 (writer, target);
+		r2sleigh_wire_u64 (writer, table->addr);
+		r2sleigh_wire_u32 (writer, table->entry_size);
+		r2sleigh_wire_u32 (writer, (uint32_t)table->num_targets);
+		for (size_t t = 0; t < table->num_targets; t++) {
+			r2sleigh_wire_u64 (writer, table->targets[t]);
 		}
 	}
-	r2sleigh_wire_u64 (writer, (uint64_t)view->total_source_bytes);
+	r2sleigh_wire_u64 (writer, (uint64_t)image->total_source_bytes);
 	return true;
 }
 
@@ -256,66 +247,68 @@ static bool walk_image(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *
 
 // The prototype radare2 recovered, which is the only place a spelling like
 // size_t survives; the interface carries where values live, not what they are.
-typedef bool (*WalkSignatureStringFn)(const RAnalFunctionSnapshot *snapshot,
-	size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
-	char *buffer, size_t buffer_size);
-
 static bool walk_signature_body(R2SleighWireWriter *writer,
-		const RAnalFunctionSnapshot *snapshot, size_t site,
-		const RAnalSnapshotSignatureView *view, WalkSignatureStringFn string_fn) {
-	if (view->num_parameters > UINT32_MAX) {
+		const RAnalFunctionSignature *signature) {
+	const size_t num_parameters = signature->params
+		? (size_t)r_list_length (signature->params): 0;
+	if (num_parameters > UINT32_MAX) {
 		return false;
 	}
-	char text[WALK_NAME_MAX];
 	r2sleigh_wire_bool (writer, true);
-	r2sleigh_wire_optional_string (writer,
-		string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_RETURN_TYPE, 0,
-			text, sizeof (text))? text: NULL);
-	r2sleigh_wire_optional_string (writer,
-		string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_CALLING_CONVENTION, 0,
-			text, sizeof (text))? text: NULL);
-	r2sleigh_wire_bool (writer, view->noreturn);
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_parameters);
-	for (size_t i = 0; i < view->num_parameters; i++) {
-		r2sleigh_wire_optional_string (writer,
-			string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_NAME, i,
-				text, sizeof (text))? text: NULL);
-		r2sleigh_wire_optional_string (writer,
-			string_fn (snapshot, site, R_ANAL_SNAPSHOT_SIGNATURE_STRING_PARAMETER_TYPE, i,
-				text, sizeof (text))? text: NULL);
+	r2sleigh_wire_optional_string (writer, walk_bounded (signature->ret_type));
+	r2sleigh_wire_optional_string (writer, walk_bounded (signature->callconv));
+	r2sleigh_wire_bool (writer, signature->noreturn);
+	r2sleigh_wire_u32 (writer, (uint32_t)num_parameters);
+	for (size_t i = 0; i < num_parameters; i++) {
+		const RAnalFunctionParam *param = r_list_get_n (signature->params, (int)i);
+		r2sleigh_wire_optional_string (writer, param? walk_bounded (param->name): NULL);
+		r2sleigh_wire_optional_string (writer, param? walk_bounded (param->type): NULL);
 	}
 	return true;
 }
 
-static bool walk_own_signature_string(const RAnalFunctionSnapshot *snapshot,
-		size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
-		char *buffer, size_t buffer_size) {
-	(void)site;
-	return r_anal_function_snapshot_signature_string (snapshot, kind, index, buffer, buffer_size);
+static const RAnalFunctionSignature *walk_own_signature(
+		const RAnalFunctionSnapshot *snapshot) {
+	if (!(snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_SIGNATURE)) {
+		return NULL;
+	}
+	return snapshot->context.signature;
 }
 
-static bool walk_call_site_signature_string(const RAnalFunctionSnapshot *snapshot,
-		size_t site, RAnalSnapshotSignatureStringKind kind, size_t index,
-		char *buffer, size_t buffer_size) {
-	return r_anal_function_snapshot_call_site_signature_string (snapshot, site, kind,
-		index, buffer, buffer_size);
+/* A call site names a callee; the prototype belongs to the callee record the
+ * context carries, matched on the pair of addresses the site was collected at. */
+static const RAnalFunctionSignature *walk_call_site_signature(
+		const RAnalFunctionSnapshot *snapshot, size_t index) {
+	if (index >= snapshot->num_call_site_interfaces || !snapshot->context.callees) {
+		return NULL;
+	}
+	const RAnalCallSiteInterfaceSnapshot *call = &snapshot->call_site_interfaces[index];
+	RListIter *iter;
+	RAnalFcnCallee *callee;
+	r_list_foreach (snapshot->context.callees, iter, callee) {
+		if (callee && callee->call_addr == call->instruction_addr
+			&& callee->addr == call->target_addr) {
+			return callee->signature;
+		}
+	}
+	return NULL;
 }
 
 static bool walk_signature(R2SleighWireWriter *writer,
 		const RAnalFunctionSnapshot *snapshot) {
-	RAnalSnapshotSignatureView view = {0};
-	if (!r_anal_function_snapshot_signature_view (snapshot, &view)) {
+	const RAnalFunctionSignature *signature = walk_own_signature (snapshot);
+	if (!signature) {
 		r2sleigh_wire_bool (writer, false);
 		return true;
 	}
-	return walk_signature_body (writer, snapshot, 0, &view, walk_own_signature_string);
+	return walk_signature_body (writer, signature);
 }
 
 /* The prototype of each function this one calls, keyed by the name the call
  * renders with. A callee named twice is written once: the prototype belongs to
  * the callee, not to the site. */
 static bool walk_callee_signatures(R2SleighWireWriter *writer,
-		const RAnalFunctionSnapshot *snapshot, const RAnalFunctionSnapshotView *top) {
+		const RAnalFunctionSnapshot *snapshot) {
 	size_t written = 0;
 	for (size_t pass = 0; pass < 2; pass++) {
 		if (pass == 1) {
@@ -325,19 +318,18 @@ static bool walk_callee_signatures(R2SleighWireWriter *writer,
 			r2sleigh_wire_u32 (writer, (uint32_t)written);
 			written = 0;
 		}
-		for (size_t i = 0; i < top->num_call_site_interfaces; i++) {
-			RAnalSnapshotSignatureView view = {0};
-			char name[WALK_NAME_MAX];
-			if (!r_anal_function_snapshot_call_site_signature_view (snapshot, i, &view)
-				|| !r_anal_function_snapshot_call_site_target_name (snapshot, i, name, sizeof (name))
-				|| !*name) {
+		for (size_t i = 0; i < snapshot->num_call_site_interfaces; i++) {
+			const RAnalFunctionSignature *signature = walk_call_site_signature (snapshot, i);
+			const char *name = walk_bounded (
+				snapshot->call_site_interfaces[i].target_name);
+			if (!signature || !name || !*name) {
 				continue;
 			}
 			bool seen = false;
 			for (size_t j = 0; j < i && !seen; j++) {
-				char earlier[WALK_NAME_MAX];
-				seen = r_anal_function_snapshot_call_site_target_name (snapshot, j,
-					earlier, sizeof (earlier)) && !strcmp (earlier, name);
+				const char *earlier = walk_bounded (
+					snapshot->call_site_interfaces[j].target_name);
+				seen = earlier && !strcmp (earlier, name);
 			}
 			if (seen) {
 				continue;
@@ -347,7 +339,7 @@ static bool walk_callee_signatures(R2SleighWireWriter *writer,
 				continue;
 			}
 			r2sleigh_wire_string (writer, name);
-			if (!walk_signature_body (writer, snapshot, i, &view, walk_call_site_signature_string)) {
+			if (!walk_signature_body (writer, signature)) {
 				return false;
 			}
 			written++;
@@ -376,49 +368,44 @@ static bool walk_stack_slot_base_tag(int base, uint8_t *out) {
 
 static bool walk_presentation(R2SleighWireWriter *writer,
 		const RAnalFunctionSnapshot *snapshot) {
-	if (!walk_string (writer, r_anal_function_snapshot_function_name, snapshot)) {
+	if (!walk_string (writer, snapshot->function_name)) {
 		return false;
 	}
 	/* Presentation names exist only alongside an interface, and must match its
 	 * parameter count exactly. Without one the list is absent, not empty-looking. */
-	RAnalFunctionSnapshotView top = {0};
-	RAnalFunctionInterfaceSnapshotView interface = {0};
-	if (!r_anal_function_snapshot_view (snapshot, &top)
-		|| (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) == 0
-		|| !r_anal_function_snapshot_interface_view (snapshot, &interface)) {
+	const RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
+	if ((snapshot->capabilities
+			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) == 0) {
 		r2sleigh_wire_u32 (writer, 0);
 		r2sleigh_wire_u32 (writer, 0);
 		if (!walk_signature (writer, snapshot)) {
 			return false;
 		}
-		return walk_callee_signatures (writer, snapshot, &top);
+		return walk_callee_signatures (writer, snapshot);
 	}
-	if (interface.num_parameters > UINT32_MAX) {
+	if (interface->num_parameters > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)interface.num_parameters);
-	for (size_t i = 0; i < interface.num_parameters; i++) {
-		char name[WALK_NAME_MAX];
-		if (!r_anal_function_snapshot_parameter_name (snapshot, i, name, sizeof (name))) {
+	r2sleigh_wire_u32 (writer, (uint32_t)interface->num_parameters);
+	for (size_t i = 0; i < interface->num_parameters; i++) {
+		if (!walk_string (writer, interface->parameters[i].name)) {
 			return false;
 		}
-		r2sleigh_wire_string (writer, name);
 	}
 	/* A slot the source named is keyed by where it sits, because the interface
 	 * sorts its inventory and a position here would name the wrong slot. */
+	const size_t num_stack_slots = walk_num_stack_slots (snapshot);
 	size_t named = 0;
-	for (size_t i = 0; i < top.num_stack_slots; i++) {
-		RAnalSnapshotStackSlotView slot = {0};
-		char name[WALK_NAME_MAX];
-		if (!r_anal_function_snapshot_stack_slot_view (snapshot, i, &slot)) {
+	for (size_t i = 0; i < num_stack_slots; i++) {
+		const RAnalFcnSlot *slot = walk_stack_slot_at (snapshot, i);
+		if (!slot) {
 			return false;
 		}
-		if (!slot.offset_valid || !walk_stack_slot_base_tag (slot.base, NULL)) {
+		if (!slot->offset_valid || !walk_stack_slot_base_tag (slot->base, NULL)) {
 			continue;
 		}
-		if (!r_anal_function_snapshot_stack_slot_string (snapshot, i,
-				R_ANAL_SNAPSHOT_STACK_SLOT_STRING_NAME, name, sizeof (name))
-			|| !*name) {
+		const char *name = walk_bounded (slot->name);
+		if (!name || !*name) {
 			continue;
 		}
 		named++;
@@ -427,33 +414,29 @@ static bool walk_presentation(R2SleighWireWriter *writer,
 		return false;
 	}
 	r2sleigh_wire_u32 (writer, (uint32_t)named);
-	for (size_t i = 0; i < top.num_stack_slots; i++) {
-		RAnalSnapshotStackSlotView slot = {0};
-		char name[WALK_NAME_MAX];
+	for (size_t i = 0; i < num_stack_slots; i++) {
+		const RAnalFcnSlot *slot = walk_stack_slot_at (snapshot, i);
 		uint8_t base_tag = 0;
-		if (!r_anal_function_snapshot_stack_slot_view (snapshot, i, &slot)) {
+		if (!slot) {
 			return false;
 		}
-		if (!slot.offset_valid || !walk_stack_slot_base_tag (slot.base, &base_tag)) {
+		if (!slot->offset_valid || !walk_stack_slot_base_tag (slot->base, &base_tag)) {
 			continue;
 		}
-		if (!r_anal_function_snapshot_stack_slot_string (snapshot, i,
-				R_ANAL_SNAPSHOT_STACK_SLOT_STRING_NAME, name, sizeof (name))
-			|| !*name) {
+		const char *name = walk_bounded (slot->name);
+		if (!name || !*name) {
 			continue;
 		}
-		char type[WALK_NAME_MAX];
-		const bool typed = r_anal_function_snapshot_stack_slot_string (snapshot, i,
-			R_ANAL_SNAPSHOT_STACK_SLOT_STRING_TYPE, type, sizeof (type)) && *type;
+		const char *type = walk_bounded (slot->type);
 		r2sleigh_wire_u8 (writer, base_tag);
-		r2sleigh_wire_i64 (writer, slot.offset);
+		r2sleigh_wire_i64 (writer, slot->offset);
 		r2sleigh_wire_string (writer, name);
-		r2sleigh_wire_optional_string (writer, typed? type: NULL);
+		r2sleigh_wire_optional_string (writer, type && *type? type: NULL);
 	}
 	if (!walk_signature (writer, snapshot)) {
 		return false;
 	}
-	return walk_callee_signatures (writer, snapshot, &top);
+	return walk_callee_signatures (writer, snapshot);
 }
 
 bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void *snapshot) {
@@ -461,18 +444,14 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 		return false;
 	}
 	const RAnalFunctionSnapshot *source = snapshot;
-	RAnalFunctionSnapshotView view = {0};
-	if (!r_anal_function_snapshot_view (source, &view)) {
+	if (!walk_machine_profile (writer, source)) {
 		return false;
 	}
-	if (!walk_machine_profile (writer, source, &view)) {
-		return false;
-	}
-	r2sleigh_wire_u64 (writer, view.function_addr);
+	r2sleigh_wire_u64 (writer, source->function_addr);
 	if (!walk_presentation (writer, source)) {
 		return false;
 	}
-	if (!walk_image (writer, source, &view)) {
+	if (!walk_image (writer, source)) {
 		return false;
 	}
 	return r2sleigh_wire_writer_ok (writer);
@@ -515,7 +494,7 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 #define WALK_CAPTURED_STACK_ALLOCATION (1u << 8)
 
 static void walk_storage(R2SleighWireWriter *writer,
-		const RAnalSnapshotRegisterStorageView *storage) {
+		const RAnalSnapshotRegisterStorage *storage) {
 	/* Every storage a snapshot reports is a register; the wire's other spaces
 	 * exist for values this transport never carries. */
 	r2sleigh_wire_u8 (writer, WALK_SPACE_REGISTER);
@@ -524,7 +503,7 @@ static void walk_storage(R2SleighWireWriter *writer,
 }
 
 static void walk_optional_storage(R2SleighWireWriter *writer, bool present,
-		const RAnalSnapshotRegisterStorageView *storage) {
+		const RAnalSnapshotRegisterStorage *storage) {
 	r2sleigh_wire_bool (writer, present);
 	if (present) {
 		walk_storage (writer, storage);
@@ -539,20 +518,14 @@ static void walk_optional_storage(R2SleighWireWriter *writer, bool present,
  * the register, and the consumer treats that as no carrier rather than as a
  * carrier at a wrong offset. */
 static void walk_named_optional_storage(R2SleighWireWriter *writer, bool present,
-		const RAnalSnapshotRegisterStorageView *storage,
-		const RAnalFunctionSnapshot *snapshot,
-		RAnalSnapshotInterfaceStorageKind kind) {
+		const RAnalSnapshotRegisterStorage *storage) {
 	r2sleigh_wire_bool (writer, present);
 	if (!present) {
 		return;
 	}
 	walk_storage (writer, storage);
-	char name[WALK_NAME_MAX];
-	if (!r_anal_function_snapshot_interface_storage_name (snapshot, kind, name,
-			sizeof (name))) {
-		name[0] = '\0';
-	}
-	r2sleigh_wire_string (writer, name);
+	const char *name = walk_bounded (storage->name);
+	r2sleigh_wire_string (writer, name? name: "");
 }
 
 static bool walk_carrier(R2SleighWireWriter *writer,
@@ -575,7 +548,7 @@ static bool walk_carrier(R2SleighWireWriter *writer,
 }
 
 static bool walk_result_kind(R2SleighWireWriter *writer, RAnalSnapshotReturnKind kind,
-		const RAnalSnapshotRegisterStorageView *storage) {
+		const RAnalSnapshotRegisterStorage *storage) {
 	switch (kind) {
 	case R_ANAL_SNAPSHOT_RETURN_VOID:
 		r2sleigh_wire_u8 (writer, WALK_RESULT_VOID);
@@ -590,31 +563,20 @@ static bool walk_result_kind(R2SleighWireWriter *writer, RAnalSnapshotReturnKind
 	}
 }
 
-static bool walk_call_site(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		size_t index) {
-	RAnalCallSiteInterfaceSnapshotView view = {0};
-	if (!r_anal_function_snapshot_call_site_view (snapshot, index, &view)) {
-		return false;
-	}
-	r2sleigh_wire_u64 (writer, view.instruction_addr);
-	r2sleigh_wire_u64 (writer, view.target_addr);
+static bool walk_call_site(R2SleighWireWriter *writer,
+		const RAnalCallSiteInterfaceSnapshot *call) {
+	r2sleigh_wire_u64 (writer, call->instruction_addr);
+	r2sleigh_wire_u64 (writer, call->target_addr);
 	/* Written before the completeness branch: a site radare2 could not give a
 	 * prototype for still has a target, and the target still has a name. */
-	char target_name[WALK_NAME_MAX];
-	if (!r_anal_function_snapshot_call_site_target_name (snapshot, index, target_name,
-			sizeof (target_name))) {
+	if (!walk_string (writer, call->target_name)) {
 		return false;
 	}
-	r2sleigh_wire_string (writer, target_name);
 	/* How control gets there. A jump that leaves the function for another
 	 * one is a call whose return is this function's, and a jump through a
 	 * relocated slot is the same with the slot standing for the callee; the
 	 * consumer has to see the difference to match the site to the machine. */
-	RAnalCallTransfer transfer = R_ANAL_CALL_TRANSFER_CALL;
-	if (!r_anal_function_snapshot_call_site_transfer (snapshot, index, &transfer)) {
-		return false;
-	}
-	switch (transfer) {
+	switch (call->transfer) {
 	case R_ANAL_CALL_TRANSFER_CALL:
 		r2sleigh_wire_u8 (writer, WALK_CALL_TRANSFER_CALL);
 		break;
@@ -631,68 +593,59 @@ static bool walk_call_site(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	}
 	/* An incomplete site described the call but not what it takes or returns,
 	 * which is a different fact from a call that takes nothing. */
-	if (!view.complete) {
+	if (!call->complete) {
 		r2sleigh_wire_bool (writer, false);
 		return true;
 	}
 	r2sleigh_wire_bool (writer, true);
-	char cc[WALK_NAME_MAX];
-	if (!r_anal_function_snapshot_call_site_calling_convention (snapshot, index, cc,
-			sizeof (cc))) {
+	if (!walk_string (writer, call->calling_convention)) {
 		return false;
 	}
-	r2sleigh_wire_string (writer, cc);
-	if (view.num_arguments > UINT32_MAX) {
+	if (call->num_arguments > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view.num_arguments);
-	for (size_t i = 0; i < view.num_arguments; i++) {
-		RAnalSnapshotParameterView argument = {0};
-		if (!r_anal_function_snapshot_call_argument_view (snapshot, index, i, &argument)) {
-			return false;
-		}
-		r2sleigh_wire_u32 (writer, argument.index);
-		walk_storage (writer, &argument.storage);
+	r2sleigh_wire_u32 (writer, (uint32_t)call->num_arguments);
+	for (size_t i = 0; i < call->num_arguments; i++) {
+		const RAnalSnapshotParameter *argument = &call->arguments[i];
+		r2sleigh_wire_u32 (writer, argument->index);
+		walk_storage (writer, &argument->storage);
 	}
-	r2sleigh_wire_bool (writer, view.variadic);
-	r2sleigh_wire_bool (writer, view.noreturn);
-	return walk_result_kind (writer, view.result_kind, &view.result_storage);
+	r2sleigh_wire_bool (writer, call->variadic);
+	r2sleigh_wire_bool (writer, call->noreturn);
+	return walk_result_kind (writer, call->result_kind, &call->result_storage);
 }
 
-static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		size_t index) {
-	RAnalSnapshotStackSlotView view = {0};
-	if (!r_anal_function_snapshot_stack_slot_view (snapshot, index, &view)) {
-		return false;
-	}
+static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFcnSlot *slot) {
 	uint8_t base_tag = 0;
-	if (!walk_stack_slot_base_tag (view.base, &base_tag)) {
+	if (!walk_stack_slot_base_tag (slot->base, &base_tag)) {
 		return false;
 	}
 	r2sleigh_wire_u8 (writer, base_tag);
-	RAnalSnapshotRegisterStorageView base_storage = {
-		.offset = view.base_offset,
-		.size = view.base_size,
+	const RAnalSnapshotRegisterStorage base_storage = {
+		.name = slot->base_name,
+		.offset = slot->base_offset,
+		.size = slot->base_size,
 	};
 	walk_storage (writer, &base_storage);
-	if (!view.offset_valid) {
+	if (!slot->offset_valid) {
 		return false;
 	}
-	r2sleigh_wire_i64 (writer, view.offset);
-	r2sleigh_wire_u32 (writer, view.size);
-	switch (view.role) {
+	r2sleigh_wire_i64 (writer, slot->offset);
+	r2sleigh_wire_u32 (writer, slot->size);
+	switch (slot->role) {
 	case R_ANAL_FCN_SLOT_LOCAL:
 		r2sleigh_wire_u8 (writer, WALK_ROLE_LOCAL);
 		break;
 	case R_ANAL_FCN_SLOT_HOME:
-		if (view.arg_index < 0) {
+		if (slot->arg_index < 0) {
 			return false;
 		}
 		r2sleigh_wire_u8 (writer, WALK_ROLE_PARAMETER_HOME);
-		r2sleigh_wire_u32 (writer, (uint32_t)view.arg_index);
-		RAnalSnapshotRegisterStorageView home = {
-			.offset = view.home_reg_offset,
-			.size = view.home_reg_size,
+		r2sleigh_wire_u32 (writer, (uint32_t)slot->arg_index);
+		const RAnalSnapshotRegisterStorage home = {
+			.name = slot->home_reg,
+			.offset = slot->home_reg_offset,
+			.size = slot->home_reg_size,
 		};
 		walk_storage (writer, &home);
 		break;
@@ -706,25 +659,22 @@ static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 }
 
 static bool walk_type_graph(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot) {
-	RAnalSnapshotTypeGraphView graph = {0};
-	if (!r_anal_function_snapshot_type_graph_view (snapshot, &graph) || !graph.complete) {
+	const RAnalSnapshotTypeGraph *graph = &snapshot->type_graph;
+	if (!graph->complete) {
 		return false;
 	}
 	/* A function that mentions no type has an empty type graph, and that is a
 	 * complete description of what it uses rather than a missing one. Refusing
 	 * here rejected the whole snapshot, so a function as small as a lone `ret`
 	 * could not be decompiled at all. */
-	if (graph.num_types > UINT32_MAX || graph.num_aggregates > UINT32_MAX) {
+	if (graph->num_types > UINT32_MAX || graph->num_aggregates > UINT32_MAX) {
 		return false;
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)graph.num_types);
-	for (size_t i = 0; i < graph.num_types; i++) {
-		RAnalSnapshotType type = {0};
-		if (!r_anal_function_snapshot_type_view (snapshot, i, &type)) {
-			return false;
-		}
-		r2sleigh_wire_u32 (writer, type.id);
-		switch (type.kind) {
+	r2sleigh_wire_u32 (writer, (uint32_t)graph->num_types);
+	for (size_t i = 0; i < graph->num_types; i++) {
+		const RAnalSnapshotType *type = &graph->types[i];
+		r2sleigh_wire_u32 (writer, type->id);
+		switch (type->kind) {
 		case R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER:
 			r2sleigh_wire_u8 (writer, WALK_TYPE_SIGNED);
 			break;
@@ -733,65 +683,56 @@ static bool walk_type_graph(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 			break;
 		case R_ANAL_SNAPSHOT_TYPE_POINTER:
 			r2sleigh_wire_u8 (writer, WALK_TYPE_POINTER);
-			r2sleigh_wire_u32 (writer, type.target_type_id);
+			r2sleigh_wire_u32 (writer, type->target_type_id);
 			break;
 		case R_ANAL_SNAPSHOT_TYPE_STRUCT:
 			r2sleigh_wire_u8 (writer, WALK_TYPE_STRUCT);
-			r2sleigh_wire_u32 (writer, type.aggregate_id);
+			r2sleigh_wire_u32 (writer, type->aggregate_id);
 			break;
 		default:
 			/* Signedness and indirection are not recoverable elsewhere. */
 			return false;
 		}
-		r2sleigh_wire_u64 (writer, type.size_bits);
-		r2sleigh_wire_u64 (writer, type.align_bits);
+		r2sleigh_wire_u64 (writer, type->size_bits);
+		r2sleigh_wire_u64 (writer, type->align_bits);
 	}
-	r2sleigh_wire_u32 (writer, (uint32_t)graph.num_aggregates);
-	for (size_t i = 0; i < graph.num_aggregates; i++) {
-		RAnalSnapshotAggregateLayoutView aggregate = {0};
-		if (!r_anal_function_snapshot_aggregate_view (snapshot, i, &aggregate)
-			|| !aggregate.complete) {
+	r2sleigh_wire_u32 (writer, (uint32_t)graph->num_aggregates);
+	for (size_t i = 0; i < graph->num_aggregates; i++) {
+		const RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
+		if (!aggregate->complete) {
 			return false;
 		}
-		r2sleigh_wire_u32 (writer, aggregate.id);
-		r2sleigh_wire_u32 (writer, aggregate.type_id);
-		r2sleigh_wire_u64 (writer, aggregate.size_bits);
-		r2sleigh_wire_u64 (writer, aggregate.align_bits);
-		char name[WALK_NAME_MAX];
-		if (!r_anal_function_snapshot_aggregate_name (snapshot, i, name, sizeof (name))) {
+		r2sleigh_wire_u32 (writer, aggregate->id);
+		r2sleigh_wire_u32 (writer, aggregate->type_id);
+		r2sleigh_wire_u64 (writer, aggregate->size_bits);
+		r2sleigh_wire_u64 (writer, aggregate->align_bits);
+		if (!walk_string (writer, aggregate->name)) {
 			return false;
 		}
-		r2sleigh_wire_string (writer, name);
-		if (aggregate.num_members > UINT32_MAX) {
+		if (aggregate->num_members > UINT32_MAX) {
 			return false;
 		}
-		r2sleigh_wire_u32 (writer, (uint32_t)aggregate.num_members);
-		for (size_t member = 0; member < aggregate.num_members; member++) {
-			RAnalSnapshotAggregateMemberView view = {0};
-			if (!r_anal_function_snapshot_aggregate_member_view (snapshot, i, member,
-					&view)) {
+		r2sleigh_wire_u32 (writer, (uint32_t)aggregate->num_members);
+		for (size_t member = 0; member < aggregate->num_members; member++) {
+			const RAnalSnapshotAggregateMember *field = &aggregate->members[member];
+			r2sleigh_wire_u32 (writer, field->member_id);
+			r2sleigh_wire_u32 (writer, field->type_id);
+			r2sleigh_wire_u64 (writer, field->offset_bits);
+			r2sleigh_wire_u64 (writer, field->size_bits);
+			if (!walk_string (writer, field->name)) {
 				return false;
 			}
-			r2sleigh_wire_u32 (writer, view.member_id);
-			r2sleigh_wire_u32 (writer, view.type_id);
-			r2sleigh_wire_u64 (writer, view.offset_bits);
-			r2sleigh_wire_u64 (writer, view.size_bits);
-			char member_name[WALK_NAME_MAX];
-			if (!r_anal_function_snapshot_aggregate_member_name (snapshot, i, member,
-					member_name, sizeof (member_name))) {
-				return false;
-			}
-			r2sleigh_wire_string (writer, member_name);
 		}
 	}
 	return true;
 }
 
-static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapshot *snapshot,
-		const RAnalFunctionSnapshotView *top, const RAnalFunctionInterfaceSnapshotView *view) {
-	const bool exact_types = (top->capabilities
+static bool walk_interface(R2SleighWireWriter *writer,
+		const RAnalFunctionSnapshot *snapshot) {
+	const RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
+	const bool exact_types = (snapshot->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES) != 0;
-	const bool exact_slots = (top->capabilities
+	const bool exact_slots = (snapshot->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES) != 0;
 	uint8_t variant = WALK_INTERFACE_PLAIN;
 	if (exact_types && exact_slots) {
@@ -803,44 +744,40 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	}
 	r2sleigh_wire_u8 (writer, variant);
 
-	const uint64_t revision = top->revision_identity;
+	const uint64_t revision = snapshot->revision_identity;
 	uint8_t revision_bytes[8];
 	for (unsigned i = 0; i < 8; i++) {
 		revision_bytes[i] = (uint8_t)((revision >> (8 * i)) & 0xff);
 	}
 	r2sleigh_wire_bytes (writer, revision_bytes, sizeof (revision_bytes));
 
-	char cc[WALK_NAME_MAX];
-	if (!r_anal_function_snapshot_interface_calling_convention (snapshot, cc, sizeof (cc))) {
-		return false;
-	}
-	r2sleigh_wire_string (writer, cc);
-
-	if (view->num_parameters > UINT32_MAX) {
-		return false;
-	}
-	r2sleigh_wire_u32 (writer, (uint32_t)view->num_parameters);
-	for (size_t i = 0; i < view->num_parameters; i++) {
-		RAnalSnapshotParameterView parameter = {0};
-		if (!r_anal_function_snapshot_parameter_view (snapshot, i, &parameter)) {
-			return false;
-		}
-		r2sleigh_wire_u32 (writer, parameter.index);
-		walk_storage (writer, &parameter.storage);
-	}
-	if (!walk_result_kind (writer, view->return_kind, &view->return_storage)) {
+	if (!walk_string (writer, interface->calling_convention)) {
 		return false;
 	}
 
-	const bool has_slots = (top->capabilities
+	if (interface->num_parameters > UINT32_MAX) {
+		return false;
+	}
+	r2sleigh_wire_u32 (writer, (uint32_t)interface->num_parameters);
+	for (size_t i = 0; i < interface->num_parameters; i++) {
+		const RAnalSnapshotParameter *parameter = &interface->parameters[i];
+		r2sleigh_wire_u32 (writer, parameter->index);
+		walk_storage (writer, &parameter->storage);
+	}
+	if (!walk_result_kind (writer, interface->return_kind, &interface->return_storage)) {
+		return false;
+	}
+
+	const bool has_slots = (snapshot->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_SLOTS) != 0;
-	const size_t num_slots = has_slots? top->num_stack_slots: 0;
+	const size_t num_slots = has_slots? walk_num_stack_slots (snapshot): 0;
 	if (num_slots > UINT32_MAX) {
 		return false;
 	}
 	r2sleigh_wire_u32 (writer, (uint32_t)num_slots);
 	for (size_t i = 0; i < num_slots; i++) {
-		if (!walk_stack_slot (writer, snapshot, i)) {
+		const RAnalFcnSlot *slot = walk_stack_slot_at (snapshot, i);
+		if (!slot || !walk_stack_slot (writer, slot)) {
 			return false;
 		}
 	}
@@ -848,21 +785,18 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 	/* Logical values and the type graph travel together: without exact types
 	 * there are no logical values to describe. */
 	if (exact_types) {
-		r2sleigh_wire_u32 (writer, (uint32_t)view->num_parameters);
-		for (size_t i = 0; i < view->num_parameters; i++) {
-			RAnalSnapshotParameterView parameter = {0};
-			if (!r_anal_function_snapshot_parameter_view (snapshot, i, &parameter)) {
-				return false;
-			}
-			r2sleigh_wire_u32 (writer, parameter.logical_type_id);
-			if (!walk_carrier (writer, &parameter.carrier)) {
+		r2sleigh_wire_u32 (writer, (uint32_t)interface->num_parameters);
+		for (size_t i = 0; i < interface->num_parameters; i++) {
+			const RAnalSnapshotParameter *parameter = &interface->parameters[i];
+			r2sleigh_wire_u32 (writer, parameter->logical_type_id);
+			if (!walk_carrier (writer, &parameter->carrier)) {
 				return false;
 			}
 		}
-		if (view->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
+		if (interface->return_kind == R_ANAL_SNAPSHOT_RETURN_REGISTER) {
 			r2sleigh_wire_bool (writer, true);
-			r2sleigh_wire_u32 (writer, view->return_type_id);
-			if (!walk_carrier (writer, &view->return_carrier)) {
+			r2sleigh_wire_u32 (writer, interface->return_type_id);
+			if (!walk_carrier (writer, &interface->return_carrier)) {
 				return false;
 			}
 		} else {
@@ -878,51 +812,48 @@ static bool walk_interface(R2SleighWireWriter *writer, const RAnalFunctionSnapsh
 		r2sleigh_wire_bool (writer, false);
 	}
 
-	r2sleigh_wire_bool (writer, view->stack_pointer_preserved_across_calls);
-	r2sleigh_wire_bool (writer, view->frame_pointer_preserved_across_calls);
+	r2sleigh_wire_bool (writer, interface->stack_pointer_preserved_across_calls);
+	r2sleigh_wire_bool (writer, interface->frame_pointer_preserved_across_calls);
 	if (r_sys_getenv_asbool ("R2SLEIGH_DEBUG_MERGES")) {
 		eprintf ("R2WIREPRESERVE sp=%d fp=%d params=%zu convention=%zu\n",
-			view->stack_pointer_preserved_across_calls,
-			view->frame_pointer_preserved_across_calls,
-			view->num_parameters, view->calling_convention_length);
+			interface->stack_pointer_preserved_across_calls,
+			interface->frame_pointer_preserved_across_calls,
+			interface->num_parameters,
+			strlen (r_str_get (interface->calling_convention)));
 	}
 
-	const bool has_return_address = (top->capabilities
+	const bool has_return_address = (snapshot->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) != 0;
-	const bool has_stack_pointer = (top->capabilities
+	const bool has_stack_pointer = (snapshot->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) != 0;
-	walk_named_optional_storage (writer, has_return_address, &view->return_address_storage,
-		snapshot, R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN_ADDRESS);
-	walk_named_optional_storage (writer, has_stack_pointer, &view->stack_pointer_storage,
-		snapshot, R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER);
+	walk_named_optional_storage (writer, has_return_address,
+		&interface->return_address_storage);
+	walk_named_optional_storage (writer, has_stack_pointer,
+		&interface->stack_pointer_storage);
 
-	RAnalSnapshotRegisterStorageView frame = {0};
-	const bool has_frame = (top->capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) != 0
-		&& r_anal_function_snapshot_interface_frame_pointer_storage (snapshot, &frame);
-	walk_named_optional_storage (writer, has_frame, &frame, snapshot,
-		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_FRAME_POINTER);
+	const bool has_frame = (snapshot->capabilities
+		& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) != 0;
+	walk_named_optional_storage (writer, has_frame, &snapshot->frame_pointer_storage);
 
-	if (top->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
-		RAnalSnapshotReturnMechanismView mechanism = {0};
-		if (!r_anal_function_snapshot_interface_return_mechanism (snapshot, &mechanism)
-			|| mechanism.kind != R_ANAL_SNAPSHOT_RETURN_MECHANISM_STACK) {
+	if (snapshot->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
+		const RAnalSnapshotReturnMechanismView *mechanism = &snapshot->return_mechanism;
+		if (mechanism->kind != R_ANAL_SNAPSHOT_RETURN_MECHANISM_STACK) {
 			return false;
 		}
-		/* The address width is not in the view: it follows the machine, the
-		 * same way the accessor transport derives it. */
-		if (top->bits <= 0 || top->bits % 8 != 0) {
+		/* The address width is not in the mechanism: it follows the machine,
+		 * the same way the accessor transport derived it. */
+		if (snapshot->bits <= 0 || snapshot->bits % 8 != 0) {
 			return false;
 		}
 		r2sleigh_wire_bool (writer, true);
 		r2sleigh_wire_u8 (writer, WALK_MECHANISM_STACKED);
-		r2sleigh_wire_i64 (writer, mechanism.entry_sp_offset);
-		r2sleigh_wire_u32 (writer, mechanism.slot_size);
-		if (mechanism.exit_sp_delta < 0) {
+		r2sleigh_wire_i64 (writer, mechanism->entry_sp_offset);
+		r2sleigh_wire_u32 (writer, mechanism->slot_size);
+		if (mechanism->exit_sp_delta < 0) {
 			return false;
 		}
-		r2sleigh_wire_u32 (writer, (uint32_t)mechanism.exit_sp_delta);
-		r2sleigh_wire_u32 (writer, (uint32_t)(top->bits / 8));
+		r2sleigh_wire_u32 (writer, (uint32_t)mechanism->exit_sp_delta);
+		r2sleigh_wire_u32 (writer, (uint32_t)(snapshot->bits / 8));
 	} else {
 		r2sleigh_wire_bool (writer, false);
 	}
@@ -935,31 +866,28 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		return false;
 	}
 	const RAnalFunctionSnapshot *source = snapshot;
-	RAnalFunctionSnapshotView top = {0};
-	if (!r_anal_function_snapshot_view (source, &top)) {
-		return false;
-	}
-	const bool has_calls = (top.capabilities
+	const RAnalFunctionInterfaceSnapshot *interface = &source->function_interface;
+	const bool has_calls = (source->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_CALL_SITE_INTERFACES) != 0;
-	const size_t num_calls = has_calls? top.num_call_site_interfaces: 0;
+	const size_t num_calls = has_calls? source->num_call_site_interfaces: 0;
 	if (num_calls > UINT32_MAX) {
 		return false;
 	}
 	r2sleigh_wire_u32 (writer, (uint32_t)num_calls);
 	for (size_t i = 0; i < num_calls; i++) {
-		if (!walk_call_site (writer, source, i)) {
+		if (!walk_call_site (writer, &source->call_site_interfaces[i])) {
 			return false;
 		}
 	}
 
 	/* The revision identity must be present: it is what binds every part of
 	 * this buffer to one capture. */
-	if (top.revision_identity == 0) {
+	if (source->revision_identity == 0) {
 		return false;
 	}
 	uint8_t revision_bytes[8];
 	for (unsigned i = 0; i < 8; i++) {
-		revision_bytes[i] = (uint8_t)((top.revision_identity >> (8 * i)) & 0xff);
+		revision_bytes[i] = (uint8_t)((source->revision_identity >> (8 * i)) & 0xff);
 	}
 	r2sleigh_wire_bytes (writer, revision_bytes, sizeof (revision_bytes));
 
@@ -967,54 +895,45 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	 * above is deliberately not: a callee carries the root's revision so a
 	 * consumer can tell the bodies were read together, and its own content
 	 * hash so the same callee under two callers is recognisably one body. */
-	if (top.content_identity == 0) {
+	if (source->content_identity == 0) {
 		return false;
 	}
 	uint8_t content_bytes[8];
 	for (unsigned i = 0; i < 8; i++) {
-		content_bytes[i] = (uint8_t)((top.content_identity >> (8 * i)) & 0xff);
+		content_bytes[i] = (uint8_t)((source->content_identity >> (8 * i)) & 0xff);
 	}
 	r2sleigh_wire_bytes (writer, content_bytes, sizeof (content_bytes));
 
 	/* An interface exists only when radare2 minted exact-interface authority.
-	 * The view answering is not enough: a thunk has a readable view that carries
-	 * no recovered prototype, and treating it as one refuses the whole
-	 * snapshot over a return kind radare2 never determined. */
-	RAnalFunctionInterfaceSnapshotView interface = {0};
-	const bool has_interface = (top.capabilities
-			& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) != 0
-		&& r_anal_function_snapshot_interface_view (source, &interface);
+	 * The struct being readable is not enough: a thunk has a readable interface
+	 * that carries no recovered prototype, and treating it as one refuses the
+	 * whole snapshot over a return kind radare2 never determined. */
+	const bool has_interface = (source->capabilities
+		& R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_INTERFACE) != 0;
 	r2sleigh_wire_bool (writer, has_interface);
-	if (has_interface && !walk_interface (writer, source, &top, &interface)) {
+	if (has_interface && !walk_interface (writer, source)) {
 		return false;
 	}
 
 	/* Machine roles repeat the return-address and stack-pointer carriers the
-	 * interface names, so a consumer without an interface still knows them. */
-	const bool has_return_address = (top.capabilities
+	 * interface names, so a consumer without an interface still knows them.
+	 * They are collected independently of any recovered prototype, so they are
+	 * reported whenever radare2 resolved them. Gating them on an exact
+	 * interface withheld the carriers from exactly the functions that have no
+	 * interface and most need them. */
+	const bool has_return_address = (source->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) != 0;
-	const bool has_stack_pointer = (top.capabilities
+	const bool has_stack_pointer = (source->capabilities
 		& R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) != 0;
-	/* The machine carriers are collected independently of any recovered
-	 * prototype, so they are reported whenever radare2 resolved them. Gating
-	 * them on an exact interface withheld the carriers from exactly the
-	 * functions that have no interface and most need them. */
-	RAnalFunctionInterfaceSnapshotView carriers = {0};
-	const bool carriers_read = r_anal_function_snapshot_interface_view (source, &carriers);
-	walk_named_optional_storage (writer, carriers_read && has_return_address,
-		&carriers.return_address_storage, source,
-		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_RETURN_ADDRESS);
-	walk_named_optional_storage (writer, carriers_read && has_stack_pointer,
-		&carriers.stack_pointer_storage, source,
-		R_ANAL_SNAPSHOT_INTERFACE_STORAGE_STACK_POINTER);
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
-		RAnalSnapshotStackAllocationContractView contract = {0};
-		if (!r_anal_function_snapshot_interface_stack_allocation_contract (source,
-				&contract)) {
-			return false;
-		}
+	walk_named_optional_storage (writer, has_return_address,
+		&interface->return_address_storage);
+	walk_named_optional_storage (writer, has_stack_pointer,
+		&interface->stack_pointer_storage);
+	if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
+		const RAnalSnapshotStackAllocationContractView *contract =
+			&source->stack_allocation_contract;
 		r2sleigh_wire_bool (writer, true);
-		switch (contract.growth) {
+		switch (contract->growth) {
 		case R_ANAL_SNAPSHOT_STACK_GROWTH_LOWER:
 			r2sleigh_wire_u8 (writer, WALK_GROWTH_LOWER);
 			break;
@@ -1024,7 +943,7 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 		default:
 			return false;
 		}
-		r2sleigh_wire_u32 (writer, contract.implicit_active_sp_bytes);
+		r2sleigh_wire_u32 (writer, contract->implicit_active_sp_bytes);
 	} else {
 		r2sleigh_wire_bool (writer, false);
 	}
@@ -1034,44 +953,39 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	 * signature -- its own comment says so -- and the interface block above is
 	 * withheld for exactly those functions, so it travels here instead. Without
 	 * it a function that calls loses every entry-relative fact about its frame:
-	 * no stack roots, and so no certificate that a slot is its own. */
-	r2sleigh_wire_bool (writer, carriers_read);
-	if (carriers_read) {
-		r2sleigh_wire_bool (writer, carriers.stack_pointer_preserved_across_calls);
-		r2sleigh_wire_bool (writer, carriers.frame_pointer_preserved_across_calls);
-	}
+	 * no stack roots, and so no certificate that a slot is its own. The
+	 * interface is always readable, so this is always present. */
+	r2sleigh_wire_bool (writer, true);
+	r2sleigh_wire_bool (writer, interface->stack_pointer_preserved_across_calls);
+	r2sleigh_wire_bool (writer, interface->frame_pointer_preserved_across_calls);
 
 	/* The convention's candidate slots describe where a caller would leave
 	 * arguments and the result. They are emitted whether or not a prototype was
 	 * recovered, because a consumer recovering parameters from machine code has
 	 * nothing to intersect against without them. */
-	RAnalFunctionInterfaceSnapshotView convention = {0};
-	const bool slots_known = r_anal_function_snapshot_interface_view (source, &convention)
-		&& convention.convention_slots_known;
-	const size_t num_slots = slots_known? convention.num_convention_argument_slots: 0;
+	const bool slots_known = interface->convention_slots_known;
+	const size_t num_slots = slots_known? interface->num_convention_argument_slots: 0;
 	if (num_slots > UINT32_MAX) {
 		return false;
 	}
-	char convention_name[WALK_NAME_MAX] = {0};
-	if (slots_known
-		&& !r_anal_function_snapshot_interface_calling_convention (source, convention_name,
-			sizeof (convention_name))) {
-		return false;
+	const char *convention_name = "";
+	if (slots_known) {
+		convention_name = walk_bounded (interface->calling_convention);
+		if (!convention_name) {
+			return false;
+		}
 	}
 	r2sleigh_wire_string (writer, convention_name);
 	r2sleigh_wire_u32 (writer, (uint32_t)num_slots);
 	for (size_t i = 0; i < num_slots; i++) {
-		RAnalSnapshotRegisterStorageView slot = {0};
-		if (!r_anal_function_snapshot_convention_argument_slot (source, i, &slot)) {
-			return false;
-		}
-		walk_storage (writer, &slot);
+		walk_storage (writer, &interface->convention_argument_slots[i]);
 	}
-	walk_optional_storage (writer, slots_known && convention.convention_result_slot.size != 0,
-		&convention.convention_result_slot);
+	walk_optional_storage (writer,
+		slots_known && interface->convention_result_slot.size != 0,
+		&interface->convention_result_slot);
 
 	uint16_t captured = 0;
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_OWNED_BOUNDED_FUNCTION_IMAGE) {
+	if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_OWNED_BOUNDED_FUNCTION_IMAGE) {
 		captured |= WALK_CAPTURED_BOUNDED_IMAGE;
 	}
 	if (has_interface) {
@@ -1081,46 +995,47 @@ bool r2sleigh_wire_write_snapshot(R2SleighWireWriter *writer, const void *snapsh
 	 * no interface there is nothing to have captured. Deriving them from the
 	 * capabilities alone claimed storages that no part of the buffer holds. */
 	if (has_interface) {
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FUNCTION_TYPES) {
 			captured |= WALK_CAPTURED_EXACT_TYPES;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_SLOT_ROLES) {
 			captured |= WALK_CAPTURED_EXACT_SLOT_ROLES;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_RETURN_ADDRESS_STORAGE) {
 			captured |= WALK_CAPTURED_RETURN_ADDRESS;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_STACK_POINTER_STORAGE) {
 			captured |= WALK_CAPTURED_STACK_POINTER;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_FRAME_POINTER_STORAGE) {
 			captured |= WALK_CAPTURED_FRAME_POINTER;
 		}
-		if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
+		if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_RETURN_MECHANISM) {
 			captured |= WALK_CAPTURED_RETURN_MECHANISM;
 		}
 	}
-	if (top.capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
+	if (source->capabilities & R_ANAL_FUNCTION_SNAPSHOT_CAP_EXACT_STACK_ALLOCATION_CONTRACT) {
 		captured |= WALK_CAPTURED_STACK_ALLOCATION;
 	}
 	r2sleigh_wire_u16 (writer, captured);
 
 	/* Diagnostics carry the same capture identity, matching the accessor
 	 * transport's own choice rather than inventing a second one. */
-	r2sleigh_wire_u64 (writer, top.revision_identity);
+	r2sleigh_wire_u64 (writer, source->revision_identity);
 
 	/* Each callee is a whole snapshot with its own string table, so it decodes
 	 * by the same reader that decodes this one and nothing about it depends on
 	 * where it sits in this buffer. They carry no callees of their own, so this
 	 * nests exactly one level. */
-	const size_t num_callees = (top.capabilities
-		& R_ANAL_FUNCTION_SNAPSHOT_CAP_CALLEE_SNAPSHOTS)? top.num_callee_snapshots: 0;
+	const size_t num_callees = (source->capabilities
+		& R_ANAL_FUNCTION_SNAPSHOT_CAP_CALLEE_SNAPSHOTS)? source->num_callee_snapshots: 0;
 	if (num_callees > UINT32_MAX) {
 		return false;
 	}
 	r2sleigh_wire_u32 (writer, (uint32_t)num_callees);
 	for (size_t i = 0; i < num_callees; i++) {
-		const RAnalFunctionSnapshot *callee = r_anal_function_snapshot_callee_snapshot (source, i);
+		const RAnalFunctionSnapshot *callee = source->callee_snapshots
+			? source->callee_snapshots[i]: NULL;
 		if (!callee) {
 			return false;
 		}
