@@ -127,6 +127,15 @@ impl<'a> FoldingContext<'a> {
         };
         let (ret_type, params, variadic) = if let Some(signature) = &cert.callee_signature {
             if signature.variadic || signature.params.len() != named {
+                r2il::refusal_evidence!(
+                    "callee-signature-arity",
+                    "callsite=({block_addr:#x}, {op_idx}) target={:?} certified_arguments={} named={named} signature_params={} call_variadic={} signature_variadic={}",
+                    cert.direct_target,
+                    args.values.len(),
+                    signature.params.len(),
+                    cert.variadic,
+                    signature.variadic
+                );
                 return Err(OpLoweringRefusal::missing_machine_projection());
             }
             (
