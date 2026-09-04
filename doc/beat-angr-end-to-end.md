@@ -11,9 +11,22 @@ current baseline over 1,768 functions:
 
 | | ours | angr | factor needed |
 | --- | --- | --- | --- |
-| coverage | 0.404 | 0.992 | ×2.5 |
+| coverage | **0.738** | 0.989 | ×1.34 |
 | `byte_match` all-function | 0.058 | 0.435 | ×7.5 |
 | `type_match` all-function | 0.066 | 0.360 | ×5.5 |
+
+**The coverage figure was wrong until now and the correction is large.** The
+baseline averaged over O0 *and* O1, but every sailr project declares
+`optimization_levels = ["O0", "O2", "O2-noinline"]` — **no project configures
+O1**. decbench builds the level when asked and then has no source data to match
+against, so all 842 O1 functions came back unmatched and scored as refusals. On
+O0 alone, which is a level that exists, coverage is 683/926 = 0.738 rather than
+714/1768 = 0.404. The harness now refuses an unconfigured level instead of
+producing a cell of zeros.
+
+The two metric rows still need re-measuring on configured levels only; they are
+carried here unchanged from the mixed baseline and are therefore pessimistic by
+an unknown amount.
 
 **Coverage alone is not sufficient**, and this is the correction that reorders
 the old plan. Even at `c = 1.0` our rendered mean of 0.144 still loses to angr's
@@ -46,15 +59,15 @@ stopped. What changes is the *granularity* of refusal, not its meaning.
 
 Land this first; it re-prices everything after it.
 
-1. **Finish the zlib/O1 root cause.** That single cell is 715 of 1,054 refusals
-   — 68% of every refusal in the benchmark. Five binaries report *zero*
-   functions observed and two report exactly one; that is whole-binary loss, not
-   715 individual refusals. Already eliminated with evidence: harness timeout
-   (the 7-binary run takes ~1,176 s against a 3,600 s per-binary budget), refusal
-   aborting the command sequence, r2 command truncation, and the harness failing
-   to install the plugin. Two instruments now exist that did not before — the
-   harness records a `harness:`-prefixed cause naming how the process ended, and
-   a run refuses outright if the plugin does not load. Re-run and read them.
+1. ~~Finish the zlib/O1 root cause.~~ **Dissolved, not solved.** O1 is not a
+   configured level for any project, so that entire cell was measuring something
+   decbench cannot score. There was no decompiler defect in it. Four instruments
+   were built while chasing it and all are worth keeping: the harness names how a
+   process ended, refuses a run whose plugin will not load, refuses an
+   unconfigured optimization level, and no longer scores radare2's "install
+   r2dec" notice as a rendered function.
+   **Re-baseline on O0 and O2 before planning anything else** — every priority
+   derived tonight came from the O1 census and is therefore untrustworthy.
 2. **Implement the marked partial tier.** This is the structural work of this
    context. The refusal must become per-cell rather than per-function, and the
    marking must be visible in the emitted C.
