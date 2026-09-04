@@ -3502,7 +3502,7 @@ fn collect_source_boundary_facts(
                     Some(SourceFunctionReturn::Register { .. }) => {
                         if let Some((block_addr, op_index)) = graph.op_site_for_inst(inst.id) {
                             for slot in return_slots {
-                                match reaching_abi_return_register_in_block(
+                                match reaching_source_return_register_in_block(
                                     function,
                                     graph,
                                     machine_context,
@@ -3650,7 +3650,7 @@ fn source_formal_parameter_projections(
                 .copied();
             let graph_storage = match (logical_value, interface.type_graph()) {
                 (Some(logical_value), Some(type_graph)) => {
-                    projected_formal_parameter_storage(abi_storage, logical_value, type_graph)?
+                    projected_logical_register_storage(abi_storage, logical_value, type_graph)?
                 }
                 (None, None) => abi_storage,
                 (Some(_), None) | (None, Some(_)) => return None,
@@ -3788,7 +3788,7 @@ fn exact_return_address_fact(
     })
 }
 
-fn projected_formal_parameter_storage(
+fn projected_logical_register_storage(
     abi_storage: CanonicalStorageId,
     logical_value: SourceLogicalValue,
     type_graph: &crate::SourceTypeGraph,
@@ -3823,6 +3823,33 @@ fn projected_formal_parameter_storage(
     }
 }
 
+/// The source-declared part of one physical ABI result slot.
+///
+/// The interface constructor has already made the type graph and carrier
+/// projection coherent. Rechecking the exact slot here keeps a mismatched ABI
+/// model from turning that logical value into a boundary fact for another
+/// register.
+fn projected_return_value_storage(
+    machine_context: &SourceMachineContext,
+    abi_storage: CanonicalStorageId,
+) -> Option<CanonicalStorageId> {
+    let interface = machine_context.function_interface()?;
+    if interface.return_kind()
+        != (SourceFunctionReturn::Register {
+            storage: abi_storage,
+        })
+    {
+        return None;
+    }
+    match (interface.return_logical_value(), interface.type_graph()) {
+        (Some(logical_value), Some(type_graph)) => {
+            projected_logical_register_storage(abi_storage, logical_value, type_graph)
+        }
+        (None, None) => Some(abi_storage),
+        (Some(_), None) | (None, Some(_)) => None,
+    }
+}
+
 enum ReachingAbiReturnRegister {
     Exact(ValueId),
     Composition(SourceReturnRegisterCompositionFact),
@@ -3838,6 +3865,58 @@ enum ReachingAbiState {
 struct ReachingAbiPolicy {
     allow_distinct_phi_inputs: bool,
     calls_are_barriers: bool,
+}
+
+/// Resolve the value the source says a return exposes.
+///
+/// A narrow logical result may be written directly to the low lane (`seta al`)
+/// without ever defining the full ABI carrier. Prefer that exact lane. A full
+/// definition remains admissible only as one value so
+/// `exact_logical_return_projection` can verify its explicit extension; a
+/// physical-carrier composition cannot stand for a separately declared logical
+/// lane.
+#[allow(clippy::too_many_arguments)]
+fn reaching_source_return_register_in_block(
+    function: &SSAFunction,
+    graph: &SsaGraph,
+    machine_context: &SourceMachineContext,
+    block_addr: u64,
+    boundary_op_index: usize,
+    slot_index: u32,
+    storage: CanonicalStorageId,
+    boundary_at: InstId,
+) -> Option<ReachingAbiReturnRegister> {
+    let logical_storage = projected_return_value_storage(machine_context, storage)?;
+    if logical_storage != storage
+        && let Some(value) = reaching_abi_value_in_block(
+            function,
+            graph,
+            machine_context,
+            block_addr,
+            boundary_op_index,
+            logical_storage,
+        )
+    {
+        return Some(ReachingAbiReturnRegister::Exact(value));
+    }
+    match reaching_abi_return_register_in_block(
+        function,
+        graph,
+        machine_context,
+        block_addr,
+        boundary_op_index,
+        slot_index,
+        storage,
+        boundary_at,
+    ) {
+        exact @ Some(ReachingAbiReturnRegister::Exact(_)) => exact,
+        composition @ Some(ReachingAbiReturnRegister::Composition(_))
+            if logical_storage == storage =>
+        {
+            composition
+        }
+        Some(ReachingAbiReturnRegister::Composition(_)) | None => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6968,8 +7047,6 @@ pub(crate) fn exact_logical_return_projection(
     if boundary_storage != storage
         || storage.space != CanonicalStorageSpace::Register
         || storage.size == 0
-        || physical_value.var.size != storage.size
-        || physical_value.canonical_storage != Some(storage)
         || projection.offset_bits() != 0
         || projection.size_bits() == 0
         || projection.size_bits() != source_type.size_bits()
@@ -6979,8 +7056,12 @@ pub(crate) fn exact_logical_return_projection(
         return None;
     }
     match projection.kind() {
-        SourceCarrierKind::Full if projection.size_bits() == physical_bits => {
-            Some((boundary.value, physical_value.var.size, Some(logical)))
+        SourceCarrierKind::Full
+            if projection.size_bits() == physical_bits
+                && physical_value.var.size == storage.size
+                && physical_value.canonical_storage == Some(storage) =>
+        {
+            Some((boundary.value, storage.size, Some(logical)))
         }
         SourceCarrierKind::LowBits
             if projection.size_bits() < physical_bits
@@ -6990,6 +7071,17 @@ pub(crate) fn exact_logical_return_projection(
                 ) =>
         {
             let logical_width = u32::try_from(projection.size_bits() / 8).ok()?;
+            let logical_storage = projected_logical_register_storage(storage, logical, type_graph)?;
+            if physical_value.var.size == logical_width
+                && physical_value.canonical_storage == Some(logical_storage)
+            {
+                return Some((boundary.value, logical_width, Some(logical)));
+            }
+            if physical_value.var.size != storage.size
+                || physical_value.canonical_storage != Some(storage)
+            {
+                return None;
+            }
             let producer = graph
                 .def_inst(boundary.value)
                 .and_then(|id| graph.inst(id))?;

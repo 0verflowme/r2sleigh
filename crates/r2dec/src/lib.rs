@@ -6613,6 +6613,115 @@ mod tests {
         DecompilerInput::new(source_owned_facts)
     }
 
+    /// A comparison written directly into the logical low byte of the ABI
+    /// result carrier, rendered through the complete source-owned pipeline.
+    #[test]
+    fn a_logical_low_byte_return_renders() {
+        let mut arch = test_arch_for_decompile();
+        arch.add_register(RegisterDef::sub("AL", 0, 1, "RAX"));
+        arch.register_projections.push(RegisterProjection {
+            written: RegisterStorage { offset: 0, size: 1 },
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage { offset: 0, size: 8 },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 8,
+                },
+            },
+        });
+        arch.register_projections
+            .sort_by_key(|projection| projection.written);
+
+        let storage = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let logical_u64 = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+        );
+        let logical_u8 = r2ssa::SourceLogicalValue::new(
+            1,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 8),
+        );
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
+                r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::UnsignedInteger, 8, 8),
+            ],
+            [],
+        )
+        .expect("exact boolean-return type graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            b"logical-low-byte-return".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0, 8),
+            },
+            [],
+            [logical_u64],
+            Some(logical_u8),
+            Some(type_graph),
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28, 8)))
+        .expect("exact boolean-return interface");
+
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::IntLess {
+            dst: Varnode::register(0, 1),
+            a: Varnode::constant(7, 8),
+            b: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared boolean return")
+                .with_name("shape_bool_probe");
+        let boundary = prepared
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("boolean return boundary");
+        assert!(boundary.complete);
+        let [boundary_value] = boundary.values.as_slice() else {
+            panic!("logical low-byte return must carry one value")
+        };
+        assert!(
+            prepared
+                .graph()
+                .value(boundary_value.value)
+                .is_some_and(|value| {
+                    value.var.size == 1 && value.canonical_storage == Some(storage(0, 1))
+                })
+        );
+
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "logical low-byte return route",
+                None,
+            ),
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+        assert!(
+            !output.contains("fallback") && !output.contains("native rendering refused"),
+            "an exact logical low-byte result must render: {output}"
+        );
+        assert!(output.contains("uint8_t shape_bool_probe("), "{output}");
+        assert!(
+            output.contains("return ") && output.contains(" < "),
+            "{output}"
+        );
+    }
+
     /// A call whose stack pointer the convention restores, rendered end to end.
     #[test]
     fn a_restored_stack_pointer_renders() {
