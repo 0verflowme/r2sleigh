@@ -1241,8 +1241,22 @@ impl TypeWritebackAnalysis {
                     .push(WritebackEvidence::CertifiedCallArgument);
             }
         }
-        if refreshed_slots != changed_slots {
-            return false;
+        // A changed slot with no argument candidate is not an inconsistency:
+        // the plan carries no variable for that parameter, so there is nothing
+        // to refresh for it. Demanding one made every function whose declared
+        // parameter types the source interface supplies -- but whose plan names
+        // no register variable for one of them -- fail its whole writeback, and
+        // with it the decompilation, once the interface began supplying every
+        // parameter's type rather than only the return's.
+        let unrefreshed = changed_slots
+            .difference(&refreshed_slots)
+            .copied()
+            .collect::<Vec<_>>();
+        if !unrefreshed.is_empty() {
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "slots {unrefreshed:?} changed type with no argument candidate to carry it"
+            );
         }
         self.plan = plan;
         true

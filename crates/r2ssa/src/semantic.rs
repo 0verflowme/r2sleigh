@@ -9571,7 +9571,7 @@ fn collect_control_domain_facts(
                 let (guard, edge_complete) =
                     control_guard_for_edge(function, predicates, predecessor, block_addr);
                 if let Some(guard) = guard {
-                    state.guards.insert(guard);
+                    insert_control_guard(&mut state.guards, guard, &switch_arity);
                 }
                 state.complete &= edge_complete;
                 incoming.push(state);
@@ -9656,13 +9656,17 @@ fn collect_control_domain_facts(
 /// values precisely so it can say "the selector is one of these", so the arms
 /// are merged rather than dropped. Growth is bounded by the switch's own case
 /// count, so the fixpoint still converges.
-fn meet_control_guards(
-    left: &BTreeSet<ControlGuard>,
-    right: &BTreeSet<ControlGuard>,
-    switch_arity: &BTreeMap<u64, (BTreeSet<u64>, bool)>,
-) -> BTreeSet<ControlGuard> {
-    let mut met = left.intersection(right).cloned().collect::<BTreeSet<_>>();
-    for guard in left {
+/// The arms of one switch that a guard set holds, as one arm per switch block.
+///
+/// Two arms of the same switch on one state are one guard weakened to the
+/// union of their cases: a path takes one arm, so the only thing both can say
+/// together is "one of these". Keeping them as two guards let every meet mint
+/// a new subset of the cases, and the states grew through the power set of a
+/// switch's arms -- which is what took one function of a binary built at -O2
+/// past a gigabyte and the harness's memory limit.
+fn switch_arms_by_block(guards: &BTreeSet<ControlGuard>) -> BTreeMap<u64, (Vec<u64>, bool)> {
+    let mut arms = BTreeMap::<u64, (Vec<u64>, bool)>::new();
+    for guard in guards {
         let ControlGuard::SwitchArm {
             block_addr,
             case_values,
@@ -9671,42 +9675,115 @@ fn meet_control_guards(
         else {
             continue;
         };
-        if met.contains(guard) {
+        let entry = arms.entry(*block_addr).or_default();
+        entry.0.extend(case_values.iter().copied());
+        entry.1 |= *includes_default;
+    }
+    for (values, _) in arms.values_mut() {
+        values.sort_unstable();
+        values.dedup();
+    }
+    arms
+}
+
+/// A merged arm that covers every way out of the switch says nothing: the
+/// block runs whatever the selector is. That is the block the switch converges
+/// on, and giving it a guard would demand one from a rendering that correctly
+/// has none.
+fn switch_arm_is_vacuous(
+    block_addr: u64,
+    case_values: &[u64],
+    includes_default: bool,
+    switch_arity: &BTreeMap<u64, (BTreeSet<u64>, bool)>,
+) -> bool {
+    switch_arity
+        .get(&block_addr)
+        .is_some_and(|(all_values, has_default)| {
+            all_values.iter().all(|value| case_values.contains(value))
+                && (includes_default || !has_default)
+        })
+}
+
+/// Add one guard to a state, keeping at most one arm per switch block.
+fn insert_control_guard(
+    guards: &mut BTreeSet<ControlGuard>,
+    guard: ControlGuard,
+    switch_arity: &BTreeMap<u64, (BTreeSet<u64>, bool)>,
+) {
+    let ControlGuard::SwitchArm {
+        block_addr,
+        case_values,
+        includes_default,
+    } = &guard
+    else {
+        guards.insert(guard);
+        return;
+    };
+    let mut merged = case_values.clone();
+    let mut default = *includes_default;
+    let existing = guards
+        .iter()
+        .filter(|other| {
+            matches!(other, ControlGuard::SwitchArm { block_addr: other_block, .. } if other_block == block_addr)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for other in existing {
+        if let ControlGuard::SwitchArm {
+            case_values: other_values,
+            includes_default: other_default,
+            ..
+        } = &other
+        {
+            merged.extend(other_values.iter().copied());
+            default |= *other_default;
+        }
+        guards.remove(&other);
+    }
+    merged.sort_unstable();
+    merged.dedup();
+    if switch_arm_is_vacuous(*block_addr, &merged, default, switch_arity) {
+        return;
+    }
+    guards.insert(ControlGuard::SwitchArm {
+        block_addr: *block_addr,
+        case_values: merged,
+        includes_default: default,
+    });
+}
+
+/// What holds on every path into a block: the branch guards both sides
+/// share, and for each switch both sides passed through, the arm covering
+/// the cases either side took.
+fn meet_control_guards(
+    left: &BTreeSet<ControlGuard>,
+    right: &BTreeSet<ControlGuard>,
+    switch_arity: &BTreeMap<u64, (BTreeSet<u64>, bool)>,
+) -> BTreeSet<ControlGuard> {
+    let mut met = left
+        .iter()
+        .filter(|guard| matches!(guard, ControlGuard::Branch { .. }))
+        .filter(|guard| right.contains(guard))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let right_arms = switch_arms_by_block(right);
+    for (block_addr, (left_values, left_default)) in switch_arms_by_block(left) {
+        let Some((right_values, right_default)) = right_arms.get(&block_addr) else {
+            continue;
+        };
+        let mut merged = left_values;
+        merged.extend(right_values.iter().copied());
+        merged.sort_unstable();
+        merged.dedup();
+        let includes_default = left_default || *right_default;
+        if switch_arm_is_vacuous(block_addr, &merged, includes_default, switch_arity) {
             continue;
         }
-        for other in right {
-            let ControlGuard::SwitchArm {
-                block_addr: other_block,
-                case_values: other_values,
-                includes_default: other_default,
-            } = other
-            else {
-                continue;
-            };
-            if other_block != block_addr {
-                continue;
-            }
-            let mut merged = case_values.clone();
-            merged.extend(other_values.iter().copied());
-            merged.sort_unstable();
-            merged.dedup();
-            let includes_default = *includes_default || *other_default;
-            // A merged arm that covers every way out of the switch says
-            // nothing: the block runs whatever the selector is. That is the
-            // block the switch converges on, and giving it a guard would demand
-            // one from a rendering that correctly has none.
-            if let Some((all_values, has_default)) = switch_arity.get(block_addr)
-                && all_values.iter().all(|value| merged.contains(value))
-                && (includes_default || !has_default)
-            {
-                continue;
-            }
-            met.insert(ControlGuard::SwitchArm {
-                block_addr: *block_addr,
-                case_values: merged,
-                includes_default,
-            });
-        }
+        met.insert(ControlGuard::SwitchArm {
+            block_addr,
+            case_values: merged,
+            includes_default,
+        });
     }
     met
 }
