@@ -3605,6 +3605,13 @@ fn collect_source_boundary_facts(
                     false
                 };
                 let results_complete = results.is_some();
+                if !arguments_complete || !results_complete {
+                    r2il::refusal_evidence!(
+                        "call-boundary-incomplete",
+                        "callsite ({block_addr:#x}, {op_index}) declares {} arguments: arguments_complete={arguments_complete} results_complete={results_complete}",
+                        interface.arguments().len()
+                    );
+                }
                 if let Some(results) = results {
                     boundary.results = results;
                 }
@@ -6754,10 +6761,25 @@ fn collect_prepared_function_certificates(
                 stack_argument_values
             };
             if !variadic {
-                argument_certificates.extend(collect_stack_call_argument_certificates(
+                let appended = collect_stack_call_argument_certificates(
                     &stack_argument_values,
                     structured,
-                ));
+                );
+                if !appended.is_empty() {
+                    r2il::refusal_evidence!(
+                        "call-argument-stack-append",
+                        "callsite ({block_addr:#x}, {op_index}) has {} register arguments from a {} boundary declaring {:?}; the outgoing-store scan appends {} more at offsets {:?}",
+                        argument_certificates.len(),
+                        if complete_boundary.is_some() { "complete" } else { "incomplete" },
+                        fixed_argument_count,
+                        appended.len(),
+                        stack_argument_values
+                            .iter()
+                            .map(|argument| argument.stack_offset)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                argument_certificates.extend(appended);
             }
             callsites_by_inst.insert(fact.at, *id);
             (
@@ -7219,6 +7241,13 @@ fn collect_return_value_certificates(
 
     for (boundary_at, boundary) in &boundaries.returns {
         if boundary.at != *boundary_at || !boundary.complete {
+            r2il::refusal_evidence!(
+                "return-certificate",
+                "{:?}: at_mismatch={} incomplete={}",
+                boundary_at,
+                boundary.at != *boundary_at,
+                !boundary.complete
+            );
             continue;
         }
         let Some((block_addr, op_index)) = graph.op_site_for_inst(boundary.at) else {
@@ -7233,11 +7262,26 @@ fn collect_return_value_certificates(
         let certificate = if boundary.register_compositions.is_empty() {
             let [boundary_value] = boundary.values.as_slice() else {
                 // A complete void boundary is authoritative, but it owns no value.
+                if !boundary.values.is_empty() {
+                    r2il::refusal_evidence!(
+                        "return-certificate",
+                        "{:?}: {} boundary values, not one",
+                        boundary_at,
+                        boundary.values.len()
+                    );
+                }
                 continue;
             };
             let Some((value, width, source_logical_value)) =
                 exact_logical_return_projection(graph, machine_context, boundary_value)
             else {
+                r2il::refusal_evidence!(
+                    "return-certificate",
+                    "{:?}: no logical projection for {:?} in slot {:?}",
+                    boundary_at,
+                    boundary_value.value,
+                    boundary_value.slot
+                );
                 continue;
             };
             ReturnValueCertificate {
@@ -7354,7 +7398,20 @@ pub(crate) fn exact_logical_return_projection(
     machine_context: Option<&SourceMachineContext>,
     boundary: &CallBoundaryValueFact,
 ) -> Option<(ValueId, u32, Option<SourceLogicalValue>)> {
-    let physical_value = graph.value(boundary.value)?;
+    r2il::refusal_evidence!(
+        "return-logical-projection",
+        "entered for {:?} slot {:?}",
+        boundary.value,
+        boundary.slot
+    );
+    let Some(physical_value) = graph.value(boundary.value) else {
+        r2il::refusal_evidence!(
+            "return-logical-projection",
+            "boundary value {:?} is not in the graph",
+            boundary.value
+        );
+        return None;
+    };
     let Some(interface) = machine_context.and_then(SourceMachineContext::function_interface) else {
         return Some((boundary.value, physical_value.var.size, None));
     };
@@ -7364,6 +7421,11 @@ pub(crate) fn exact_logical_return_projection(
         return Some((boundary.value, physical_value.var.size, None));
     };
     let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        r2il::refusal_evidence!(
+            "return-logical-projection",
+            "interface declares no register return: {:?}",
+            interface.return_kind()
+        );
         return None;
     };
     let CallBoundarySlot::Register {
@@ -7371,12 +7433,25 @@ pub(crate) fn exact_logical_return_projection(
         ..
     } = boundary.slot
     else {
+        r2il::refusal_evidence!(
+            "return-logical-projection",
+            "boundary slot is not a register: {:?}",
+            boundary.slot
+        );
         return None;
     };
-    let source_type = type_graph
+    let Some(source_type) = type_graph
         .types()
         .get(usize::try_from(logical.type_id()).ok()?)
-        .filter(|source_type| source_type.id() == logical.type_id())?;
+        .filter(|source_type| source_type.id() == logical.type_id())
+    else {
+        r2il::refusal_evidence!(
+            "return-logical-projection",
+            "type graph has no type {} for the declared return",
+            logical.type_id()
+        );
+        return None;
+    };
     let projection = logical.carrier();
     let physical_bits = u64::from(storage.size).checked_mul(8)?;
     if boundary_storage != storage
@@ -7388,6 +7463,16 @@ pub(crate) fn exact_logical_return_projection(
         || !projection.size_bits().is_multiple_of(8)
         || projection.size_bits() > physical_bits
     {
+        r2il::refusal_evidence!(
+            "return-logical-projection",
+            "sanity gate: boundary {:?} vs declared {:?}, projection {} bits at offset {}, source type {} bits, physical {} bits",
+            boundary_storage,
+            storage,
+            projection.size_bits(),
+            projection.offset_bits(),
+            source_type.size_bits(),
+            physical_bits
+        );
         return None;
     }
     match projection.kind() {
@@ -7405,8 +7490,25 @@ pub(crate) fn exact_logical_return_projection(
                     SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
                 ) =>
         {
-            let logical_width = u32::try_from(projection.size_bits() / 8).ok()?;
-            let logical_storage = projected_logical_register_storage(storage, logical, type_graph)?;
+            let Ok(logical_width) = u32::try_from(projection.size_bits() / 8) else {
+                r2il::refusal_evidence!(
+                    "return-logical-projection",
+                    "logical width {} bits does not fit a u32 byte count",
+                    projection.size_bits()
+                );
+                return None;
+            };
+            let Some(logical_storage) =
+                projected_logical_register_storage(storage, logical, type_graph)
+            else {
+                r2il::refusal_evidence!(
+                    "return-logical-projection",
+                    "no projected narrow storage for {} bits of {:?}",
+                    projection.size_bits(),
+                    storage
+                );
+                return None;
+            };
             if physical_value.var.size == logical_width
                 && physical_value.canonical_storage == Some(logical_storage)
             {
@@ -7417,26 +7519,180 @@ pub(crate) fn exact_logical_return_projection(
             {
                 return None;
             }
-            let producer = graph
-                .def_inst(boundary.value)
-                .and_then(|id| graph.inst(id))?;
-            let [input] = producer.inputs.as_slice() else {
-                return None;
-            };
-            let logical_value = graph.value(*input)?;
-            let InstPayload::Op(SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src }) =
-                &producer.payload
-            else {
-                return None;
-            };
-            (producer.output == Some(boundary.value)
-                && *dst == physical_value.var
-                && *src == logical_value.var
-                && logical_value.var.size == logical_width)
-                .then_some((*input, logical_width, Some(logical)))
+            // The carrier's own definition is one extension of the logical
+            // width. Every way of failing that test is a fall-through to the
+            // frontier walk below, not a refusal: this used to be written
+            // inline with `?`, so a carrier defined by a merge left the whole
+            // function before anything else could look at it.
+            if let Some(input) = exact_single_extension_logical_input(
+                graph,
+                boundary.value,
+                physical_value,
+                logical_width,
+            ) {
+                return Some((input, logical_width, Some(logical)));
+            }
+            // The carrier's definition is not itself the extension. Follow the
+            // copies and merges it arrives through: where every definition
+            // that reaches the return extends the logical width, the carrier
+            // holds the logical value on every path, and the return is exact.
+            //
+            // A function whose returns merge -- which is most of them once the
+            // compiler is optimising -- has a phi in the return register, and
+            // requiring the extension to be the immediate producer refused it.
+            // That was the largest single refusal in the benchmark.
+            //
+            // The carrier is what is certified here rather than one frontier
+            // value, because a merge has several and the certificate names
+            // one. The render site narrows it against the declared return
+            // type, which is the same spelling the direct narrow lane above
+            // produces.
+            if carrier_reaches_only_logical_extensions(
+                graph,
+                boundary.value,
+                logical_storage,
+                logical_width,
+            ) {
+                return Some((boundary.value, logical_width, Some(logical)));
+            }
+            r2il::refusal_evidence!(
+                "return-logical-projection",
+                "LowBits width {} of {:?}: value {:?} is {} bytes at {:?}, defined by {}",
+                logical_width,
+                storage,
+                boundary.value,
+                physical_value.var.size,
+                physical_value.canonical_storage,
+                graph
+                    .def_inst(boundary.value)
+                    .and_then(|id| graph.inst(id))
+                    .map_or_else(
+                        || "nothing".to_string(),
+                        |inst| format!("{:?}", inst.payload)
+                    )
+            );
+            None
         }
-        _ => None,
+        kind => {
+            r2il::refusal_evidence!(
+                "return-logical-projection",
+                "carrier kind {:?} of {:?}: projection {} bits, value {:?} is {} bytes at {:?}, source type {:?}",
+                kind,
+                storage,
+                projection.size_bits(),
+                boundary.value,
+                physical_value.var.size,
+                physical_value.canonical_storage,
+                source_type.kind()
+            );
+            None
+        }
     }
+}
+
+/// The value a single extension writes into `carrier`, when the carrier's own
+/// definition is exactly that extension.
+///
+/// Returns `None` for every other shape, including a merge, so the caller can
+/// go on to ask the wider question rather than refusing here.
+fn exact_single_extension_logical_input(
+    graph: &SsaGraph,
+    carrier: ValueId,
+    carrier_value: &crate::graph::GraphValue,
+    logical_width: u32,
+) -> Option<ValueId> {
+    let producer = graph.def_inst(carrier).and_then(|id| graph.inst(id))?;
+    let [input] = producer.inputs.as_slice() else {
+        return None;
+    };
+    let logical_value = graph.value(*input)?;
+    let InstPayload::Op(SSAOp::IntZExt { dst, src } | SSAOp::IntSExt { dst, src }) =
+        &producer.payload
+    else {
+        return None;
+    };
+    (producer.output == Some(carrier)
+        && *dst == carrier_value.var
+        && *src == logical_value.var
+        && logical_value.var.size == logical_width)
+        .then_some(*input)
+}
+
+/// Whether every definition reaching `carrier` extends exactly `logical_width`
+/// bytes of `logical_storage` into it.
+///
+/// The walk follows the two operations that move a value without changing it,
+/// `Copy` and `Phi`, and stops at anything else. A definition that is not an
+/// extension of the logical width -- a full-width computation, a load, a call
+/// result, a constant -- answers `false` for the whole carrier, because then
+/// some path leaves bits in it that the declared logical type does not
+/// account for.
+///
+/// The visited set makes a loop terminate: a carrier defined by a phi that
+/// reaches itself contributes nothing new on the second visit, so a cycle
+/// whose other edges all extend is admitted, and one whose other edges do not
+/// is refused by those edges.
+fn carrier_reaches_only_logical_extensions(
+    graph: &SsaGraph,
+    carrier: ValueId,
+    logical_storage: CanonicalStorageId,
+    logical_width: u32,
+) -> bool {
+    let Some(logical_bits) = logical_width.checked_mul(8) else {
+        return false;
+    };
+    let mut pending = vec![carrier];
+    let mut visited = BTreeSet::new();
+    let mut extensions = 0usize;
+    while let Some(value) = pending.pop() {
+        if !visited.insert(value) {
+            continue;
+        }
+        // A constant whose bits above the logical width are zero *is* the
+        // zero-extension of its own low bits, so it needs no extension
+        // instruction to prove it. This is what `return Z_STREAM_ERROR;`
+        // compiles to: `mov eax, 0xfffffffe`, which the lift states as an
+        // eight-byte constant copy into the carrier and which zeroes the
+        // upper half exactly as a `zext` would.
+        if let Some(constant) = graph
+            .value(value)
+            .and_then(|value| value.var.constant_bits())
+        {
+            if logical_bits >= 64 || constant >> logical_bits == 0 {
+                extensions += 1;
+                continue;
+            }
+            return false;
+        }
+        let Some(inst) = graph.def_inst(value).and_then(|id| graph.inst(id)) else {
+            return false;
+        };
+        let InstPayload::Op(op) = &inst.payload else {
+            return false;
+        };
+        match op {
+            SSAOp::IntZExt { src, .. } | SSAOp::IntSExt { src, .. } => {
+                let Some(source) = graph.value_id_for_var(src).and_then(|id| graph.value(id))
+                else {
+                    return false;
+                };
+                if source.var.size != logical_width
+                    || source.canonical_storage != Some(logical_storage)
+                {
+                    return false;
+                }
+                extensions += 1;
+            }
+            SSAOp::Copy { .. } | SSAOp::Phi { .. } => {
+                if inst.inputs.is_empty() {
+                    return false;
+                }
+                pending.extend(inst.inputs.iter().copied());
+            }
+            _ => return false,
+        }
+    }
+    extensions > 0
 }
 
 fn return_carrier_for_boundary_value(
@@ -12514,9 +12770,12 @@ mod tests {
                 b: Varnode::constant(7, 4),
             });
         } else {
+            // Bits above the logical width, so the carrier is not the
+            // zero-extension of its own low half and nothing proves what the
+            // declared 32-bit return holds.
             block.push(R2ILOp::Copy {
                 dst: Varnode::register(0, 8),
-                src: Varnode::constant(7, 8),
+                src: Varnode::constant(0x1_0000_0007, 8),
             });
         }
         if write_logical_carrier {
@@ -12689,6 +12948,158 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(return_value_obligations.len(), 1);
         assert_eq!(return_value_obligations[0].inputs, [certificate.value]);
+    }
+
+    /// `return Z_STREAM_ERROR;` from an `int` function: the compiler emits
+    /// `mov eax, 0xfffffffe`, which the lift states as an eight-byte constant
+    /// copy into the carrier. No extension instruction exists, and none is
+    /// needed -- a constant whose bits above the logical width are zero is
+    /// the zero-extension of its own low half. Refusing it cost 132 of the
+    /// 140 low-bits return refusals in zlib's minigzip at -O2.
+    /// A function whose whole body is `mov eax, N; ret`, lifted as an
+    /// eight-byte constant copy into the return carrier.
+    fn constant_low_return_artifact(constant: u64) -> SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::sub("eax", 0, 4, "rax"));
+        arch.add_register(RegisterDef::new("rip", 16, 8));
+        arch.add_register(RegisterDef::new("sp", 32, 8));
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
+                },
+            }
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 16,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 16,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 32,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 32,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
+        let mut block = R2ILBlock::new(0x2f20, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(constant, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(16, 8),
+        });
+        let logical = SourceLogicalValue::new(
+            0,
+            SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
+        );
+        let type_graph = SourceTypeGraph::new(
+            [SourceType::new(0, SourceTypeKind::SignedInteger, 32, 32)],
+            [],
+        )
+        .expect("constant low return type graph");
+        let interface = SourceFunctionInterface::new_exact_with_logical_types(
+            b"constant-low-return".to_vec(),
+            "test-register-abi",
+            [],
+            SourceFunctionReturn::Register {
+                storage: register_storage(0, 8),
+            },
+            [],
+            [],
+            Some(logical),
+            Some(type_graph),
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(16, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(32, 8)))
+        .expect("constant low return interface");
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("constant low return artifact")
+    }
+
+    #[test]
+    fn low_bit_return_certificate_owns_a_constant_that_is_its_own_zero_extension() {
+        for constant in [1u64, 0xffff_fffe, 0xffff_ffff] {
+            let artifact = constant_low_return_artifact(constant);
+            let boundary = artifact
+                .facts()
+                .boundaries
+                .returns
+                .values()
+                .next()
+                .expect("return boundary");
+            assert!(boundary.complete, "constant {constant:#x}");
+            let (block_addr, op_index) = artifact
+                .graph()
+                .op_site_for_inst(boundary.at)
+                .expect("return op site");
+            let certificate = artifact
+                .return_certificate_for_op(block_addr, op_index)
+                .unwrap_or_else(|| panic!("certificate for constant {constant:#x}"));
+            assert_eq!(certificate.width, 4, "constant {constant:#x}");
+            assert_eq!(
+                certificate.carrier,
+                Some(ReturnCarrier::Register {
+                    storage: register_storage(0, 8),
+                }),
+                "constant {constant:#x}"
+            );
+            assert_eq!(
+                certificate.source_logical_value,
+                artifact
+                    .machine_context()
+                    .function_interface()
+                    .and_then(SourceFunctionInterface::return_logical_value),
+                "constant {constant:#x}"
+            );
+        }
+    }
+
+    /// The same shape with a constant that does not fit the logical width:
+    /// its upper bits are not zero, so the carrier is not the zero-extension
+    /// of the declared return and nothing proves what the return holds.
+    #[test]
+    fn low_bit_return_certificate_refuses_a_constant_wider_than_the_logical_width() {
+        let artifact = constant_low_return_artifact(0x1_0000_0007);
+        let boundary = artifact
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("return boundary");
+        assert!(boundary.complete);
+        assert!(artifact.certificates().returns.is_empty());
     }
 
     #[test]

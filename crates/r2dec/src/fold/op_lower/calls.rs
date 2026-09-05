@@ -139,12 +139,17 @@ impl<'a> FoldingContext<'a> {
             if signature.variadic || signature.params.len() != named {
                 r2il::refusal_evidence!(
                     "callee-signature-arity",
-                    "callsite=({block_addr:#x}, {op_idx}) target={:?} certified_arguments={} named={named} signature_params={} call_variadic={} signature_variadic={}",
+                    "callsite=({block_addr:#x}, {op_idx}) target={:?} certified_arguments={} named={named} signature_params={} fixed_argument_count={:?} call_variadic={} signature_variadic={} argument_locations={:?}",
                     cert.direct_target,
                     args.values.len(),
                     signature.params.len(),
+                    cert.fixed_argument_count,
                     cert.variadic,
-                    signature.variadic
+                    signature.variadic,
+                    cert.argument_values
+                        .iter()
+                        .map(|argument| (argument.index, argument.value))
+                        .collect::<Vec<_>>()
                 );
                 return Err(OpLoweringRefusal::missing_machine_projection());
             }
