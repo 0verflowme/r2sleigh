@@ -300,6 +300,103 @@ mod tests {
         )
     }
 
+    /// A function whose only operation is a tail call through a relocated
+    /// slot, with the slot's prototype: the shape of every import thunk.
+    fn prepared_from_r2il_blocks_with_tail_slot(
+        blocks: &[R2ILBlock],
+        arch: &ArchSpec,
+        name: &str,
+        slot: u64,
+        callee: &str,
+        argument_count: usize,
+        returns_value: bool,
+    ) -> SourceOwnedPreparedFixture {
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"r2dec-fold-pipeline-source-v1";
+        let parameter_offsets = [0x10u64, 0x18, 0x38, 0x40, 0x48, 0x50];
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.to_vec(),
+            "sysv64",
+            parameter_offsets
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, offset)| {
+                    r2ssa::SourceAbiParameterSpec::new(index as u32, storage(offset))
+                })
+                .collect::<Vec<_>>(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .expect("exact source interface");
+        let slot_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Ram,
+            offset: slot,
+            size: 8,
+        };
+        let (identities, interfaces): (Vec<_>, Vec<_>) = blocks
+            .iter()
+            .flat_map(|block| {
+                block.ops.iter().enumerate().filter_map(|(op_index, op)| {
+                    let R2ILOp::BranchInd { .. } = op else {
+                        return None;
+                    };
+                    let identity =
+                        r2ssa::SourceCallSiteIdentity::new(block.addr, op_index, slot_storage);
+                    let interface = r2ssa::SourceCallSiteInterface::new(
+                        revision.to_vec(),
+                        identity,
+                        true,
+                        "sysv64",
+                        parameter_offsets
+                            .iter()
+                            .copied()
+                            .take(argument_count)
+                            .enumerate()
+                            .map(|(index, offset)| {
+                                r2ssa::SourceCallArgumentSpec::new(index as u32, storage(offset))
+                            }),
+                        false,
+                        false,
+                        if returns_value {
+                            r2ssa::SourceCallResult::Register {
+                                storage: storage(0),
+                            }
+                        } else {
+                            r2ssa::SourceCallResult::Void
+                        },
+                    )
+                    .expect("exact tail slot interface");
+                    Some((identity, interface))
+                })
+            })
+            .unzip();
+        let mut parsed_context = r2types::ParsedExternalContext::default();
+        parsed_context
+            .callee_facts
+            .insert(slot, minimal_import_callee_fact(slot, callee));
+        SourceOwnedPreparedFixture::new_with_context(
+            r2ssa::SsaArtifact::for_decompile_with_interfaces_and_tail_calls(
+                blocks,
+                Some(arch),
+                Some(interface),
+                interfaces,
+                identities,
+            )
+            .expect("prepared SSA should build")
+            .with_name(name),
+            parsed_context,
+        )
+    }
+
     fn prepared_x86_with_demo_struct_parameter(
         blocks: &[R2ILBlock],
         arch: &ArchSpec,
@@ -1709,6 +1806,77 @@ mod tests {
     #[test]
     fn observed_indirect_call_marks_only_graph_target_input() {
         assert_observed_call_marks_only_graph_target(true);
+    }
+
+    #[test]
+    fn a_tail_call_through_a_relocated_slot_renders_as_the_callee() {
+        // An import thunk is `jmp qword [reloc.X]`: an indirect branch through
+        // a slot the relocation table names, which r2ssa certifies as a tail
+        // call to that slot. The lowering admitted only the direct-branch
+        // shape of a tail call, so every thunk refused on the loaded target
+        // having no rendered occurrence -- 32 functions per binary.
+        let arch = make_test_arch_x86_64();
+        let slot = 0x20f70;
+        let mut thunk = R2ILBlock::new(0x1340, 6);
+        thunk.push(R2ILOp::BranchInd {
+            target: Varnode::ram(slot, 8),
+        });
+
+        let prepared = prepared_from_r2il_blocks_with_tail_slot(
+            std::slice::from_ref(&thunk),
+            &arch,
+            "sym_imp_fileno",
+            slot,
+            "fileno",
+            1,
+            true,
+        );
+        let input = crate::DecompilerInput::new(prepared.facts.clone());
+        let audit = crate::Decompiler::new(crate::DecompilerConfig::x86_64())
+            .decompile_input_with_binding_audit(&input);
+        assert_eq!(audit.render_refusal(), None, "{}", audit.output());
+        assert!(
+            audit.output().contains("return fileno("),
+            "a value-returning thunk returns its callee's result: {}",
+            audit.output()
+        );
+        assert!(
+            !audit.output().contains("indirect branch target unresolved"),
+            "a certified tail slot is not an unresolved dispatch: {}",
+            audit.output()
+        );
+
+        let prepared = prepared_from_r2il_blocks_with_tail_slot(
+            std::slice::from_ref(&thunk),
+            &arch,
+            "sym_imp_perror",
+            slot,
+            "perror",
+            1,
+            false,
+        );
+        let input = crate::DecompilerInput::new(prepared.facts.clone());
+        let audit = crate::Decompiler::new(crate::DecompilerConfig::x86_64())
+            .decompile_input_with_binding_audit(&input);
+        assert_eq!(audit.render_refusal(), None, "{}", audit.output());
+        assert!(
+            audit.output().contains("perror(") && audit.output().contains("return;"),
+            "a void thunk calls and returns: {}",
+            audit.output()
+        );
+
+        // The same branch with nothing certifying it stays what it is: an
+        // indirect dispatch nobody resolved.
+        let prepared = prepared_from_r2il_blocks(std::slice::from_ref(&thunk), &arch)
+            .with_name("unresolved_dispatch");
+        let input = crate::DecompilerInput::new(prepared.facts.clone());
+        let audit = crate::Decompiler::new(crate::DecompilerConfig::x86_64())
+            .decompile_input_with_binding_audit(&input);
+        assert!(
+            !audit.output().contains("fileno(") && !audit.output().contains("return fileno("),
+            "{}",
+            audit.output()
+        );
     }
 
     #[test]

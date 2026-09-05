@@ -730,7 +730,14 @@ static FcnContextTransferKind fcn_context_block_transfer(RAnal *anal, const RAna
 	if (decoded > 0 && !conditional) {
 		if (base == R_ANAL_OP_TYPE_UJMP || through_memory) {
 			kind = FCN_TRANSFER_VALUE_JUMP;
-			if (through_memory) {
+			// The slot a memory-indirect jump reads is the operand's
+			// pointer whichever way the analysis spelled the jump:
+			// `jmp qword [rip + X]` arrives as an indirect register jump
+			// with the pointer set, not as a memory jump, and reading the
+			// pointer only for the memory spelling left every import
+			// thunk without its callee. The pointer is a candidate; the
+			// relocation table decides whether it is a slot.
+			if (through_memory || (op.type & (R_ANAL_OP_TYPE_MEM | R_ANAL_OP_TYPE_IND))) {
 				*memory_operand = op.ptr;
 			}
 		} else if (base == R_ANAL_OP_TYPE_JMP && op.jump != UT64_MAX) {
@@ -763,8 +770,15 @@ static bool fcn_context_collect_slot_callees(RAnal *anal, RList *callees, const 
 	size_t i;
 	for (i = 0; i < len; i++) {
 		const RAnalRef *ref = RVecAnalRef_at (refs, i);
-		if (!ref || ref->at < block->addr || ref->at >= block_end
-			|| R_ANAL_REF_TYPE_MASK (ref->type) != R_ANAL_REF_TYPE_DATA) {
+		if (!ref || ref->at < block->addr || ref->at >= block_end) {
+			continue;
+		}
+		// A data reference anywhere in the block may name the slot. A code
+		// reference names it only from the transfer itself, which is how
+		// the analysis records `jmp [slot]`.
+		const ut32 ref_type = R_ANAL_REF_TYPE_MASK (ref->type);
+		if (ref_type != R_ANAL_REF_TYPE_DATA
+			&& !(ref_type == R_ANAL_REF_TYPE_CODE && ref->at == transfer_addr)) {
 			continue;
 		}
 		if (!fcn_context_offer_slot_callee (anal, callees, transfer_addr, ref->addr)) {

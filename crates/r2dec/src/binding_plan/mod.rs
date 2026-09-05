@@ -261,21 +261,8 @@ pub(crate) fn certified_boundary_read_values(
         values.insert(selector);
     }
 
-    if let Some(certificate) = certificates
-        .callsites_by_inst
-        .get(&at)
-        .and_then(|call_site| certificates.callsites.get(call_site))
-        .filter(|certificate| {
-            certificate.at == at
-                && (certificate.block_addr, certificate.op_index) == site
-                && (matches!(
-                    payload,
-                    r2ssa::InstPayload::Op(
-                        r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. }
-                    )
-                ) || certificate.transfer == r2ssa::CallSiteTransfer::TailCall
-                    && matches!(payload, r2ssa::InstPayload::Op(r2ssa::SSAOp::Branch { .. })))
-        })
+    if let Some(certificate) = certified_call_site(source, at)
+        .filter(|certificate| (certificate.block_addr, certificate.op_index) == site)
     {
         values.extend(
             certificate
@@ -310,16 +297,8 @@ pub(crate) fn certified_frame_object_call_argument(
     argument_index: usize,
     value: ValueId,
 ) -> Option<r2ssa::ObjectId> {
-    let graph = source.graph();
-    let inst = graph.inst(at)?;
-    let call_site = source.certificates().callsites_by_inst.get(&at)?;
-    let certificate = source.certificates().callsites.get(call_site)?;
-    if certificate.at != at
-        || !matches!(
-            inst.payload,
-            r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. })
-        )
-        || certificate.argument_values.get(argument_index).copied() != Some(value)
+    let certificate = certified_call_site(source, at)?;
+    if certificate.argument_values.get(argument_index).copied() != Some(value)
         || !certificate
             .argument_certificates
             .iter()
@@ -567,6 +546,11 @@ pub(super) fn certified_return_control_values(source: &r2ssa::SsaArtifact) -> BT
 /// `BranchInd` whose switch is certified: the case topology is what expresses
 /// it. Unresolved indirect branches, call, predicate, and return operands have
 /// different rendering contracts.
+///
+/// A branch r2ssa certified as a call site is a call, whatever its shape: the
+/// callee's name is what expresses it, not the topology, and its operand is
+/// accounted as a call target. Deciding that from the op variant alone gave
+/// one use two owners.
 pub(super) fn certified_direct_control_target_sites(
     source: &r2ssa::SsaArtifact,
 ) -> BTreeSet<UseSite> {
@@ -575,6 +559,9 @@ pub(super) fn certified_direct_control_target_sites(
         .insts
         .iter()
         .filter_map(|inst| {
+            if certified_call_site(source, inst.id).is_some() {
+                return None;
+            }
             let target = match &inst.payload {
                 r2ssa::InstPayload::Op(
                     r2ssa::SSAOp::Branch { target } | r2ssa::SSAOp::CBranch { target, .. },
@@ -607,20 +594,41 @@ pub(super) fn certified_direct_control_target_sites(
         .collect()
 }
 
+/// The call site r2ssa certified `at` as, if any.
+///
+/// Membership is the certificate's, not the operation's shape. r2ssa
+/// certifies an ordinary call as `Call` or `CallInd` and a tail call as
+/// `Branch` or `BranchInd` carrying `TailCall`, and it owns the map from
+/// instruction to call site. Re-deciding membership here from the op variant
+/// admitted a strict subset of what was proven: an import thunk is
+/// `jmp [reloc.X]`, a `BranchInd` through a relocated slot, and every one of
+/// them was refused for that alone.
+pub(crate) fn certified_call_site(
+    source: &r2ssa::SsaArtifact,
+    at: InstId,
+) -> Option<&r2ssa::CallsiteCertificate> {
+    let certificates = source.certificates();
+    let certificate = certificates
+        .callsites
+        .get(certificates.callsites_by_inst.get(&at)?)?;
+    (certificate.at == at).then_some(certificate)
+}
+
 /// Exact direct-call target uses the call expression renders as the callee.
 ///
-/// Only `Call` operand zero qualifies. `CallInd`'s target is a value the
-/// program computed and reads, and it keeps its ordinary rendering contract.
+/// Only a site whose certificate names a direct target qualifies: the call
+/// spells the callee's name and the operand is elided beside it. A site with
+/// no direct target reads a value the program computed, and that value keeps
+/// its ordinary rendering contract.
 pub(super) fn certified_direct_call_target_sites(source: &r2ssa::SsaArtifact) -> BTreeSet<UseSite> {
     let graph = source.graph();
     graph
         .insts
         .iter()
         .filter_map(|inst| {
-            let r2ssa::InstPayload::Op(r2ssa::SSAOp::Call { target }) = &inst.payload else {
-                return None;
-            };
-            let value = graph.value_id_for_var(target)?;
+            let certificate = certified_call_site(source, inst.id)?;
+            certificate.direct_target?;
+            let value = certificate.target;
             let site = UseSite {
                 inst: inst.id,
                 input_idx: 0,

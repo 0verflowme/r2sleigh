@@ -162,7 +162,15 @@ impl<'a> FoldingContext<'a> {
                 self.inputs.function_return_type,
                 call_result_bits,
             )
-            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+            .ok_or_else(|| {
+                r2il::refusal_evidence!(
+                    "callee-declaration-return",
+                    "callsite=({block_addr:#x}, {op_idx}) disposition={:?} function_return_type={:?} call_result_bits={call_result_bits:?}",
+                    render_fact.disposition,
+                    self.inputs.function_return_type
+                );
+                OpLoweringRefusal::missing_machine_projection()
+            })?;
             let params = args.values[..named]
                 .iter()
                 .map(|value| self.machine_value_width_bits(*value).map(CType::uint))

@@ -562,6 +562,43 @@ impl SsaArtifact {
         ))
     }
 
+    /// Build decompiler-prepared SSA whose machine context also carries the
+    /// tail calls the source proved, by call-site identity.
+    ///
+    /// This is the shape production builds from a capture: a tail call
+    /// through a relocated slot is a `BranchInd` the source names as a call
+    /// site, and only a context that knows the identity certifies it as one.
+    pub fn for_decompile_with_interfaces_and_tail_calls(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        tail_call_identities: Vec<SourceCallSiteIdentity>,
+    ) -> Option<Self> {
+        let machine_context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+            blocks,
+            arch,
+            function_interface,
+            SourceMachineRoles::default(),
+            None,
+            call_site_interfaces,
+            tail_call_identities,
+        );
+        Some(Self::new_with_context(
+            SSAFunction::from_blocks_for_decompile_with_interface_and_control(
+                blocks,
+                arch,
+                coherent_function_interface(&machine_context),
+                machine_context.machine_roles().call_preserved_carriers(),
+                machine_context.stack_pointer_carrier(),
+                &UncheckedSsaWorkControl,
+            )
+            .ok()?,
+            FunctionPrepareMode::Decompile,
+            machine_context,
+        ))
+    }
+
     /// Build controlled decompiler SSA with explicit source interfaces.
     pub fn for_decompile_with_interfaces_and_control<C: SsaWorkControl + ?Sized>(
         blocks: &[R2ILBlock],
@@ -1279,7 +1316,17 @@ fn correlate_call_site_interfaces(
     let mut tail_calls = Vec::new();
     let mut interfaces = Vec::new();
     for call in source.advisory_calls() {
-        let Some(identity) = unique_call_site_identity(blocks, call) else {
+        let identity = unique_call_site_identity(blocks, call);
+        r2il::refusal_evidence!(
+            "call-site-correlation",
+            "advisory {:?} at {:#x} target {:#x} prototype={} correlated={:?}",
+            call.transfer(),
+            call.instruction_address(),
+            call.target_address(),
+            call.prototype().is_some(),
+            identity.map(|identity| (identity.block_addr(), identity.op_index()))
+        );
+        let Some(identity) = identity else {
             continue;
         };
         if matches!(

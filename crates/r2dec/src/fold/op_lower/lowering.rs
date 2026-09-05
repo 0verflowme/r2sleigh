@@ -1486,10 +1486,22 @@ impl<'a> FoldingContext<'a> {
                                 return Err(OpLoweringRefusal::missing_machine_projection());
                             };
                             let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
+                            // Whether the callee is named is the certificate's
+                            // to say. A `call [reloc.X]` is indirect in shape
+                            // and direct in fact.
+                            let direct = cert.direct_target.is_some();
                             let func_expr =
-                                self.certified_call_target_expr(frame, target, cert, false)?;
+                                self.certified_call_target_expr(frame, target, cert, direct)?;
                             let certified_args =
                                 self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            if direct {
+                                self.record_callee_declaration(
+                                    &func_expr,
+                                    source_block,
+                                    source_op_idx,
+                                    &certified_args,
+                                )?;
+                            }
                             let call = CExpr::call_at(
                                 (source_block, source_op_idx),
                                 func_expr,
@@ -1504,7 +1516,9 @@ impl<'a> FoldingContext<'a> {
                                 ),
                             );
                         }
-                        SSAOp::Branch { target }
+                        // A tail call is certified through either branch
+                        // shape; the thunk `jmp [reloc.X]` is the indirect one.
+                        SSAOp::Branch { target } | SSAOp::BranchInd { target }
                             if frame.source_call_site.is_some_and(|(block_addr, op_idx)| {
                                 self.certified_call_render_fact_for_op(block_addr, op_idx)
                                     .is_some_and(|fact| fact.disposition.is_terminal_return())
@@ -1576,7 +1590,7 @@ impl<'a> FoldingContext<'a> {
     ) -> OpLoweringResult<Option<CStmt>> {
         let source_site = self.source_op_site_for_normalized_op(block_addr, op_idx);
         let carries_callsite = matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
-            || matches!(op, SSAOp::Branch { .. })
+            || matches!(op, SSAOp::Branch { .. } | SSAOp::BranchInd { .. })
                 && source_site.is_some_and(|(block_addr, op_idx)| {
                     self.certified_call_render_fact_for_op(block_addr, op_idx)
                         .is_some_and(|fact| fact.disposition.is_terminal_return())

@@ -1006,10 +1006,62 @@ fn infer_signature_return_type_from_prepared(
     return_values.sort();
     return_values.dedup();
     if return_values.is_empty() {
-        return (CTypeLike::Void, SignatureTypeEvidence::default());
+        return infer_signature_return_type_from_tail_boundaries(prepared, ptr_bits);
     }
 
     infer_signature_return_type_from_values(prepared, &return_values, evidence_types, ptr_bits)
+}
+
+/// What a function with no `Return` of its own returns.
+///
+/// A tail call returns its callee's result on this function's behalf, and the
+/// exact boundary at that site says what the callee returns. Reading only the
+/// `Return` certificates scored every tail-only function `void`, so an import
+/// thunk -- `jmp [reloc.fileno]`, the whole of it -- was declared to return
+/// nothing while its body returned `fileno(stream)`, and the declaration
+/// refused the call. Absence of a `Return` is not a fact about the return.
+///
+/// The callee's own logical type is not known here; the boundary proves the
+/// carrier and its width, and that width takes the same default a parameter
+/// of that width takes with no evidence. Tail sites that disagree, or a site
+/// whose interface is missing, leave the type unknown rather than guessed.
+fn infer_signature_return_type_from_tail_boundaries(
+    prepared: &SsaArtifact,
+    ptr_bits: u32,
+) -> (CTypeLike, SignatureTypeEvidence) {
+    let evidence = SignatureTypeEvidence::default();
+    let context = prepared.machine_context();
+    let mut agreed: Option<CTypeLike> = None;
+    let mut saw_tail = false;
+    for certificate in prepared.facts().certificates.callsites.values() {
+        if certificate.transfer != r2ssa::CallSiteTransfer::TailCall {
+            continue;
+        }
+        let Some(interface) = context.call_site_interface(certificate.call_site) else {
+            return (CTypeLike::Unknown, evidence);
+        };
+        saw_tail = true;
+        let ty = match interface.result() {
+            r2ssa::SourceCallResult::Void => CTypeLike::Void,
+            r2ssa::SourceCallResult::Register { storage } => {
+                resolve_evidence_driven_signature_type(
+                    CTypeLike::Unknown,
+                    storage.size,
+                    ptr_bits,
+                    &evidence,
+                )
+            }
+        };
+        match &agreed {
+            None => agreed = Some(ty),
+            Some(existing) if *existing == ty => {}
+            Some(_) => return (CTypeLike::Unknown, evidence),
+        }
+    }
+    if !saw_tail {
+        return (CTypeLike::Void, evidence);
+    }
+    (agreed.unwrap_or(CTypeLike::Unknown), evidence)
 }
 
 fn transparent_return_source_value(

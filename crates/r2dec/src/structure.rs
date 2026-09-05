@@ -504,11 +504,22 @@ impl<'a, 'o> ControlFlowStructurer<'a, 'o> {
         let Some(cfg_block) = self.func.cfg().get_block(addr) else {
             return false;
         };
+        // A source-proven tail call through a slot is an indirect branch with
+        // no successor, and it is resolved: its callsite fact renders the
+        // terminal return. Only a dispatch nothing certified is unresolved.
+        let certified_terminal_call = self.func.get_block(addr).is_some_and(|block| {
+            block.ops.iter().enumerate().any(|(op_idx, _)| {
+                self.fold_ctx
+                    .certified_call_render_fact_for_op(addr, op_idx)
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+            })
+        });
 
         matches!(
             cfg_block.terminator,
             r2ssa::cfg::BlockTerminator::IndirectBranch
-        ) && self.func.successors(addr).is_empty()
+        ) && !certified_terminal_call
+            && self.func.successors(addr).is_empty()
             && self.func.switch_info(addr).is_none()
     }
 

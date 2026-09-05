@@ -5202,11 +5202,52 @@ fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::Evidenc
             Some(_) => return CType::Unknown,
         }
     }
-    candidate.unwrap_or(if saw_return {
-        CType::Unknown
-    } else {
-        CType::Void
-    })
+    if saw_return {
+        r2il::refusal_evidence!(
+            "return-evidence",
+            "return certificates present; agreed={:?}",
+            candidate
+        );
+        return candidate.unwrap_or(CType::Unknown);
+    }
+    // A function with no `Return` of its own may still return: a tail call
+    // returns its callee's result on this function's behalf, and the exact
+    // boundary at that site says what the callee returns. Reading only the
+    // `Return` certificates scored every tail-only function `void`, and a
+    // thunk's `return fileno(stream);` then had no type to be declared with.
+    let mut tail_candidate: Option<CType> = None;
+    let mut saw_tail = false;
+    for certificate in source.certificates().callsites.values() {
+        if certificate.transfer != r2ssa::CallSiteTransfer::TailCall {
+            continue;
+        }
+        let Some(interface) = source
+            .machine_context()
+            .call_site_interface(certificate.call_site)
+        else {
+            return CType::Unknown;
+        };
+        saw_tail = true;
+        let ty = match interface.result() {
+            r2ssa::SourceCallResult::Void => CType::Void,
+            r2ssa::SourceCallResult::Register { storage } => CType::uint(storage.size * 8),
+        };
+        match &tail_candidate {
+            None => tail_candidate = Some(ty),
+            Some(existing) if existing == &ty => {}
+            Some(_) => return CType::Unknown,
+        }
+    }
+    r2il::refusal_evidence!(
+        "return-evidence",
+        "no return certificate; tail boundaries={} agreed={:?}",
+        saw_tail,
+        tail_candidate
+    );
+    if saw_tail {
+        return tail_candidate.unwrap_or(CType::Unknown);
+    }
+    CType::Void
 }
 
 fn void_function_has_value_return(func: &CFunction) -> bool {
