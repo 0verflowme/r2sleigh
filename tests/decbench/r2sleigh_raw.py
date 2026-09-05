@@ -431,16 +431,25 @@ class RawR2SleighDecompiler(Decompiler):
             # Name the stage that emptied the list, and count the loss against
             # what discovery found, so the census records a harness failure
             # rather than an absence of work.
-            lost = stages[0][1]
-            emptied = next(
-                (label for label, count in stages[1:] if count == 0),
-                "discovery",
-            )
-            if lost:
+            trail = ", ".join(f"{label}={count}" for label, count in stages)
+            if stages[0][1] == 0:
+                # Discovery itself came back empty, which is the case the
+                # filters cannot explain. `_discover` returns its run for
+                # exactly this: a binary radare2 genuinely found nothing in and
+                # an `aaa` that never finished look identical from here, and
+                # only the run says which.
+                declined[f"harness: {binary_path.name}"] = (
+                    "harness: radare2 reported no functions; "
+                    f"the discovery run {discovery.ending}"
+                )
+            else:
+                emptied = next(
+                    (label for label, count in stages[1:] if count == 0),
+                    "discovery",
+                )
                 declined[f"harness: {binary_path.name}"] = (
                     "harness: no function reached the decompiler; "
-                    f"the candidate list was emptied {emptied} "
-                    "(" + ", ".join(f"{label}={count}" for label, count in stages) + ")"
+                    f"the candidate list was emptied {emptied} ({trail})"
                 )
         _write_refusal_census(output_dir, binary_path, declined, len(rendered))
 

@@ -12290,3 +12290,99 @@ survive.
 `r_core_anal_artifact_store_new` is `artifact_store_clone`, which requires an
 existing store — so `r_core_anal_artifacts_replace` answers `INVALID_ARGUMENT`
 the first time it is called.
+
+## The DWARF prototype nobody was reading
+
+The first census taken on a configured optimization level ranked
+`OpLowering(implementation.rs:1324)` -- an incomplete return boundary -- as the
+largest single refusal cause, 30 of 119 refusals across five zlib binaries. The
+trace ran four layers and ended somewhere none of the earlier guesses reached.
+
+The renderer refuses because `SourceReturnBoundaryFact::complete` is false. It
+is false because no value reaches the declared return carrier. The carrier is
+the full 8-byte `rax` rather than the 4-byte lane an `int` return occupies,
+which matters because `reaching_source_return_register_in_block` only takes the
+cross-block walk when a *narrower* logical lane is projected; when the
+projection equals the carrier it falls to a block-local walk that cannot see a
+definition in a predecessor. The carrier is 8 bytes because the interface was
+recovered from the instructions rather than read from the source, and recovery
+can only report the width the code observes. And the interface was recovered
+because the capture carried none: for all forty-six functions of zlib's
+`minigzip`, radare2 had a prototype (`int gz_avail (gz_statep state)`) and had
+not linked it to the function's address.
+
+The reason no link existed is one line. `dwarf_sdb_unset_like_checked` called
+`sdb_unset_like`, which returns *the number of keys it removed*, and read that
+count as a truth value. A first import has no `fcn.<name>.arg.*` keys to clear,
+so it removed none and returned zero, so every `sdb_save_dwarf_function`
+reported failure, so `exact_formal_records_ok` -- one flag covering the whole
+import -- was cleared, so `dwarf_function_links_publish` was never reached and
+every staged function type link was discarded. Fixed in `de472a1e58` by making
+the wrapper assert its postcondition, which the `sdb_foreach` scan beside it
+was already checking.
+
+Measured on a three-function `gcc -g -O0` binary: before, all three staged a
+link with `link_complete=1` and none survived; after, all three carry an
+address-linked signature and only the PLT stubs, which have no DWARF, take the
+no-interface exit. On `minigzip` the no-interface exits fall from 46 to 35 and
+`gz_avail` stops refusing at the return boundary -- it now refuses at
+`memory_renderer.rs:94`, which is the next cause rather than a failed fix.
+
+**The corpus cannot see this class of defect.** `tests/corpus/run_matrix.sh`
+builds with `clang -O<n>` and no `-g`, so every one of the fifty-four cells
+takes the recovered-interface path and the source-interface path had never run
+end to end. The differential gate passes 54/54 before and after.
+
+Four diagnostics were added on the way and are worth keeping, because the trace
+took one pass with them and had taken none without: `interface-source-absent`
+names the moment recovery is chosen over the source, `return-register-unreachable`
+names the projection actually searched rather than the carrier declared,
+`return-projection-untyped`/`-partial` separate a missing logical value from a
+missing type graph, and `R2SLEIGH_DEBUG_INTERFACE` makes the capture say whether
+radare2 had a prototype at all and whether it was linked to this address.
+
+## The real baseline, and the cell that replaces zlib/O1
+
+Taken on O0 and O2, the levels every sailr project actually declares:
+
+| cell | functions | ours | angr |
+| --- | --- | --- | --- |
+| bzip2/O0 | 128 | 66 (0.516) | 125 |
+| bzip2/O2 | 109 | 22 (0.202) | 106 |
+| zlib/O0 | 798 | 579 (0.726) | 791 |
+| **zlib/O2** | **695** | **5 (0.007)** | **693** |
+
+672/1730 = 0.388 against angr's 0.991. **zlib/O2 holds 690 of the 1058
+refusals**, which is the same 65%-of-everything shape the O1 cell had -- except
+O1 was an unconfigured level decbench could not score, and this one is real.
+
+Five zlib binaries wrote a census of zero rendered and zero declined, meaning
+the adapter never asked about a single function. Reproduced locally: `r2 -q -c
+'aaa; afl'` on `minigzip` built at O2 runs for 628 seconds, logs `r2sleigh: V2
+engine request failed (5): trusted SSA preparation failed: malformed SSA source
+input`, and then **exits without running the next command**. The same binary at
+O0 finishes in seconds and reports 185 functions. Whether r2 is dying inside
+r2sleigh's post-analysis or exiting some other way is unfinished; a run
+capturing the exit status was in flight when this was written.
+
+Two harness gaps were closed while establishing that. An empty candidate list
+now records a named harness cause with the count after every filter, and the
+case where *discovery itself* returns nothing is reported separately using the
+discovery run's own ending -- the two have different fixes and looked identical
+before. And the refusal census, which every sweep wrote and every sweep then
+deleted unread, now comes home with the run artifacts; `census_decbench.py`
+ranks it, keeping `harness:` causes apart from real refusals.
+
+## Open, unrelated: `make install` aborted on its own symlinks
+
+`make symstall` links each installed data file and binary back into the source
+tree. A later `make install` then asks `cp` and `install(1)` to copy a file onto
+itself, which BSD tools call an error, and the install stops there -- so
+everything after it, libraries included, was silently not installed. Three
+places did it: the magic database, the platform scripts, and `r2sdb`. Fixed by
+removing the destination first, which the same Makefile already does for
+`clang-format-radare2` and `r2-indent`.
+
+This is upstream code and unrelated to Sleigh, so it is prepared as its own
+branch, `pr/install-over-symlink`, cherry-picked onto `master` and not pushed.
+No existing open PR of the user's covers it. Opening the PR is the user's call.
