@@ -1802,21 +1802,26 @@ impl SourceOwnedFunctionFacts {
     /// Parameter-slot resolution needs a coherent ABI. When the source does not
     /// carry one there are no parameter slots to resolve, so the steps keyed on
     /// them have nothing to do; every other piece of evidence is still valid and
-    /// is still attached. Returns the number of parameter declarations that
-    /// changed and whether the return declaration changed in the final signature.
+    /// is still attached. Returns which parameter declarations changed and
+    /// whether the return declaration changed in the final signature.
     #[cfg(test)]
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
-    ) -> (usize, bool) {
+    ) -> (BTreeSet<usize>, bool) {
         Self::enrich_report_from_source_with_callee_signatures(source, report, &BTreeMap::new())
     }
 
+    /// The parameter slots whose declared type changed, and whether the return
+    /// changed, are decided here, on `merged_signature`, and handed on. They
+    /// were once counted here and recounted by the plan refresh on the
+    /// render-authorized projection, and the two owners disagreeing failed the
+    /// function. One fact has one owner.
     pub(crate) fn enrich_report_from_source_with_callee_signatures(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
         callee_signatures: &BTreeMap<u64, SourceOwnedCalleeSignature>,
-    ) -> (usize, bool) {
+    ) -> (BTreeSet<usize>, bool) {
         let prior_signature = report.types.merged_signature.clone();
         let mut enriched = report.clone();
         let mut usage = source.facts().assumption_usage.clone();
@@ -1844,7 +1849,7 @@ impl SourceOwnedFunctionFacts {
         Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
         enriched.apply_source_owned_callee_signatures(source, callee_signatures);
         let final_signature = enriched.types.merged_signature.as_ref();
-        let changed_parameters = final_signature.map_or(0, |signature| {
+        let changed_parameters = final_signature.map_or_else(BTreeSet::new, |signature| {
             signature
                 .params
                 .iter()
@@ -1856,7 +1861,8 @@ impl SourceOwnedFunctionFacts {
                         .and_then(|parameter| parameter.ty.as_ref())
                         != parameter.ty.as_ref()
                 })
-                .count()
+                .map(|(slot, _)| slot)
+                .collect()
         });
         let return_type_changed = prior_signature
             .as_ref()

@@ -1065,7 +1065,6 @@ impl TypeWritebackAnalysis {
         if crate::prepare::prepared_arch_display_name(self.source.as_ref()).is_none() {
             return false;
         }
-        let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
         let (changed_parameters, return_type_changed) =
             SourceOwnedFunctionFacts::enrich_report_from_source_with_callee_signatures(
@@ -1073,16 +1072,23 @@ impl TypeWritebackAnalysis {
                 &mut self.function_facts,
                 &self.callee_signatures,
             );
-        if (changed_parameters > 0 || return_type_changed)
-            && !self.refresh_plan_after_source_constraints(
-                &prior_facts,
-                changed_parameters,
-                return_type_changed,
-            )
+        if (!changed_parameters.is_empty() || return_type_changed)
+            && !self.refresh_plan_after_source_constraints(&changed_parameters)
         {
-            self.function_facts = prior_facts;
+            // The plan is the writeback's projection of the facts, and it is
+            // refreshed atomically: a plan that binds one argument twice, or
+            // to a register that is no slot, would write conflicting types
+            // back, so such a plan is left as it was. That is a fact about the
+            // writeback, not about the decompilation. The enriched facts are
+            // what the rendering reads, and they stand; only the plan keeps
+            // its prior signature, which the writeback authority sees.
+            // Failing the whole function here had cost every function whose
+            // plan carried one such binding its decompilation.
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "plan not refreshed: changed slots {changed_parameters:?} return_changed={return_type_changed}; facts enriched, plan kept"
+            );
             self.plan = prior_plan;
-            return false;
         }
         true
     }
@@ -1133,19 +1139,30 @@ impl TypeWritebackAnalysis {
         .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
     }
 
-    fn refresh_plan_after_source_constraints(
-        &mut self,
-        prior_facts: &FunctionFacts,
-        expected_parameter_changes: usize,
-        expected_return_type_change: bool,
-    ) -> bool {
+    /// Project the enriched signature into the writeback plan.
+    ///
+    /// `changed_slots` is the enrichment's own account of which parameter
+    /// declarations changed; nothing is recounted here, and the return type
+    /// arrives with the signature itself. The refresh is
+    /// atomic over the plan's argument bindings: a binding with no register,
+    /// with a register that is no argument slot, or a second binding for one
+    /// slot leaves the plan untouched and returns false, because a plan half
+    /// refreshed would write conflicting types back.
+    fn refresh_plan_after_source_constraints(&mut self, changed_slots: &BTreeSet<usize>) -> bool {
         let Some(signature) = self
             .function_facts
             .type_facts()
             .render_authorized_signature()
             .cloned()
         else {
-            return false;
+            // Nothing is authorized for the plan to carry, so there is
+            // nothing to refresh; the facts changed all the same, and the
+            // rendering reads the facts.
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "no render-authorized signature; plan not refreshed for changed slots {changed_slots:?}"
+            );
+            return true;
         };
         let source = self.source.as_ref();
         let Some(arch_name) = crate::prepare::prepared_arch_display_name(source) else {
@@ -1179,27 +1196,6 @@ impl TypeWritebackAnalysis {
             .signature
             .callconv_confidence
             .max(prior_callconv_confidence);
-        let prior_signature = prior_facts.type_facts().merged_signature.as_ref();
-        let changed_slots = signature
-            .params
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, parameter)| {
-                (prior_signature
-                    .and_then(|signature| signature.params.get(slot))
-                    .and_then(|parameter| parameter.ty.as_ref())
-                    != parameter.ty.as_ref())
-                .then_some(slot)
-            })
-            .collect::<BTreeSet<_>>();
-        if changed_slots.len() != expected_parameter_changes {
-            return false;
-        }
-        let return_type_changed = prior_signature.and_then(|signature| signature.ret_type.as_ref())
-            != signature.ret_type.as_ref();
-        if return_type_changed != expected_return_type_change {
-            return false;
-        }
         let mut refreshed_slots = BTreeSet::new();
         for candidate in plan
             .var_type_candidates
@@ -11972,7 +11968,6 @@ mod tests {
     #[test]
     fn constrained_plan_refresh_uses_exact_storage_alias_and_updates_size() {
         let (source, _) = source_owned_worker_fixture(0x401200);
-        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
         let mut analysis = constrained_refresh_test_analysis(
             source,
             8,
@@ -11982,7 +11977,7 @@ mod tests {
             )],
         );
 
-        assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
+        assert!(analysis.refresh_plan_after_source_constraints(&BTreeSet::from([0])));
         let candidate = &analysis.plan().var_type_candidates[0];
         assert_eq!(candidate.var_type, parse_test_type("int8_t", 64));
         assert_eq!(candidate.size, 1);
@@ -11997,7 +11992,6 @@ mod tests {
     #[test]
     fn constrained_plan_refresh_refuses_name_only_foreign_and_duplicate_bindings_atomically() {
         let (source, _) = source_owned_worker_fixture(0x401300);
-        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
         let mutations = [
             vec![constrained_refresh_candidate(None, "renamed_parameter")],
             vec![constrained_refresh_candidate(
@@ -12014,7 +12008,7 @@ mod tests {
             let mut analysis =
                 constrained_refresh_test_analysis(Arc::clone(&source), 8, candidates);
             let prior_plan = analysis.plan().clone();
-            assert!(!analysis.refresh_plan_after_source_constraints(&prior_facts, 1, false));
+            assert!(!analysis.refresh_plan_after_source_constraints(&BTreeSet::from([0])));
             assert_eq!(analysis.plan(), &prior_plan);
         }
     }
