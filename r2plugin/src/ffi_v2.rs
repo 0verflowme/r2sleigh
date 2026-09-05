@@ -3691,6 +3691,34 @@ pub extern "C" fn r2sleigh_engine_budget_usec_v2(function_count: usize) -> u64 {
     .unwrap_or(r2engine::POST_ANALYSIS_MINIMUM_BUDGET_USEC)
 }
 
+/// Whether a function of this shape is past the size the engine will accept.
+///
+/// Exported so the capture can ask before it builds anything. Everything the
+/// engine refuses on size was, until now, first collected in full: the blocks,
+/// their bytes, the call graph and the type graph, then serialized to the wire
+/// and decoded again on this side, only for `decompile_complexity_limit_exceeded`
+/// to decline it one call later. On zlib built at -O2 that cost between three
+/// and six gigabytes resident and the kernel killed `r2` outright, which loses
+/// every function in the binary rather than the one that was too big.
+///
+/// The counts come from radare2's own basic blocks, which is a floor for what
+/// lifting produces -- lifting splits blocks and expands one instruction into
+/// several operations, never the reverse -- so a function this refuses is one
+/// the engine would have refused too.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_engine_complexity_limit_exceeded_v2(
+    block_count: usize,
+    op_count: usize,
+) -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        u8::from(r2engine::decompile_complexity_limit_exceeded(
+            block_count,
+            op_count,
+        ))
+    }))
+    .unwrap_or(0)
+}
+
 /// Return the immutable V2 API table. The table and all callback addresses are
 /// process-lifetime borrows and must not be freed.
 #[unsafe(no_mangle)]
