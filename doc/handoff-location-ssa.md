@@ -12622,3 +12622,81 @@ snapshot baseline, both predating today; import thunks (32 per binary,
 unplaceable parameter type does not cost a function every parameter's type;
 local names still rendering as `stack_m16` though the declared name is in the
 slot record.
+
+### The derivation, and three structural rewrites
+
+Asked whether a plan listing seven cause-by-cause fixes was the best design,
+the answer was no: it fixed instances of three structural violations without
+naming them. The plan was rewritten as a derivation, in
+`~/.claude/plans/ask-questions-from-my-curried-pearl.md`, and the summary is
+worth keeping here.
+
+**The optimum.** Let `Ent(B)` be what the binary entails and `M` the facts an
+external source asserts that the proof line marks. Correct output is
+`A ⊆ Ent(B) ∪ M`; complete output maximises `|A ∩ Ent(B)|`. So the target is
+`A = Ent(B) ∪ M`, spelled in C where C can spell it, as a marked intrinsic
+where the semantics are entailed but C has no spelling, and as a marked gap
+where nothing is entailed. Every refusal in a census must therefore classify
+as **(a)** an entailment limit, **(b)** a representation limit, or **(c)** a
+downstream layer re-deriving what an upstream layer already certified. Only
+(c) is a defect, and the work is complete when no (c) remains.
+
+**Why per-cell gaps are not a compromise.** With `n` cells and residue rate
+`p`, all-or-nothing rendering gives `P(rendered) = (1−p)^n` — exponential
+decay in function size, which is exactly the -O0/-O2 split. Per-cell gives
+`1−p` independent of `n`. Gaps change the decay law, and they come after the
+recovery work so that `p` is the residue rate rather than the defect rate.
+
+Three violations of monotone certificate flow were found, and all three are
+now fixed:
+
+**S1, membership re-derived by op shape** (commit "Let the certificate say
+what is a call site"). r2ssa certifies a tail call through a slot as
+`BranchInd` carrying `TailCall`, and owns `callsites_by_inst`. Six r2dec
+files asked the operation's shape instead. Also fixed under it: the plugin's
+transfer classifier read a memory-indirect jump's pointer only when radare2
+spelled the jump as a memory jump, and radare2 spells `jmp qword [rip + X]`
+as an indirect *register* jump; and a tail-only function's return type, which
+the local inference scored `void` for want of a `Return`, now comes from its
+tail boundaries. Import thunks render as `return fileno(stream);`.
+minigzip -O0 110 → 135, -O2 52 → 77.
+
+**S3, one fact with two owners** (commit "Give a signature change one owner").
+The enrichment counted changed parameter slots on the merged signature; the
+plan refresh recounted them on the render-authorized projection and failed the
+whole function when the two disagreed. The enrichment now decides and the
+refresh consumes. A plan that cannot be refreshed atomically keeps its prior
+signature rather than costing the function its decompilation.
+
+**S2, boundary facts aggregated all-or-nothing** (commit "Materialize the
+entry carriers a call reads implicitly"). A call reads its register arguments
+implicitly, so a pass-through argument has no operation naming it; entry
+carriers were materialized only for declared formals, so a function whose
+captured prototype declares fewer parameters than it passes through had no
+value to name and `exact_register_call_arguments` discarded the *entire*
+argument list. The convention's own argument slots are now materialized too.
+100 call sites at -O0 and 125 at -O2 went from certifying zero arguments to
+certifying their real count. -O2 77 → 79.
+
+Every coordinate of a call boundary that cannot be resolved now names itself
+(`call-argument-coordinates`), which is how the above was found.
+
+**State.** minigzip -O0 135 of 183 rendered (was 110), -O2 79 of 163 (was 52).
+Differential gate 54 of 54 throughout; nothing newly refused at either level.
+
+**Next, in order.** The return boundary is now the largest cause: 
+`implementation.rs:1368` (19 at -O2, 6 at -O0) and `:1324` (9 and 7), which
+the plan's P2 covers — `exact_logical_return_projection` should follow the def
+graph through `Phi`/`Copy` to the extension frontier, and `:1324` is an ABI
+model that was never recovered. Then `missing_definition` (9 and 6) and the
+`calls.rs:202` declaration conflict (8 and 3).
+
+**One decision is open.** At a call whose callee signature is proven from the
+callee's own body, the call-site interface and that signature can disagree on
+arity — `certified_arguments=4` against `signature_params=3` on
+`minigzip -O2` at 0x5500. Two sources for one fact, so an S3 instance. The
+body-proven signature is the stronger evidence, but the extra certified
+argument is then a register the caller wrote that the callee does not read,
+and its obligation still has to be discharged rather than dropped. That is a
+question about which source owns the arity and what becomes of the surplus
+argument, and it should be put to the user rather than settled in passing.
