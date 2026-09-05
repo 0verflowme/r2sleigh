@@ -778,6 +778,7 @@ impl BindingPlan {
                     array_layout,
                     source_slot,
                     callee_allocation,
+                    ty: _,
                 } = entity
                 else {
                     continue;
@@ -854,6 +855,17 @@ impl BindingPlan {
                         || certificate.accesses.is_empty()
                         || certificate.active_sp_offsets.is_empty()
                     {
+                        r2il::refusal_evidence!(
+                            "stack-object-identity",
+                            "object={:?} callee allocation disagrees: source_slot={} certificate_object={:?} certificate_size={} size={} accesses={} active_sp_offsets={}",
+                            object,
+                            source_slot.is_some(),
+                            certificate.object,
+                            certificate.size_bytes,
+                            size_bytes,
+                            certificate.accesses.len(),
+                            certificate.active_sp_offsets.len()
+                        );
                         stack_objects.insert(
                             *object,
                             StackObjectDisposition::Refused {

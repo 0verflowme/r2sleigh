@@ -114,6 +114,9 @@ typedef struct r_anal_fcn_slot_t {
 	char *home_reg;
 	ut64 home_reg_offset;
 	ut32 home_reg_size;
+	/* The slot's declared type as a node of the function's type graph, or
+	 * R_ANAL_SNAPSHOT_TYPE_ID_INVALID when the graph does not carry it. */
+	ut32 logical_type_id;
 } RAnalFcnSlot;
 
 typedef struct r_anal_fcn_callee_t {
@@ -177,6 +180,11 @@ typedef enum {
 	R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER,
 	R_ANAL_SNAPSHOT_TYPE_POINTER,
 	R_ANAL_SNAPSHOT_TYPE_STRUCT,
+	/* An object the graph does not describe, and code. Neither has a size or
+	 * a layout; each exists only to be pointed at, which is how `void *` and
+	 * a function pointer are placed without inventing what they point to. */
+	R_ANAL_SNAPSHOT_TYPE_VOID,
+	R_ANAL_SNAPSHOT_TYPE_CODE,
 } RAnalSnapshotTypeKind;
 
 typedef enum {

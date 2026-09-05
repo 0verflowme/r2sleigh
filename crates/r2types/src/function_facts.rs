@@ -1033,6 +1033,10 @@ pub enum CertifiedEntity {
         /// Upstream proof for a compiler-created, source-less callee-owned
         /// stack object. Consumers may use it but must not reconstruct it.
         callee_allocation: Option<r2ssa::CalleeStackAllocationCertificate>,
+        /// Exact declared type of the slot from the immutable source
+        /// interface's type graph. Absence is unknown and must not be
+        /// repaired from evidence.
+        ty: Option<CTypeLike>,
     },
     LoopCarrier {
         id: r2ssa::SemanticId,
@@ -4438,6 +4442,16 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                     array_layout: cert.array_layout.clone(),
                     source_slot: cert.source_slot,
                     callee_allocation: cert.callee_allocation.clone(),
+                    ty: cert
+                        .source_slot
+                        .and_then(|slot| slot.logical_type())
+                        .and_then(|type_id| {
+                            let graph = prepared
+                                .machine_context()
+                                .function_interface()?
+                                .type_graph()?;
+                            crate::writeback::source_type_like(graph, type_id, &mut BTreeSet::new())
+                        }),
                 },
             )
         })
@@ -5162,6 +5176,7 @@ mod tests {
             array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
             source_slot: None,
             callee_allocation: None,
+            ty: None,
         };
 
         assert_eq!(forward.coalescing_values(), reversed.coalescing_values());
@@ -5609,6 +5624,7 @@ mod tests {
                             array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
                             source_slot: None,
                             callee_allocation: None,
+                            ty: None,
                         },
                     )
                 })
@@ -7687,6 +7703,7 @@ mod tests {
                     array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
                     source_slot: None,
                     callee_allocation: None,
+                    ty: None,
                 },
             )]),
             certified_effects: BTreeMap::from([

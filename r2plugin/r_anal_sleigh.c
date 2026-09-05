@@ -778,6 +778,8 @@ static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFu
 	 * reason. radare2's own block count and instruction total are a floor for
 	 * what lifting produces, so nothing refused here would have been accepted. */
 	if (sleigh_function_exceeds_engine_limits (fcn)) {
+		R_LOG_ERROR ("r2sleigh: capture refused '%s': the function exceeds the engine complexity limit",
+			r_str_get (fcn->name));
 		return NULL;
 	}
 	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
@@ -792,7 +794,15 @@ static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFu
 	}
 	sleigh_function_capture_release ();
 	const ut64 walk_started = sleigh_callback_start ();
-	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (core, fcn->addr, NULL);
+	const char *refusal = NULL;
+	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (core, fcn->addr, &refusal);
+	const bool snapshot_taken = snapshot != NULL;
+	if (!snapshot) {
+		/* The capture names what it refused; dropping that name left every
+		 * refused function reporting only that it could not be captured. */
+		R_LOG_ERROR ("r2sleigh: capture refused '%s': %s", r_str_get (fcn->name),
+			refusal? refusal: "no reason recorded");
+	}
 	uint8_t *wire = NULL;
 	size_t wire_len = 0;
 	ut64 revision = 0;
@@ -811,6 +821,16 @@ static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFu
 	if (!wire || !revision
 			|| r_anal_function_dirty_epoch (fcn) != function_epoch
 			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+		/* Four conditions end here and the caller sees only that the capture
+		 * is absent; name the one that failed. */
+		if (snapshot_taken) {
+			R_LOG_ERROR ("r2sleigh: capture refused '%s': %s", r_str_get (fcn->name),
+				!wire? "the snapshot could not be serialized"
+				: !revision? "the snapshot carries no revision identity"
+				: r_anal_function_dirty_epoch (fcn) != function_epoch
+					? "the function changed during capture"
+					: "the type database changed during capture");
+		}
 		free (wire);
 		return NULL;
 	}

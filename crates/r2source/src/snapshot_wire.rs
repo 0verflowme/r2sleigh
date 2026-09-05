@@ -22,7 +22,7 @@ pub const SNAPSHOT_WIRE_MAGIC: u32 = 0x5232_5357; // "R2SW"
 
 /// Format revision. Owned by this crate, and bumped only when the encoding
 /// changes; it is not radare2's ABI version, which moves for unrelated reasons.
-pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 8;
+pub const SNAPSHOT_WIRE_FORMAT_VERSION: u32 = 9;
 const SNAPSHOT_WIRE_MIN_FORMAT_VERSION: u32 = 1;
 
 /// Bytes of fixed header preceding the string table.
@@ -1412,6 +1412,8 @@ const TYPE_SIGNED: u8 = 0;
 const TYPE_UNSIGNED: u8 = 1;
 const TYPE_POINTER: u8 = 2;
 const TYPE_STRUCT: u8 = 3;
+const TYPE_VOID: u8 = 4;
+const TYPE_CODE: u8 = 5;
 
 pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
     writer.u32(source_type.id());
@@ -1426,6 +1428,8 @@ pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
             writer.u8(TYPE_STRUCT);
             writer.u32(aggregate_id);
         }
+        SourceTypeKind::Void => writer.u8(TYPE_VOID),
+        SourceTypeKind::Code => writer.u8(TYPE_CODE),
     }
     writer.u64(source_type.size_bits());
     writer.u64(source_type.align_bits());
@@ -1442,6 +1446,8 @@ pub fn read_type(reader: &mut SnapshotWireReader<'_>) -> Result<SourceType, Snap
         TYPE_STRUCT => SourceTypeKind::Struct {
             aggregate_id: reader.u32()?,
         },
+        TYPE_VOID => SourceTypeKind::Void,
+        TYPE_CODE => SourceTypeKind::Code,
         // Signedness and indirection are not recoverable from anything else in
         // the record, so an unknown kind is refused.
         tag => {
@@ -1656,6 +1662,8 @@ pub fn write_stack_slot(writer: &mut SnapshotWireWriter, slot: &SourceStackSlotS
             write_storage(writer, home_storage);
         }
     }
+    // The slot's node in the type graph, or the invalid id when it has none.
+    writer.u32(slot.logical_type().unwrap_or(u32::MAX));
 }
 
 pub fn read_stack_slot(
@@ -1676,7 +1684,7 @@ pub fn read_stack_slot(
     let size_bytes = reader.u32()?;
     // Role carries authority: a parameter home is not interchangeable with an
     // unclassified resource, so each is rebuilt through its own constructor.
-    Ok(match reader.u8()? {
+    let slot = match reader.u8()? {
         ROLE_UNCLASSIFIED => SourceStackSlotSpec::new(base, base_storage, offset, size_bytes),
         ROLE_LOCAL => SourceStackSlotSpec::new_local(base, base_storage, offset, size_bytes),
         ROLE_PARAMETER_HOME => {
@@ -1697,6 +1705,18 @@ pub fn read_stack_slot(
                 tag: u64::from(tag),
             });
         }
+    };
+    // A slot's declared type is a node of the function's type graph from
+    // format 9 on; the invalid id says the graph does not carry it.
+    let logical_type = if reader.format_version() >= 9 {
+        let id = reader.u32()?;
+        (id != u32::MAX).then_some(id)
+    } else {
+        None
+    };
+    Ok(match logical_type {
+        Some(type_id) => slot.with_logical_type(type_id),
+        None => slot,
     })
 }
 

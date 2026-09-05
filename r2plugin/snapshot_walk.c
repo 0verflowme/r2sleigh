@@ -469,6 +469,8 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 #define WALK_TYPE_UNSIGNED 1
 #define WALK_TYPE_POINTER 2
 #define WALK_TYPE_STRUCT 3
+#define WALK_TYPE_VOID 4
+#define WALK_TYPE_CODE 5
 #define WALK_ROLE_UNCLASSIFIED 0
 #define WALK_ROLE_LOCAL 1
 #define WALK_ROLE_PARAMETER_HOME 2
@@ -614,7 +616,7 @@ static bool walk_call_site(R2SleighWireWriter *writer,
 	return walk_result_kind (writer, call->result_kind, &call->result_storage);
 }
 
-static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFcnSlot *slot) {
+static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFcnSlot *slot, bool exact_types) {
 	uint8_t base_tag = 0;
 	if (!walk_stack_slot_base_tag (slot->base, &base_tag)) {
 		return false;
@@ -654,6 +656,10 @@ static bool walk_stack_slot(R2SleighWireWriter *writer, const RAnalFcnSlot *slot
 		r2sleigh_wire_u8 (writer, WALK_ROLE_UNCLASSIFIED);
 		break;
 	}
+	/* The slot's node in the type graph travels only with the graph: without
+	 * exact types there is no graph for the id to index. */
+	r2sleigh_wire_u32 (writer, exact_types
+		? slot->logical_type_id: R_ANAL_SNAPSHOT_TYPE_ID_INVALID);
 	return true;
 }
 
@@ -687,6 +693,12 @@ static bool walk_type_graph(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 		case R_ANAL_SNAPSHOT_TYPE_STRUCT:
 			r2sleigh_wire_u8 (writer, WALK_TYPE_STRUCT);
 			r2sleigh_wire_u32 (writer, type->aggregate_id);
+			break;
+		case R_ANAL_SNAPSHOT_TYPE_VOID:
+			r2sleigh_wire_u8 (writer, WALK_TYPE_VOID);
+			break;
+		case R_ANAL_SNAPSHOT_TYPE_CODE:
+			r2sleigh_wire_u8 (writer, WALK_TYPE_CODE);
 			break;
 		default:
 			/* Signedness and indirection are not recoverable elsewhere. */
@@ -776,7 +788,7 @@ static bool walk_interface(R2SleighWireWriter *writer,
 	r2sleigh_wire_u32 (writer, (uint32_t)num_slots);
 	for (size_t i = 0; i < num_slots; i++) {
 		const RAnalFcnSlot *slot = walk_stack_slot_at (snapshot, i);
-		if (!slot || !walk_stack_slot (writer, slot)) {
+		if (!slot || !walk_stack_slot (writer, slot, exact_types)) {
 			return false;
 		}
 	}

@@ -12386,3 +12386,126 @@ removing the destination first, which the same Makefile already does for
 This is upstream code and unrelated to Sleigh, so it is prepared as its own
 branch, `pr/install-over-symlink`, cherry-picked onto `master` and not pushed.
 No existing open PR of the user's covers it. Opening the PR is the user's call.
+
+## Session 2026-09-05 (afternoon): the O0 chain after the DWARF records arrived
+
+Sweep3 (fork at de472a1e58, plugin at fbc9165) finished: 207/1492 = 0.139
+overall; zlib/O0 72/635, zlib/O2 101/705, bzip2/O0 17/88, bzip2/O2 17/64.
+Two O2 binaries per project still die at ~6 GB (SIGKILL at candidate 15 of
+136 and 30 of 142). The census's two top causes were `memory_renderer.rs:94`
+(368) and `implementation.rs:1324` (218). Both were traced on minigzip-O0
+and each turned out to be a chain of upstream defects, not engine ones.
+
+### What was traced and fixed
+
+1. **`implementation.rs:1324` = ABI model incoherent = stack slot roles
+   incomplete.** The fork commit that let a DWARF stack home *replace* the
+   register formal (41636fdf73, unpushed) deleted the register variable and
+   with it the spill accesses that `r_anal_var_get_dst_var` reads to link a
+   register formal to its stack home. Replaced by cfa7ebfd44: the register
+   formal stays, the slot takes the DWARF type, the DWARF name only when no
+   other variable holds it, and the slot is marked an argument only where the
+   exact-formal promotion still needs it. `inflateStateCheck` renders.
+
+2. **Frame-pointer slots never matched their objects.** The engine restates a
+   frame-pointer slot at its entry-relative coordinate (`semantic.rs`,
+   translation via `unique_stack_root_for_storage`), but stored the *original*
+   `SourceStackSlotSpec` under the translated key, and the binding plan then
+   compared the slot's base/offset against the object's and refused every
+   frame-pointer local as `MissingSourceIdentity`. Fixed by
+   `SourceStackSlotSpec::restated` and inserting the restated slot. Test
+   `memory_ssa_separates_saved_sp_slot_from_frame_relative_local` updated.
+
+3. **`long unsigned int` had no size.** `save_atomic_type` filed DWARF base
+   types under `r_str_sanitize_sdb_key` (spaces to underscores) while every
+   typedef and variable refers to the verbatim spelling. Fork 491f09ee58 saves
+   the verbatim key (refusing only `=`, `,`, newline). The plugin's
+   `snapshot_type_integer_spec` had a matching compensating sanitization on
+   lookup; removed, since the resolver captures keys verbatim.
+
+4. **Type graph refused for every typedef'd parameter** (consequence of 3):
+   `uLong`, `z_crc_t`, `off64_t` could not root, so the interface had no
+   logical types, every parameter took its carrier width (64) and every
+   32-bit parameter's 4-byte home refused as `ParameterHomeWidthMismatch`
+   (34 of the 35 `memory_renderer.rs:94` on minigzip-O0). With the lookup
+   fixed, `multmodp` renders as `uint32_t multmodp(uint32_t a, uint32_t b)`.
+   No binding-width change was needed: the interface already models the
+   low-bits lane and r2ssa indexes parameter entry values by the lane storage.
+
+5. **Array-typed locals had no extent** (`unsigned char[4]`, `ush[16]`,
+   `code const[512] const`): `r_anal_type_bitsize` sizes only the element
+   spelling. The capture now sizes a slot as element × count through
+   `snapshot_type_member_element_spec`.
+
+6. **Enums had no width**: `save_enum` never persisted `type.<name>.size`
+   and `r_type_get_bitsize` returned 0 for kind `enum`. Fork: both fixed
+   (declared width, else the language's int width). Built, not yet measured.
+
+7. Diagnostics added (all env-gated or evidence lines): slot-role and
+   stack-resource reports (`R2SLEIGH_DEBUG_INTERFACE`), type-graph root
+   refusals naming the spelling, `stack-slot-translation` evidence,
+   callee-allocation disagreement evidence, `InvalidLogicalTypes { reason }`,
+   `logical-types` evidence with the root ids, and the capture refusal reason
+   in the "cannot capture" error.
+
+8. **Locals' types are now nodes of the type graph, referenced by their
+   slot.** The capture had started rooting each local's type so struct layouts
+   reached the graph, but nothing referenced the node, and the interface
+   contract requires every graph type to be reachable from a root, so the
+   whole interface was rejected (`InvalidLogicalTypes`). `RAnalFcnSlot` now
+   carries `logical_type_id`, the wire (format 9) carries it per slot,
+   `SourceStackSlotSpec::logical_type` is a root, `CertifiedEntity::StackSlot`
+   carries the resolved `ty`, and `declaration_type_for_stack_object` uses it
+   ahead of recovered hints. A local root that fails midway is rolled back
+   (`snapshot_type_graph_rollback`), because a half-built aggregate left in a
+   complete graph made the walker refuse to serialize the whole snapshot.
+
+9. **`void *` and function pointers are placeable.** Two opaque kinds,
+   `Void` and `Code` (wire tags 4 and 5, no size, only ever a pointer's
+   target), on both sides of the wire; the renderer spells them `void *` and
+   `void (*)()`. Integer signedness is now derived from the C specifiers in a
+   spelling rather than from a list of orderings, so `long unsigned int` (as
+   DWARF spells it) and `unsigned long` are one type.
+
+Local minigzip-O0 census: 54 rendered before this session → 92 after all of
+the above, 8 errors. The differential gate passes 54/54; the six `diag=wrong`
+and the snapshot mismatches predate this session (the snapshot baseline is
+still unblessed).
+
+### Open, in priority order
+
+- **Unions.** Every remaining type-graph refusal on zlib traces to one
+  anonymous union inside `ct_data_s` (`fc`, `dl`): `deflate_state`,
+  `internal_state`, `z_stream_s` (through `state`), `gz_state` and `ct_data`
+  all refuse for it, and with them every deflate and gz function keeps
+  carrier-width parameters, which is what the remaining 30
+  `memory_renderer.rs:94` (`ParameterHomeWidthMismatch`) are. The graph needs
+  a `Union` kind: members all at offset 0, size the maximum, overlap allowed
+  in the contract's aggregate validation, `CTypeLike::Union` in the renderer,
+  and an ambiguous-member access refused per access in `aggregate_access.rs`.
+- **Per-parameter logical types.** One unplaceable parameter type still
+  loses every parameter's type for the function; the standing rule is that a
+  type refusal is per value. `parameter_logical_values` should become
+  `Option` per parameter (wire presence bit, contract validation of the
+  present ones, roots from the present ones), and the capture should roll
+  back and continue past a parameter it cannot root.
+- `capture refused 'gzgetc'`, `gzputc`: "the block successors are not
+  coherent" (2 functions); one "snapshot could not be serialized" remains.
+- O2 SIGKILLs: minigzip-O2 harness candidate 16 in discovery order is
+  `gz_look` (21 blocks, 100 instructions) — the killer is a function *under*
+  the caps. Reproduce with `/usr/bin/time -l` and `ulimit -v`.
+- `return-register-unreachable` (gz_avail, gz_read, crc32_z, gzgetc).
+- DWARF statics inside functions (`static const code lenfix[512]`) show up
+  as a bp variable at offset 0 and a register variable named after the
+  global; source is radare2's type-link propagation after
+  `parse_data_object_type_link`. Breaks `fixedtables`.
+- Import thunks (`sym.imp.*`): `RenderedValueRequired` on the GOT load
+  (31 on minigzip-O0); the thunk-rendering thread.
+- The exact DWARF path (`dwarf_exact_stack_location_parse`,
+  `dwarf_function_frame_pointer_stage`) still refuses
+  `DW_OP_call_frame_cfa`, which gcc emits for every function. The machine
+  spill link covers O0; the exact path would be needed where the spill is not
+  proven. CFA is defined by CFI; radare2 parses `.eh_frame` only for LSDA.
+- Upstream PR candidates (radare2 fixes unrelated to Sleigh):
+  `save_atomic_type` verbatim key, enum width, install-over-symlink
+  (`pr/install-over-symlink`, unpushed), the DWARF stack-home integration.

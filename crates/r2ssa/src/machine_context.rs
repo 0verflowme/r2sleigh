@@ -707,6 +707,8 @@ fn write_type_graph(writer: &mut MachineContextIdentityWriter, graph: Option<&So
                 writer.u8(4);
                 writer.u32(aggregate_id);
             }
+            SourceTypeKind::Void => writer.u8(5),
+            SourceTypeKind::Code => writer.u8(6),
         }
         writer.u64(source_type.size_bits());
         writer.u64(source_type.align_bits());
@@ -3094,10 +3096,10 @@ mod tests {
             Some(SourceLogicalValue::new(1, low_i32)),
             Some(demo_struct_type_graph()),
         );
-        assert_eq!(
+        assert!(matches!(
             invalid,
-            Err(SourceFunctionInterfaceError::InvalidLogicalTypes)
-        );
+            Err(SourceFunctionInterfaceError::InvalidLogicalTypes { .. })
+        ));
     }
 
     #[test]

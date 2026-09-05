@@ -156,8 +156,20 @@ impl SourceAbiClass {
 pub enum SourceTypeKind {
     SignedInteger,
     UnsignedInteger,
-    Pointer { target_type_id: u32 },
-    Struct { aggregate_id: u32 },
+    Pointer {
+        target_type_id: u32,
+    },
+    Struct {
+        aggregate_id: u32,
+    },
+    /// An object the graph does not describe. It has no size and no layout
+    /// and exists only as a pointer's target: it is how `void *` is placed
+    /// without inventing what it points at.
+    Void,
+    /// Code. Like `Void` it has no size and is only a pointer's target; the
+    /// signature is not carried, so a pointer to it is a function pointer
+    /// whose parameters the graph does not state.
+    Code,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -392,8 +404,21 @@ impl SourceTypeGraph {
         // complete account of the types it uses, not an absent one, and
         // rejecting it refused every function whose body needs nothing named.
         for (position, source_type) in types.iter().enumerate() {
-            if u32::try_from(position) != Ok(source_type.id)
-                || source_type.size_bits == 0
+            if u32::try_from(position) != Ok(source_type.id) {
+                return Err(SourceTypeGraphError::InvalidType);
+            }
+            // An opaque kind has no size and no alignment, by definition;
+            // every other kind is an object and has both.
+            if matches!(
+                source_type.kind,
+                SourceTypeKind::Void | SourceTypeKind::Code
+            ) {
+                if source_type.size_bits != 0 || source_type.align_bits != 0 {
+                    return Err(SourceTypeGraphError::InvalidType);
+                }
+                continue;
+            }
+            if source_type.size_bits == 0
                 || !source_type.size_bits.is_multiple_of(8)
                 || source_type.align_bits == 0
                 || !source_type.align_bits.is_multiple_of(8)
@@ -430,6 +455,7 @@ impl SourceTypeGraph {
                         return Err(SourceTypeGraphError::InvalidType);
                     }
                 }
+                SourceTypeKind::Void | SourceTypeKind::Code => {}
             }
         }
         for (position, aggregate) in aggregates.iter().enumerate() {
@@ -455,6 +481,12 @@ impl SourceTypeGraph {
                 let Some(member_type) = usize::try_from(member.type_id)
                     .ok()
                     .and_then(|id| types.get(id))
+                    .filter(|member_type| {
+                        !matches!(
+                            member_type.kind,
+                            SourceTypeKind::Void | SourceTypeKind::Code
+                        )
+                    })
                 else {
                     return Err(SourceTypeGraphError::InvalidMember);
                 };
@@ -579,7 +611,10 @@ impl SourceTypeGraph {
                         }
                     }
                 }
-                SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger => {}
+                SourceTypeKind::SignedInteger
+                | SourceTypeKind::UnsignedInteger
+                | SourceTypeKind::Void
+                | SourceTypeKind::Code => {}
             }
         }
         reachable.len() == self.types.len()
@@ -782,6 +817,10 @@ pub struct SourceStackSlotSpec {
     offset: i64,
     size_bytes: u32,
     role: SourceStackSlotRole,
+    /// The slot's declared type as a node of the interface's type graph.
+    /// Absent when the interface carries no graph or the graph could not
+    /// place the declaration; never a guess.
+    logical_type: Option<u32>,
 }
 
 impl SourceStackSlotSpec {
@@ -798,6 +837,7 @@ impl SourceStackSlotSpec {
             offset,
             size_bytes,
             role: SourceStackSlotRole::UnclassifiedResource,
+            logical_type: None,
         }
     }
 
@@ -813,6 +853,7 @@ impl SourceStackSlotSpec {
             offset,
             size_bytes,
             role: SourceStackSlotRole::Local,
+            logical_type: None,
         }
     }
 
@@ -833,7 +874,20 @@ impl SourceStackSlotSpec {
                 parameter_index,
                 home_storage,
             },
+            logical_type: None,
         }
+    }
+
+    /// The same slot with its declared type named as a graph node.
+    pub const fn with_logical_type(self, type_id: u32) -> Self {
+        Self {
+            logical_type: Some(type_id),
+            ..self
+        }
+    }
+
+    pub const fn logical_type(&self) -> Option<u32> {
+        self.logical_type
     }
 
     pub const fn base(&self) -> StackAddressBase {
@@ -854,6 +908,29 @@ impl SourceStackSlotSpec {
 
     pub const fn role(&self) -> SourceStackSlotRole {
         self.role
+    }
+
+    /// The same slot stated against another base.
+    ///
+    /// A source declares a slot against the register it saw the code use,
+    /// and a consumer that identifies objects by their entry-relative
+    /// position has to restate a frame-pointer slot before the two can be
+    /// compared. Width and role are properties of the slot, not of the
+    /// coordinate, so they carry over unchanged.
+    pub const fn restated(
+        self,
+        base: StackAddressBase,
+        base_storage: CanonicalStorageId,
+        offset: i64,
+    ) -> Self {
+        Self {
+            base,
+            base_storage,
+            offset,
+            size_bytes: self.size_bytes,
+            role: self.role,
+            logical_type: self.logical_type,
+        }
     }
 }
 
@@ -1005,7 +1082,13 @@ pub enum SourceFunctionInterfaceError {
     InvalidStackSlot,
     InvalidStackSlotRole,
     OverlappingStackSlots,
-    InvalidLogicalTypes,
+    /// The logical types do not describe the physical interface. The reason
+    /// names which of the five conditions failed: a consumer that only ever
+    /// saw the verdict had no way to tell a lane that overran its carrier
+    /// from a type nothing could reach.
+    InvalidLogicalTypes {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for SourceFunctionInterfaceError {
@@ -1215,32 +1298,75 @@ impl SourceFunctionInterface {
         match type_graph.as_ref() {
             None => {
                 if !parameter_logical_values.is_empty() || return_logical_value.is_some() {
-                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes);
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "logical values without a type graph",
+                    });
+                }
+                if stack_slots.iter().any(|slot| slot.logical_type.is_some()) {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a slot names a type without a type graph",
+                    });
                 }
             }
             Some(graph) => {
-                if parameter_logical_values.len() != parameters.len()
-                    || parameter_logical_values
-                        .iter()
-                        .zip(&parameters)
-                        .any(|(value, parameter)| {
-                            !graph.validates_logical_value(*value, parameter.storage.size)
-                        })
-                    || match (return_kind, return_logical_value) {
-                        (SourceFunctionReturn::Void, None) => false,
-                        (SourceFunctionReturn::Register { storage }, Some(value)) => {
-                            !graph.validates_logical_value(value, storage.size)
+                if parameter_logical_values.len() != parameters.len() {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "one logical value per parameter",
+                    });
+                }
+                if parameter_logical_values
+                    .iter()
+                    .zip(&parameters)
+                    .any(|(value, parameter)| {
+                        !graph.validates_logical_value(*value, parameter.storage.size)
+                    })
+                {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a parameter's logical value does not fit its carrier",
+                    });
+                }
+                match (return_kind, return_logical_value) {
+                    (SourceFunctionReturn::Void, None) => {}
+                    (SourceFunctionReturn::Register { storage }, Some(value)) => {
+                        if !graph.validates_logical_value(value, storage.size) {
+                            return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                                reason: "the return's logical value does not fit its carrier",
+                            });
                         }
-                        _ => true,
                     }
-                    || !graph.all_types_reachable(
+                    _ => {
+                        return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                            reason: "return kind and return logical value disagree",
+                        });
+                    }
+                }
+                // A slot's declared type is a root like a parameter's: the
+                // graph holds every type the interface names, and the locals
+                // name types too.
+                if !graph.all_types_reachable(
+                    parameter_logical_values
+                        .iter()
+                        .map(|value| value.type_id())
+                        .chain(return_logical_value.map(SourceLogicalValue::type_id))
+                        .chain(stack_slots.iter().filter_map(|slot| slot.logical_type)),
+                ) {
+                    r2il::refusal_evidence!(
+                        "logical-types",
+                        "roots {:?} return {:?} slots {:?} against a graph of {} types",
                         parameter_logical_values
                             .iter()
                             .map(|value| value.type_id())
-                            .chain(return_logical_value.map(SourceLogicalValue::type_id)),
-                    )
-                {
-                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes);
+                            .collect::<Vec<_>>(),
+                        return_logical_value.map(SourceLogicalValue::type_id),
+                        stack_slots
+                            .iter()
+                            .filter_map(|slot| slot.logical_type)
+                            .collect::<Vec<_>>(),
+                        graph.types.len()
+                    );
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a logical type is not in the graph",
+                    });
                 }
             }
         }

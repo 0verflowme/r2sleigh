@@ -6659,6 +6659,13 @@ pub(crate) fn source_type_like(
                 })?;
             CTypeLike::Struct(aggregate.name().to_string())
         }
+        r2ssa::SourceTypeKind::Void => CTypeLike::Void,
+        // A function whose signature the graph does not carry; spelled with
+        // an empty parameter list, which in C is an unspecified one.
+        r2ssa::SourceTypeKind::Code => CTypeLike::Function {
+            ret: Box::new(CTypeLike::Void),
+            params: Vec::new(),
+        },
     };
     visiting.remove(&type_id);
     Some(ty)

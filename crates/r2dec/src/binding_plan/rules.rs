@@ -368,6 +368,18 @@ pub(super) fn declaration_type_for_stack_object(
 ) -> r2types::CTypeLike {
     let machine = r2types::CTypeLike::machine_bits(width_bits);
     let source = source_owned.source();
+    // The slot's declared type, when the source interface carries it as a
+    // node of its type graph, is exact and outranks every recovered hint: it
+    // is what the program declared, at the width the storage has.
+    if let Some(r2types::CertifiedEntity::StackSlot { ty: Some(ty), .. }) =
+        source_owned.report().render().and_then(|render| {
+            render
+                .certified_entities
+                .get(&r2ssa::SemanticId::stack_slot(object))
+        })
+    {
+        return admit_declaration(ty.clone(), width_bits, ptr_bits);
+    }
     let array_layout = source
         .certificates()
         .stack_slots

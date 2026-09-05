@@ -921,6 +921,7 @@ impl BindingPlan {
                     array_layout,
                     source_slot,
                     callee_allocation,
+                    ty: _,
                 } => Some((
                     *id,
                     *object,

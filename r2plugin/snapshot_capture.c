@@ -340,6 +340,7 @@ static RAnalFcnSlot *fcn_context_collect_slot(RAnal *anal, const RAnalFcnContext
 
 	R_RETURN_VAL_IF_FAIL (anal && ctx && fcn && var, NULL);
 	RAnalFcnSlot *slot = R_NEW0 (RAnalFcnSlot);
+	slot->logical_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
 	if (R_STR_ISNOTEMPTY (var->name)) {
 		slot->name = strdup (var->name);
 	}
@@ -412,9 +413,18 @@ static RAnalFcnSlot *fcn_context_collect_slot(RAnal *anal, const RAnalFcnContext
 		slot->arg_index = -1;
 	}
 	if (R_STR_ISNOTEMPTY (slot->type)) {
-		ut64 bits = r_anal_type_bitsize (anal, slot->type);
-		if (bits && !(bits % 8) && bits / 8 <= UT32_MAX) {
-			slot->size = (ut32)(bits / 8);
+		// An array slot is as wide as its element repeated: the type
+		// database sizes only the element's spelling, so a local declared
+		// `unsigned char[4]` had no extent and left every slot in the frame
+		// unproven against overlap.
+		ut64 count = 1;
+		char *element = snapshot_type_member_element_spec (slot->type, &count);
+		ut64 bits = element? r_anal_type_bitsize (anal, element): 0;
+		free (element);
+		ut64 total_bits;
+		if (bits && count && !r_mul_overflow (bits, count, &total_bits)
+			&& !(total_bits % 8) && total_bits / 8 <= UT32_MAX) {
+			slot->size = (ut32)(total_bits / 8);
 		}
 	}
 
@@ -2156,16 +2166,32 @@ static bool snapshot_stack_pointer_storage_conflicts_interface(
 	}
 	return false;
 }
+/* Name the slot that leaves the resources incomplete: the verdict rests on
+ * every slot having a base, a position and an extent, and on no two extents
+ * overlapping, and the consumer sees only the verdict. */
+static void snapshot_stack_resource_report(const RAnalFcnSlot *slot, const char *why) {
+	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		return;
+	}
+	eprintf ("r2sleigh: stack resources incomplete: %s: slot=%s type=%s base=%d offset_valid=%d offset=%" PFMT64d " size=%u\n",
+		why, r_str_get (slot->name), r_str_get (slot->type), (int)slot->base,
+		slot->offset_valid? 1: 0, slot->offset, slot->size);
+}
+
 static bool snapshot_stack_resources_complete(const RAnalFcnContext *ctx) {
 	RListIter *left_iter;
 	RAnalFcnSlot *left;
 	r_list_foreach (ctx->fcn_slots, left_iter, left) {
-		if (!left || (left->base != R_ANAL_FCN_BASE_BP
+		if (!left) {
+			return false;
+		}
+		if ((left->base != R_ANAL_FCN_BASE_BP
 				&& left->base != R_ANAL_FCN_BASE_SP)
 			|| R_STR_ISEMPTY (left->base_name) || !left->base_size
 			|| left->base_offset > UT64_MAX - left->base_size
 			|| !left->offset_valid || !left->size
 			|| left->offset > ST64_MAX - (st64)left->size) {
+			snapshot_stack_resource_report (left, "no base, position or extent");
 			return false;
 		}
 		const st64 left_end = left->offset + (st64)left->size;
@@ -2177,16 +2203,32 @@ static bool snapshot_stack_resources_complete(const RAnalFcnContext *ctx) {
 			}
 			if (!right->offset_valid || !right->size
 				|| right->offset > ST64_MAX - (st64)right->size) {
+				snapshot_stack_resource_report (right, "no position or extent");
 				return false;
 			}
 			const st64 right_end = right->offset + (st64)right->size;
 			if (left->offset < right_end && right->offset < left_end) {
+				snapshot_stack_resource_report (left, "overlaps a later slot");
+				snapshot_stack_resource_report (right, "overlaps an earlier slot");
 				return false;
 			}
 		}
 	}
 	return true;
 }
+/* Name the slot that leaves the roles incomplete. Six conditions decide the
+ * verdict and the consumer sees only the verdict, so without this a trace
+ * stops at "roles incomplete" and starts guessing. */
+static void snapshot_stack_slot_role_report(const RAnalFcnSlot *slot, const char *why) {
+	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		return;
+	}
+	eprintf ("r2sleigh: stack slot roles incomplete: %s: slot=%s role=%d base=%d offset=%" PFMT64d " arg_index=%d home=%s+%" PFMT64u "/%u\n",
+		why, r_str_get (slot->name), (int)slot->role, (int)slot->base,
+		slot->offset, slot->arg_index, r_str_get (slot->home_reg),
+		slot->home_reg_offset, slot->home_reg_size);
+}
+
 static bool snapshot_stack_slot_roles_complete(
 	const RAnalFcnContext *ctx, const RAnalFunctionInterfaceSnapshot *interface) {
 	RListIter *iter;
@@ -2198,6 +2240,7 @@ static bool snapshot_stack_slot_roles_complete(
 		if (slot->role == R_ANAL_FCN_SLOT_LOCAL) {
 			if (slot->arg_index != -1 || slot->home_reg_offset
 				|| slot->home_reg_size) {
+				snapshot_stack_slot_role_report (slot, "local carries a formal's fields");
 				return false;
 			}
 			continue;
@@ -2206,6 +2249,7 @@ static bool snapshot_stack_slot_roles_complete(
 			|| (size_t)slot->arg_index >= interface->num_parameters
 			|| !slot->home_reg_size
 			|| slot->home_reg_offset > UT64_MAX - slot->home_reg_size) {
+			snapshot_stack_slot_role_report (slot, "neither local nor a parameter's home");
 			return false;
 		}
 		const RAnalSnapshotParameter *parameter =
@@ -2213,6 +2257,7 @@ static bool snapshot_stack_slot_roles_complete(
 		if (parameter->index != (ut32)slot->arg_index
 			|| slot->home_reg_offset != parameter->storage.offset
 			|| slot->home_reg_size != parameter->storage.size) {
+			snapshot_stack_slot_role_report (slot, "home register differs from the parameter's storage");
 			return false;
 		}
 		RListIter *previous_iter;
@@ -2223,6 +2268,7 @@ static bool snapshot_stack_slot_roles_complete(
 			}
 			if (previous && previous->role == R_ANAL_FCN_SLOT_HOME
 				&& previous->arg_index == slot->arg_index) {
+				snapshot_stack_slot_role_report (slot, "a second home for one parameter");
 				return false;
 			}
 		}
@@ -3057,10 +3103,53 @@ static char *snapshot_type_member_element_spec(const char *spec, ut64 *count) {
 	}
 	return element;
 }
+/* `ret (*)(args)`: a pointer to a function. The graph places it as a pointer
+ * to code, without the signature, which is the whole of what a spelling with
+ * parentheses is allowed to mean here. */
+static bool snapshot_type_spec_is_function_pointer(const char *spec) {
+	if (R_STR_ISEMPTY (spec)) {
+		return false;
+	}
+	const char *star = strstr (spec, "(*)");
+	const size_t len = strlen (spec);
+	return star && star > spec && spec[len - 1] == ')'
+		&& strchr (spec, '[') == NULL && strchr (spec, ']') == NULL;
+}
 static bool snapshot_type_spec_rejected(const char *spec) {
+	if (snapshot_type_spec_is_function_pointer (spec)) {
+		return strstr (spec, "atomic") != NULL;
+	}
 	return R_STR_ISEMPTY (spec) || strchr (spec, '[') || strchr (spec, ']')
 		|| strchr (spec, '(') || strchr (spec, ')')
 		|| strstr (spec, "atomic");
+}
+/* The one node of an opaque kind: an object the graph does not describe, or
+ * code. It has no size and no layout and is only ever a pointer's target. */
+static SnapshotTypeGraphResult snapshot_type_add_opaque(
+	SnapshotTypeGraphBuilder *builder, RAnalSnapshotTypeKind kind,
+	RAnalSnapshotTypeId *result_id) {
+	size_t i;
+	for (i = 0; i < builder->graph->num_types; i++) {
+		if (builder->graph->types[i].kind == kind) {
+			*result_id = builder->graph->types[i].id;
+			return SNAPSHOT_TYPE_GRAPH_VALID;
+		}
+	}
+	if (builder->graph->num_types >= builder->type_capacity
+		|| builder->graph->num_types >= UT32_MAX) {
+		return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
+	}
+	RAnalSnapshotType *snapshot_type =
+		&builder->graph->types[builder->graph->num_types];
+	snapshot_type->id = (RAnalSnapshotTypeId)builder->graph->num_types;
+	snapshot_type->kind = kind;
+	snapshot_type->size_bits = 0;
+	snapshot_type->align_bits = 0;
+	snapshot_type->target_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
+	snapshot_type->aggregate_id = UT32_MAX;
+	builder->graph->num_types++;
+	*result_id = snapshot_type->id;
+	return SNAPSHOT_TYPE_GRAPH_VALID;
 }
 static SnapshotTypeGraphResult snapshot_type_unalias(
 	const SnapshotTypeGraphBuilder *builder, const char *type, char **result) {
@@ -3134,35 +3223,66 @@ static SnapshotIntegerSyntax snapshot_type_integer_syntax(const char *spec) {
 		}
 		return syntax;
 	}
-	static const char *signed_specs[] = {
-		"signed char", "short", "short int", "signed short",
-		"signed short int", "int", "signed", "signed int", "long",
-		"long int", "signed long", "signed long int", "long long",
-		"long long int", "signed long long", "signed long long int",
+	// C fixes the meaning of an integer spelling by the set of specifiers in
+	// it, not their order: `long unsigned int` (how DWARF spells it) and
+	// `unsigned long` (how the type database spells it) are one type. Listing
+	// spellings matched only the orderings someone had thought to write down.
+	// Signedness is the presence of `unsigned`; every other specifier only
+	// picks the width, and the width comes from the base type's record. _Bool
+	// is unsigned by the language and is spelled _Bool in debug info.
+	if (!strcmp (spec, "_Bool") || !strcmp (spec, "bool")) {
+		syntax.valid = true;
+		syntax.kind = R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER;
+		return syntax;
+	}
+	static const char *specifiers[] = {
+		"signed", "unsigned", "char", "short", "int", "long",
 	};
-	static const char *unsigned_specs[] = {
-		"unsigned char", "unsigned short", "unsigned short int", "unsigned",
-		"unsigned int", "unsigned long", "unsigned long int",
-		"unsigned long long", "unsigned long long int",
-		// C fixes _Bool as unsigned, so unlike plain char this needs no
-		// per-target choice. Both compilers spell it _Bool in debug info.
-		"_Bool", "bool",
-	};
-	size_t i;
-	for (i = 0; i < R_ARRAY_SIZE (signed_specs); i++) {
-		if (!strcmp (spec, signed_specs[i])) {
-			syntax.valid = true;
-			syntax.kind = R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER;
+	bool is_unsigned = false;
+	bool any = false;
+	bool only_char = true;
+	const char *cursor = spec;
+	while (*cursor) {
+		while (*cursor == ' ') {
+			cursor++;
+		}
+		if (!*cursor) {
+			break;
+		}
+		const char *word_end = cursor;
+		while (*word_end && *word_end != ' ') {
+			word_end++;
+		}
+		const size_t word_len = (size_t)(word_end - cursor);
+		size_t i;
+		bool known = false;
+		for (i = 0; i < R_ARRAY_SIZE (specifiers); i++) {
+			if (strlen (specifiers[i]) == word_len
+				&& !strncmp (cursor, specifiers[i], word_len)) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
 			return syntax;
 		}
-	}
-	for (i = 0; i < R_ARRAY_SIZE (unsigned_specs); i++) {
-		if (!strcmp (spec, unsigned_specs[i])) {
-			syntax.valid = true;
-			syntax.kind = R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER;
-			return syntax;
+		any = true;
+		if (word_len == strlen ("unsigned") && !strncmp (cursor, "unsigned", word_len)) {
+			is_unsigned = true;
 		}
+		if (!(word_len == strlen ("char") && !strncmp (cursor, "char", word_len))) {
+			only_char = false;
+		}
+		cursor = word_end;
 	}
+	// Plain `char` alone has a target-chosen signedness; the caller answers it.
+	if (!any || only_char) {
+		return syntax;
+	}
+	syntax.valid = true;
+	syntax.kind = is_unsigned
+		? R_ANAL_SNAPSHOT_TYPE_UNSIGNED_INTEGER
+		: R_ANAL_SNAPSHOT_TYPE_SIGNED_INTEGER;
 	return syntax;
 }
 static SnapshotTypeGraphResult snapshot_type_integer_spec(
@@ -3203,15 +3323,16 @@ static SnapshotTypeGraphResult snapshot_type_integer_spec(
 				required_bits = syntax.required_bits;
 			}
 		}
-		char *base_name = r_str_sanitize_sdb_key (current);
-		if (!base_name) {
-			free (current);
-			return SNAPSHOT_TYPE_GRAPH_NO_MEMORY;
-		}
+		// A base type is filed under its own spelling: `unsigned int` in the
+		// default database and `long unsigned int` from DWARF both carry
+		// their spaces, and the resolver captured them by that key. Looking
+		// them up under the identifier sanitizer's spelling matched only the
+		// base types that spelling had mis-filed, so every multi-word integer
+		// type -- and every typedef of one -- failed to root and took the
+		// function's type graph with it.
 		bool ambiguous;
 		const RAnalBaseType *base = snapshot_type_find_bare_base (
-			builder, base_name, &ambiguous);
-		free (base_name);
+			builder, current, &ambiguous);
 		if (ambiguous) {
 			break;
 		}
@@ -3437,8 +3558,10 @@ static SnapshotTypeGraphResult snapshot_type_add_struct(
 		}
 		const RAnalSnapshotType *member_type =
 			&builder->graph->types[member_type_id];
+		// A member is an object with a size; an opaque kind has none.
 		if (base_member->bitsize
-			|| base_member->offset > UT64_MAX / 8) {
+			|| base_member->offset > UT64_MAX / 8
+			|| !member_type->size_bits) {
 			return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 		}
 		// An array member repeats its element type. Fold that extent into the
@@ -3489,30 +3612,48 @@ static SnapshotTypeGraphResult snapshot_type_add_pointer(
 	if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
 		return result;
 	}
-	// Split at the last star so the pointee keeps any remaining ones: a
-	// pointer to a pointer is described by describing what it points at, which
-	// is another pointer this function can build. Refusing them left `char **`
-	// unrepresentable, and with it the argv of every main.
-	char *star = strrchr (spec, '*');
-	if (!star || *r_str_trim_head_ro (star + 1)) {
-		free (spec);
-		return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
-	}
-	char *pointee = r_str_trim_ndup (spec, (size_t)(star - spec));
-	free (spec);
-	if (!pointee) {
-		return SNAPSHOT_TYPE_GRAPH_NO_MEMORY;
-	}
 	RAnalSnapshotTypeId target_id;
-	result = snapshot_type_add_integer (builder, pointee, &target_id);
-	if (result == SNAPSHOT_TYPE_GRAPH_UNSUPPORTED) {
-		result = strchr (pointee, '*')
-			? snapshot_type_add_pointer (builder, pointee, &target_id)
-			: snapshot_type_add_struct (builder, pointee, &target_id);
-	}
-	free (pointee);
-	if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
-		return result;
+	if (snapshot_type_spec_is_function_pointer (spec)) {
+		// A function pointer points at code. The signature is not carried:
+		// the graph has no node for it, and a pointer to code without one is
+		// still exactly what the spelling says the value is.
+		free (spec);
+		result = snapshot_type_add_opaque (builder, R_ANAL_SNAPSHOT_TYPE_CODE, &target_id);
+		if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+			return result;
+		}
+	} else {
+		// Split at the last star so the pointee keeps any remaining ones: a
+		// pointer to a pointer is described by describing what it points at,
+		// which is another pointer this function can build. Refusing them left
+		// `char **` unrepresentable, and with it the argv of every main.
+		char *star = strrchr (spec, '*');
+		if (!star || *r_str_trim_head_ro (star + 1)) {
+			free (spec);
+			return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
+		}
+		char *pointee = r_str_trim_ndup (spec, (size_t)(star - spec));
+		free (spec);
+		if (!pointee) {
+			return SNAPSHOT_TYPE_GRAPH_NO_MEMORY;
+		}
+		snapshot_type_strip_qualifiers (pointee);
+		r_str_trim (pointee);
+		if (!strcmp (pointee, "void")) {
+			// `void *` points at an object the graph does not describe.
+			result = snapshot_type_add_opaque (builder, R_ANAL_SNAPSHOT_TYPE_VOID, &target_id);
+		} else {
+			result = snapshot_type_add_integer (builder, pointee, &target_id);
+			if (result == SNAPSHOT_TYPE_GRAPH_UNSUPPORTED) {
+				result = strchr (pointee, '*')
+					? snapshot_type_add_pointer (builder, pointee, &target_id)
+					: snapshot_type_add_struct (builder, pointee, &target_id);
+			}
+		}
+		free (pointee);
+		if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+			return result;
+		}
 	}
 	size_t i;
 	for (i = 0; i < builder->graph->num_types; i++) {
@@ -3540,6 +3681,59 @@ static SnapshotTypeGraphResult snapshot_type_add_pointer(
 	*result_id = snapshot_type->id;
 	return SNAPSHOT_TYPE_GRAPH_VALID;
 }
+/* Where the graph stood before a root was attempted. A root that fails
+ * midway may already have appended a type and a half-built aggregate, and a
+ * graph that keeps them is one the walker refuses to serialize -- which lost
+ * the whole function for one local it could not type. Rolling the counts
+ * back discards exactly what the failed root added: nodes are appended in
+ * order and only ever reference earlier ones. */
+typedef struct {
+	size_t num_types;
+	size_t num_aggregates;
+} SnapshotTypeGraphMark;
+
+static SnapshotTypeGraphMark snapshot_type_graph_mark(const SnapshotTypeGraphBuilder *builder) {
+	SnapshotTypeGraphMark mark = {
+		.num_types = builder->graph->num_types,
+		.num_aggregates = builder->graph->num_aggregates,
+	};
+	return mark;
+}
+
+static void snapshot_type_graph_rollback(SnapshotTypeGraphBuilder *builder, SnapshotTypeGraphMark mark) {
+	RAnalSnapshotTypeGraph *graph = builder->graph;
+	size_t i;
+	for (i = mark.num_aggregates; i < graph->num_aggregates; i++) {
+		RAnalSnapshotAggregateLayout *aggregate = &graph->aggregates[i];
+		size_t j;
+		for (j = 0; j < aggregate->num_members; j++) {
+			free (aggregate->members[j].name);
+		}
+		free (aggregate->members);
+		free (aggregate->name);
+		memset (aggregate, 0, sizeof (*aggregate));
+		if (builder->aggregate_sources) {
+			builder->aggregate_sources[i] = NULL;
+		}
+	}
+	for (i = mark.num_types; i < graph->num_types; i++) {
+		memset (&graph->types[i], 0, sizeof (graph->types[i]));
+	}
+	graph->num_aggregates = mark.num_aggregates;
+	graph->num_types = mark.num_types;
+}
+
+/* Name the spelling a root could not place, and at which stage. Rooting
+ * recurses through pointees and members, so the first report is the innermost
+ * spelling that failed -- the member type, not the struct that holds it. */
+static void snapshot_type_root_report(const char *stage, const char *type, const char *spec, SnapshotTypeGraphResult result) {
+	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		return;
+	}
+	eprintf ("r2sleigh: type root refused: %s: type=%s resolved=%s result=%d\n",
+		stage, r_str_get (type), r_str_get (spec), (int)result);
+}
+
 static SnapshotTypeGraphResult snapshot_type_add_root(
 	SnapshotTypeGraphBuilder *builder, const char *type,
 	RAnalSnapshotTypeId *result_id) {
@@ -3551,18 +3745,28 @@ static SnapshotTypeGraphResult snapshot_type_add_root(
 	char *spec = NULL;
 	result = snapshot_type_unalias (builder, type, &spec);
 	if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+		snapshot_type_root_report ("unalias", type, NULL, result);
 		return result;
 	}
 	const bool pointer = strchr (spec, '*') != NULL;
-	free (spec);
 	if (pointer) {
-		return snapshot_type_add_pointer (builder, type, result_id);
+		result = snapshot_type_add_pointer (builder, type, result_id);
+		if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+			snapshot_type_root_report ("pointer", type, spec, result);
+		}
+		free (spec);
+		return result;
 	}
 	// An aggregate could only enter the graph as something a pointer pointed at,
 	// so a struct held directly -- returned by value, or kept in a frame slot --
 	// contributed no layout at all and a consumer had to invent its width and its
 	// member names from the offsets it saw touched.
-	return snapshot_type_add_struct (builder, type, result_id);
+	result = snapshot_type_add_struct (builder, type, result_id);
+	if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+		snapshot_type_root_report ("struct", type, spec, result);
+	}
+	free (spec);
+	return result;
 }
 static bool snapshot_type_carrier_project(
 	const RAnalSnapshotTypeGraph *graph, RAnalSnapshotTypeId type_id,
@@ -3584,12 +3788,27 @@ static bool snapshot_type_carrier_project(
 	projection->size_bits = type->size_bits;
 	return true;
 }
+/* Name the spelling that kept the type graph from being built. Every
+ * parameter and the return type is a root, one unplaceable root loses the
+ * whole graph, and with it every logical width the consumer would have used;
+ * the consumer only ever sees "type graph absent". */
+static void snapshot_type_graph_report(const char *what, const char *spelling, SnapshotTypeGraphResult result) {
+	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		return;
+	}
+	eprintf ("r2sleigh: type graph refused: %s: type=%s result=%d\n",
+		what, r_str_get (spelling), (int)result);
+}
+
 static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 	RAnal *anal, const RAnalFcnContext *ctx, RAnalFunctionSnapshot *snapshot,
 	const RAnalFunctionSnapshotLimits *limits) {
 	RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
 	function_logical_types_clear (interface);
 	if (!interface->complete || !ctx->signature) {
+		snapshot_type_graph_report (interface->complete
+			? "no signature": "interface incomplete", NULL,
+			SNAPSHOT_TYPE_GRAPH_UNSUPPORTED);
 		return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 	}
 	// Pointer width is the only thing the builder takes from the target: it
@@ -3693,6 +3912,9 @@ static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 			|| !snapshot_type_carrier_project (graph,
 				snapshot_parameter->logical_type_id, &snapshot_parameter->storage,
 				&snapshot_parameter->carrier)) {
+			snapshot_type_graph_report (result == SNAPSHOT_TYPE_GRAPH_VALID
+				? "parameter type does not project onto its carrier"
+				: "parameter type cannot be rooted", parameter->type, result);
 			if (result == SNAPSHOT_TYPE_GRAPH_VALID) {
 				result = SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 			}
@@ -3711,16 +3933,25 @@ static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 			&& !snapshot_type_carrier_project (graph, interface->return_type_id,
 				&interface->return_storage, &interface->return_carrier)) {
 			result = SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
+			snapshot_type_graph_report ("return type does not project onto its carrier",
+				ctx->signature->ret_type, result);
+		} else if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
+			snapshot_type_graph_report ("return type cannot be rooted",
+				ctx->signature->ret_type, result);
 		}
 	} else if (result == SNAPSHOT_TYPE_GRAPH_VALID
 		&& interface->return_kind != R_ANAL_SNAPSHOT_RETURN_VOID) {
 		result = SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 	}
-	// Root what the locals are declared as. A struct a function only ever keeps
-	// in a frame slot reached the graph through nothing, so its layout was absent
-	// and a consumer had to invent both its width and its member names. A slot
-	// whose type does not resolve is left alone rather than failing the graph,
-	// because a local is not what the interface rests on.
+	// Root what the locals are declared as, and hand each slot its node. A
+	// struct a function only ever keeps in a frame slot reached the graph
+	// through nothing, so its layout was absent and a consumer had to invent
+	// both its width and its member names. The node has to be *referenced*
+	// by the slot: the graph's contract is that every type in it is reachable
+	// from the interface, so a type rooted for a local and then forgotten was
+	// an unreachable node that failed the whole interface. A slot whose type
+	// does not resolve keeps no node rather than failing the graph, because a
+	// local is not what the interface rests on.
 	if (result == SNAPSHOT_TYPE_GRAPH_VALID && ctx->fcn_slots) {
 		RListIter *slot_iter;
 		RAnalFcnSlot *slot;
@@ -3728,18 +3959,34 @@ static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 			if (!slot || R_STR_ISEMPTY (slot->type)) {
 				continue;
 			}
-			ut32 slot_type_id = 0;
-			if (snapshot_type_add_root (&builder, slot->type, &slot_type_id)
-					== SNAPSHOT_TYPE_GRAPH_NO_MEMORY) {
+			ut32 slot_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
+			const SnapshotTypeGraphMark mark = snapshot_type_graph_mark (&builder);
+			const SnapshotTypeGraphResult rooted = snapshot_type_add_root (
+				&builder, slot->type, &slot_type_id);
+			if (rooted == SNAPSHOT_TYPE_GRAPH_NO_MEMORY) {
 				result = SNAPSHOT_TYPE_GRAPH_NO_MEMORY;
 				break;
 			}
+			if (rooted != SNAPSHOT_TYPE_GRAPH_VALID) {
+				snapshot_type_graph_rollback (&builder, mark);
+			}
+			slot->logical_type_id = rooted == SNAPSHOT_TYPE_GRAPH_VALID
+				? slot_type_id: R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
 		}
 	}
 	free (aggregate_sources);
 	if (result != SNAPSHOT_TYPE_GRAPH_VALID) {
 		snapshot_type_graph_fini (graph);
 		function_logical_types_clear (interface);
+		if (ctx->fcn_slots) {
+			RListIter *slot_iter;
+			RAnalFcnSlot *slot;
+			r_list_foreach (ctx->fcn_slots, slot_iter, slot) {
+				if (slot) {
+					slot->logical_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
+				}
+			}
+		}
 		return result;
 	}
 	graph->complete = true;

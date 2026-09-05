@@ -6348,14 +6348,49 @@ fn collect_prepared_function_certificates(
             // Only when the base register has exactly one such position. More
             // than one means the register is reused for something else and no
             // single displacement describes it.
-            if slot.base() == StackAddressBase::FramePointer
-                && let Some(base_root) =
-                    unique_stack_root_for_storage(function, slot.base_storage())
-                && let Some(entry_offset) = base_root.offset.checked_add(slot.offset())
-            {
-                let translated = (StackAddressBase::StackPointer, entry_offset);
-                if exact_stack_slots.insert(translated, *slot).is_some() {
-                    ambiguous_stack_slots.insert(translated);
+            //
+            // The restated slot carries the translated coordinate itself, not
+            // only its key: the consumer that binds an object to its declared
+            // slot compares the slot's base and offset against the object's,
+            // and a slot still spelling the frame pointer there never
+            // matched, so every frame-pointer local was refused for want of
+            // an identity it had.
+            if slot.base() == StackAddressBase::FramePointer {
+                let base_root = unique_stack_root_for_storage(function, slot.base_storage());
+                match base_root
+                    .and_then(|root| root.offset.checked_add(slot.offset()))
+                    .zip(interface.stack_pointer_storage())
+                {
+                    Some((entry_offset, stack_pointer)) => {
+                        let translated = (StackAddressBase::StackPointer, entry_offset);
+                        let restated = slot.restated(
+                            StackAddressBase::StackPointer,
+                            stack_pointer,
+                            entry_offset,
+                        );
+                        if exact_stack_slots.insert(translated, restated).is_some() {
+                            r2il::refusal_evidence!(
+                                "stack-slot-translation",
+                                "slot {:?} at frame offset {} translates to entry offset {} already declared",
+                                slot.base_storage(),
+                                slot.offset(),
+                                entry_offset
+                            );
+                            ambiguous_stack_slots.insert(translated);
+                        }
+                    }
+                    None => {
+                        // A declared slot that cannot be restated is a slot
+                        // no object will ever match; the reason is the base
+                        // register's entry-relative position, or its absence.
+                        r2il::refusal_evidence!(
+                            "stack-slot-translation",
+                            "slot {:?} at frame offset {} has no unique entry-relative base: root={:?}",
+                            slot.base_storage(),
+                            slot.offset(),
+                            base_root
+                        );
+                    }
                 }
             }
         }
@@ -11352,10 +11387,19 @@ mod tests {
             Some(4),
             "the prepared certificate must retain the exact source stack-slot width"
         );
+        // The certificate carries the declared slot restated in the coordinate
+        // objects are identified in: the same width and role, at the entry
+        // position the frame pointer's proven offset gives it. A consumer that
+        // binds the object to its declared slot compares base and offset, and
+        // a slot still spelling the frame pointer there never matched.
+        let declared = interface.stack_slots()[0];
+        let stack_pointer = interface
+            .stack_pointer_storage()
+            .expect("the interface names its stack pointer");
         assert_eq!(
             local_certificate.source_slot,
-            interface.stack_slots().first().copied(),
-            "the prepared certificate must retain the complete exact source stack-slot identity"
+            Some(declared.restated(StackAddressBase::StackPointer, stack_pointer, -16)),
+            "the prepared certificate must retain the declared slot's width and role at its entry position"
         );
         // Each has the width its own accesses give it, and they differ. The
         // concern this replaces was that a resource could borrow a width from

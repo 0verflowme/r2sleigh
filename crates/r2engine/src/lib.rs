@@ -1868,8 +1868,11 @@ fn source_member_type_spelling(
         r2ssa::SourceTypeKind::SignedInteger => format!("int{bits}_t"),
         r2ssa::SourceTypeKind::UnsignedInteger => format!("uint{bits}_t"),
         r2ssa::SourceTypeKind::Pointer { .. } => "void *".to_string(),
-        // An inline struct member has no scalar width to check an access against.
-        r2ssa::SourceTypeKind::Struct { .. } => return None,
+        // An inline struct member has no scalar width to check an access against,
+        // and an opaque kind is never a member at all.
+        r2ssa::SourceTypeKind::Struct { .. }
+        | r2ssa::SourceTypeKind::Void
+        | r2ssa::SourceTypeKind::Code => return None,
     };
     // A member wider than one element repeats it. The capture states the repeat
     // count, but the Rust contract for a member does not carry it, so the
