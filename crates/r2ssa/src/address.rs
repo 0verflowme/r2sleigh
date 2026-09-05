@@ -30,14 +30,129 @@ pub struct ParameterAddressExpression {
     pub offset: i64,
 }
 
+/// One dereference on the way from a parameter to a pointee base.
+///
+/// `offset` is where the pointer was read from inside the object the step
+/// starts in, and `size` is the width of that read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PointeeStep {
+    pub offset: i64,
+    pub size: u32,
+}
+
+/// An address relative to memory reached *through* a parameter.
+///
+/// `*(arg0 + 0x38)` is a pointer the function loaded, and `*(that + 0)` is an
+/// address inside whatever it points to. Before this existed such an address
+/// had no provenance at all: the loaded value is a fresh unknown, so every
+/// access through it fell into the escaped-unknown object, and any analysis
+/// that wanted to summarize it had to ask a solver to enumerate concrete
+/// addresses for a pointer it had already been handed by name. The path is the
+/// identity: the same parameter and the same sequence of loads reach the same
+/// object, and two different paths are two objects that may alias.
+///
+/// A path is finite by construction. Each step is a distinct load on a
+/// definition chain, and a phi only carries an expression its sources agree
+/// on, so a loop that walks `p = p->next` produces no expression rather than an
+/// unbounded one. The collector still bounds the length by the number of loads
+/// in the function, which is the most steps any chain can have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PointeeAddressExpression {
+    /// The parameter the chain starts from.
+    pub root: usize,
+    pub root_storage: Option<CanonicalStorageId>,
+    /// The loads taken from the parameter to the pointee base, in order.
+    pub path: Vec<PointeeStep>,
+    pub terms: Vec<AffineAddressTerm>,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddressProvenanceFacts {
     pub parameter_expressions: BTreeMap<ValueId, ParameterAddressExpression>,
+    /// Addresses reached through at least one load from a parameter. Kept
+    /// apart from `parameter_expressions` so that everything reading the
+    /// latter keeps its meaning: a parameter expression is directly
+    /// parameter-relative, a pointee expression never is.
+    pub pointee_expressions: BTreeMap<ValueId, PointeeAddressExpression>,
 }
 
 impl AddressProvenanceFacts {
     pub fn parameter_expression(&self, value: ValueId) -> Option<&ParameterAddressExpression> {
         self.parameter_expressions.get(&value)
+    }
+
+    pub fn pointee_expression(&self, value: ValueId) -> Option<&PointeeAddressExpression> {
+        self.pointee_expressions.get(&value)
+    }
+}
+
+/// What an address is relative to, inside the collector.
+///
+/// One affine mechanism serves both bases; only the public view splits them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddressBase {
+    Parameter {
+        index: usize,
+        storage: Option<CanonicalStorageId>,
+    },
+    Pointee {
+        root: usize,
+        root_storage: Option<CanonicalStorageId>,
+        path: Vec<PointeeStep>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddressExpression {
+    base: AddressBase,
+    terms: Vec<AffineAddressTerm>,
+    offset: i64,
+}
+
+impl AddressExpression {
+    /// The address one load further along: the value read at this address,
+    /// treated as a pointer, at offset zero inside what it points to.
+    fn dereferenced(&self, size: u32) -> Option<Self> {
+        if !self.terms.is_empty() {
+            return None;
+        }
+        let step = PointeeStep {
+            offset: self.offset,
+            size,
+        };
+        let base = match &self.base {
+            AddressBase::Parameter { index, storage } => AddressBase::Pointee {
+                root: *index,
+                root_storage: *storage,
+                path: vec![step],
+            },
+            AddressBase::Pointee {
+                root,
+                root_storage,
+                path,
+            } => {
+                let mut path = path.clone();
+                path.push(step);
+                AddressBase::Pointee {
+                    root: *root,
+                    root_storage: *root_storage,
+                    path,
+                }
+            }
+        };
+        Some(Self {
+            base,
+            terms: Vec::new(),
+            offset: 0,
+        })
+    }
+
+    fn path_len(&self) -> usize {
+        match &self.base {
+            AddressBase::Parameter { .. } => 0,
+            AddressBase::Pointee { path, .. } => path.len(),
+        }
     }
 }
 
@@ -119,11 +234,14 @@ struct AddressCollector<'a> {
     function: &'a SSAFunction,
     graph: &'a SsaGraph,
     definitions: HashMap<SSAVar, SSAOp>,
-    expressions: BTreeMap<ValueId, ParameterAddressExpression>,
+    expressions: BTreeMap<ValueId, AddressExpression>,
     scalar_memo: HashMap<ValueId, Option<AffineScalar>>,
     scalar_visiting: HashSet<ValueId>,
-    stack_in: BTreeMap<u64, BTreeMap<SpillSlotKey, ParameterAddressExpression>>,
-    stack_out: BTreeMap<u64, BTreeMap<SpillSlotKey, ParameterAddressExpression>>,
+    stack_in: BTreeMap<u64, BTreeMap<SpillSlotKey, AddressExpression>>,
+    stack_out: BTreeMap<u64, BTreeMap<SpillSlotKey, AddressExpression>>,
+    /// The number of loads in the function: the most dereferences any chain
+    /// can take, and so the bound on a pointee path.
+    load_count: usize,
 }
 
 impl<'a> AddressCollector<'a> {
@@ -143,11 +261,13 @@ impl<'a> AddressCollector<'a> {
                 if let Some(value) = graph.value_id_for_var(var) {
                     expressions.insert(
                         value,
-                        ParameterAddressExpression {
-                            parameter: *parameter,
-                            parameter_storage: graph
-                                .value(value)
-                                .and_then(|value| value.canonical_storage),
+                        AddressExpression {
+                            base: AddressBase::Parameter {
+                                index: *parameter,
+                                storage: graph
+                                    .value(value)
+                                    .and_then(|value| value.canonical_storage),
+                            },
                             terms: Vec::new(),
                             offset: 0,
                         },
@@ -155,6 +275,16 @@ impl<'a> AddressCollector<'a> {
                 }
             }
         }
+        let load_count = function
+            .blocks()
+            .flat_map(|block| block.ops.iter())
+            .filter(|op| {
+                matches!(
+                    op,
+                    SSAOp::Load { .. } | SSAOp::LoadLinked { .. } | SSAOp::LoadGuarded { .. }
+                )
+            })
+            .count();
         Self {
             function,
             graph,
@@ -164,6 +294,7 @@ impl<'a> AddressCollector<'a> {
             scalar_visiting: HashSet::new(),
             stack_in: BTreeMap::new(),
             stack_out: BTreeMap::new(),
+            load_count,
         }
     }
 
@@ -195,15 +326,45 @@ impl<'a> AddressCollector<'a> {
                 }
             }
         }
-        AddressProvenanceFacts {
-            parameter_expressions: self.expressions,
+        let mut facts = AddressProvenanceFacts::default();
+        for (value, expression) in self.expressions {
+            match expression.base {
+                AddressBase::Parameter { index, storage } => {
+                    facts.parameter_expressions.insert(
+                        value,
+                        ParameterAddressExpression {
+                            parameter: index,
+                            parameter_storage: storage,
+                            terms: expression.terms,
+                            offset: expression.offset,
+                        },
+                    );
+                }
+                AddressBase::Pointee {
+                    root,
+                    root_storage,
+                    path,
+                } => {
+                    facts.pointee_expressions.insert(
+                        value,
+                        PointeeAddressExpression {
+                            root,
+                            root_storage,
+                            path,
+                            terms: expression.terms,
+                            offset: expression.offset,
+                        },
+                    );
+                }
+            }
         }
+        facts
     }
 
     fn merge_predecessor_stack(
         &self,
         block_addr: u64,
-    ) -> BTreeMap<SpillSlotKey, ParameterAddressExpression> {
+    ) -> BTreeMap<SpillSlotKey, AddressExpression> {
         let predecessors = self.function.predecessors(block_addr);
         let known = predecessors
             .iter()
@@ -227,8 +388,8 @@ impl<'a> AddressCollector<'a> {
     fn transfer_block(
         &mut self,
         block_addr: u64,
-        mut stack: BTreeMap<SpillSlotKey, ParameterAddressExpression>,
-    ) -> (BTreeMap<SpillSlotKey, ParameterAddressExpression>, bool) {
+        mut stack: BTreeMap<SpillSlotKey, AddressExpression>,
+    ) -> (BTreeMap<SpillSlotKey, AddressExpression>, bool) {
         let Some(block) = self.function.get_block(block_addr) else {
             return (stack, false);
         };
@@ -284,6 +445,15 @@ impl<'a> AddressCollector<'a> {
                             .cloned()
                     }) {
                         changed |= self.insert_expression(dst, expression);
+                    } else if *space == SpaceId::Ram
+                        && let Some(expression) = self.expression_for_var(addr)
+                        && expression.path_len() < self.load_count
+                        && let Some(pointee) = expression.dereferenced(dst.size)
+                    {
+                        // The value read at a known address, taken as a
+                        // pointer: its own address is one step further along
+                        // the chain from the parameter.
+                        changed |= self.insert_expression(dst, pointee);
                     }
                 }
                 _ => {}
@@ -298,7 +468,7 @@ impl<'a> AddressCollector<'a> {
     fn derive_op_expression<'b>(
         &mut self,
         op: &'b SSAOp,
-    ) -> Option<(&'b SSAVar, ParameterAddressExpression)> {
+    ) -> Option<(&'b SSAVar, AddressExpression)> {
         match op {
             SSAOp::Copy { dst, src }
             | SSAOp::Cast { dst, src }
@@ -345,7 +515,7 @@ impl<'a> AddressCollector<'a> {
         right: &SSAVar,
         right_sign: i128,
         right_scale: i128,
-    ) -> Option<ParameterAddressExpression> {
+    ) -> Option<AddressExpression> {
         let left_base = self.expression_for_var(left);
         let right_base = self.expression_for_var(right);
         if left_base.is_some() && right_base.is_some() {
@@ -366,12 +536,12 @@ impl<'a> AddressCollector<'a> {
         None
     }
 
-    fn expression_for_var(&self, var: &SSAVar) -> Option<ParameterAddressExpression> {
+    fn expression_for_var(&self, var: &SSAVar) -> Option<AddressExpression> {
         let value = self.graph.value_id_for_var(var)?;
         self.expressions.get(&value).cloned()
     }
 
-    fn insert_expression(&mut self, var: &SSAVar, expression: ParameterAddressExpression) -> bool {
+    fn insert_expression(&mut self, var: &SSAVar, expression: AddressExpression) -> bool {
         let Some(value) = self.graph.value_id_for_var(var) else {
             return false;
         };
@@ -459,10 +629,7 @@ impl<'a> AddressCollector<'a> {
     }
 }
 
-fn add_delta(
-    mut base: ParameterAddressExpression,
-    delta: AffineScalar,
-) -> Option<ParameterAddressExpression> {
+fn add_delta(mut base: AddressExpression, delta: AffineScalar) -> Option<AddressExpression> {
     let mut terms = base
         .terms
         .drain(..)
@@ -515,9 +682,9 @@ mod tests {
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, ObjectKind, RelativeMemoryAddress, SSAOp,
-        SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn, SourceStackSlotSpec,
-        SsaArtifact, StackAddressBase,
+        CanonicalStorageId, CanonicalStorageSpace, ObjectKind, PointeeStep, RelativeMemoryAddress,
+        SSAOp, SourceAbiParameterSpec, SourceFunctionInterface, SourceFunctionReturn,
+        SourceStackSlotSpec, SsaArtifact, StackAddressBase,
     };
 
     fn aarch64_two_arg_arch() -> ArchSpec {
@@ -601,6 +768,108 @@ mod tests {
                 .parameter_expression(value.id)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_pointer_loaded_from_a_parameter_gets_a_pointee_expression() {
+        let arch = aarch64_two_arg_arch();
+        let interface = exact_parameter_interface(b"pointee-provenance", 1);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(0x38, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x20, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x30, 8),
+            a: Varnode::unique(0x20, 8),
+            b: Varnode::constant(0x10, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x40, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x30, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic_with_interface(&[block], Some(&arch), interface)
+            .expect("artifact");
+        let value = |name: &str| {
+            artifact
+                .graph()
+                .values
+                .iter()
+                .find(|value| value.var.name == name)
+                .map(|value| value.id)
+                .expect(name)
+        };
+        // The address x0 + 0x38 is directly parameter-relative, as before.
+        let first_address = artifact
+            .addresses()
+            .parameter_expression(value("tmp:10"))
+            .expect("parameter expression");
+        assert_eq!((first_address.parameter, first_address.offset), (0, 0x38));
+        assert!(
+            artifact
+                .addresses()
+                .pointee_expression(value("tmp:10"))
+                .is_none()
+        );
+        // The value loaded there is a pointer into a pointee object, and is
+        // deliberately not a parameter expression: everything reading those
+        // keeps its meaning.
+        assert!(
+            artifact
+                .addresses()
+                .parameter_expression(value("tmp:20"))
+                .is_none()
+        );
+        let loaded = artifact
+            .addresses()
+            .pointee_expression(value("tmp:20"))
+            .expect("pointee expression for the loaded pointer");
+        assert_eq!(loaded.root, 0);
+        assert_eq!(
+            loaded.path,
+            vec![PointeeStep {
+                offset: 0x38,
+                size: 8
+            }]
+        );
+        assert_eq!(loaded.offset, 0);
+        // Arithmetic on it stays inside the same object.
+        let inner = artifact
+            .addresses()
+            .pointee_expression(value("tmp:30"))
+            .expect("offset pointee expression");
+        assert_eq!(inner.path, loaded.path);
+        assert_eq!(inner.offset, 0x10);
+        // And a second load is one step further along the chain.
+        let second = artifact
+            .addresses()
+            .pointee_expression(value("tmp:40"))
+            .expect("second-level pointee expression");
+        assert_eq!(second.path.len(), 2);
+        assert_eq!(
+            second.path[1],
+            PointeeStep {
+                offset: 0x10,
+                size: 8
+            }
+        );
+        // The object model names the chain.
+        let object = artifact
+            .objects()
+            .object_for_value(value("tmp:30"), SpaceId::Ram)
+            .expect("pointee object");
+        assert_eq!(
+            artifact.objects().access_path(object).as_deref(),
+            Some("*(arg0 + 0x38)")
+        );
+        assert_eq!(artifact.objects().root_parameter(object), Some(0));
     }
 
     #[test]

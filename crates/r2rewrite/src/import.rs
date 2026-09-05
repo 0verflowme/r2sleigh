@@ -926,7 +926,8 @@ impl Importer<'_> {
             ObjectKind::Global { address, .. } => ObjectPlacement::Global(address),
             ObjectKind::Parameter { .. }
             | ObjectKind::HeapAlloc { .. }
-            | ObjectKind::EscapedUnknown { .. } => return,
+            | ObjectKind::EscapedUnknown { .. }
+            | ObjectKind::Pointee { .. } => return,
         };
         self.arena.place_object(object, placement);
     }

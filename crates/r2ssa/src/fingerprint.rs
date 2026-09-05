@@ -483,6 +483,12 @@ enum CanonicalObjectKindKey {
     EscapedUnknown {
         space: (u8, u32),
     },
+    Pointee {
+        space: (u8, u32),
+        base: Box<CanonicalObjectKindKey>,
+        offset: i64,
+        size: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -541,6 +547,29 @@ fn canonical_object_kind_key(
         ObjectKind::EscapedUnknown { space } => CanonicalObjectKindKey::EscapedUnknown {
             space: space_key(*space),
         },
+        ObjectKind::Pointee {
+            space,
+            base,
+            offset,
+            size,
+        } => {
+            // The base is an object too, so its key is this same function on
+            // it; a chain that does not resolve is keyed as escaped rather
+            // than dropped, so the fingerprint stays total.
+            let base_key = artifact
+                .objects()
+                .object(*base)
+                .map(|fact| canonical_object_kind_key(artifact, &fact.kind, inst_ids))
+                .unwrap_or(CanonicalObjectKindKey::EscapedUnknown {
+                    space: space_key(*space),
+                });
+            CanonicalObjectKindKey::Pointee {
+                space: space_key(*space),
+                base: Box::new(base_key),
+                offset: *offset,
+                size: *size,
+            }
+        }
     }
 }
 
@@ -642,6 +671,19 @@ fn hash_object_kind(writer: &mut FingerprintWriter, kind: &CanonicalObjectKindKe
             writer.tag(6);
             writer.tag(u16::from(space.0));
             writer.u32(space.1);
+        }
+        CanonicalObjectKindKey::Pointee {
+            space,
+            base,
+            offset,
+            size,
+        } => {
+            writer.tag(7);
+            writer.tag(u16::from(space.0));
+            writer.u32(space.1);
+            hash_object_kind(writer, base);
+            writer.i64(*offset);
+            writer.u32(*size);
         }
     }
 }

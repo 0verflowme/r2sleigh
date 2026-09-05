@@ -289,6 +289,7 @@ fn vm_memory_condition_info_from_sym(
                 crate::MemoryRegionKind::Heap => "heap",
                 crate::MemoryRegionKind::Replay => "replay",
                 crate::MemoryRegionKind::EscapedUnknown => "unknown",
+                crate::MemoryRegionKind::Pointee => "pointee",
             },
             condition.region.name,
             condition.region.id

@@ -249,6 +249,21 @@ pub enum ObjectKind {
     EscapedUnknown {
         space: SpaceId,
     },
+    /// The memory a pointer read from `base` at `offset` points to.
+    ///
+    /// `*(arg0 + 0x38)` is a pointer this function loaded; the object here is
+    /// whatever it points at, and an access through it is at some offset
+    /// inside this object. Before this kind existed every such access fell
+    /// into `EscapedUnknown`, so a function that walked `strm->state->strm`
+    /// had no name for either dereference. The base is itself an object --
+    /// a parameter or another pointee -- so the identity is the whole access
+    /// path from the parameter, and two different paths are two objects.
+    Pointee {
+        space: SpaceId,
+        base: ObjectId,
+        offset: i64,
+        size: u32,
+    },
 }
 
 impl ObjectKind {
@@ -259,9 +274,20 @@ impl ObjectKind {
             | Self::Parameter { space, .. }
             | Self::Global { space, .. }
             | Self::HeapAlloc { space, .. }
-            | Self::EscapedUnknown { space } => *space,
+            | Self::EscapedUnknown { space }
+            | Self::Pointee { space, .. } => *space,
         }
     }
+}
+
+/// The identity of a pointee object: the object the pointer was read from,
+/// and where inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PointeeObjectKey {
+    pub base: ObjectId,
+    pub offset: i64,
+    pub size: u32,
+    pub space: ObjectSpaceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +308,7 @@ pub struct ObjectModel {
     /// Alias refinement is disabled when this source fact is unavailable.
     pub address_bits_by_space: BTreeMap<ObjectSpaceId, u32>,
     pub parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
+    pub pointee_objects: BTreeMap<PointeeObjectKey, ObjectId>,
     pub global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     pub escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
     /// Addresses that reach their object at an offset the machine computes.
@@ -327,6 +354,41 @@ impl ObjectModel {
 
     pub fn escaped_unknown_object(&self, space: SpaceId) -> Option<ObjectId> {
         self.escaped_unknown.get(&ObjectSpaceId(space)).copied()
+    }
+
+    /// The parameter a chain of pointee objects starts from, if it starts
+    /// from one.
+    pub fn root_parameter(&self, id: ObjectId) -> Option<usize> {
+        let mut current = id;
+        // A chain is acyclic by construction and no longer than the object
+        // table; the bound only guards against a corrupt model.
+        for _ in 0..=self.objects.len() {
+            match &self.object(current)?.kind {
+                ObjectKind::Parameter { index, .. } => return Some(*index),
+                ObjectKind::Pointee { base, .. } => current = *base,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// How an object reads as a C access path: `arg0`, `*(arg0 + 0x38)`,
+    /// `*(*(arg0 + 0x38) + 0x0)`. Only parameters and pointees have one.
+    pub fn access_path(&self, id: ObjectId) -> Option<String> {
+        match &self.object(id)?.kind {
+            ObjectKind::Parameter { index, .. } => Some(format!("arg{index}")),
+            ObjectKind::Pointee { base, offset, .. } => {
+                let base = self.access_path(*base)?;
+                Some(if *offset == 0 {
+                    format!("*{base}")
+                } else if *offset > 0 {
+                    format!("*({base} + 0x{offset:x})")
+                } else {
+                    format!("*({base} - 0x{:x})", offset.unsigned_abs())
+                })
+            }
+            _ => None,
+        }
     }
 
     pub fn memory_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
@@ -1986,6 +2048,7 @@ struct ObjectModelBuilder<'a> {
     ambiguous_entry_stack_objects: BTreeSet<ObjectId>,
     address_bits_by_space: BTreeMap<ObjectSpaceId, u32>,
     parameter_objects: BTreeMap<ParameterObjectKey, ObjectId>,
+    pointee_objects: BTreeMap<PointeeObjectKey, ObjectId>,
     global_objects: BTreeMap<GlobalObjectKey, ObjectId>,
     escaped_unknown: BTreeMap<ObjectSpaceId, ObjectId>,
     next_object_id: u32,
@@ -2033,6 +2096,7 @@ impl<'a> ObjectModelBuilder<'a> {
             ambiguous_entry_stack_objects: BTreeSet::new(),
             address_bits_by_space,
             parameter_objects: BTreeMap::new(),
+            pointee_objects: BTreeMap::new(),
             global_objects: BTreeMap::new(),
             escaped_unknown,
             next_object_id: 1,
@@ -2057,9 +2121,26 @@ impl<'a> ObjectModelBuilder<'a> {
             .parameter_expressions
             .values()
             .map(|expression| expression.parameter)
+            .chain(
+                self.addresses
+                    .pointee_expressions
+                    .values()
+                    .map(|expression| expression.root),
+            )
             .collect::<BTreeSet<_>>();
         for parameter in parameter_indices {
             self.ensure_parameter_object(parameter);
+        }
+        // Seeded in path order so an object's id does not depend on which
+        // access happened to be classified first.
+        let pointee_chains = self
+            .addresses
+            .pointee_expressions
+            .values()
+            .map(|expression| (expression.root, expression.path.clone()))
+            .collect::<BTreeSet<_>>();
+        for (root, path) in pointee_chains {
+            self.ensure_pointee_chain(root, &path);
         }
 
         for block in function.blocks() {
@@ -2087,6 +2168,7 @@ impl<'a> ObjectModelBuilder<'a> {
             entry_stack_roots: self.entry_stack_roots,
             address_bits_by_space: self.address_bits_by_space,
             parameter_objects: self.parameter_objects,
+            pointee_objects: self.pointee_objects,
             global_objects: self.global_objects,
             escaped_unknown: self.escaped_unknown,
         }
@@ -2129,6 +2211,8 @@ impl<'a> ObjectModelBuilder<'a> {
                 self.ensure_stack_object(root)
             } else if let Some(expression) = self.addresses.parameter_expression(value_id) {
                 self.ensure_parameter_object(expression.parameter)
+            } else if let Some(expression) = self.addresses.pointee_expression(value_id) {
+                self.ensure_pointee_chain(expression.root, &expression.path)
             } else if let Some(address) = resolve_const_value(self.facts, value) {
                 self.ensure_global_object(GlobalObjectKey { space, address })
             } else {
@@ -2251,6 +2335,40 @@ impl<'a> ObjectModelBuilder<'a> {
         );
         self.parameter_objects.insert(key, id);
         id
+    }
+
+    /// The object at the end of a chain of loads from a parameter, creating
+    /// every object along the way. Same path, same objects.
+    fn ensure_pointee_chain(&mut self, root: usize, path: &[crate::PointeeStep]) -> ObjectId {
+        let mut current = self.ensure_parameter_object(root);
+        for step in path {
+            let key = PointeeObjectKey {
+                base: current,
+                offset: step.offset,
+                size: step.size,
+                space: ObjectSpaceId(SpaceId::Ram),
+            };
+            current = if let Some(object) = self.pointee_objects.get(&key).copied() {
+                object
+            } else {
+                let id = self.alloc_object_id();
+                self.objects.insert(
+                    id,
+                    ObjectFact {
+                        id,
+                        kind: ObjectKind::Pointee {
+                            space: SpaceId::Ram,
+                            base: current,
+                            offset: step.offset,
+                            size: step.size,
+                        },
+                    },
+                );
+                self.pointee_objects.insert(key, id);
+                id
+            };
+        }
+        current
     }
 
     fn ensure_escaped_unknown(&mut self, space: SpaceId) -> ObjectId {
@@ -2678,6 +2796,18 @@ pub(crate) fn memory_locations_may_alias(
             ObjectKind::Parameter { .. },
         ) => false,
         (ObjectKind::Parameter { .. }, _) | (_, ObjectKind::Parameter { .. }) => true,
+        // Memory reached through a parameter is not the frame, for the same
+        // reason the parameter's own memory is not; against anything else it
+        // may alias, because nothing here proves two pointers distinct.
+        (
+            ObjectKind::Pointee { .. },
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+        )
+        | (
+            ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. },
+            ObjectKind::Pointee { .. },
+        ) => false,
+        (ObjectKind::Pointee { .. }, _) | (_, ObjectKind::Pointee { .. }) => true,
         (
             ObjectKind::Global {
                 space: left_space,
@@ -4888,7 +5018,8 @@ fn collect_callee_stack_allocation_certificates(
             ObjectKind::Parameter { .. }
             | ObjectKind::Global { .. }
             | ObjectKind::HeapAlloc { .. }
-            | ObjectKind::EscapedUnknown { .. } => continue,
+            | ObjectKind::EscapedUnknown { .. }
+            | ObjectKind::Pointee { .. } => continue,
         };
         if space != SpaceId::Ram || exact_stack_slots.contains_key(&(base, offset)) {
             continue;
@@ -5015,7 +5146,8 @@ fn collect_callee_stack_allocation_certificates(
                 ObjectKind::Parameter { .. }
                 | ObjectKind::Global { .. }
                 | ObjectKind::HeapAlloc { .. }
-                | ObjectKind::EscapedUnknown { .. } => None,
+                | ObjectKind::EscapedUnknown { .. }
+                | ObjectKind::Pointee { .. } => None,
             };
             other_size.is_some_and(|other_size| {
                 checked_ranges_overlap(
@@ -6407,7 +6539,8 @@ fn collect_prepared_function_certificates(
             | ObjectKind::Global { .. }
             | ObjectKind::Parameter { .. }
             | ObjectKind::HeapAlloc { .. }
-            | ObjectKind::EscapedUnknown { .. } => None,
+            | ObjectKind::EscapedUnknown { .. }
+            | ObjectKind::Pointee { .. } => None,
         })
         .collect();
 
@@ -10258,12 +10391,12 @@ fn memory_location_for_addr(
     space: SpaceId,
     size: u32,
 ) -> MemoryLocation {
+    let value_id = graph.value_id_for_var(addr);
     let parameter_expression = (space == SpaceId::Ram)
-        .then(|| {
-            graph
-                .value_id_for_var(addr)
-                .and_then(|value| addresses.parameter_expression(value))
-        })
+        .then(|| value_id.and_then(|value| addresses.parameter_expression(value)))
+        .flatten();
+    let pointee_expression = (space == SpaceId::Ram)
+        .then(|| value_id.and_then(|value| addresses.pointee_expression(value)))
         .flatten();
     let object = object_model
         .object_for_var(graph, addr, space)
@@ -10288,29 +10421,35 @@ fn memory_location_for_addr(
     MemoryLocation {
         space,
         object,
-        address: parameter_expression.map_or_else(
-            || {
-                if matches!(
-                    object_model.object(object).map(|fact| &fact.kind),
-                    Some(ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. })
-                        | Some(ObjectKind::Global { .. })
-                ) {
-                    RelativeMemoryAddress::Exact(0)
-                } else {
-                    RelativeMemoryAddress::Unknown
-                }
-            },
-            |expression| {
-                if expression.terms.is_empty() {
-                    RelativeMemoryAddress::Exact(expression.offset)
-                } else {
-                    RelativeMemoryAddress::Affine {
-                        terms: expression.terms.clone(),
-                        offset: expression.offset,
+        address: parameter_expression
+            .map(|expression| (expression.terms.as_slice(), expression.offset))
+            .or_else(|| {
+                pointee_expression
+                    .map(|expression| (expression.terms.as_slice(), expression.offset))
+            })
+            .map_or_else(
+                || {
+                    if matches!(
+                        object_model.object(object).map(|fact| &fact.kind),
+                        Some(ObjectKind::StackSlot { .. } | ObjectKind::FrameObject { .. })
+                            | Some(ObjectKind::Global { .. })
+                    ) {
+                        RelativeMemoryAddress::Exact(0)
+                    } else {
+                        RelativeMemoryAddress::Unknown
                     }
-                }
-            },
-        ),
+                },
+                |(terms, offset)| {
+                    if terms.is_empty() {
+                        RelativeMemoryAddress::Exact(offset)
+                    } else {
+                        RelativeMemoryAddress::Affine {
+                            terms: terms.to_vec(),
+                            offset,
+                        }
+                    }
+                },
+            ),
         size,
     }
 }

@@ -26,6 +26,10 @@ pub enum MemoryRegionKind {
     Heap,
     Replay,
     EscapedUnknown,
+    /// Memory reached by dereferencing a pointer that was itself read from a
+    /// parameter's memory: `*(arg0 + 0x38)` and what lies beyond it. Its
+    /// identity is the access path, which r2ssa models as a pointee object.
+    Pointee,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,7 +938,7 @@ fn compare_region_specificity<'ctx>(
     fn kind_rank(kind: &MemoryRegionKind) -> u8 {
         match kind {
             MemoryRegionKind::Replay => 0,
-            MemoryRegionKind::Input => 1,
+            MemoryRegionKind::Input | MemoryRegionKind::Pointee => 1,
             MemoryRegionKind::Global => 2,
             MemoryRegionKind::Heap => 3,
             MemoryRegionKind::Stack => 4,

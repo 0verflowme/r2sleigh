@@ -4177,9 +4177,9 @@ pub fn machine_address_provenance(
             ObjectKind::Global { address, .. } => {
                 MachineAddressProvenance::Global { address: *address }
             }
-            ObjectKind::HeapAlloc { .. } | ObjectKind::EscapedUnknown { .. } => {
-                MachineAddressProvenance::Unknown
-            }
+            ObjectKind::HeapAlloc { .. }
+            | ObjectKind::EscapedUnknown { .. }
+            | ObjectKind::Pointee { .. } => MachineAddressProvenance::Unknown,
         })
         .unwrap_or(MachineAddressProvenance::Unknown)
 }

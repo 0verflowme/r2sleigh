@@ -55,7 +55,10 @@ pub mod taint;
 pub(crate) mod var;
 
 pub use abi::AbiProfile;
-pub use address::{AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression};
+pub use address::{
+    AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression,
+    PointeeAddressExpression, PointeeStep,
+};
 pub use aggregate_access::{
     AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION, AggregateAccessBinding, AggregateAccessProjection,
     AggregateAccessProjectionFacts, AggregateElementIndexProjection,

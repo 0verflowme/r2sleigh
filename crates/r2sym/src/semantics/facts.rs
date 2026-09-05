@@ -1234,6 +1234,108 @@ mod tests {
     }
 
     #[test]
+    fn branch_through_a_loaded_pointer_compiles_exactly_on_a_pointee_region() {
+        // `if (*(*(x0 + 0x38) + 0) == 0x41)`: the pointer is loaded from the
+        // parameter's memory and dereferenced again. Before pointee objects
+        // existed the second load had no structural location, the backward
+        // condition was ResidualSearchRequired, and only a forward search
+        // could answer -- fifteen minutes on zlib's inflateStateCheck.
+        let mut arch = ArchSpec::new("aarch64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("x0", 0x00, 8));
+        let interface = SourceFunctionInterface::new_exact(
+            b"pointee-branch-v1".to_vec(),
+            "aarch64",
+            [SourceAbiParameterSpec::new(0, register_storage(0x00, 8))],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact untyped x0 parameter interface");
+
+        let mut branch = r2il::R2ILBlock::new(0x1000, 4);
+        branch.push(r2il::R2ILOp::IntAdd {
+            dst: Varnode::unique(0x10, 8),
+            a: Varnode::register(0x00, 8),
+            b: Varnode::constant(0x38, 8),
+        });
+        branch.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0x20, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x10, 8),
+        });
+        branch.push(r2il::R2ILOp::Load {
+            dst: Varnode::unique(0x30, 1),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x20, 8),
+        });
+        branch.push(r2il::R2ILOp::IntEqual {
+            dst: Varnode::unique(0x40, 1),
+            a: Varnode::unique(0x30, 1),
+            b: Varnode::constant(0x41, 1),
+        });
+        branch.push(r2il::R2ILOp::CBranch {
+            target: Varnode::constant(0x1010, 8),
+            cond: Varnode::unique(0x40, 1),
+        });
+        let mut false_exit = r2il::R2ILBlock::new(0x1004, 4);
+        false_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let mut true_exit = r2il::R2ILBlock::new(0x1010, 4);
+        true_exit.push(r2il::R2ILOp::Return {
+            target: Varnode::constant(1, 8),
+        });
+        let artifact = SsaArtifact::for_symbolic_with_interface(
+            &[branch, false_exit, true_exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("pointee branch fixture should build SSA");
+        let ctx = Context::thread_local();
+
+        let (observations, diagnostics) = collect_branch_observations_for_branch_blocks(
+            &ctx,
+            &artifact,
+            &arch,
+            &[(0x1000, 0x1010, 0x1004)],
+            ForwardSearch::Skip,
+            &SymExecutionControl::default(),
+            |_| {},
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(diagnostics.branches_unknown, 0, "{observations:#?}");
+        let compiled = observations[0]
+            .true_compiled
+            .as_ref()
+            .expect("compiled pointee branch");
+        assert_eq!(
+            compiled.precision,
+            BackwardConditionPrecision::Exact,
+            "{compiled:#?}"
+        );
+        assert_eq!(compiled.backward_memory_residual_fallbacks, 0);
+        let pointee = compiled
+            .memory_terms
+            .iter()
+            .find(|term| {
+                matches!(
+                    &term.region,
+                    crate::BackwardMemoryRegion::Region(region)
+                        if region.kind == crate::MemoryRegionKind::Pointee
+                )
+            })
+            .expect("a memory term on the pointee region");
+        let crate::BackwardMemoryRegion::Region(region) = &pointee.region else {
+            unreachable!();
+        };
+        assert_eq!(region.root_parameter, Some(0));
+        assert_eq!(region.name, "*(arg0 + 0x38)");
+        assert_eq!(pointee.address.offset_lo(), 0);
+        assert!(pointee.address.is_exact_offset());
+    }
+
+    #[test]
     fn disjoint_affine_parameter_store_preserves_exact_branch_input() {
         let (arch, interface) = exact_affine_aarch64_fixture();
 

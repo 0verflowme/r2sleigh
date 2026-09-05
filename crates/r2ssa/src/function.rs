@@ -2476,7 +2476,7 @@ impl SSAFunction {
         }
 
         // Build CFG
-        let cfg = CFG::from_blocks(blocks).ok_or(malformed_ssa_input())?;
+        let cfg = CFG::from_blocks(blocks).ok_or_else(malformed_ssa_input)?;
         control.poll()?;
         let entry = cfg.entry;
 
@@ -2514,7 +2514,7 @@ impl SSAFunction {
         let mut ssa_blocks = HashMap::new();
         for &addr in &renamed.block_order {
             control.poll()?;
-            let cfg_block = cfg.get_block(addr).ok_or(malformed_ssa_input())?;
+            let cfg_block = cfg.get_block(addr).ok_or_else(malformed_ssa_input)?;
             let ops = renamed.blocks.get(&addr).cloned().unwrap_or_default();
 
             // Separate phi nodes from other ops

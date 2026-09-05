@@ -139,7 +139,10 @@ fn inferred_memory_term_evidence(
                 SemanticEvidenceReason::DerivedFromRanking,
             ),
             BackwardMemoryRegion::Region(region) => match region.kind {
-                MemoryRegionKind::Stack | MemoryRegionKind::Global | MemoryRegionKind::Input => (
+                MemoryRegionKind::Stack
+                | MemoryRegionKind::Global
+                | MemoryRegionKind::Input
+                | MemoryRegionKind::Pointee => (
                     16,
                     SemanticEvidenceProvenance::Stable,
                     SemanticEvidenceReason::DerivedFromRanking,
@@ -179,6 +182,11 @@ pub struct BackwardRegionRef {
     pub id: MemoryRegionId,
     pub kind: MemoryRegionKind,
     pub name: String,
+    /// The parameter a pointee region's access path starts from. A memory
+    /// term on such a region is evidence about that parameter -- it was
+    /// dereferenced -- which is what the claims read it for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_parameter: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -518,7 +526,15 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 {
                     return Ok(memory_input);
                 }
+                // A structural location is exact, and enumerating concrete
+                // addresses on top of it answers a different question: which
+                // absolute addresses a pointer argument could hold, which is
+                // every address, at up to 256 solver checks per load. Only an
+                // address with no structural reading needs the solver.
                 let resolved_locations = resolved_locations.unwrap_or_else(|| {
+                    if !structural_locations.is_empty() {
+                        return Vec::new();
+                    }
                     self.resolved_memory_locations(&addr_value, dst.size)
                         .unwrap_or_default()
                         .into_iter()
@@ -715,18 +731,26 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
         location: &r2ssa::MemoryLocation,
         value: &SymValue<'ctx>,
     ) -> bool {
-        let Some(r2ssa::ObjectKind::Parameter { index, .. }) = self
+        let region = match self
             .func
             .objects()
             .object(location.object)
             .map(|object| &object.kind)
-        else {
-            return false;
+        {
+            Some(r2ssa::ObjectKind::Parameter { index, .. }) => {
+                BackwardMemoryRegion::Argument { index: *index }
+            }
+            Some(r2ssa::ObjectKind::Pointee { .. }) => {
+                let Some(region) = self.pointee_region(location.object) else {
+                    return false;
+                };
+                region
+            }
+            _ => return false,
         };
         let Some(address) = SemanticMemoryAddress::from_ssa(&location.address) else {
             return false;
         };
-        let region = BackwardMemoryRegion::Argument { index: *index };
         let value_expr = value.to_string();
         let expr = backward_memory_term_expr(&region, &address, &value_expr);
         self.memory_terms.push(BackwardMemoryCondition {
@@ -754,6 +778,21 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
                 region: BackwardMemoryRegion::Argument {
                     index: expression.parameter,
                 },
+                offset: expression.offset,
+            }]);
+        }
+        // An address through a loaded pointer is as structural as one off the
+        // parameter itself: the object model already names what it reaches.
+        if let Some(expression) = self.func.addresses().pointee_expression(value_id)
+            && expression.terms.is_empty()
+            && let Some(object) = self
+                .func
+                .objects()
+                .object_for_value(value_id, r2il::SpaceId::Ram)
+            && let Some(region) = self.pointee_region(object)
+        {
+            return Some(vec![NormalizedMemoryLocation {
+                region,
                 offset: expression.offset,
             }]);
         }
@@ -790,6 +829,23 @@ impl<'a, 'ctx> ValueTranslator<'a, 'ctx> {
             id: def.id,
             kind: def.kind.clone(),
             name: def.name.clone(),
+            root_parameter: None,
+        }))
+    }
+
+    /// The region for a pointee object: the memory a chain of loads from a
+    /// parameter reaches. Named by its access path so the term reads as the
+    /// C it stands for.
+    fn pointee_region(&self, object: r2ssa::ObjectId) -> Option<BackwardMemoryRegion> {
+        let objects = self.func.objects();
+        let r2ssa::ObjectKind::Pointee { .. } = objects.object(object)?.kind else {
+            return None;
+        };
+        Some(BackwardMemoryRegion::Region(BackwardRegionRef {
+            id: MemoryRegionId(object.0),
+            kind: MemoryRegionKind::Pointee,
+            name: objects.access_path(object)?,
+            root_parameter: objects.root_parameter(object),
         }))
     }
 
@@ -1461,11 +1517,13 @@ mod tests {
             id: MemoryRegionId(1),
             kind: MemoryRegionKind::Global,
             name: "global".to_string(),
+            root_parameter: None,
         });
         let replay_region = BackwardMemoryRegion::Region(BackwardRegionRef {
             id: MemoryRegionId(2),
             kind: MemoryRegionKind::Replay,
             name: "replay".to_string(),
+            root_parameter: None,
         });
 
         let global = inferred_memory_term_evidence(&global_region, 0, 12, false);
@@ -1491,6 +1549,7 @@ mod tests {
             id: MemoryRegionId(3),
             kind: MemoryRegionKind::Heap,
             name: "heap".to_string(),
+            root_parameter: None,
         });
 
         let heap = inferred_memory_term_evidence(&heap_region, 8, 16, false);

@@ -941,6 +941,10 @@ fn vm_memory_region_ref_from_object(
             format!("heap_alloc@{}", call_site.0),
         ),
         ObjectKind::EscapedUnknown { .. } => return None,
+        ObjectKind::Pointee { .. } => (
+            MemoryRegionKind::Input,
+            func.objects().access_path(object_id)?,
+        ),
     };
     Some(VmMemoryRegionRef {
         id: object_id.0,
