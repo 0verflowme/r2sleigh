@@ -1050,7 +1050,7 @@ impl TypeWritebackAnalysis {
             })
             .collect::<Option<Vec<_>>>()?;
         crate::SourceOwnedCalleeSignature::new(
-            Arc::clone(&self.source),
+            &self.source,
             crate::FunctionType {
                 return_type,
                 params,

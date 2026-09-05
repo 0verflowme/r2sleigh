@@ -6,7 +6,7 @@
 //! needed for a request. Analysis artifacts are built directly for each
 //! source snapshot request.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,9 @@ mod program_cache;
 pub use json::*;
 pub use policy::*;
 pub use program_cache::{
-    PreparedRole, ProgramCacheStats, cache_function_artifact, cache_program_data_object_types,
-    cached_function_artifact, cached_function_fingerprint, clear_program_cache,
-    program_cache_stats,
+    PreparedRole, ProgramCacheStats, cache_callee_facts, cache_program_data_object_types,
+    cache_root_artifact, cached_callee_facts, cached_root_artifact, cached_root_fingerprint,
+    clear_program_cache, program_cache_stats,
 };
 
 mod route;
@@ -1533,10 +1533,9 @@ pub struct EngineAnalyzeRequest {
     pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
     /// Bodies of the functions the root calls, captured in the same transaction.
-    trusted_callees: Vec<Arc<r2ssa::SsaArtifact>>,
+    callee_facts: Vec<CalleeFacts>,
     /// Each callee's own typed source context, retained until `r2types` derives
     /// the source-owned signature that callers may consume.
-    trusted_callee_contexts: BTreeMap<u64, r2types::ParsedExternalContext>,
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
@@ -2004,6 +2003,77 @@ fn trusted_callee_signatures(
         .collect()
 }
 
+/// Everything one callee contributes to a caller's request.
+///
+/// Each field is derived from that callee's own snapshot and nothing else, so
+/// one derivation serves every caller of that function. The callee's prepared
+/// body is read to produce this and is then done with: what a caller reads of
+/// a callee is its interface, the local effect summary the interprocedural
+/// fixpoint iterates over, the C signature its own typed body proves, and the
+/// data objects its image observed. Holding the body instead, so that a later
+/// caller could redo those four derivations from it, is what made a session
+/// retain a prepared function per function in the program.
+#[derive(Debug, Clone)]
+pub struct CalleeFacts {
+    address: u64,
+    interface: r2ssa::SourceFunctionInterface,
+    summary: r2ssa::PreparedCalleeSummary,
+    signature: Option<r2types::SourceOwnedCalleeSignature>,
+    observed_data_objects: r2types::ProgramDataObjectTypeFacts,
+}
+
+impl CalleeFacts {
+    /// Derive a callee's contribution from the body that owns it. The body is
+    /// read here and not retained.
+    pub fn derive(callee: &Arc<r2ssa::TrustedSsaArtifact>, ptr_bits: u32) -> Option<Self> {
+        let shared = callee.shared_artifact();
+        let address = shared.function().entry;
+        let interface = shared.machine_context().function_interface()?.clone();
+        let summary =
+            r2ssa::PreparedCalleeSummary::derive(r2ssa::InterprocFunctionId(address), &shared)
+                .ok()?;
+        let external_type_db = trusted_external_type_db(callee);
+        let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            callee
+                .source()
+                .image()
+                .data_symbols()
+                .iter()
+                .map(|object| (object.address(), object.type_spelling())),
+            ptr_bits,
+            &external_type_db,
+        );
+        let context = trusted_parsed_context(callee, ptr_bits);
+        let signature = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(Arc::clone(&shared), context).ok()?,
+        )
+        .ok()
+        .and_then(|analysis| analysis.source_owned_callee_signature());
+        Some(Self {
+            address,
+            interface,
+            summary,
+            signature,
+            observed_data_objects,
+        })
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn interface(&self) -> &r2ssa::SourceFunctionInterface {
+        &self.interface
+    }
+
+    /// Re-announce this callee's observed data objects to the program view.
+    /// Absorption is monotone, so replaying it is what a cached derivation
+    /// owes a session that did not run the derivation itself.
+    pub fn announce_data_objects(&self) {
+        let _ = cache_program_data_object_types(&self.observed_data_objects);
+    }
+}
+
 fn trusted_parsed_context(
     trusted: &r2ssa::TrustedSsaArtifact,
     ptr_bits: u32,
@@ -2141,8 +2211,7 @@ impl EngineAnalyzeRequest {
             arch: parts.arch,
             source_snapshot: parts.source_snapshot,
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
-            trusted_callee_contexts: BTreeMap::new(),
+            callee_facts: Vec::new(),
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
@@ -2183,25 +2252,19 @@ impl EngineAnalyzeRequest {
         self
     }
 
-    /// Attach the bodies of the functions the root calls, captured with it.
+    /// Attach what the functions the root calls contribute to it.
     ///
     /// Without them the solver has no callee to look at and must assume every
     /// direct call does anything to anything it was handed.
-    pub fn with_trusted_callees(
-        mut self,
-        callees: impl IntoIterator<Item = Arc<r2ssa::TrustedSsaArtifact>>,
-    ) -> Self {
-        self.trusted_callees.clear();
-        self.trusted_callee_contexts.clear();
+    pub fn with_callee_facts(mut self, callees: impl IntoIterator<Item = CalleeFacts>) -> Self {
+        self.callee_facts.clear();
+        let mut seen = std::collections::BTreeSet::new();
         for callee in callees {
-            let source = callee.shared_artifact();
-            let address = source.function().entry;
-            if self.trusted_callee_contexts.contains_key(&address) {
+            if !seen.insert(callee.address()) {
                 continue;
             }
-            self.trusted_callee_contexts
-                .insert(address, trusted_parsed_context(&callee, self.ptr_bits));
-            self.trusted_callees.push(source);
+            callee.announce_data_objects();
+            self.callee_facts.push(callee);
         }
         self
     }
@@ -2316,7 +2379,7 @@ pub struct EngineFunctionDecompileRequestInput {
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
-    trusted_callees: Vec<Arc<r2ssa::TrustedSsaArtifact>>,
+    callee_facts: Vec<CalleeFacts>,
 }
 
 impl EngineFunctionDecompileRequestInput {
@@ -2334,7 +2397,7 @@ impl EngineFunctionDecompileRequestInput {
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         }
     }
 
@@ -2354,11 +2417,8 @@ impl EngineFunctionDecompileRequestInput {
     }
 
     /// Attach the bodies of the functions the root calls, captured with it.
-    pub fn with_trusted_callees(
-        mut self,
-        callees: impl IntoIterator<Item = Arc<r2ssa::TrustedSsaArtifact>>,
-    ) -> Self {
-        self.trusted_callees = callees.into_iter().collect();
+    pub fn with_callee_facts(mut self, callees: impl IntoIterator<Item = CalleeFacts>) -> Self {
+        self.callee_facts = callees.into_iter().collect();
         self
     }
 
@@ -2385,7 +2445,7 @@ impl EngineFunctionDecompileRequestInput {
 impl EngineFunctionDecompileRequest {
     pub(crate) fn full_semantics_for_function(input: EngineFunctionDecompileRequestInput) -> Self {
         let trusted_ssa = input.trusted_ssa;
-        let trusted_callees = input.trusted_callees;
+        let callee_facts = input.callee_facts;
         Self {
             input_quality: Some(input.input_quality),
             analysis: EngineAnalyzeRequest::full_semantics_for_function(
@@ -2400,7 +2460,7 @@ impl EngineFunctionDecompileRequest {
             )
             .with_execution_control(input.execution)
             .with_optional_trusted_ssa(trusted_ssa)
-            .with_trusted_callees(trusted_callees),
+            .with_callee_facts(callee_facts),
         }
     }
 }
@@ -4008,60 +4068,42 @@ struct InterprocSummaryBuildInput<'a> {
     /// Bodies of the functions the root calls, captured with it. Without these
     /// every direct call is an unresolved callee, and the solver has to mark
     /// every pointer argument read, written and escaped.
-    pub trusted_callees: &'a [Arc<r2ssa::SsaArtifact>],
+    pub callee_summaries: &'a [r2ssa::PreparedCalleeSummary],
 }
 
 fn build_prepared_interproc_summary_set(
     input: InterprocSummaryBuildInput<'_>,
 ) -> Result<r2ssa::PreparedInterprocSummarySet, r2ssa::PreparedInterprocSummaryError> {
     let root = r2ssa::InterprocFunctionId(input.analysis.ssa_func.function().entry);
-    let mut functions = vec![r2ssa::PreparedInterprocFunctionInput {
-        id: root,
-        name: input.analysis.ssa_func.function().name.clone(),
-        prepared: &input.analysis.ssa_func,
-    }];
-    for callee in input.trusted_callees {
-        let id = r2ssa::InterprocFunctionId(callee.function().entry);
-        if id == root || functions.iter().any(|function| function.id == id) {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut callees = Vec::new();
+    for summary in input.callee_summaries {
+        if summary.id() == root || !seen.insert(summary.id()) {
             continue;
         }
-        functions.push(r2ssa::PreparedInterprocFunctionInput {
-            id,
-            name: callee.function().name.clone(),
-            prepared: callee,
-        });
+        callees.push(summary.clone());
     }
-    r2ssa::solve_prepared_interproc_summary_set(
+    r2ssa::solve_prepared_interproc_summary_set_from_callee_summaries(
         Arc::clone(&input.analysis.ssa_func),
-        &functions,
+        &callees,
         r2ssa::InterprocSolveConfig {
             max_iterations: input.max_iterations.max(1),
         },
     )
 }
 
-/// Derive each captured callee's C signature from its own typed body once.
+/// Each captured callee's C signature, proved once from its own typed body.
 ///
-/// The returned certificate retains that exact SSA owner. A callee that cannot
-/// prove a complete signature contributes nothing; the root keeps the ordinary
-/// call-carrier fallback instead of manufacturing the missing source types.
+/// A callee that cannot prove a complete signature contributes nothing; the
+/// root keeps the ordinary call-carrier fallback instead of manufacturing the
+/// missing source types.
 fn build_source_owned_callee_signatures(
     request: &EngineAnalyzeRequest,
 ) -> Vec<r2types::SourceOwnedCalleeSignature> {
     request
-        .trusted_callees
+        .callee_facts
         .iter()
-        .filter_map(|callee| {
-            let context = request
-                .trusted_callee_contexts
-                .get(&callee.function().entry)?
-                .clone();
-            let analysis = r2types::build_source_owned_type_writeback_analysis(
-                r2types::TypeWritebackAnalysisRequest::new(Arc::clone(callee), context).ok()?,
-            )
-            .ok()?;
-            analysis.source_owned_callee_signature()
-        })
+        .filter_map(|callee| callee.signature.clone())
         .collect()
 }
 
@@ -4093,7 +4135,11 @@ fn build_engine_analysis_artifact(
         match build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
             analysis: &semantic_analysis,
             max_iterations: request.interproc_max_iterations,
-            trusted_callees: &request.trusted_callees,
+            callee_summaries: &request
+                .callee_facts
+                .iter()
+                .map(|callee| callee.summary.clone())
+                .collect::<Vec<_>>(),
         }) {
             Ok(summary) => Some(summary),
             Err(
@@ -5237,8 +5283,7 @@ mod tests {
                 arch: Some(arch),
                 source_snapshot: Some(exact_rdi_test_source_snapshot("sym.assumed/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -5903,11 +5948,22 @@ mod tests {
             .expect("helper prepared"),
         );
         let analysis = EngineAnalysis::from_prepared_ssa(Arc::clone(&root_prepared));
-        let solve = |trusted_callees: &[Arc<r2ssa::SsaArtifact>]| {
+        // A body that is not source-owned is refused when its contribution is
+        // derived, which is before a caller can consult it at all.
+        let solve = |callees: &[Arc<r2ssa::SsaArtifact>]| {
+            let summaries = callees
+                .iter()
+                .map(|callee| {
+                    r2ssa::PreparedCalleeSummary::derive(
+                        r2ssa::InterprocFunctionId(callee.function().entry),
+                        callee,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
                 analysis: &analysis,
                 max_iterations: 1,
-                trusted_callees,
+                callee_summaries: &summaries,
             })
         };
 
@@ -6333,8 +6389,7 @@ mod tests {
             arch: Some(x86_64_result_arch()),
             source_snapshot: Some(exact_empty_test_source_snapshot("sym.zero/analyze/rev1")),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
-            trusted_callee_contexts: BTreeMap::new(),
+            callee_facts: Vec::new(),
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
@@ -7638,8 +7693,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7675,8 +7729,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7781,8 +7834,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.init_node/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -7830,7 +7882,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -7892,7 +7944,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -7952,7 +8004,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -8004,7 +8056,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -8056,7 +8108,7 @@ mod tests {
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
-            trusted_callees: Vec::new(),
+            callee_facts: Vec::new(),
         });
 
         let quality = response
@@ -8092,8 +8144,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.direct_partial/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8141,8 +8192,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.raw_name/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8186,8 +8236,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.caller/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8229,8 +8278,7 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.string_const/rev1")),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
-                trusted_callee_contexts: BTreeMap::new(),
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
@@ -8267,7 +8315,7 @@ mod tests {
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
                 trusted_ssa: None,
-                trusted_callees: Vec::new(),
+                callee_facts: Vec::new(),
             },
         );
 

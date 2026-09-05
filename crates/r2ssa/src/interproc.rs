@@ -531,6 +531,12 @@ fn validate_function_summary_map(
 pub struct PreparedInterprocSummarySet {
     root: InterprocFunctionId,
     owners: BTreeMap<InterprocFunctionId, Arc<SsaArtifact>>,
+    /// Every function this evidence was derived from a body for, whether or
+    /// not that body's allocation is still retained. Retention is a memory
+    /// decision; which functions contributed evidence is a fact about the
+    /// evidence, and a consumer asking "was there a body for this callee"
+    /// is asking the second question.
+    bodies: BTreeSet<InterprocFunctionId>,
     report: InterprocSummarySet,
 }
 
@@ -550,6 +556,16 @@ impl PreparedInterprocSummarySet {
     /// Borrow one exact immutable SSA owner by its function identity.
     pub fn owner(&self, id: InterprocFunctionId) -> Option<&Arc<SsaArtifact>> {
         self.owners.get(&id)
+    }
+
+    /// Whether this evidence was derived from a body for `id`.
+    pub fn has_body(&self, id: InterprocFunctionId) -> bool {
+        self.bodies.contains(&id)
+    }
+
+    /// Every function a body contributed evidence for.
+    pub fn bodies(&self) -> &BTreeSet<InterprocFunctionId> {
+        &self.bodies
     }
 
     /// Borrow the report projection produced from the retained root.
@@ -1031,6 +1047,155 @@ fn require_trusted_root_for_helper_scope(
 /// mislabeled roots are refused before any report is sealed. Every helper id
 /// must equal its prepared entry and be unique. This authoritative path is
 /// deliberately seedless; external and name-derived seeds remain report-only.
+/// One callee's whole contribution to a caller's interprocedural solve.
+///
+/// Everything here is derived from that callee's own prepared body and
+/// nothing else: the local effect summary the fixpoint iterates over, and the
+/// facts the caller checks it against. So it can be derived once for a
+/// function and used by every caller of it, which is what lets a caller reuse
+/// the work without keeping the callee's whole SSA allocation alive to redo
+/// it from.
+#[derive(Debug, Clone)]
+pub struct PreparedCalleeSummary {
+    id: InterprocFunctionId,
+    architecture_family: crate::MachineArchitectureFamily,
+    revision_identity: Vec<u8>,
+    blocks: Vec<(u64, u32)>,
+    local: LocalSummaryFacts,
+}
+
+impl PreparedCalleeSummary {
+    /// Derive a callee's contribution from the body that owns it. The body is
+    /// read here and not retained.
+    ///
+    /// No name is taken. Names supplied by a scope are presentation advice
+    /// rather than evidence the prepared owner retains, and an authoritative
+    /// summary is invariant to them.
+    pub fn derive(
+        id: InterprocFunctionId,
+        prepared: &Arc<SsaArtifact>,
+    ) -> Result<Self, PreparedInterprocSummaryError> {
+        if id.0 != prepared.function().entry {
+            return Err(PreparedInterprocSummaryError::MislabeledFunction);
+        }
+        if prepared.provenance_kind() != crate::SsaArtifactProvenanceKind::TrustedSource {
+            return Err(PreparedInterprocSummaryError::ManualFunction);
+        }
+        let abi = AbiProfile::from_machine_context(prepared.machine_context())
+            .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+        let revision_identity = prepared
+            .machine_context()
+            .function_interface()
+            .map(|interface| interface.revision_identity().to_vec())
+            .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+        let local = collect_source_owned_summary_facts(prepared, &abi);
+        require_converged_call_carriers(&local)?;
+        Ok(Self {
+            id,
+            architecture_family: prepared.machine_context().architecture_family(),
+            revision_identity,
+            blocks: prepared
+                .function()
+                .blocks()
+                .map(|block| (block.addr, block.size))
+                .collect(),
+            local,
+        })
+    }
+
+    pub const fn id(&self) -> InterprocFunctionId {
+        self.id
+    }
+}
+
+/// Solve the summary set for one root against callee contributions already
+/// derived from their own bodies.
+///
+/// The root still arrives as its exact allocation, because the evidence is
+/// sealed to it. A callee arrives as what it contributes, which is all the
+/// solve reads of it.
+pub fn solve_prepared_interproc_summary_set_from_callee_summaries(
+    root: Arc<SsaArtifact>,
+    callees: &[PreparedCalleeSummary],
+    config: InterprocSolveConfig,
+) -> Result<PreparedInterprocSummarySet, PreparedInterprocSummaryError> {
+    let root_id = InterprocFunctionId(root.function().entry);
+    let mut seen = BTreeSet::new();
+    seen.insert(root_id);
+    for callee in callees {
+        if callee.id == root_id {
+            return Err(PreparedInterprocSummaryError::DuplicateRoot);
+        }
+        if !seen.insert(callee.id) {
+            return Err(PreparedInterprocSummaryError::DuplicateFunction);
+        }
+    }
+
+    let root_family = root.machine_context().architecture_family();
+    let root_revision = root
+        .machine_context()
+        .function_interface()
+        .map(|interface| interface.revision_identity().to_vec())
+        .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+    let root_abi = AbiProfile::from_machine_context(root.machine_context())
+        .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
+
+    for callee in callees {
+        if callee.architecture_family != root_family {
+            return Err(PreparedInterprocSummaryError::ArchitectureMismatch);
+        }
+        if callee.revision_identity != root_revision {
+            return Err(PreparedInterprocSummaryError::ForeignFunction);
+        }
+    }
+    validate_interproc_block_ranges(
+        root.function()
+            .blocks()
+            .map(|block| (root_id, block.addr, block.size))
+            .chain(callees.iter().flat_map(|callee| {
+                callee
+                    .blocks
+                    .iter()
+                    .map(move |(addr, size)| (callee.id, *addr, *size))
+            })),
+    )?;
+
+    let root_local = collect_source_owned_summary_facts(&root, &root_abi);
+    require_converged_call_carriers(&root_local)?;
+    require_trusted_root_for_helper_scope(root.provenance_kind(), callees.len() + 1)?;
+
+    let mut owners = BTreeMap::new();
+    let mut bodies = BTreeSet::new();
+    let mut locals = BTreeMap::new();
+    let mut current = BTreeMap::new();
+    owners.insert(root_id, Arc::clone(&root));
+    bodies.insert(root_id);
+    current.insert(root_id, initial_summary(root_id, None, &root_local));
+    locals.insert(root_id, (None, root_local));
+    for callee in callees {
+        bodies.insert(callee.id);
+        current.insert(callee.id, initial_summary(callee.id, None, &callee.local));
+        locals.insert(callee.id, (None, callee.local.clone()));
+    }
+
+    let report = solve_interproc_summary_set_from_locals(
+        locals,
+        current,
+        Some(root_id),
+        config,
+        callees.len() + 1,
+    );
+    require_converged_summary_report(&report)?;
+    Ok(PreparedInterprocSummarySet {
+        root: root_id,
+        owners,
+        bodies,
+        report,
+    })
+}
+
+/// Solve from whole prepared bodies. Each non-root body is reduced to its
+/// contribution first, which is all the solve reads of it.
 pub fn solve_prepared_interproc_summary_set(
     root: Arc<SsaArtifact>,
     functions: &[PreparedInterprocFunctionInput<'_>],
@@ -1075,62 +1240,36 @@ pub fn solve_prepared_interproc_summary_set(
     if !Arc::ptr_eq(root_input.prepared, &root) {
         return Err(PreparedInterprocSummaryError::ForeignRoot);
     }
-    validate_prepared_interproc_block_ranges(functions)?;
-
+    // Refuse in the order this entry point always has. A body that is not
+    // source-owned cannot contribute at all, but a scope that is the wrong
+    // architecture or whose functions overlap is wrong about every body in
+    // it, so those answers come first.
     let root_family = root.machine_context().architecture_family();
-    let root_revision = root
-        .machine_context()
-        .function_interface()
-        .map(|interface| interface.revision_identity())
-        .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
-    let mut owners = BTreeMap::new();
-    let mut locals = BTreeMap::new();
-    let mut current = BTreeMap::new();
     for function in functions {
         if function.prepared.machine_context().architecture_family() != root_family {
             return Err(PreparedInterprocSummaryError::ArchitectureMismatch);
         }
-        let abi = AbiProfile::from_machine_context(function.prepared.machine_context())
-            .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
-        if function.id != root_id {
-            if function.prepared.provenance_kind()
-                != crate::SsaArtifactProvenanceKind::TrustedSource
-            {
-                return Err(PreparedInterprocSummaryError::ManualFunction);
-            }
-            let helper_revision = function
-                .prepared
-                .machine_context()
-                .function_interface()
-                .map(|interface| interface.revision_identity())
-                .ok_or(PreparedInterprocSummaryError::UnknownOrIncoherentMachineContext)?;
-            if helper_revision != root_revision {
-                return Err(PreparedInterprocSummaryError::ForeignFunction);
-            }
-        }
-        let local = collect_source_owned_summary_facts(function.prepared, &abi);
-        require_converged_call_carriers(&local)?;
-        owners.insert(function.id, Arc::clone(function.prepared));
-        // Names supplied by a scope are presentation advice, not evidence
-        // retained by the exact prepared owner. Authoritative summaries must
-        // therefore be invariant to that detached advice.
-        current.insert(function.id, initial_summary(function.id, None, &local));
-        locals.insert(function.id, (None, local));
     }
-    require_trusted_root_for_helper_scope(root.provenance_kind(), functions.len())?;
-    let report = solve_interproc_summary_set_from_locals(
-        locals,
-        current,
-        Some(root_id),
-        config,
-        functions.len(),
-    );
-    require_converged_summary_report(&report)?;
-    Ok(PreparedInterprocSummarySet {
-        root: root_id,
-        owners,
-        report,
-    })
+    validate_prepared_interproc_block_ranges(functions)?;
+
+    let mut callees = Vec::new();
+    for function in functions {
+        if function.id == root_id {
+            continue;
+        }
+        callees.push(PreparedCalleeSummary::derive(
+            function.id,
+            function.prepared,
+        )?);
+    }
+    let mut set =
+        solve_prepared_interproc_summary_set_from_callee_summaries(root, &callees, config)?;
+    // This entry point was handed the bodies, so it can retain them.
+    for function in functions {
+        set.owners
+            .insert(function.id, Arc::clone(function.prepared));
+    }
+    Ok(set)
 }
 
 fn compute_summary_sccs(

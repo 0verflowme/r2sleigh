@@ -1185,11 +1185,14 @@ unsafe fn capture_trusted_ssa_from_buffer(
     //
     // A callee that will not lift costs the caller nothing: the solver falls
     // back to knowing nothing about that call, which is where it started.
-    let mut lifted_callees = Vec::new();
+    let mut callee_facts = Vec::new();
     let mut callee_interfaces = std::collections::BTreeMap::new();
     let callee_started = Instant::now();
     let callee_count = callees.len();
     let mut callee_hits = 0usize;
+    // Every callee in one capture is the same machine as the root, which is
+    // what the interprocedural solve checks before it uses any of them.
+    let ptr_bits = source.machine().bits();
     for callee in callees {
         let entry = callee.function().address();
         // A callee body is prepared from its own snapshot and nothing else --
@@ -1208,26 +1211,30 @@ unsafe fn capture_trusted_ssa_from_buffer(
         let key = r2source::snapshot_wire::encode_snapshot_cache_key(&callee).ok();
         let cached = key
             .as_deref()
-            .and_then(|key| r2engine::cached_function_artifact(CALLEE, entry, key));
-        let artifact = match cached {
-            Some(artifact) => {
+            .and_then(|key| r2engine::cached_callee_facts(entry, key));
+        let facts = match cached {
+            Some(facts) => {
+                // A hit answers the whole of what this callee contributes, so
+                // its body is never built. That is the point of deriving the
+                // contribution rather than keeping the body to re-derive it.
                 callee_hits += 1;
-                artifact
+                facts
             }
             None => {
                 let Ok(artifact) = trusted_from_source(callee, execution) else {
                     continue;
                 };
+                let Some(facts) = r2engine::CalleeFacts::derive(&artifact, ptr_bits) else {
+                    continue;
+                };
                 if let Some(key) = key.as_deref() {
-                    r2engine::cache_function_artifact(CALLEE, entry, key, &artifact);
+                    r2engine::cache_callee_facts(entry, key, &facts);
                 }
-                artifact
+                facts
             }
         };
-        if let Some(interface) = artifact.artifact().machine_context().function_interface() {
-            callee_interfaces.insert(entry, interface.clone());
-        }
-        lifted_callees.push(artifact);
+        callee_interfaces.insert(entry, facts.interface().clone());
+        callee_facts.push(facts);
     }
     let callee_elapsed = callee_started.elapsed();
     let root_started = Instant::now();
@@ -1237,17 +1244,17 @@ unsafe fn capture_trusted_ssa_from_buffer(
     // from the function and everything it calls: two requests that agree on it
     // agree on every input the root's preparation reads.
     let root_address = source.function().address();
-    let (root, root_hit) = match r2engine::cached_function_artifact(ROOT, root_address, bytes) {
+    let (root, root_hit) = match r2engine::cached_root_artifact(root_address, bytes) {
         Some(root) => (root, true),
         None => {
             let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
-            r2engine::cache_function_artifact(ROOT, root_address, bytes, &root);
+            r2engine::cache_root_artifact(root_address, bytes, &root);
             (root, false)
         }
     };
     Ok(TrustedIngress {
         root,
-        callees: lifted_callees,
+        callees: callee_facts,
         capture: CaptureTiming {
             decode: decode_elapsed,
             callee_lift: callee_elapsed,
@@ -1258,9 +1265,6 @@ unsafe fn capture_trusted_ssa_from_buffer(
         },
     })
 }
-
-const ROOT: r2engine::PreparedRole = r2engine::PreparedRole::Root;
-const CALLEE: r2engine::PreparedRole = r2engine::PreparedRole::Callee;
 
 /// What one snapshot capture cost, split where the cost actually divides.
 ///
@@ -1306,7 +1310,7 @@ impl CaptureTiming {
 /// One trusted root and the bodies of what it calls, from one capture.
 pub(crate) struct TrustedIngress {
     pub(crate) root: Arc<r2ssa::TrustedSsaArtifact>,
-    pub(crate) callees: Vec<Arc<r2ssa::TrustedSsaArtifact>>,
+    pub(crate) callees: Vec<r2engine::CalleeFacts>,
     pub(crate) capture: CaptureTiming,
 }
 

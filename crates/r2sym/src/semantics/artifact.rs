@@ -526,7 +526,7 @@ fn interproc_summary_uses_owned_helper(summaries: &PreparedInterprocSummarySet) 
         };
         for callee in &summary.direct_callees {
             let callee = InterprocFunctionId(*callee);
-            if callee != root && summaries.owner(callee).is_some() {
+            if callee != root && summaries.has_body(callee) {
                 return true;
             }
             pending.push(callee);

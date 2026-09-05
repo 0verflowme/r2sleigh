@@ -100,13 +100,14 @@ pub use integrity::{ScalarWidthRule, SsaIntegrityError, SsaValueSite, validate_s
 pub use interproc::{
     CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary, InterprocFunctionId,
     InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
-    PreparedInterprocFunctionInput, PreparedInterprocSummaryError, PreparedInterprocSummarySet,
-    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
-    SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
-    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
-    SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
-    SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
-    solve_prepared_interproc_summary_set,
+    PreparedCalleeSummary, PreparedInterprocFunctionInput, PreparedInterprocSummaryError,
+    PreparedInterprocSummarySet, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
+    SummaryAtomicOp, SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
+    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummarySyncOp,
+    SummaryTransferEffect, SummaryTransferLength, observe_call_arguments,
+    solve_interproc_summary_set, solve_prepared_interproc_summary_set,
+    solve_prepared_interproc_summary_set_from_callee_summaries,
 };
 pub use machine::{
     MachineAddressProvenance, MachineAddressSpace, MachineArithmeticFlagOp, MachineArithmeticMode,

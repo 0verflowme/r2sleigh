@@ -1622,16 +1622,23 @@ pub struct SourceOwnedFunctionFacts {
 /// cannot pair an arbitrary signature with an SSA body. The retained function
 /// interface also lets a caller prove that this is the same physical contract
 /// `r2ssa` admitted at its call site before consuming the logical C types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceOwnedCalleeSignature {
-    source: Arc<r2ssa::SsaArtifact>,
+    address: u64,
     interface: r2ssa::SourceFunctionInterface,
     signature: crate::FunctionType,
 }
 
 impl SourceOwnedCalleeSignature {
+    /// Derive a callee's C signature certificate from the body that owns it.
+    ///
+    /// The body is read here and not retained. What proves this signature
+    /// belongs to a call site is the interface matching the one the call site
+    /// declares, which is a comparison by value; holding the SSA allocation as
+    /// well made every certificate keep a whole prepared function alive, which
+    /// is what a caller then had to cache to reuse one.
     pub(crate) fn new(
-        source: Arc<r2ssa::SsaArtifact>,
+        source: &Arc<r2ssa::SsaArtifact>,
         signature: crate::FunctionType,
     ) -> Option<Self> {
         let interface = source.machine_context().function_interface()?.clone();
@@ -1644,14 +1651,14 @@ impl SourceOwnedCalleeSignature {
                 .default_address_bits(),
         )
         .then_some(Self {
-            source,
+            address: source.function().entry,
             interface,
             signature,
         })
     }
 
     pub(crate) fn address(&self) -> u64 {
-        self.source.function().entry
+        self.address
     }
 }
 
@@ -6543,7 +6550,7 @@ mod tests {
             variadic: false,
         };
         let source_owned_signature =
-            SourceOwnedCalleeSignature::new(callee_source, signed_signature.clone())
+            SourceOwnedCalleeSignature::new(&callee_source, signed_signature.clone())
                 .expect("logical type fits the exact low-bit carrier");
         facts.apply_source_owned_callee_signatures(
             &prepared,

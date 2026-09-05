@@ -2605,7 +2605,7 @@ fn r2sleigh_engine_decompile_trusted_output(
     .with_input_quality(r2engine::EngineFunctionInputQuality::complete(block_count))
     .with_execution_control(execution)
     .with_trusted_ssa(trusted)
-    .with_trusted_callees(callees);
+    .with_callee_facts(callees);
     let response = decompiler::run_engine_decompile(decompile_input);
     Some(EngineV2Output {
         output: response.output,
@@ -2654,7 +2654,7 @@ fn r2sleigh_engine_type_function_trusted_output(
         .analysis
         .with_execution_control(execution)
         .with_trusted_ssa(trusted)
-        .with_trusted_callees(callees);
+        .with_callee_facts(callees);
     let response = match r2engine::EngineSession::new().type_function_checked(
         r2engine::EngineTypeAnalysisRequest::from_interproc_budget(request.analysis, 1, false),
     ) {

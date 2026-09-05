@@ -64,9 +64,6 @@ struct CachedFunction<T> {
     /// The serialized snapshot this artifact was built from. Held whole,
     /// because a hash of it would be a completeness claim nothing can check.
     input: Box<[u8]>,
-    /// Semantics of the prepared artifact, for reporting and for the check
-    /// that a reused artifact is the one a fresh build would have produced.
-    fingerprint: u64,
     artifact: T,
 }
 
@@ -137,28 +134,14 @@ impl<T: Clone> FunctionCache<T> {
         }
     }
 
-    fn insert(
-        &mut self,
-        role: PreparedRole,
-        address: u64,
-        input: &[u8],
-        artifact: T,
-        fingerprint: u64,
-    ) {
+    fn insert(&mut self, role: PreparedRole, address: u64, input: &[u8], artifact: T) {
         self.by_function.insert(
             (role, address),
             CachedFunction {
                 input: Box::from(input),
-                fingerprint,
                 artifact,
             },
         );
-    }
-
-    fn fingerprint(&self, role: PreparedRole, address: u64) -> Option<u64> {
-        self.by_function
-            .get(&(role, address))
-            .map(|entry| entry.fingerprint)
     }
 
     fn stats(&self) -> ProgramCacheStats {
@@ -171,9 +154,86 @@ impl<T: Clone> FunctionCache<T> {
     }
 }
 
+/// The most recent root, and nothing older.
+///
+/// A root is the function being decompiled, so a session sweeping a binary
+/// asks about each exactly once and every entry but the last is dead weight;
+/// asking about one function again, which is what an interactive session
+/// does, is served by the one entry. The bound is the request in hand rather
+/// than a number chosen to be large enough.
+/// The one root a session holds, and what identifies it.
+struct HeldRoot {
+    address: u64,
+    /// The serialized capture it was prepared from. Held whole, because a
+    /// hash of it would be a completeness claim nothing can check.
+    input: Box<[u8]>,
+    artifact: Arc<r2ssa::TrustedSsaArtifact>,
+    fingerprint: u64,
+}
+
+#[derive(Default)]
+struct LastRoot {
+    entry: Option<HeldRoot>,
+    hits: u64,
+    misses: u64,
+    replacements: u64,
+}
+
+impl LastRoot {
+    fn lookup(&mut self, address: u64, input: &[u8]) -> Option<Arc<r2ssa::TrustedSsaArtifact>> {
+        match &self.entry {
+            Some(held) if held.address == address && held.input.as_ref() == input => {
+                self.hits += 1;
+                Some(Arc::clone(&held.artifact))
+            }
+            Some(held) if held.address == address => {
+                self.replacements += 1;
+                self.misses += 1;
+                None
+            }
+            _ => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        address: u64,
+        input: &[u8],
+        artifact: Arc<r2ssa::TrustedSsaArtifact>,
+        fingerprint: u64,
+    ) {
+        self.entry = Some(HeldRoot {
+            address,
+            input: Box::from(input),
+            artifact,
+            fingerprint,
+        });
+    }
+
+    fn fingerprint(&self, address: u64) -> Option<u64> {
+        self.entry
+            .as_ref()
+            .filter(|held| held.address == address)
+            .map(|held| held.fingerprint)
+    }
+
+    fn stats(&self) -> ProgramCacheStats {
+        ProgramCacheStats {
+            entries: usize::from(self.entry.is_some()),
+            hits: self.hits,
+            misses: self.misses,
+            replacements: self.replacements,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ProgramCache {
-    functions: FunctionCache<Arc<r2ssa::TrustedSsaArtifact>>,
+    callees: FunctionCache<crate::CalleeFacts>,
+    root: LastRoot,
     data_objects: r2types::ProgramDataObjectTypeFacts,
 }
 
@@ -192,38 +252,55 @@ fn lock_program_cache() -> MutexGuard<'static, ProgramCache> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The prepared artifact for this function, if one was built from exactly
-/// these bytes.
-pub fn cached_function_artifact(
-    role: PreparedRole,
-    address: u64,
-    input: &[u8],
-) -> Option<Arc<r2ssa::TrustedSsaArtifact>> {
-    lock_program_cache().functions.lookup(role, address, input)
+/// What this callee contributes, if it was derived from exactly these bytes.
+pub fn cached_callee_facts(address: u64, input: &[u8]) -> Option<crate::CalleeFacts> {
+    lock_program_cache()
+        .callees
+        .lookup(PreparedRole::Callee, address, input)
 }
 
-/// Record a prepared artifact under the bytes that produced it, and return the
-/// semantics it was recorded as.
-pub fn cache_function_artifact(
-    role: PreparedRole,
+/// Record what a callee contributes, under the bytes it was derived from.
+pub fn cache_callee_facts(address: u64, input: &[u8], facts: &crate::CalleeFacts) {
+    lock_program_cache()
+        .callees
+        .insert(PreparedRole::Callee, address, input, facts.clone());
+}
+
+/// The prepared root, if the last one asked for was this one built from
+/// exactly these bytes.
+pub fn cached_root_artifact(address: u64, input: &[u8]) -> Option<Arc<r2ssa::TrustedSsaArtifact>> {
+    lock_program_cache().root.lookup(address, input)
+}
+
+/// Hold this root as the most recent, and return the semantics it was
+/// recorded as.
+pub fn cache_root_artifact(
     address: u64,
     input: &[u8],
     artifact: &Arc<r2ssa::TrustedSsaArtifact>,
 ) -> u64 {
     let fingerprint = r2ssa::stable_ssa_semantic_fingerprint(artifact.artifact());
     lock_program_cache()
-        .functions
-        .insert(role, address, input, Arc::clone(artifact), fingerprint);
+        .root
+        .insert(address, input, Arc::clone(artifact), fingerprint);
     fingerprint
 }
 
-/// The semantics recorded for this address, if anything is recorded for it.
-pub fn cached_function_fingerprint(role: PreparedRole, address: u64) -> Option<u64> {
-    lock_program_cache().functions.fingerprint(role, address)
+/// The semantics recorded for the most recent root, if it is this address.
+pub fn cached_root_fingerprint(address: u64) -> Option<u64> {
+    lock_program_cache().root.fingerprint(address)
 }
 
 pub fn program_cache_stats() -> ProgramCacheStats {
-    lock_program_cache().functions.stats()
+    let cache = lock_program_cache();
+    let callees = cache.callees.stats();
+    let root = cache.root.stats();
+    ProgramCacheStats {
+        entries: callees.entries + root.entries,
+        hits: callees.hits + root.hits,
+        misses: callees.misses + root.misses,
+        replacements: callees.replacements + root.replacements,
+    }
 }
 
 /// Add source-owned observations and return the complete program-scope view.
@@ -249,9 +326,8 @@ mod tests {
     #[test]
     fn the_same_address_with_the_same_bytes_returns_what_was_stored() {
         let mut cache = FunctionCache::<u32>::default();
-        cache.insert(PreparedRole::Root, 0x1000, b"body", 99, 0xfeed);
+        cache.insert(PreparedRole::Root, 0x1000, b"body", 99);
         assert_eq!(cache.lookup(PreparedRole::Root, 0x1000, b"body"), Some(99));
-        assert_eq!(cache.fingerprint(PreparedRole::Root, 0x1000), Some(0xfeed));
         let stats = cache.stats();
         assert_eq!((stats.hits, stats.misses, stats.entries), (1, 0, 1));
     }
@@ -259,12 +335,12 @@ mod tests {
     #[test]
     fn the_same_address_with_different_bytes_is_a_replacement_not_a_hit() {
         let mut cache = FunctionCache::<u32>::default();
-        cache.insert(PreparedRole::Root, 0x1000, b"first", 99, 0xfeed);
+        cache.insert(PreparedRole::Root, 0x1000, b"first", 99);
         assert_eq!(cache.lookup(PreparedRole::Root, 0x1000, b"second"), None);
         let stats = cache.stats();
         assert_eq!((stats.hits, stats.replacements), (0, 1));
         // And the replacement is one entry, not two: the address is the key.
-        cache.insert(PreparedRole::Root, 0x1000, b"second", 100, 0xbeef);
+        cache.insert(PreparedRole::Root, 0x1000, b"second", 100);
         assert_eq!(cache.stats().entries, 1);
         assert_eq!(
             cache.lookup(PreparedRole::Root, 0x1000, b"second"),
@@ -279,8 +355,8 @@ mod tests {
         // storing both under the address alone would make each one evict the
         // other and neither would ever hit.
         let mut cache = FunctionCache::<u32>::default();
-        cache.insert(PreparedRole::Root, 0x1000, b"root-capture", 1, 0xaa);
-        cache.insert(PreparedRole::Callee, 0x1000, b"callee-body", 2, 0xbb);
+        cache.insert(PreparedRole::Root, 0x1000, b"root-capture", 1);
+        cache.insert(PreparedRole::Callee, 0x1000, b"callee-body", 2);
         assert_eq!(cache.stats().entries, 2);
         assert_eq!(
             cache.lookup(PreparedRole::Root, 0x1000, b"root-capture"),
@@ -307,7 +383,7 @@ mod tests {
         // agreed on every byte it had would otherwise reuse a body built from
         // more than it carries.
         let mut cache = FunctionCache::<u32>::default();
-        cache.insert(PreparedRole::Root, 0x1000, b"body-and-more", 99, 0xfeed);
+        cache.insert(PreparedRole::Root, 0x1000, b"body-and-more", 99);
         assert_eq!(cache.lookup(PreparedRole::Root, 0x1000, b"body"), None);
         assert_eq!(cache.stats().replacements, 1);
     }
