@@ -12567,3 +12567,58 @@ Open:
   become optional per parameter with a wire presence bit.
 - Local names still render as `stack_m16`; the declared name is in the
   slot record and should travel like its type does.
+
+### Evening: the O2 blocker, and reusing summaries instead of bodies
+
+**The O2 sweep blocker was one function, not accumulation.** `gz_decomp` in
+zlib at -O2 (eighteen blocks, eighty-two instructions) did not finish in two
+hundred seconds while every neighbour took under two.
+`expression_dependency_occurrences` walked the dependency graph from every
+consumer root, once per memory read, and memoised a value only when nothing
+below it was still being computed -- which on a cycle is no value above the
+cycle, so the memo was defeated exactly where it was needed and the walk fell
+back to enumerating paths. Replaced by one least-fixpoint propagation from the
+roots down for the whole function (`expression_inline_multiplicity`).
+minigzip at -O2 went from not finishing in 1500 s with 28 rendered to 19 s
+with 52 rendered and no errors. This is what had been killing four of zlib's
+seven -O2 binaries in the harness.
+
+**The program cache held the wrong thing.** It kept a whole prepared function
+plus a copy of its input bytes for every function a session asked about, and
+never evicted; its own doc bounded it by entry count while the cost was bytes.
+Measured on minigzip at -O2: 430 MB and 4.5 s for nothing, because a sweep
+asks about each function once. Refactored: what a caller reads of a callee is
+its interface, its local effect summary, the C signature its own typed body
+proves, and its observed data objects -- all derived from that callee alone.
+`r2engine::CalleeFacts` is that value and the cache holds it; a hit never
+builds the callee's body. Three things had to stop retaining bodies:
+`SourceOwnedCalleeSignature` (matching is by interface value),
+the interproc solver (now takes `PreparedCalleeSummary`), and
+`PreparedInterprocSummarySet`, which conflated "evidence came from a body"
+with "we still hold that body" (now `bodies()` and `has_body()`). The root is
+held one deep. Result: 16.9 s / 0.64 GB for the -O2 sweep, and repeated
+queries of one function went from 6.4 s / 114 MB to 3.2 s / 82 MB.
+
+**A correctness regression from the type batch, found and fixed.** With
+declared types arriving, an x86 test that asserted a SIMD worker refuses
+started rendering instead -- and rendered `RDI_0[i]` for a parameter declared
+`uint64_t`, which does not compile. `CExpr::Subscript` was emitted from an
+array certificate without requiring the base's *declaration* to be a pointer
+or array. That precondition is now stated. **Follow-up worth taking:** a
+parameter with a certified strided access is a pointer and should be declared
+one, which would turn that refusal back into a subscript over a real pointer.
+
+**Four upstream radare2 PRs opened**, each reproduced on stock upstream master
+and re-verified with the fix, `r2r db` green (the one XX is `cmd_pipe
+r2pipe.py`, unrelated): #26654 base type saved under a sanitized key, #26655
+enum width never recorded nor answered, #26656 `const void *` rendered as a
+bare ` *`, #26657 install aborting over a symstall symlink. Staying in the
+fork: the DWARF exactness changes (no upstream counterpart) and the
+placeholder folding (depends on the resolver from open PR #26644).
+
+Still open: the six `diagnostic: wrong` corpus cells and the unblessed
+snapshot baseline, both predating today; import thunks (32 per binary,
+`RenderedValueRequired` on the GOT load); per-parameter logical types so one
+unplaceable parameter type does not cost a function every parameter's type;
+local names still rendering as `stack_m16` though the declared name is in the
+slot record.
