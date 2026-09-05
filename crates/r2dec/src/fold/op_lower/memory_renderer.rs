@@ -346,6 +346,26 @@ impl<'a> FoldingContext<'a> {
         matching.next().is_none().then_some(first)
     }
 
+    /// Whether a rendered name may carry a C subscript.
+    ///
+    /// `base[index]` is only C where the base is a pointer or an array. An
+    /// array certificate proves an access is element `index` of a run at that
+    /// base; it does not, on its own, make the base's *declaration* one of
+    /// those. Emitting the subscript anyway produced `RDI_0[i]` for a
+    /// parameter declared `uint64_t`, which no compiler accepts, so the
+    /// certificate has to be rendered some other way when the declaration
+    /// cannot carry it. A base whose declaration is unknown is not refused
+    /// here: nothing has said it is not a pointer.
+    fn name_may_be_subscripted(&self, base: &CExpr) -> bool {
+        match self.declared_type_of_name(base) {
+            Some(declared) => match declared.as_type() {
+                Some(CType::Pointer(_) | CType::Array(_, _)) | None => true,
+                Some(_) => false,
+            },
+            None => true,
+        }
+    }
+
     fn render_certified_structured_memory_expr(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
@@ -369,7 +389,10 @@ impl<'a> FoldingContext<'a> {
                 expr: index,
                 stride,
             } = index?;
-            if offset != expected_offset || stride != expected_stride {
+            if offset != expected_offset
+                || stride != expected_stride
+                || !self.name_may_be_subscripted(&base)
+            {
                 return None;
             }
             let indexed = CExpr::Subscript {
@@ -575,6 +598,9 @@ impl<'a> FoldingContext<'a> {
             }
         };
         let index = self.observe_certified_address_read_expr(index_value, array.access, index);
+        if !self.name_may_be_subscripted(&base) {
+            return None;
+        }
         let indexed = CExpr::Subscript {
             base: Box::new(base),
             index: Box::new(index),
