@@ -115,6 +115,58 @@ Expect the second cause to be `UnrepresentableControlFlow`
 `crates/r2engine/src/route.rs:618`, both aggravated by -O1 inlining merging
 callee loops into callers.
 
+## What the second census found, and the mathematics of the cost
+
+The DWARF fix made type graphs real for the first time and exposed a cost
+cliff: three zlib binaries hit the harness's 3600 s timeout. Traced to one
+126-byte, eleven-block function, `inflateStateCheck`, that did not finish in
+fifteen minutes. The cost had two layers and a missing safety net, and the
+lattice hypothesis written earlier in this document was wrong — the arena
+interns structurally and could never hold a cycle.
+
+**Layer one: the forward search had no consumer.** Semantic compilation ran two
+forward symbolic explorations per conditional branch (`find_paths_to`), each up
+to 256 states × 2,500 steps with an SMT check per state, and each symbolic load
+inside a step built two fresh solvers over the whole path condition and
+enumerated up to 256 concrete targets. Every consumer of the result was
+traced: reachability statuses feed control claims, which gate only the worker,
+VM and structuring routes; types come from the interprocedural summary set and
+the *backward* compiler's memory terms; the plain native route reads none of
+it. So ∂(bytes)/∂(search) = 0 on the whole benchmark population. The search now
+runs only in the bounded large-CFG collection whose consumers exist
+(`fbc9165`). Corpus: zero of fifty-four files changed. `inflateStateCheck`:
+fifteen minutes → 300 ms.
+
+**Layer two: a loaded pointer had no identity.** Address provenance knew
+parameter-relative addresses only, so `*(arg0 + 0x38)` was a fresh unknown and
+`*(that + 0)` had no structural location; the backward compiler then asked a
+solver to enumerate up to 256 concrete addresses per load — for a pointer
+argument, which is every address. `ObjectKind::Pointee` and
+`pointee_expression` make the access path the identity, finite by construction
+(≤ the function's load count), and a structural reading is never enumerated on
+top of (`88096c3`). 300 ms → 18 ms. The two-level branch compiles *exactly*
+now, on a pointee term rooted at the parameter, which is also new type
+evidence.
+
+**The safety net.** `EngineExecutionControl` and `SymExecutionControl` are the
+same two fields, and the engine's token already wrapped the symbolic one, but no
+call passed either through: every symbolic compilation ran with no deadline.
+Connected in `fbc9165`; the user's ruling is that the cost is the defect and the
+deadline only a net.
+
+**Next cause, already traced to the fork.** With cost gone the function refused
+at the stack slot its parameter is spilled to: radare2 applied the signature
+first, naming `strm` after its register, and then refused the DWARF stack home
+`strm @ bp-24` as the same name at a different kind — plain records are applied
+with no ordinal, so the collision was never looked up. Fixed in the fork
+(`41636fdf73`): the home replaces the register placeholder, and `state` at
+bp-8 appears for the first time. The next link after that is an incoherent ABI
+model, being traced with the term that fails now named.
+
+**Also found by the census: two more OOM kills at O2**, on `example` and
+`minigzip`, at functions 31 and 16 of the batch — under the size caps, ~6 GB.
+The killer function is being identified from discovery order.
+
 ## Context B — rendered quality, `byte_match` 0.144 → 0.45+
 
 The main lever is `r2rewrite`: 93 proven rules, a proof harness, a live call

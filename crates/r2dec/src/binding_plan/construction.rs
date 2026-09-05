@@ -806,6 +806,18 @@ impl BindingPlan {
                 if source_slot.is_none() && callee_allocation.is_none() && size.is_none()
                     || source_slot.is_some() && callee_allocation.is_some()
                 {
+                    // Three inputs decide this and the refusal names none of
+                    // them. Which one is missing is which layer to fix: a
+                    // source slot is radare2's, a width consensus is the
+                    // dataflow's, a callee allocation is a certificate's.
+                    r2il::refusal_evidence!(
+                        "stack-object-identity",
+                        "object={:?} source_slot={} callee_allocation={} size={:?}",
+                        object,
+                        source_slot.is_some(),
+                        callee_allocation.is_some(),
+                        size
+                    );
                     stack_objects.insert(
                         *object,
                         StackObjectDisposition::Refused {

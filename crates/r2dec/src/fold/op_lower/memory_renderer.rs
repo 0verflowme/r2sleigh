@@ -623,6 +623,25 @@ impl<'a> FoldingContext<'a> {
         let expr = match self.planned_value_expr(fact.address) {
             Ok(expr) => expr,
             Err(error) => {
+                // The refusal the reader sees names the site that noticed the
+                // address had no expression, one call above this one; the
+                // error here says why the plan had none, which is the fact
+                // that decides what to fix.
+                r2il::refusal_evidence!(
+                    "memory-address-unplanned",
+                    "value={:?} object={:?} kind={:?} indexed={} slot_offset={:?} error={error:?}",
+                    fact.address,
+                    fact.object,
+                    self.prepared_ssa()
+                        .and_then(|prepared| prepared.objects().object(fact.object))
+                        .map(|object| object.kind.clone()),
+                    self.prepared_ssa().is_some_and(|prepared| prepared
+                        .objects()
+                        .address_is_indexed(fact.address)),
+                    self.inputs
+                        .render_facts()
+                        .and_then(|facts| facts.stack_slot_offset(fact.object))
+                );
                 self.retain_first_observation_error(error);
                 self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
                 return None;

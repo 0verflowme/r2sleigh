@@ -5928,18 +5928,54 @@ fn collect_stack_geometry_certificate(
 /// state.
 fn accessed_object_width(structured: &StructuredDataflowFacts, object: ObjectId) -> Option<u32> {
     let mut width = None;
+    let mut seen = 0usize;
     for access in structured.memory_accesses.values() {
         if access.object != object {
             continue;
         }
+        seen += 1;
         if !access.provenance_complete || access.width == 0 {
+            r2il::refusal_evidence!(
+                "stack-object-width",
+                "object={object:?} access={:?} provenance_complete={} width={}",
+                access.address,
+                access.provenance_complete,
+                access.width
+            );
             return None;
         }
         match width {
             None => width = Some(access.width),
             Some(existing) if existing == access.width => {}
-            Some(_) => return None,
+            Some(existing) => {
+                r2il::refusal_evidence!(
+                    "stack-object-width",
+                    "object={object:?} widths disagree: {existing} and {}",
+                    access.width
+                );
+                return None;
+            }
         }
+    }
+    if seen == 0 {
+        // Which objects the accesses *do* carry is the fact that says whether
+        // this object is unreferenced or the accesses were filed elsewhere.
+        let filed: Vec<(ObjectId, ValueId, u32, bool)> = structured
+            .memory_accesses
+            .values()
+            .map(|access| {
+                (
+                    access.object,
+                    access.address,
+                    access.width,
+                    access.provenance_complete,
+                )
+            })
+            .collect();
+        r2il::refusal_evidence!(
+            "stack-object-width",
+            "object={object:?} has no accesses; all accesses={filed:?}"
+        );
     }
     width
 }

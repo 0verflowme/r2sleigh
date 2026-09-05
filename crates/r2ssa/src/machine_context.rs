@@ -1013,12 +1013,41 @@ impl SourceMachineContext {
                     .stack_pointer_storage()
                     .is_none_or(is_exact_address_register)
                 && frame_pointer_storage.is_none_or(is_exact_address_register);
-            abi_model.coherent &= exact_interface_roles_exist
+            let frame_pointer_matches =
+                frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch);
+            let return_mechanism_matches =
+                return_mechanism_matches_machine(interface, arch, &memory_model);
+            let coherent = exact_interface_roles_exist
                 && carrier_storages_are_disjoint
                 && declared_storages_exist
                 && machine_carriers_are_exact_address_registers
-                && frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch)
-                && return_mechanism_matches_machine(interface, arch, &memory_model);
+                && frame_pointer_matches
+                && return_mechanism_matches;
+            if !coherent {
+                // An incoherent model leaves every return boundary incomplete
+                // and the function refused, and six terms decide it. Naming
+                // the one that failed is the difference between a trace and
+                // a search: an interface that now carries the frame-pointer
+                // homes DWARF declared fails `exact_interface_roles_exist`
+                // for want of a frame-pointer storage, which is a different
+                // repair from a carrier that is not an address register.
+                r2il::refusal_evidence!(
+                    "abi-model-incoherent",
+                    "roles_exist={exact_interface_roles_exist} \
+                     slot_roles_complete={} return_address={} stack_pointer={} \
+                     frame_pointer_slots={has_frame_pointer_slots} \
+                     frame_pointer_storage={} carriers_disjoint={carrier_storages_are_disjoint} \
+                     declared_exist={declared_storages_exist} \
+                     carriers_are_addresses={machine_carriers_are_exact_address_registers} \
+                     frame_pointer_matches={frame_pointer_matches} \
+                     return_mechanism_matches={return_mechanism_matches}",
+                    interface.stack_slot_roles_complete(),
+                    interface.return_address_storage().is_some(),
+                    interface.stack_pointer_storage().is_some(),
+                    frame_pointer_storage.is_some()
+                );
+            }
+            abi_model.coherent &= coherent;
         }
         let (raw_call_sites_by_id, tail_call_sites) =
             collect_raw_call_site_identities(blocks, &tail_call_identities);
