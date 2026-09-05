@@ -1419,6 +1419,19 @@ impl TrustedSsaArtifact {
         let function_interface = match source.function_interface().cloned() {
             Some(interface) => Some(interface),
             None => 'recovered: {
+                // Which of the two interfaces a function ends up with decides
+                // how its return boundary is checked, and the difference is
+                // large: a source interface carries the declared result width,
+                // while a recovered one can only report the width the
+                // instructions observe. Nothing downstream says which one was
+                // used, so a boundary that refused because the source was
+                // absent looked identical to one that refused with the source
+                // present. Say it here, where the choice is made.
+                r2il::refusal_evidence!(
+                    "interface-source-absent",
+                    "the capture carried no function interface; recovering one from {} blocks",
+                    blocks.len()
+                );
                 // Recover against the same decompile-normalized SSA shape the
                 // final artifact will use. The generic SSA constructor can
                 // number a call differently from decompile preparation after

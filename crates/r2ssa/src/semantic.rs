@@ -3845,8 +3845,27 @@ fn projected_return_value_storage(
         (Some(logical_value), Some(type_graph)) => {
             projected_logical_register_storage(abi_storage, logical_value, type_graph)
         }
-        (None, None) => Some(abi_storage),
-        (Some(_), None) | (None, Some(_)) => None,
+        // No source types at all: the widest thing the interface can honestly
+        // say the return travels in is the carrier itself. This is not a
+        // refusal here, but it decides one downstream -- a 32-bit `int` return
+        // then has to be found as an exact 64-bit definition -- so which half
+        // was missing is worth naming.
+        (None, None) => {
+            r2il::refusal_evidence!(
+                "return-projection-untyped",
+                "carrier={abi_storage:?} logical=absent type_graph=absent"
+            );
+            Some(abi_storage)
+        }
+        (logical, graph) => {
+            r2il::refusal_evidence!(
+                "return-projection-partial",
+                "carrier={abi_storage:?} logical={} type_graph={}",
+                logical.is_some(),
+                graph.is_some()
+            );
+            None
+        }
     }
 }
 
@@ -3899,7 +3918,7 @@ fn reaching_source_return_register_in_block(
     {
         return Some(ReachingAbiReturnRegister::Exact(value));
     }
-    reaching_abi_return_register_in_block(
+    let found = reaching_abi_return_register_in_block(
         function,
         graph,
         machine_context,
@@ -3908,7 +3927,25 @@ fn reaching_source_return_register_in_block(
         slot_index,
         storage,
         boundary_at,
-    )
+    );
+    if found.is_none() {
+        // The completeness evidence downstream names the ABI carrier the
+        // interface declared and nothing about the search that failed, so a
+        // boundary that refused because the declared carrier is 8 bytes wide
+        // and a boundary that refused because nothing reaches it read
+        // identically. These two operands separate them: whether a narrower
+        // logical lane was projected at all, and whether that projection was
+        // the carrier itself -- which is what decides that the cross-block
+        // walk above was skipped and only the block-local one ran.
+        r2il::refusal_evidence!(
+            "return-register-unreachable",
+            "carrier={:?} logical={:?} projected_narrower={}",
+            storage,
+            logical_storage,
+            logical_storage.is_some_and(|logical| logical != storage)
+        );
+    }
+    found
 }
 
 #[allow(clippy::too_many_arguments)]

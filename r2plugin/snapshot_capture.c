@@ -2337,7 +2337,22 @@ static bool function_interface_snapshot_collect(
 			interface->stack_pointer_preserved_across_calls,
 			r_str_get (fp_name), interface->frame_pointer_preserved_across_calls);
 	}
-	if (!ctx->signature || !r_anal_function_has_address_linked_signature_current (fcn)) {
+	const bool address_linked =
+		r_anal_function_has_address_linked_signature_current (fcn);
+	if (!ctx->signature || !address_linked) {
+		// Leaving without a word here hid the largest refusal cause in the
+		// benchmark. A function that takes this exit carries no interface into
+		// the snapshot, so the engine recovers one from the instructions
+		// instead -- and a recovered interface reports the width the code
+		// observes rather than the width the source declared, which is what
+		// makes an `int` return look like a 64-bit carrier no exact definition
+		// reaches. Whether radare2 had a prototype and whether it was linked
+		// to this address are different failures wanting different fixes.
+		if (r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+			eprintf ("R2SLEIGH_INTERFACE addr=0x%" PFMT64x
+				" signature=%d address_linked=%d\n",
+				fcn->addr, ctx->signature? 1: 0, address_linked? 1: 0);
+		}
 		return true;
 	}
 	const char *signature_calling_convention = ctx->signature->callconv;
