@@ -14,7 +14,7 @@ use z3::Context;
 use z3::ast::{BV, Bool};
 
 use crate::memory::{MemoryRegionId, MemoryRegionKind, SymMemory};
-use crate::value::SymValue;
+use crate::value::{SymValue, SymbolicKey};
 
 fn debug_runtime_continuation_log(message: &str) {
     if std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_CONTINUATION").is_none() {
@@ -231,8 +231,8 @@ pub struct SymState<'ctx> {
     /// Materialized constraint list, populated lazily from the shared cursor chain.
     materialized_constraints: OnceCell<Vec<Bool>>,
     /// Syntactic value facts derived while adding constraints.
-    known_zero_values: Rc<BTreeSet<String>>,
-    known_nonzero_values: Rc<BTreeSet<String>>,
+    known_zero_values: Rc<HashSet<SymbolicKey>>,
+    known_nonzero_values: Rc<HashSet<SymbolicKey>>,
     /// Current program counter.
     pc: u64,
     /// Address domain for the current program counter.
@@ -315,8 +315,8 @@ impl<'ctx> SymState<'ctx> {
             memory: SymMemory::new(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
-            known_zero_values: Rc::new(BTreeSet::new()),
-            known_nonzero_values: Rc::new(BTreeSet::new()),
+            known_zero_values: Rc::new(HashSet::new()),
+            known_nonzero_values: Rc::new(HashSet::new()),
             pc: entry_pc,
             execution_pc: ExecutionPc::Static,
             predecessor: None,
@@ -339,8 +339,8 @@ impl<'ctx> SymState<'ctx> {
             memory: SymMemory::new_symbolic(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
-            known_zero_values: Rc::new(BTreeSet::new()),
-            known_nonzero_values: Rc::new(BTreeSet::new()),
+            known_zero_values: Rc::new(HashSet::new()),
+            known_nonzero_values: Rc::new(HashSet::new()),
             pc: entry_pc,
             execution_pc: ExecutionPc::Static,
             predecessor: None,
@@ -1002,8 +1002,8 @@ impl<'ctx> SymState<'ctx> {
             hash_sym_value(self.ctx, &self.registers[name], &mut hasher);
         }
 
-        self.known_zero_values.hash(&mut hasher);
-        self.known_nonzero_values.hash(&mut hasher);
+        hash_unordered(&self.known_zero_values, &mut hasher);
+        hash_unordered(&self.known_nonzero_values, &mut hasher);
 
         let mut symbolic_input_names: Vec<_> = self.symbolic_inputs.keys().collect();
         symbolic_input_names.sort_unstable();
@@ -2152,4 +2152,20 @@ mod tests {
         assert_eq!(state.pc(), 0x401000);
         assert!(state.pending_exception().is_some());
     }
+}
+
+/// Hash a set whose iteration order is not part of its meaning.
+///
+/// `BTreeSet` hashed in order and a `HashSet` cannot, so combining the members'
+/// hashes has to be commutative. Exclusive-or is, and it keeps the state's
+/// identity a function of which facts are present rather than of the order the
+/// table happens to store them in.
+fn hash_unordered(values: &HashSet<SymbolicKey>, hasher: &mut impl Hasher) {
+    let mut combined = 0u64;
+    for value in values {
+        let mut member = DefaultHasher::new();
+        value.hash(&mut member);
+        combined ^= member.finish();
+    }
+    combined.hash(hasher);
 }
