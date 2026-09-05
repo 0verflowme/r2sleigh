@@ -62,6 +62,29 @@ pub struct CFGRiskSummary {
 
 pub use r2source::StackAddressBase;
 
+/// `SsaPrepareError::MalformedInput`, with the predicate that decided it named.
+///
+/// Fifteen checks in this file answer with that one variant, and it reaches a
+/// reader as the single string "malformed SSA source input" -- which says that
+/// something rejected the function and nothing about what. That was the last
+/// unattributed hard error on the path where zlib's -O2 binaries were being
+/// lost, and attributing a refusal to the predicate that made it is what turned
+/// the return-boundary hunt from a search into a read.
+///
+/// `#[track_caller]` puts the caller's line in the message, so each site costs
+/// nothing to say and cannot drift from where it actually is.
+#[track_caller]
+fn malformed_ssa_input() -> SsaPrepareError {
+    let location = std::panic::Location::caller();
+    r2il::refusal_evidence!(
+        "ssa-malformed-input",
+        "{}:{}",
+        location.file(),
+        location.line()
+    );
+    SsaPrepareError::MalformedInput
+}
+
 /// Proven stack-address root: `base +/- offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StackAddressRoot {
@@ -309,7 +332,7 @@ impl SsaArtifact {
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
-        validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
+        validate_ssa_function(&function).map_err(|_| malformed_ssa_input())?;
         machine_context.remap_memory_sites_to_prepared(&function);
         let mut graph = SsaGraph::from_function_with_storage(&function);
         crate::semantic::ensure_source_formal_parameter_values(&mut graph, &machine_context);
@@ -606,11 +629,11 @@ impl SsaArtifact {
         control: &C,
     ) -> Result<Self, SsaPrepareError> {
         let Some(function_interface) = function_interface else {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         };
         if function_interface.revision_identity() != lifted.authority().layout().revision_identity()
         {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
         let blocks = lifted
             .blocks()
@@ -636,7 +659,7 @@ impl SsaArtifact {
             control,
         )?;
         if function.entry != lifted.authority().layout().entry_addr() {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
         control.poll()?;
         let mut artifact = Self::new_with_context_control_and_provenance(
@@ -651,7 +674,7 @@ impl SsaArtifact {
             .obligations
             .bind_genuine_native_spans(native_spans)
         {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
         Ok(artifact)
     }
@@ -1528,7 +1551,7 @@ impl TrustedSsaArtifact {
             function = function.with_name(presented);
         }
         if function.entry != source.image().entry_address() {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
         control.poll()?;
         let mut artifact = SsaArtifact::new_with_context_control_and_provenance(
@@ -1545,7 +1568,7 @@ impl TrustedSsaArtifact {
             .obligations
             .bind_genuine_native_spans(native_spans)
         {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
         Ok(Self {
             artifact: Arc::new(artifact),
@@ -2329,7 +2352,7 @@ impl SSAFunction {
             function_interface,
             control,
         )?;
-        validate_ssa_function(&func).map_err(|_| SsaPrepareError::MalformedInput)?;
+        validate_ssa_function(&func).map_err(|_| malformed_ssa_input())?;
         control.poll()?;
         Ok(func)
     }
@@ -2360,7 +2383,7 @@ impl SSAFunction {
         func.decompile_prep_facts = None;
         func.invalidate_query_index();
         crate::optimize::optimize_function_with_control(&mut func, &cfg, control)?;
-        validate_ssa_function(&func).map_err(|_| SsaPrepareError::MalformedInput)?;
+        validate_ssa_function(&func).map_err(|_| malformed_ssa_input())?;
         func.refresh_decompile_prep_facts_with_control(arch, control)?;
         control.poll()?;
         Ok(func)
@@ -2449,11 +2472,11 @@ impl SSAFunction {
     ) -> Result<Self, SsaPrepareError> {
         control.poll()?;
         if blocks.is_empty() {
-            return Err(SsaPrepareError::MalformedInput);
+            return Err(malformed_ssa_input());
         }
 
         // Build CFG
-        let cfg = CFG::from_blocks(blocks).ok_or(SsaPrepareError::MalformedInput)?;
+        let cfg = CFG::from_blocks(blocks).ok_or(malformed_ssa_input())?;
         control.poll()?;
         let entry = cfg.entry;
 
@@ -2491,7 +2514,7 @@ impl SSAFunction {
         let mut ssa_blocks = HashMap::new();
         for &addr in &renamed.block_order {
             control.poll()?;
-            let cfg_block = cfg.get_block(addr).ok_or(SsaPrepareError::MalformedInput)?;
+            let cfg_block = cfg.get_block(addr).ok_or(malformed_ssa_input())?;
             let ops = renamed.blocks.get(&addr).cloned().unwrap_or_default();
 
             // Separate phi nodes from other ops
@@ -2507,7 +2530,7 @@ impl SSAFunction {
                     unreachable!("phi partition contains only phi operations");
                 };
                 if sources.len() != preds.len() {
-                    return Err(SsaPrepareError::MalformedInput);
+                    return Err(malformed_ssa_input());
                 }
                 let phi_sources = sources
                     .into_iter()
@@ -2549,7 +2572,7 @@ impl SSAFunction {
         if let Some(arch) = arch {
             function.normalize_register_alias_sources_with_control(arch, control)?;
         }
-        validate_ssa_function(&function).map_err(|_| SsaPrepareError::MalformedInput)?;
+        validate_ssa_function(&function).map_err(|_| malformed_ssa_input())?;
         control.poll()?;
         Ok(function)
     }
