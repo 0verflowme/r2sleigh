@@ -326,11 +326,19 @@ class RawR2SleighDecompiler(Decompiler):
         def to_file_addr(addr: int) -> int:
             return addr - baddr + min_vaddr
 
+        # Counted at every stage, because a binary that reports no functions
+        # says nothing about which of the three filters removed them, and an
+        # empty list is written out as a census of zero refusals -- which reads
+        # as a decompiler that was never asked rather than a harness that
+        # discarded the work. Five zlib binaries reported zero functions each
+        # this way.
+        stages: list[tuple[str, int]] = [("discovered", len(discovered))]
         candidates = [
             (name, addr)
             for (name, addr) in discovered
             if not common.should_skip_function(name, to_file_addr(addr), text_range)
         ]
+        stages.append(("after skip-list", len(candidates)))
         if functions is not None:
             # Compare on the source's own name, not radare2's flag. radare2
             # spells a function it learned from DWARF `dbg.slide_hash`, while the
@@ -343,6 +351,7 @@ class RawR2SleighDecompiler(Decompiler):
                 (name, addr) for (name, addr) in candidates
                 if _source_name(name) in requested
             ]
+            stages.append(("after requested-name filter", len(candidates)))
         # The benchmark hands a stripped binary and names its own targets by
         # DWARF low_pc, so narrowing is by address, not by symbol.
         narrowed = common.narrow_to_source(
@@ -353,6 +362,7 @@ class RawR2SleighDecompiler(Decompiler):
         )
         kept = {name for (name, _) in narrowed}
         candidates = [(name, addr) for (name, addr) in candidates if name in kept]
+        stages.append(("after source narrowing", len(candidates)))
 
         rendered: dict[str, FunctionDecompilation] = {}
         declined: dict[str, str] = {}
@@ -417,6 +427,21 @@ class RawR2SleighDecompiler(Decompiler):
         # crashed process is the case where the census is most worth having and
         # was previously the one case that never wrote one, because the timeout
         # escaped before this line.
+        if not candidates:
+            # Name the stage that emptied the list, and count the loss against
+            # what discovery found, so the census records a harness failure
+            # rather than an absence of work.
+            lost = stages[0][1]
+            emptied = next(
+                (label for label, count in stages[1:] if count == 0),
+                "discovery",
+            )
+            if lost:
+                declined[f"harness: {binary_path.name}"] = (
+                    "harness: no function reached the decompiler; "
+                    f"the candidate list was emptied {emptied} "
+                    "(" + ", ".join(f"{label}={count}" for label, count in stages) + ")"
+                )
         _write_refusal_census(output_dir, binary_path, declined, len(rendered))
 
         ended_early = discovery.ended_early or (decompile is not None and decompile.ended_early)
