@@ -68,11 +68,47 @@ Land this first; it re-prices everything after it.
    r2dec" notice as a rendered function.
    **Re-baseline on O0 and O2 before planning anything else** — every priority
    derived tonight came from the O1 census and is therefore untrustworthy.
-2. **Implement the marked partial tier.** This is the structural work of this
+2. ~~Find the top refusal cause and fix it at source.~~ **Done, and it was one
+   defect three layers down.** The first honest census -- taken on O0, with the
+   harness now keeping the census a sweep writes instead of deleting it -- ranked
+   `OpLowering(implementation.rs:1324)` first at 30 of 119 refusals. That site
+   refuses a return boundary it was handed as incomplete. The trace ran:
+
+   - the boundary was incomplete because no value reached the declared return
+     carrier, and the carrier was the full 8-byte `rax` rather than the 4-byte
+     lane an `int` return occupies, so only a block-local exact-width walk ran;
+   - the carrier was 8 bytes because the interface had been *recovered from the
+     instructions* rather than read from the source, and recovery can only
+     report the width the code observes;
+   - the interface was recovered because the capture carried none: for all
+     forty-six functions of zlib's `minigzip`, radare2 had a prototype and had
+     not linked it to the function's address;
+   - no link existed because `dwarf_sdb_unset_like_checked` read the *count*
+     `sdb_unset_like` returns as a truth value. A first import has no
+     `fcn.<name>.arg.*` keys to clear, so it removed none, so every DWARF
+     function save reported failure, so the whole-import exactness flag was
+     cleared and every staged function type link was discarded.
+
+   One line in the fork (`de472a1e58`). Verified on a three-function `gcc -g -O0`
+   binary: before, all three staged a link and none survived; after, all three
+   carry an address-linked signature and only the PLT stubs -- which have no
+   DWARF -- take the no-interface exit. On `minigzip` the no-interface exits fall
+   from 46 to 35 and `gz_avail` stops refusing at the return boundary.
+
+   Two lessons worth keeping. **The corpus could never have caught this**: its
+   binaries are built without `-g`, so every one of the fifty-four cells takes
+   the recovery path and the source-interface path was untested end to end. And
+   the causes really do compose -- `gz_avail` now refuses at
+   `memory_renderer.rs:94` instead, which is the next cause, not a failure of the
+   fix.
+
+3. **Implement the marked partial tier.** This is the structural work of this
    context. The refusal must become per-cell rather than per-function, and the
    marking must be visible in the emitted C.
-3. **Re-census on the benchmark population and iterate** by frequency, taking a
-   fresh census after each cause is closed.
+4. **Re-census on the benchmark population and iterate** by frequency, taking a
+   fresh census after each cause is closed. The census now comes home with the
+   run and `tests/decbench/census_decbench.py` ranks it, separating `harness:`
+   causes -- the tooling saying it never got to ask -- from real refusals.
 
 Expect the second cause to be `UnrepresentableControlFlow`
 (`crates/r2dec/src/lib.rs:3215`) or the loop-graph guard at
