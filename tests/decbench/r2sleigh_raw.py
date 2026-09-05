@@ -493,12 +493,20 @@ def _write_refusal_census(
         payload = {
             "schema_version": 1,
             "binary": binary_path.name,
+            "binary_path": str(binary_path),
             "rendered": rendered,
             "declined": len(declined),
             "causes": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
             "by_function": dict(sorted(declined.items())),
         }
-        path = target / f"r2sleigh-refusals-{binary_path.name}.json"
+        # Named from the whole path, not the binary's name. One run decompiles
+        # the same names at every optimization level -- zlib builds `example`
+        # under O0 and again under O2 -- into one census directory, so keying on
+        # the name alone silently overwrote the earlier level's census with the
+        # later one's. The path is the binary's identity here; using all of it
+        # cannot collide, and the payload carries it back for the reader.
+        stem = str(binary_path).strip("/").replace("/", "_")
+        path = target / f"r2sleigh-refusals-{stem}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:

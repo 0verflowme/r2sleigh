@@ -574,6 +574,24 @@ for project in "${projects[@]}"; do
     scp "${ssh_keepalive[@]}" -q "$host:$remote/results/$project.scoreboard.toml" \
         "$artifact_root/raw/$project.scoreboard.toml"
 done
+# The refusal census is the only record of *why* a function was declined; the
+# per-function results carry a bare boolean. It was written on the host and
+# never fetched, and the run directory is removed a few lines below, so every
+# sweep so far destroyed its own evidence. Fetch it with the rest.
+mkdir -p "$artifact_root/census"
+census_written=$(ssh "${ssh_keepalive[@]}" "$host" \
+    "ls -1 '$remote/results'/r2sleigh-refusals-*.json 2>/dev/null | wc -l")
+if (( census_written > 0 )); then
+    scp "${ssh_keepalive[@]}" -q "$host:$remote/results/r2sleigh-refusals-*.json" \
+        "$artifact_root/census/"
+    echo "refusal census: $census_written binaries"
+    python3 "$root/tests/decbench/census_decbench.py" "$artifact_root/census" \
+        | sed 's/^/  /'
+    rm -rf -- "$root/tests/decbench/artifacts/census"
+    cp -R "$artifact_root/census" "$root/tests/decbench/artifacts/census"
+else
+    echo "refusal census: no binary wrote one" >&2
+fi
 scp "${ssh_keepalive[@]}" -q "$host:$remote/run.meta" "$artifact_root/run.meta"
 scp "${ssh_keepalive[@]}" -q "$host:$remote/project-stats.tsv" "$artifact_root/project-stats.tsv"
 mkdir -p "$artifact_root/witness-checks"
