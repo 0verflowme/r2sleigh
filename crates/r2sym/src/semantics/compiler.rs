@@ -7,6 +7,7 @@ use r2ssa::{
 };
 use z3::Context;
 
+use crate::control::SymExecutionControl;
 use crate::sim::{SummaryProfile, source_arch_spec};
 
 use super::artifact::{
@@ -497,6 +498,7 @@ fn compile_function_semantics_from_current_inputs(
     ctx: &Context,
     func: &Arc<SsaArtifact>,
     summary_profile: SummaryProfile,
+    execution: &SymExecutionControl,
 ) -> SemanticArtifact {
     let arch = source_arch_spec(func.as_ref());
     let symbol_map = HashMap::new();
@@ -529,6 +531,7 @@ fn compile_function_semantics_from_current_inputs(
                 &symbol_map,
                 summary_profile,
                 bounded_large_cfg_branch_limit(func),
+                execution,
             );
 
             let execution = if vm_step_ready {
@@ -575,6 +578,7 @@ fn compile_function_semantics_from_current_inputs(
             Some(arch),
             &symbol_map,
             summary_profile,
+            execution,
         );
     } else {
         collected.diagnostics.skipped_missing_arch = true;
@@ -621,7 +625,28 @@ pub fn compile_function_semantics(
     func: &Arc<SsaArtifact>,
     summary_profile: SummaryProfile,
 ) -> SemanticArtifact {
-    compile_function_semantics_from_current_inputs(ctx, func, summary_profile)
+    compile_function_semantics_with_control(
+        ctx,
+        func,
+        summary_profile,
+        &SymExecutionControl::default(),
+    )
+}
+
+/// Compile under a caller's deadline and cancellation.
+///
+/// The engine hands every request a deadline, and until this existed none of
+/// it reached the symbolic executor: `EngineExecutionControl` and
+/// `SymExecutionControl` are the same two fields, and the engine's cancellation
+/// token already wraps the symbolic one, but no call site passed either
+/// through. An 18.5-second budget therefore ran for fifteen minutes.
+pub fn compile_function_semantics_with_control(
+    ctx: &Context,
+    func: &Arc<SsaArtifact>,
+    summary_profile: SummaryProfile,
+    execution: &SymExecutionControl,
+) -> SemanticArtifact {
+    compile_function_semantics_from_current_inputs(ctx, func, summary_profile, execution)
 }
 
 pub fn compile_semantic_artifact(
@@ -637,6 +662,14 @@ pub fn compile_semantic_artifact_default(
     func: &Arc<SsaArtifact>,
 ) -> SemanticArtifact {
     compile_semantic_artifact(ctx, func, SummaryProfile::Default)
+}
+
+pub fn compile_semantic_artifact_default_with_control(
+    ctx: &Context,
+    func: &Arc<SsaArtifact>,
+    execution: &SymExecutionControl,
+) -> SemanticArtifact {
+    compile_function_semantics_with_control(ctx, func, SummaryProfile::Default, execution)
 }
 
 #[cfg(test)]

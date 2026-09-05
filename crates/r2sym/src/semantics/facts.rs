@@ -12,6 +12,7 @@ use crate::backward::{
     BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
     BackwardMemoryRegion, compile_branch_preconditions,
 };
+use crate::control::SymExecutionControl;
 use crate::path::{ExploreConfig, PathExplorer};
 use crate::runtime::{seed_default_state_for_arch, seed_default_state_for_prepared};
 use crate::semantics::{
@@ -594,8 +595,40 @@ fn symbolic_condition_hint(summary: Option<&BackwardConditionSummary>) -> Option
 /// function proved depend on how busy the machine was.
 const SYMBOLIC_FACT_MAX_STEPS: u64 = 2_500;
 
-fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
-    let mut explorer = PathExplorer::with_config(
+/// Whether branch reachability may fall back to a forward search from the
+/// function entry when the compiled backward condition is not exact.
+///
+/// The search is the expensive half of semantic compilation: two explorations
+/// per conditional branch, each popping up to 256 states for up to 2,500
+/// steps, and every symbolic load inside a step builds fresh solvers over the
+/// whole path condition and enumerates up to 256 concrete targets. On zlib's
+/// `inflateStateCheck` -- eleven blocks, seven branches, walking
+/// `strm->state->strm` -- that did not finish in fifteen minutes.
+///
+/// What the search produces is a `Reachable`/`Unreachable` status per branch
+/// target. Every consumer of that status was traced: it feeds control claims,
+/// which gate only the worker, VM and structuring routes -- the ones a large
+/// or dispatch-shaped CFG takes. Types come from the interprocedural summary
+/// and from the backward compiler's memory terms, both computed before the
+/// search. The plain native route reads none of it. Measured on the corpus:
+/// with the search disabled, zero of fifty-four rendered files changed.
+///
+/// So the search runs where a consumer exists and nowhere else. Where it is
+/// skipped and the backward condition is not exact, the status is `Unknown`,
+/// which is what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardSearch {
+    /// Explore forward when the backward condition cannot decide.
+    Run,
+    /// Report `Unknown` instead; no route on this path reads the answer.
+    Skip,
+}
+
+fn symbolic_fact_explorer<'ctx>(
+    ctx: &'ctx Context,
+    execution: &SymExecutionControl,
+) -> PathExplorer<'ctx> {
+    let mut explorer = PathExplorer::with_config_and_execution_control(
         ctx,
         ExploreConfig {
             subsumption_states: true,
@@ -606,6 +639,7 @@ fn symbolic_fact_explorer<'ctx>(ctx: &'ctx Context) -> PathExplorer<'ctx> {
             merge_states: false,
             ..ExploreConfig::default()
         },
+        execution.clone(),
     );
     explorer.set_target_guided_queries(true);
     explorer
@@ -697,11 +731,14 @@ fn collect_branch_observations_for_branch_blocks<'ctx, F>(
     func: &SsaArtifact,
     arch: &ArchSpec,
     branch_blocks: &[(u64, u64, u64)],
+    forward_search: ForwardSearch,
+    execution: &SymExecutionControl,
     install_hooks: F,
 ) -> (Vec<BranchObservation>, SymbolicFunctionFactDiagnostics)
 where
     F: Fn(&mut PathExplorer<'ctx>),
 {
+    let skip_forward = matches!(forward_search, ForwardSearch::Skip);
     let mut branch_facts = Vec::new();
     let mut diagnostics = SymbolicFunctionFactDiagnostics::default();
     for &(block_addr, true_target, false_target) in branch_blocks {
@@ -718,7 +755,7 @@ where
             state
         };
 
-        let mut true_explorer = symbolic_fact_explorer(ctx);
+        let mut true_explorer = symbolic_fact_explorer(ctx, execution);
         install_hooks(&mut true_explorer);
         let true_initial_state = make_state();
         let ((compiled_true_status, true_compiled), (compiled_false_status, false_compiled)) =
@@ -731,7 +768,7 @@ where
         let true_condition = symbolic_condition_hint(true_compiled.as_ref());
         let true_status = if let Some(status) = compiled_true_status {
             status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
+        } else if skip_forward || predicate_uses_call_result || func_contains_calls(func) {
             SymbolicReachabilityStatus::Unknown
         } else {
             let paths = true_explorer.find_paths_to(func, make_state(), true_target);
@@ -741,10 +778,10 @@ where
         let false_condition = symbolic_condition_hint(false_compiled.as_ref());
         let false_status = if let Some(status) = compiled_false_status {
             status
-        } else if predicate_uses_call_result || func_contains_calls(func) {
+        } else if skip_forward || predicate_uses_call_result || func_contains_calls(func) {
             SymbolicReachabilityStatus::Unknown
         } else {
-            let mut false_explorer = symbolic_fact_explorer(ctx);
+            let mut false_explorer = symbolic_fact_explorer(ctx, execution);
             install_hooks(&mut false_explorer);
             let paths = false_explorer.find_paths_to(func, make_state(), false_target);
             symbolic_reachability_status(paths.len(), false_explorer.budget_exhausted())
@@ -938,6 +975,7 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
     branch_limit: usize,
+    execution: &SymExecutionControl,
 ) -> CollectedNativeSemanticRegions {
     let mut collected = if branch_limit == 0 {
         CollectedNativeSemanticRegions {
@@ -951,11 +989,16 @@ pub(super) fn collect_large_cfg_canonical_semantic_regions_with_limit(
         }
     } else {
         let branch_blocks = limited_branch_blocks(func, branch_limit);
+        // This is the collection the worker, summary-island and structuring
+        // routes read their control claims from, so the forward search has a
+        // consumer here and runs, bounded by `branch_limit`.
         let (branch_facts, diagnostics) = collect_branch_observations_for_branch_blocks(
             ctx,
             func,
             arch,
             &branch_blocks,
+            ForwardSearch::Run,
+            execution,
             |explorer| {
                 install_symbolic_fact_hooks(explorer, func, arch, summary_profile, symbol_map);
             },
@@ -992,6 +1035,7 @@ pub(super) fn collect_canonical_semantic_regions_with_profile(
     arch: Option<&ArchSpec>,
     symbol_map: &HashMap<u64, String>,
     summary_profile: SummaryProfile,
+    execution: &SymExecutionControl,
 ) -> CollectedNativeSemanticRegions {
     let Some(arch) = arch else {
         return CollectedNativeSemanticRegions {
@@ -1015,15 +1059,22 @@ pub(super) fn collect_canonical_semantic_regions_with_profile(
             symbol_map,
             summary_profile,
             large_cfg_branch_limit(func),
+            execution,
         );
     }
 
     let branch_blocks = collect_branch_blocks(func);
+    // A function on this path -- a CFG under the large-CFG thresholds with no
+    // dispatch evidence -- can only take the plain native route, and that route
+    // reads no reachability status. The backward compiler still answers every
+    // branch it can decide exactly; the rest are `Unknown`.
     let (branch_facts, diagnostics) = collect_branch_observations_for_branch_blocks(
         ctx,
         func,
         arch,
         &branch_blocks,
+        ForwardSearch::Skip,
+        execution,
         |explorer| {
             install_symbolic_fact_hooks(explorer, func, arch, summary_profile, symbol_map);
         },
@@ -1144,6 +1195,8 @@ mod tests {
             &artifact,
             &arch,
             &[(0x1000, 0x1010, 0x1004)],
+            ForwardSearch::Run,
+            &SymExecutionControl::default(),
             |_| {},
         );
 
@@ -1268,6 +1321,8 @@ mod tests {
             &artifact,
             &arch,
             &[(0x1000, 0x1010, 0x1004)],
+            ForwardSearch::Run,
+            &SymExecutionControl::default(),
             |_| {},
         );
 

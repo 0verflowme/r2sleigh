@@ -20,8 +20,9 @@ pub use claims::{
     SummaryRouteCertificateKind,
 };
 pub use compiler::{
-    compile_function_semantics, compile_native_worker_summary_artifact, compile_semantic_artifact,
-    compile_semantic_artifact_default,
+    compile_function_semantics, compile_function_semantics_with_control,
+    compile_native_worker_summary_artifact, compile_semantic_artifact,
+    compile_semantic_artifact_default, compile_semantic_artifact_default_with_control,
     compile_summary_dense_worker_artifact_from_interproc_summary,
 };
 pub use facts::{SymbolicReachabilityStatus, augment_semantic_artifact_with_interproc_summary};

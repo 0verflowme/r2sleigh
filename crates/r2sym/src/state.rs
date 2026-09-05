@@ -1768,6 +1768,22 @@ impl<'ctx> std::fmt::Debug for SymState<'ctx> {
     }
 }
 
+/// Hash a set whose iteration order is not part of its meaning.
+///
+/// `BTreeSet` hashed in order and a `HashSet` cannot, so combining the members'
+/// hashes has to be commutative. Exclusive-or is, and it keeps the state's
+/// identity a function of which facts are present rather than of the order the
+/// table happens to store them in.
+fn hash_unordered(values: &HashSet<SymbolicKey>, hasher: &mut impl Hasher) {
+    let mut combined = 0u64;
+    for value in values {
+        let mut member = DefaultHasher::new();
+        value.hash(&mut member);
+        combined ^= member.finish();
+    }
+    combined.hash(hasher);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2152,20 +2168,4 @@ mod tests {
         assert_eq!(state.pc(), 0x401000);
         assert!(state.pending_exception().is_some());
     }
-}
-
-/// Hash a set whose iteration order is not part of its meaning.
-///
-/// `BTreeSet` hashed in order and a `HashSet` cannot, so combining the members'
-/// hashes has to be commutative. Exclusive-or is, and it keeps the state's
-/// identity a function of which facts are present rather than of the order the
-/// table happens to store them in.
-fn hash_unordered(values: &HashSet<SymbolicKey>, hasher: &mut impl Hasher) {
-    let mut combined = 0u64;
-    for value in values {
-        let mut member = DefaultHasher::new();
-        value.hash(&mut member);
-        combined ^= member.finish();
-    }
-    combined.hash(hasher);
 }

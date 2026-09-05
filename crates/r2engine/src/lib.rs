@@ -1396,6 +1396,18 @@ impl EngineExecutionControl {
         self.cancellation.clone()
     }
 
+    /// The same control, in the symbolic executor's terms.
+    ///
+    /// The two types carry the same two fields, and the engine's cancellation
+    /// token already wraps the symbolic one, so this is a clone rather than a
+    /// translation. It exists because nothing performed the clone: every
+    /// symbolic compilation the engine requested ran under
+    /// `SymExecutionControl::default()`, with no deadline and no cancellation,
+    /// however tight the budget the engine had been given.
+    pub fn symbolic(&self) -> r2sym::SymExecutionControl {
+        r2sym::SymExecutionControl::new(self.cancellation.symbolic.clone(), self.deadline)
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
@@ -4110,12 +4122,14 @@ fn build_engine_analysis_artifact(
             return maybe_compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
                 interproc_summary_set.as_ref(),
+                &request.execution.symbolic(),
             );
         }
         optional_semantics_required.then(|| {
-            r2sym::compile_semantic_artifact_default(
+            r2sym::compile_semantic_artifact_default_with_control(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
+                &request.execution.symbolic(),
             )
         })
     })();
@@ -4165,6 +4179,7 @@ fn build_engine_analysis_artifact(
 fn maybe_compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
+    execution: &r2sym::SymExecutionControl,
 ) -> Option<r2sym::SemanticArtifact> {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
     if should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary) {
@@ -4191,6 +4206,7 @@ fn maybe_compile_semantic_artifact_for_analysis(
     Some(compile_semantic_artifact_for_analysis(
         ssa_func,
         interproc_summaries,
+        execution,
     ))
 }
 
@@ -4215,6 +4231,7 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 fn compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
+    execution: &r2sym::SymExecutionControl,
 ) -> r2sym::SemanticArtifact {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
     let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
@@ -4235,8 +4252,11 @@ fn compile_semantic_artifact_for_analysis(
     {
         return artifact;
     }
-    let mut artifact =
-        r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), ssa_func);
+    let mut artifact = r2sym::compile_semantic_artifact_default_with_control(
+        &z3::Context::thread_local(),
+        ssa_func,
+        execution,
+    );
     if let Some(summaries) = interproc_summaries {
         r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
     }
@@ -7362,7 +7382,11 @@ mod tests {
                 .with_name("dbg.init_node"),
         );
 
-        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None);
+        let artifact = compile_semantic_artifact_for_analysis(
+            &ssa_func,
+            None,
+            &r2sym::SymExecutionControl::default(),
+        );
 
         assert_ne!(
             artifact.granularity,
@@ -7433,7 +7457,14 @@ mod tests {
         );
 
         assert!(should_skip_unbounded_semantic_artifact_after_worker_preprobe(&loop_ssa, None));
-        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None).is_none());
+        assert!(
+            maybe_compile_semantic_artifact_for_analysis(
+                &loop_ssa,
+                None,
+                &r2sym::SymExecutionControl::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -7455,8 +7486,12 @@ mod tests {
         );
         assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
 
-        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None)
-            .expect("vm artifact should not be refused before classification");
+        let artifact = maybe_compile_semantic_artifact_for_analysis(
+            &vm_ssa,
+            None,
+            &r2sym::SymExecutionControl::default(),
+        )
+        .expect("vm artifact should not be refused before classification");
 
         assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
         assert!(artifact.vm_body().is_some());
