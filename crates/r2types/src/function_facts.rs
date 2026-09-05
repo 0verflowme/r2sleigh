@@ -1827,6 +1827,9 @@ impl SourceOwnedFunctionFacts {
         // Exact immutable interface evidence outranks advisory propagation.
         // Apply it after recovered call evidence so the latter cannot rewrite
         // a declared signedness or logical projection through a weak scalar.
+        // Where the interface carries a type graph the whole signature comes
+        // from it; the return-only projection below then finds it agreeing.
+        enriched.apply_exact_source_signature(source);
         enriched.apply_exact_source_return_type(source);
         // Type constraints may change advisory member/carrier types. Rebuild
         // once more so the sealed render projection is a pure function of the
@@ -2911,6 +2914,13 @@ impl FunctionFacts {
                 continue;
             };
             cert.bindings.insert(parameter_id);
+            r2il::refusal_evidence!(
+                "parameter-entry",
+                "slot {slot} entry value {:?} of {} bytes ({:?})",
+                value.id,
+                value.var.size,
+                value.canonical_storage
+            );
             let entry = entry_values_by_slot.entry(slot as u32).or_default();
             entry.0.insert(value.id);
             entry.1 = entry.1.max(value.var.size);
@@ -2984,6 +2994,17 @@ impl FunctionFacts {
         }
         for (slot, (entry_values, carrier_width)) in entry_values_by_slot {
             let id = r2ssa::SemanticId::Parameter(slot);
+            r2il::refusal_evidence!(
+                "parameter-entity",
+                "slot {slot} carrier {carrier_width} logical {:?}",
+                prepared
+                    .machine_context()
+                    .function_interface()
+                    .and_then(|interface| interface
+                        .parameter_logical_values()
+                        .get(slot as usize)
+                        .copied())
+            );
             let ty = prepared
                 .machine_context()
                 .function_interface()
@@ -3210,6 +3231,79 @@ impl FunctionFacts {
         self.types
             .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
         applied.len()
+    }
+
+    /// Take the whole signature from the immutable source interface where it
+    /// carries a type graph: each parameter's and the return's declared type,
+    /// resolved through the graph, which is the same source the binding layer
+    /// declares from. The rendered header and the body then agree by
+    /// construction. radare2's spelled signature was the header's source before
+    /// and stays the fallback: it names typedefs the renderer cannot place and
+    /// carries signedness the source never declared, which is how `z_streamp`
+    /// rendered as a machine word and a header parameter disagreed with the
+    /// typed local it was stored into. Parameter names are kept from the
+    /// spelled signature when it has the same arity.
+    fn apply_exact_source_signature(&mut self, source: &r2ssa::SsaArtifact) -> bool {
+        let context = source.machine_context();
+        let Some(interface) = context.function_interface() else {
+            return false;
+        };
+        let Some(graph) = interface.type_graph() else {
+            return false;
+        };
+        let logical = interface.parameter_logical_values();
+        if logical.len() != interface.parameters().len() {
+            return false;
+        }
+        let spelled = self.types.merged_signature.clone();
+        let names = spelled
+            .as_ref()
+            .filter(|signature| signature.params.len() == logical.len())
+            .map(|signature| {
+                signature
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>()
+            });
+        let mut params = Vec::with_capacity(logical.len());
+        for (index, value) in logical.iter().enumerate() {
+            let Some(ty) =
+                crate::writeback::source_type_like(graph, value.type_id(), &mut BTreeSet::new())
+            else {
+                return false;
+            };
+            let name = names
+                .as_ref()
+                .and_then(|names| names.get(index).cloned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("arg{index}"));
+            params.push(crate::FunctionParamSpec { name, ty: Some(ty) });
+        }
+        let ret_type = match interface.return_kind() {
+            r2ssa::SourceFunctionReturn::Void => Some(CTypeLike::Void),
+            r2ssa::SourceFunctionReturn::Register { .. } => {
+                interface.return_logical_value().and_then(|value| {
+                    crate::writeback::source_type_like(graph, value.type_id(), &mut BTreeSet::new())
+                })
+            }
+        };
+        let Some(ret_type) = ret_type else {
+            return false;
+        };
+        let signature = crate::FunctionSignatureSpec {
+            ret_type: Some(ret_type),
+            params,
+        };
+        let Some(certificate) = crate::SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::SourceInterface],
+        ) else {
+            return false;
+        };
+        self.types.merged_signature = Some(signature);
+        self.types.signature_certificate = Some(certificate);
+        true
     }
 
     /// Preserve the source-declared logical return type only when every native

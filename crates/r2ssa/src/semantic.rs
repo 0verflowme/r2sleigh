@@ -1767,13 +1767,28 @@ impl PreparedFunctionFacts {
         assumptions: &AssumptionSet,
         machine_context: Option<&SourceMachineContext>,
     ) -> Self {
+        // Each phase reports how long it took and how much it produced. One
+        // function in a binary built at -O2 grew past the harness's memory
+        // limit inside this collector while the same function alone took two
+        // seconds; the phase that grows is the one to trace, and nothing
+        // downstream can tell which it was.
+        let phase_started = std::time::Instant::now();
+        let phase = |name: &str, size: usize| {
+            r2il::refusal_evidence!(
+                "collect-phase",
+                "{name} {} ms size {size}",
+                phase_started.elapsed().as_millis()
+            );
+        };
         let addresses = collect_address_provenance(function, graph, machine_context);
+        phase("addresses", 0);
         let call_sites = collect_call_sites(
             function,
             graph,
             function.decompile_prep_facts(),
             machine_context,
         );
+        phase("call_sites", call_sites.by_id.len());
         let (objects, memory) = collect_object_and_memory_facts(
             function,
             graph,
@@ -1781,9 +1796,12 @@ impl PreparedFunctionFacts {
             &call_sites,
             machine_context,
         );
+        phase("objects", objects.objects.len());
         let predicates = collect_predicate_facts(function, graph);
+        phase("predicates", 0);
         let boundaries =
             collect_source_boundary_facts(function, graph, &call_sites, machine_context);
+        phase("boundaries", boundaries.calls.len());
         let return_storages = machine_context
             .into_iter()
             .flat_map(|context| context.abi_model().return_registers())
@@ -1803,9 +1821,12 @@ impl PreparedFunctionFacts {
                 machine_context,
             },
         );
+        phase("structured", structured.memory_accesses.len());
         let control_domains = collect_control_domain_facts(function, &predicates, &structured);
+        phase("control_domains", 0);
         let obligations =
             SemanticObligationInventory::collect(graph, &structured, &boundaries, machine_context);
+        phase("obligations", 0);
         // A lifted body merges every storage live across a join, so the graph
         // records uses that carry no program observation. `DeadPhis` names
         // exactly those, and the merges stay in the function by design, so a
@@ -1825,6 +1846,7 @@ impl PreparedFunctionFacts {
             &structured,
             &unobserved,
         );
+        phase("certificates", certificates.stack_slots.len());
         let (applied_assumption_bindings, assumption_usage) = collect_prepared_assumption_usage(
             graph,
             &objects,
@@ -1832,6 +1854,7 @@ impl PreparedFunctionFacts {
             assumptions,
             machine_context,
         );
+        phase("assumptions", 0);
         Self {
             addresses,
             objects,
@@ -3495,7 +3518,7 @@ fn collect_source_boundary_facts(
                         // explicitly, so no SSA value names it. That is a
                         // description of where the value comes from, not a
                         // failure to find it.
-                        reaching_abi_argument_in_block(
+                        let found = reaching_abi_argument_in_block(
                             function,
                             graph,
                             machine_context,
@@ -3503,8 +3526,16 @@ fn collect_source_boundary_facts(
                             block_addr,
                             op_index,
                             argument.storage(),
-                        )
-                        .map(|value| SourceCallArgumentFact {
+                        );
+                        if found.is_none() {
+                            r2il::refusal_evidence!(
+                                "call-argument",
+                                "callsite ({block_addr:#x}, {op_index}) argument {} in {:?} has no reaching value",
+                                argument.index(),
+                                argument.storage()
+                            );
+                        }
+                        found.map(|value| SourceCallArgumentFact {
                             slot: CallBoundarySlot::Register {
                                 index: argument.index(),
                                 storage: argument.storage(),
@@ -3755,6 +3786,14 @@ fn source_formal_parameter_projections(
             None => !interface.parameter_logical_values().is_empty(),
         }
     {
+        r2il::refusal_evidence!(
+            "formal-projections",
+            "interface schema {} graph {:?} parameters {} logical values {}",
+            interface.schema_version(),
+            interface.type_graph().map(|graph| graph.schema_version()),
+            interface.parameters().len(),
+            interface.parameter_logical_values().len()
+        );
         return Vec::new();
     }
 
@@ -3772,6 +3811,12 @@ fn source_formal_parameter_projections(
                 .count()
                 != 1
             {
+                r2il::refusal_evidence!(
+                    "formal-projections",
+                    "parameter {} storage {:?} is not exactly one argument register of the ABI model",
+                    parameter.index(),
+                    abi_storage
+                );
                 return None;
             }
             let logical_value = interface
@@ -4400,6 +4445,12 @@ fn reaching_abi_value_before(
             // A later overlapping slice means an older exact-width definition
             // is not the value at this boundary. Generic boundary recovery has
             // no implicit register-merge semantics, so it must fail closed.
+            r2il::refusal_evidence!(
+                "reaching-abi-value",
+                "({block_addr:#x}, {op_index}) writes {:?}, a slice of the {:?} wanted",
+                dst_storage,
+                storage
+            );
             return None;
         }
         return graph
@@ -4471,7 +4522,16 @@ fn reaching_abi_value_before(
     let [first, rest @ ..] = values.as_slice() else {
         return None;
     };
-    rest.iter().all(|value| value == first).then_some(*first)
+    if !rest.iter().all(|value| value == first) {
+        r2il::refusal_evidence!(
+            "reaching-abi-value",
+            "{block_addr:#x} has no phi for {:?} and its predecessors disagree: {:?}",
+            storage,
+            values
+        );
+        return None;
+    }
+    Some(*first)
 }
 
 fn register_storages_overlap(left: CanonicalStorageId, right: CanonicalStorageId) -> bool {

@@ -6659,6 +6659,15 @@ pub(crate) fn source_type_like(
                 })?;
             CTypeLike::Struct(aggregate.name().to_string())
         }
+        r2ssa::SourceTypeKind::Union { aggregate_id } => {
+            let aggregate = graph
+                .aggregates()
+                .get(usize::try_from(aggregate_id).ok()?)
+                .filter(|aggregate| {
+                    aggregate.id() == aggregate_id && aggregate.type_id() == type_id
+                })?;
+            CTypeLike::Union(aggregate.name().to_string())
+        }
         r2ssa::SourceTypeKind::Void => CTypeLike::Void,
         // A function whose signature the graph does not carry; spelled with
         // an empty parameter list, which in C is an unspecified one.

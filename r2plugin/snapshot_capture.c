@@ -6,6 +6,7 @@
  * everything here runs against radare2's public API while the caller holds
  * anal->lock, which is the one thing the fork still has to provide. */
 
+#include <errno.h>
 #include <r_anal.h>
 #include <r_core.h>
 #include <r_util.h>
@@ -335,6 +336,133 @@ static RAnalFcnSlotRole fcn_context_classify_slot(const RAnalVar *var, RAnalVar 
 	}
 	return R_ANAL_FCN_SLOT_UNKNOWN;
 }
+#define DWARF_EXACT_FORMAL_RECORD_V1 "dwarf-stack-home-v1"
+
+static bool dwarf_parse_st64_local(const char *text, R_OUT st64 *value) {
+	if (R_STR_ISEMPTY (text) || !value) {
+		return false;
+	}
+	errno = 0;
+	char *end = NULL;
+	const long long parsed = strtoll (text, &end, 10);
+	if (errno == ERANGE || !end || *end || (st64)parsed != parsed) {
+		return false;
+	}
+	*value = (st64)parsed;
+	return true;
+}
+
+/* Whether a stack variable's type was declared by DWARF for this function.
+ *
+ * radare2 keeps the DWARF records it integrated under the "dwarf" namespace of
+ * the analysis database: `fcn.<name>.addr`, `fcn.<name>.var.<v>` as
+ * `<kind>,<offset>,<type>` and `fcn.<name>.arg.<n>` as `<v>,<kind>,<offset>,<type>`
+ * (or the exact-record form). A variable is declared when a record of the
+ * same kind sits at the same frame offset. Nothing else counts: a type radare2
+ * inferred for a slot is evidence about it, and passing it on as a declaration
+ * made a `char *` out of a `size_t` in the corpus and broke the compile. */
+typedef struct {
+	RAnal *anal;
+	RAnalFunction *fcn;
+	const RAnalVar *var;
+	const char *sname;
+	bool declared;
+} SlotDwarfProvenance;
+
+static bool slot_dwarf_record_matches(const SlotDwarfProvenance *probe, const char *value, bool is_arg) {
+	if (R_STR_ISEMPTY (value)) {
+		return false;
+	}
+	char *copy = strdup (value);
+	if (!copy) {
+		return false;
+	}
+	bool matches = false;
+	char *cursor = copy;
+	if (r_str_startswith (copy, DWARF_EXACT_FORMAL_RECORD_V1 ",")) {
+		// dwarf-stack-home-v1,<ordinal>,<kind>,<offset>,<name64>,<type64>
+		char *fields[4] = {0};
+		size_t i;
+		for (i = 0; i < 4; i++) {
+			fields[i] = sdb_anext (cursor, &cursor);
+			if (!fields[i]) {
+				break;
+			}
+		}
+		if (i == 4) {
+			st64 offset = 0;
+			matches = fields[2][0] == (char)probe->var->kind
+				&& dwarf_parse_st64_local (fields[3], &offset)
+				&& offset == r_anal_var_frame_delta (probe->anal, probe->fcn,
+					probe->var->kind, probe->var->delta);
+		}
+	} else {
+		if (is_arg) {
+			(void)sdb_anext (cursor, &cursor); // the name
+		}
+		char *kind = cursor? sdb_anext (cursor, &cursor): NULL;
+		char *offset_text = cursor? sdb_anext (cursor, &cursor): NULL;
+		st64 offset = 0;
+		matches = kind && offset_text && kind[0] == (char)probe->var->kind
+			&& dwarf_parse_st64_local (offset_text, &offset)
+			&& offset == r_anal_var_frame_delta (probe->anal, probe->fcn,
+				probe->var->kind, probe->var->delta);
+	}
+	free (copy);
+	return matches;
+}
+
+static bool slot_dwarf_provenance_cb(void *user, const char *key, const char *value) {
+	SlotDwarfProvenance *probe = user;
+	if (probe->declared || !r_str_startswith (key, "fcn.")) {
+		return true;
+	}
+	const char *rest = key + strlen ("fcn.");
+	const size_t name_len = strlen (probe->sname);
+	if (strncmp (rest, probe->sname, name_len) || rest[name_len] != '.') {
+		return true;
+	}
+	const char *field = rest + name_len + 1;
+	if (r_str_startswith (field, "var.")) {
+		probe->declared = slot_dwarf_record_matches (probe, value, false);
+	} else if (r_str_startswith (field, "arg.")) {
+		probe->declared = slot_dwarf_record_matches (probe, value, true);
+	}
+	return true;
+}
+
+static bool slot_dwarf_sname_cb(void *user, const char *key, const char *value) {
+	SlotDwarfProvenance *probe = user;
+	if (probe->sname || !r_str_startswith (key, "fcn.") || !r_str_endswith (key, ".addr")) {
+		return true;
+	}
+	if (sdb_atoi (value) != probe->fcn->addr) {
+		return true;
+	}
+	const size_t len = strlen (key) - strlen ("fcn.") - strlen (".addr");
+	probe->sname = r_str_ndup (key + strlen ("fcn."), len);
+	return true;
+}
+
+static bool fcn_context_slot_declared_by_dwarf(RAnal *anal, RAnalFunction *fcn, const RAnalVar *var) {
+	if (!anal || !anal->sdb || !fcn || !var
+		|| (var->kind != R_ANAL_VAR_KIND_BPV && var->kind != R_ANAL_VAR_KIND_SPV)) {
+		return false;
+	}
+	Sdb *dwarf = sdb_ns (anal->sdb, "dwarf", 0);
+	if (!dwarf) {
+		return false;
+	}
+	SlotDwarfProvenance probe = { .anal = anal, .fcn = fcn, .var = var };
+	sdb_foreach (dwarf, slot_dwarf_sname_cb, &probe);
+	if (!probe.sname) {
+		return false;
+	}
+	sdb_foreach (dwarf, slot_dwarf_provenance_cb, &probe);
+	free ((char *)probe.sname);
+	return probe.declared;
+}
+
 static RAnalFcnSlot *fcn_context_collect_slot(RAnal *anal, const RAnalFcnContext *ctx, RAnalFunction *fcn, RAnalVar *var, RAnalVar *home_source, int arg_index) {
 	const RAnalFunctionParam *signature_param = NULL;
 
@@ -380,6 +508,7 @@ static RAnalFcnSlot *fcn_context_collect_slot(RAnal *anal, const RAnalFcnContext
 	}
 	slot->offset_valid = fcn_context_stack_offset (fcn, var, &slot->offset);
 	slot->role = fcn_context_classify_slot (var, home_source);
+	slot->dwarf_declared = fcn_context_slot_declared_by_dwarf (anal, fcn, var);
 
 	if (home_source) {
 		signature_param = (ctx->signature && arg_index >= 0)? r_list_get_n (ctx->signature->params, arg_index): NULL;
@@ -3446,17 +3575,26 @@ static SnapshotTypeGraphResult snapshot_type_resolve_struct(
 		return result;
 	}
 	const char *name = spec;
+	RAnalBaseTypeKind kind = R_ANAL_BASE_TYPE_KIND_STRUCT;
 	if (r_str_startswith (name, "struct ")) {
 		name = r_str_trim_head_ro (name + strlen ("struct "));
+	} else if (r_str_startswith (name, "union ")) {
+		name = r_str_trim_head_ro (name + strlen ("union "));
+		kind = R_ANAL_BASE_TYPE_KIND_UNION;
 	}
-	if (R_STR_ISEMPTY (name) || strchr (name, '*')
-		|| r_str_startswith (name, "union ")) {
+	if (R_STR_ISEMPTY (name) || strchr (name, '*')) {
 		free (spec);
 		return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 	}
 	bool ambiguous;
 	const RAnalBaseType *base = snapshot_type_find_unique_base (
-		builder->base_types, name, R_ANAL_BASE_TYPE_KIND_STRUCT, &ambiguous);
+		builder->base_types, name, kind, &ambiguous);
+	// A bare name resolves to whichever aggregate carries it: `ct_data_s`
+	// names a struct, and an anonymous union's synthetic name names a union.
+	if (!ambiguous && !base && kind == R_ANAL_BASE_TYPE_KIND_STRUCT) {
+		base = snapshot_type_find_unique_base (
+			builder->base_types, name, R_ANAL_BASE_TYPE_KIND_UNION, &ambiguous);
+	}
 	free (spec);
 	if (ambiguous || !base) {
 		return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
@@ -3488,9 +3626,11 @@ static SnapshotTypeGraphResult snapshot_type_add_struct(
 	}
 	const size_t type_index = builder->graph->num_types++;
 	const size_t aggregate_index = builder->graph->num_aggregates++;
+	const bool is_union = base->kind == R_ANAL_BASE_TYPE_KIND_UNION;
 	RAnalSnapshotType *snapshot_type = &builder->graph->types[type_index];
 	snapshot_type->id = (RAnalSnapshotTypeId)type_index;
-	snapshot_type->kind = R_ANAL_SNAPSHOT_TYPE_STRUCT;
+	snapshot_type->kind = is_union
+		? R_ANAL_SNAPSHOT_TYPE_UNION: R_ANAL_SNAPSHOT_TYPE_STRUCT;
 	snapshot_type->target_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
 	snapshot_type->aggregate_id = (ut32)aggregate_index;
 	RAnalSnapshotAggregateLayout *aggregate =
@@ -3501,6 +3641,9 @@ static SnapshotTypeGraphResult snapshot_type_add_struct(
 	if (r_str_startswith (presentation_name, "struct ")) {
 		presentation_name = r_str_trim_head_ro (
 			presentation_name + strlen ("struct "));
+	} else if (r_str_startswith (presentation_name, "union ")) {
+		presentation_name = r_str_trim_head_ro (
+			presentation_name + strlen ("union "));
 	}
 	if (R_STR_ISEMPTY (presentation_name) || strchr (presentation_name, '*')) {
 		presentation_name = base->name;
@@ -3574,7 +3717,15 @@ static SnapshotTypeGraphResult snapshot_type_add_struct(
 			return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
 		}
 		ut64 expected_offset;
-		if (!snapshot_type_align_up (cursor, member_type->align_bits, &expected_offset)
+		if (is_union) {
+			// Every member of a union begins at its start, and the union
+			// is as wide as its widest member.
+			if (base_member->offset) {
+				return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
+			}
+			expected_offset = 0;
+			cursor = R_MAX (cursor, member_size_bits);
+		} else if (!snapshot_type_align_up (cursor, member_type->align_bits, &expected_offset)
 			|| expected_offset != (ut64)base_member->offset * 8
 			|| r_add_overflow (expected_offset, member_size_bits, &cursor)) {
 			return SNAPSHOT_TYPE_GRAPH_UNSUPPORTED;
@@ -3681,6 +3832,12 @@ static SnapshotTypeGraphResult snapshot_type_add_pointer(
 	*result_id = snapshot_type->id;
 	return SNAPSHOT_TYPE_GRAPH_VALID;
 }
+/* The function whose type graph is being built, for the reports below. The
+ * reports go to stderr while the rendering goes to stdout, so without a name
+ * a report cannot be attributed to a function once the two interleave. The
+ * capture is single-threaded, so one current name suffices. */
+static const char *snapshot_type_report_function = NULL;
+
 /* Where the graph stood before a root was attempted. A root that fails
  * midway may already have appended a type and a half-built aggregate, and a
  * graph that keeps them is one the walker refuses to serialize -- which lost
@@ -3730,8 +3887,9 @@ static void snapshot_type_root_report(const char *stage, const char *type, const
 	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
 		return;
 	}
-	eprintf ("r2sleigh: type root refused: %s: type=%s resolved=%s result=%d\n",
-		stage, r_str_get (type), r_str_get (spec), (int)result);
+	eprintf ("r2sleigh: type root refused: fcn=%s: %s: type=%s resolved=%s result=%d\n",
+		r_str_get (snapshot_type_report_function), stage, r_str_get (type),
+		r_str_get (spec), (int)result);
 }
 
 static SnapshotTypeGraphResult snapshot_type_add_root(
@@ -3796,14 +3954,16 @@ static void snapshot_type_graph_report(const char *what, const char *spelling, S
 	if (!r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
 		return;
 	}
-	eprintf ("r2sleigh: type graph refused: %s: type=%s result=%d\n",
-		what, r_str_get (spelling), (int)result);
+	eprintf ("r2sleigh: type graph refused: fcn=%s: %s: type=%s result=%d\n",
+		r_str_get (snapshot_type_report_function), what, r_str_get (spelling),
+		(int)result);
 }
 
 static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 	RAnal *anal, const RAnalFcnContext *ctx, RAnalFunctionSnapshot *snapshot,
 	const RAnalFunctionSnapshotLimits *limits) {
 	RAnalFunctionInterfaceSnapshot *interface = &snapshot->function_interface;
+	snapshot_type_report_function = snapshot->function_name;
 	function_logical_types_clear (interface);
 	if (!interface->complete || !ctx->signature) {
 		snapshot_type_graph_report (interface->complete
@@ -3956,7 +4116,9 @@ static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 		RListIter *slot_iter;
 		RAnalFcnSlot *slot;
 		r_list_foreach (ctx->fcn_slots, slot_iter, slot) {
-			if (!slot || R_STR_ISEMPTY (slot->type)) {
+			// Only a declaration is exact. A type radare2 inferred for the
+			// slot stays evidence and reaches the consumer by that path.
+			if (!slot || R_STR_ISEMPTY (slot->type) || !slot->dwarf_declared) {
 				continue;
 			}
 			ut32 slot_type_id = R_ANAL_SNAPSHOT_TYPE_ID_INVALID;
@@ -3991,6 +4153,11 @@ static SnapshotTypeGraphResult function_type_graph_snapshot_collect(
 	}
 	graph->complete = true;
 	interface->logical_types_complete = true;
+	if (r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		eprintf ("r2sleigh: type graph built: fcn=%s types=%u aggregates=%u parameters=%u\n",
+			r_str_get (snapshot->function_name), (unsigned)graph->num_types,
+			(unsigned)graph->num_aggregates, (unsigned)interface->num_parameters);
+	}
 	return SNAPSHOT_TYPE_GRAPH_VALID;
 }
 static int call_site_interface_snapshot_compare(const void *left, const void *right) {
@@ -5946,6 +6113,16 @@ static RAnalBaseType *get_enum_type(RAnal *anal, const char *sname) {
 	RAnalBaseType *base_type = r_anal_base_type_new (R_ANAL_BASE_TYPE_KIND_ENUM);
 	if (!base_type) {
 		return NULL;
+	}
+	// The width the declaration recorded, else the width C gives an enum. An
+	// enum loaded without one could not be rooted as an integer, and every
+	// struct holding one -- inflate's state, deflate's block state -- lost its
+	// layout with it.
+	{
+		char *size_key = r_str_newf ("type.%s.size", sname);
+		const ut64 recorded = size_key? sdb_num_get (anal->sdb_types, size_key, 0): 0;
+		free (size_key);
+		base_type->size = recorded? recorded: 32;
 	}
 
 	char *members = get_type_data (anal->sdb_types, "enum", sname);

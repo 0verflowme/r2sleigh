@@ -471,6 +471,7 @@ bool r2sleigh_wire_write_snapshot_prefix(R2SleighWireWriter *writer, const void 
 #define WALK_TYPE_STRUCT 3
 #define WALK_TYPE_VOID 4
 #define WALK_TYPE_CODE 5
+#define WALK_TYPE_UNION 6
 #define WALK_ROLE_UNCLASSIFIED 0
 #define WALK_ROLE_LOCAL 1
 #define WALK_ROLE_PARAMETER_HOME 2
@@ -700,6 +701,10 @@ static bool walk_type_graph(R2SleighWireWriter *writer, const RAnalFunctionSnaps
 		case R_ANAL_SNAPSHOT_TYPE_CODE:
 			r2sleigh_wire_u8 (writer, WALK_TYPE_CODE);
 			break;
+		case R_ANAL_SNAPSHOT_TYPE_UNION:
+			r2sleigh_wire_u8 (writer, WALK_TYPE_UNION);
+			r2sleigh_wire_u32 (writer, type->aggregate_id);
+			break;
 		default:
 			/* Signedness and indirection are not recoverable elsewhere. */
 			return false;
@@ -752,6 +757,12 @@ static bool walk_interface(R2SleighWireWriter *writer,
 		variant = WALK_INTERFACE_LOGICAL;
 	} else if (exact_slots) {
 		variant = WALK_INTERFACE_EXACT_SLOTS;
+	}
+	if (r_sys_getenv_asbool ("R2SLEIGH_DEBUG_INTERFACE")) {
+		eprintf ("r2sleigh: interface written: fcn=%s variant=%u exact_types=%d exact_slots=%d graph_complete=%d logical_complete=%d parameters=%u\n",
+			r_str_get (snapshot->function_name), (unsigned)variant, exact_types? 1: 0,
+			exact_slots? 1: 0, snapshot->type_graph.complete? 1: 0,
+			interface->logical_types_complete? 1: 0, (unsigned)interface->num_parameters);
 	}
 	r2sleigh_wire_u8 (writer, variant);
 

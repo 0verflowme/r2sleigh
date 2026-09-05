@@ -170,6 +170,11 @@ pub enum SourceTypeKind {
     /// signature is not carried, so a pointer to it is a function pointer
     /// whose parameters the graph does not state.
     Code,
+    /// An aggregate whose members all begin at its start and which is as
+    /// wide as its widest member.
+    Union {
+        aggregate_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -447,7 +452,8 @@ impl SourceTypeGraph {
                         return Err(SourceTypeGraphError::InvalidType);
                     }
                 }
-                SourceTypeKind::Struct { aggregate_id } => {
+                SourceTypeKind::Struct { aggregate_id }
+                | SourceTypeKind::Union { aggregate_id } => {
                     if usize::try_from(aggregate_id)
                         .ok()
                         .is_none_or(|id| id >= aggregates.len())
@@ -459,20 +465,48 @@ impl SourceTypeGraph {
             }
         }
         for (position, aggregate) in aggregates.iter().enumerate() {
-            if u32::try_from(position) != Ok(aggregate.id)
-                || usize::try_from(aggregate.type_id)
-                    .ok()
-                    .and_then(|id| types.get(id))
-                    .is_none_or(|source_type| {
-                        source_type.size_bits != aggregate.size_bits
-                            || source_type.align_bits != aggregate.align_bits
-                            || source_type.kind
-                                != (SourceTypeKind::Struct {
-                                    aggregate_id: aggregate.id,
-                                })
-                    })
-                || aggregate.members.is_empty()
-            {
+            let Some(owner) = usize::try_from(aggregate.type_id)
+                .ok()
+                .and_then(|id| types.get(id))
+                .filter(|source_type| {
+                    source_type.size_bits == aggregate.size_bits
+                        && source_type.align_bits == aggregate.align_bits
+                })
+            else {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) has no owning type of its size and alignment: type {} size {} align {}",
+                    aggregate.id,
+                    aggregate.name,
+                    aggregate.type_id,
+                    aggregate.size_bits,
+                    aggregate.align_bits
+                );
+                return Err(SourceTypeGraphError::InvalidAggregate);
+            };
+            let is_union = match owner.kind {
+                SourceTypeKind::Struct { aggregate_id } if aggregate_id == aggregate.id => false,
+                SourceTypeKind::Union { aggregate_id } if aggregate_id == aggregate.id => true,
+                _ => {
+                    r2il::refusal_evidence!(
+                        "type-graph",
+                        "aggregate {} ({}) is owned by a type of another kind: {:?}",
+                        aggregate.id,
+                        aggregate.name,
+                        owner.kind
+                    );
+                    return Err(SourceTypeGraphError::InvalidAggregate);
+                }
+            };
+            if u32::try_from(position) != Ok(aggregate.id) || aggregate.members.is_empty() {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) at position {} has {} members",
+                    aggregate.id,
+                    aggregate.name,
+                    position,
+                    aggregate.members.len()
+                );
                 return Err(SourceTypeGraphError::InvalidAggregate);
             }
             let mut cursor = 0u64;
@@ -504,25 +538,53 @@ impl SourceTypeGraph {
                     || member_type.size_bits == 0
                     || !member.size_bits.is_multiple_of(member_type.size_bits)
                     || !member.offset_bits.is_multiple_of(8)
-                    || source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits)
                 {
                     return Err(SourceTypeGraphError::InvalidMember);
                 }
-                cursor = member
-                    .offset_bits
-                    .checked_add(member.size_bits)
-                    .ok_or(SourceTypeGraphError::InvalidMember)?;
+                // A struct lays its members out in order; a union lays every
+                // member at its start and is as wide as the widest.
+                if is_union {
+                    if member.offset_bits != 0 {
+                        return Err(SourceTypeGraphError::InvalidMember);
+                    }
+                    cursor = cursor.max(member.size_bits);
+                } else {
+                    if source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits) {
+                        return Err(SourceTypeGraphError::InvalidMember);
+                    }
+                    cursor = member
+                        .offset_bits
+                        .checked_add(member.size_bits)
+                        .ok_or(SourceTypeGraphError::InvalidMember)?;
+                }
                 maximum_alignment = maximum_alignment.max(member_type.align_bits);
             }
             if maximum_alignment != aggregate.align_bits
                 || source_align_up(cursor, maximum_alignment) != Some(aggregate.size_bits)
             {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) members end at {} with alignment {} but it claims size {} align {}",
+                    aggregate.id,
+                    aggregate.name,
+                    cursor,
+                    maximum_alignment,
+                    aggregate.size_bits,
+                    aggregate.align_bits
+                );
                 return Err(SourceTypeGraphError::InvalidAggregate);
             }
         }
+        // Every aggregate is owned by exactly one struct or union type, and
+        // every struct or union type owns exactly one aggregate.
         if types
             .iter()
-            .filter(|source_type| matches!(source_type.kind, SourceTypeKind::Struct { .. }))
+            .filter(|source_type| {
+                matches!(
+                    source_type.kind,
+                    SourceTypeKind::Struct { .. } | SourceTypeKind::Union { .. }
+                )
+            })
             .count()
             != aggregates.len()
         {
@@ -604,7 +666,8 @@ impl SourceTypeGraph {
                         worklist.push(target_type_id);
                     }
                 }
-                SourceTypeKind::Struct { aggregate_id } => {
+                SourceTypeKind::Struct { aggregate_id }
+                | SourceTypeKind::Union { aggregate_id } => {
                     for member in &self.aggregates[aggregate_id as usize].members {
                         if reachable.insert(member.type_id) {
                             worklist.push(member.type_id);

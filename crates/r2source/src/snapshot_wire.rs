@@ -1414,6 +1414,7 @@ const TYPE_POINTER: u8 = 2;
 const TYPE_STRUCT: u8 = 3;
 const TYPE_VOID: u8 = 4;
 const TYPE_CODE: u8 = 5;
+const TYPE_UNION: u8 = 6;
 
 pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
     writer.u32(source_type.id());
@@ -1430,6 +1431,10 @@ pub fn write_type(writer: &mut SnapshotWireWriter, source_type: &SourceType) {
         }
         SourceTypeKind::Void => writer.u8(TYPE_VOID),
         SourceTypeKind::Code => writer.u8(TYPE_CODE),
+        SourceTypeKind::Union { aggregate_id } => {
+            writer.u8(TYPE_UNION);
+            writer.u32(aggregate_id);
+        }
     }
     writer.u64(source_type.size_bits());
     writer.u64(source_type.align_bits());
@@ -1448,6 +1453,9 @@ pub fn read_type(reader: &mut SnapshotWireReader<'_>) -> Result<SourceType, Snap
         },
         TYPE_VOID => SourceTypeKind::Void,
         TYPE_CODE => SourceTypeKind::Code,
+        TYPE_UNION => SourceTypeKind::Union {
+            aggregate_id: reader.u32()?,
+        },
         // Signedness and indirection are not recoverable from anything else in
         // the record, so an unknown kind is refused.
         tag => {
@@ -1916,6 +1924,14 @@ fn read_interface_record(
         None
     };
 
+    r2il::refusal_evidence!(
+        "interface-record",
+        "variant {variant} parameters {} logical values {} return logical {} graph {:?}",
+        parameters.len(),
+        logical_parameters.len(),
+        return_logical.is_some(),
+        type_graph.as_ref().map(|graph| graph.types().len())
+    );
     let mut interface = match variant {
         INTERFACE_EXACT_BOTH => SourceFunctionInterface::new_exact_with_logical_types(
             revision,

@@ -164,6 +164,7 @@ impl SignatureCertificate {
                         | SignatureCertificateSource::SlotTypeOverride
                         | SignatureCertificateSource::SemanticProjection
                         | SignatureCertificateSource::InterprocSummary
+                        | SignatureCertificateSource::SourceInterface
                 )
             })
             && signature.params.iter().all(|param| param.ty.is_some());
@@ -234,6 +235,11 @@ pub enum SignatureCertificateSource {
     /// does not certify parameter types or authorize signature writeback by
     /// itself.
     SourceReturnType,
+    /// The whole signature is projected from the immutable source function
+    /// interface's type graph: every parameter and the return carry the exact
+    /// declared type the binding layer already uses. radare2's spelled
+    /// signature is only the fallback where no graph was captured.
+    SourceInterface,
 }
 
 impl SignatureCertificateSource {
@@ -249,6 +255,7 @@ impl SignatureCertificateSource {
             Self::SemanticProjection => "semantic_projection",
             Self::InterprocSummary => "interproc_summary",
             Self::SourceReturnType => "source_return_type",
+            Self::SourceInterface => "source_interface",
         }
     }
 
@@ -256,6 +263,7 @@ impl SignatureCertificateSource {
         matches!(
             self,
             Self::ExternalContext
+                | Self::SourceInterface
                 | Self::TypeAssumption
                 | Self::SlotTypeOverride
                 | Self::SemanticProjection

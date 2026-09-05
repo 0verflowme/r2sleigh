@@ -42,22 +42,40 @@ fn apply_parameter_declaration_types(
     bindings: &mut [Binding],
     ptr_bits: u32,
 ) {
-    let Some(signature) = source_owned
+    let signature = source_owned
         .report()
         .type_facts()
-        .render_authorized_signature()
-    else {
-        return;
-    };
+        .render_authorized_signature();
     for (slot, disposition) in parameters.iter().enumerate() {
         let Some(ParameterDisposition::Bound { binding, .. }) = disposition else {
             continue;
         };
-        let Some(ty) = signature
-            .params
-            .get(slot)
-            .and_then(|parameter| parameter.ty.as_ref())
-        else {
+        // The exact declared type, resolved through the source interface's
+        // type graph, outranks the signature's spelling: the spelling names a
+        // typedef whose width nothing here can measure, and a parameter that
+        // was `z_streamp` in the source rendered as a machine word for it.
+        let exact = u32::try_from(slot).ok().and_then(|slot| {
+            source_owned
+                .report()
+                .render()
+                .and_then(|render| render.certified_entities.get(&SemanticId::Parameter(slot)))
+                .and_then(|entity| match entity {
+                    r2types::CertifiedEntity::Parameter { ty, .. } => ty.as_ref(),
+                    _ => None,
+                })
+        });
+        r2il::refusal_evidence!(
+            "parameter-declaration",
+            "parameter {slot} exact {:?} signature {:?}",
+            exact,
+            signature.and_then(|signature| signature.params.get(slot).and_then(|p| p.ty.as_ref()))
+        );
+        let Some(ty) = exact.or_else(|| {
+            signature?
+                .params
+                .get(slot)
+                .and_then(|parameter| parameter.ty.as_ref())
+        }) else {
             continue;
         };
         let Some(binding) = bindings.get_mut(binding.0 as usize) else {
@@ -69,6 +87,13 @@ fn apply_parameter_declaration_types(
             continue;
         };
         if super::rules::declaration_type_width(ty, ptr_bits) != Some(binding_width_bits) {
+            r2il::refusal_evidence!(
+                "parameter-declaration",
+                "parameter {slot} declared {:?} at {:?} bits but its binding is {} bits wide",
+                ty,
+                super::rules::declaration_type_width(ty, ptr_bits),
+                binding_width_bits
+            );
             continue;
         }
         binding.declaration_type =
@@ -696,6 +721,11 @@ impl BindingPlan {
                     continue;
                 }
             };
+            r2il::refusal_evidence!(
+                "parameter-width",
+                "parameter {slot} carrier {} bytes",
+                width_bytes
+            );
             let width_bits = match parameter_width(entity, slot, width_bytes) {
                 Ok(width_bits) => width_bits,
                 Err(reason) => {

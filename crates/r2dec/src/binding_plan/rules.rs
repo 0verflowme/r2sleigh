@@ -77,12 +77,22 @@ pub(super) fn parameter_candidates(
 ) -> Vec<Option<ParameterCandidate>> {
     let mut candidates = Vec::new();
     if let Some(interface) = source_owned.source().machine_context().function_interface() {
-        for parameter in interface.parameters() {
-            insert_formal_parameter_candidate(
-                &mut candidates,
-                parameter.index(),
-                parameter.storage().size,
-            );
+        for (position, parameter) in interface.parameters().iter().enumerate() {
+            // A parameter declared narrower than its carrier is the low lane
+            // of that carrier: `unsigned len` in rdx is four bytes wide, and
+            // its four-byte home is its home. The carrier width is only the
+            // answer where the interface states no narrower lane.
+            let width_bytes = interface
+                .parameter_logical_values()
+                .get(position)
+                .and_then(|logical| match logical.carrier().kind() {
+                    r2ssa::SourceCarrierKind::LowBits => {
+                        u32::try_from(logical.carrier().size_bits() / 8).ok()
+                    }
+                    r2ssa::SourceCarrierKind::Full => None,
+                })
+                .unwrap_or(parameter.storage().size);
+            insert_formal_parameter_candidate(&mut candidates, parameter.index(), width_bytes);
         }
     }
     let Some(render) = source_owned.report().render() else {

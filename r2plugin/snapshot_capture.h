@@ -117,6 +117,9 @@ typedef struct r_anal_fcn_slot_t {
 	/* The slot's declared type as a node of the function's type graph, or
 	 * R_ANAL_SNAPSHOT_TYPE_ID_INVALID when the graph does not carry it. */
 	ut32 logical_type_id;
+	/* Whether the variable's type came from a DWARF record for this slot.
+	 * Only a declared type is exact; radare2's own inference is evidence. */
+	bool dwarf_declared;
 } RAnalFcnSlot;
 
 typedef struct r_anal_fcn_callee_t {
@@ -185,6 +188,8 @@ typedef enum {
 	 * a function pointer are placed without inventing what they point to. */
 	R_ANAL_SNAPSHOT_TYPE_VOID,
 	R_ANAL_SNAPSHOT_TYPE_CODE,
+	/* An aggregate whose members all begin at its start. */
+	R_ANAL_SNAPSHOT_TYPE_UNION,
 } RAnalSnapshotTypeKind;
 
 typedef enum {

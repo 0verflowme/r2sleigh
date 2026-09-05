@@ -709,6 +709,10 @@ fn write_type_graph(writer: &mut MachineContextIdentityWriter, graph: Option<&So
             }
             SourceTypeKind::Void => writer.u8(5),
             SourceTypeKind::Code => writer.u8(6),
+            SourceTypeKind::Union { aggregate_id } => {
+                writer.u8(7);
+                writer.u32(aggregate_id);
+            }
         }
         writer.u64(source_type.size_bits());
         writer.u64(source_type.align_bits());

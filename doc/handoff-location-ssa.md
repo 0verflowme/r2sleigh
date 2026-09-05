@@ -12509,3 +12509,61 @@ still unblessed).
 - Upstream PR candidates (radare2 fixes unrelated to Sleigh):
   `save_atomic_type` verbatim key, enum width, install-over-symlink
   (`pr/install-over-symlink`, unpushed), the DWARF stack-home integration.
+
+### Later the same day: unions, enums, lane widths, provenance, and the header
+
+Decisions taken with the user (recorded in memory as well): only
+DWARF-sourced declarations are exact, radare2's inferred variable types stay
+evidence; and the rendered header derives from the interface's exact types,
+with radare2's spelled signature as the fallback.
+
+What landed after the previous section:
+
+- **Unions** are a graph kind (`SourceTypeKind::Union`, wire tag 6): members
+  all at offset zero, width the widest member; `CTypeLike::Union` in the
+  renderer; an access at a union offset stays unnamed rather than guessed.
+  This unblocked every zlib struct reachable through `ct_data_s`.
+- **Enum widths**: the fork saves and loads an enum's recorded width, the
+  plugin's own enum loader reads it, and an enum's underlying `DW_AT_type` no
+  longer makes a DWARF type reference inexact. A bare `const`/`volatile`/
+  `restrict` DIE is qualified void and renders as such. These linked the five
+  `deflate_*` prototypes, `inflate_table`, and the `gz_*` writers.
+- **Lane-width parameters**: a parameter declared narrower than its carrier
+  takes the lane width from the interface's logical value when it has no
+  live entry value (`parameter_candidates`), so `unsigned len` is 32 bits
+  and its 4-byte home is its home.
+- **Exact parameter types** feed both the binding declaration
+  (`apply_parameter_declaration_types`) and the whole rendered signature
+  (`apply_exact_source_signature`, certificate source `SourceInterface`).
+  `inflateStateCheck` renders `int32_t inflateStateCheck(struct z_stream* strm)`.
+- **Provenance**: `RAnalFcnSlot::dwarf_declared` is derived from the DWARF
+  records in the analysis database's `dwarf` namespace (same kind and frame
+  offset); only such slots root a type node. This is what fixed the corpus
+  compile regression (`char *` guessed for a `size_t`).
+- **Placeholders inside declared aggregates**: after DWARF integration the
+  fork folds radare2's offset-named placeholders into the declared variable
+  they landed in (`inflate_table`'s `here` versus `var_6ah`/`var_6bh`),
+  which the interface contract had refused as overlapping slots.
+
+minigzip-O0 census at the time of writing: 109 rendered, 73 fallbacks of
+which 32 are import thunks, 9 errors. Remaining native causes there:
+`implementation.rs:1368` (6, `crc_word` and friends: return certificate
+site mismatch), `implementation.rs:1324` (6), `missing_definition` (6),
+`calls.rs:149`/`194` (8, call-boundary arguments), two variadic format
+refusals.
+
+Open:
+
+- **O2 memory blow-up reproduced locally**: `pdd @@F` on minigzip-O2 grows
+  past 1.7 GB and never finishes after `gz_avail`, while `gz_look` alone
+  takes 1.7 s at 113 MB. So the killer is state carried across functions in
+  one r2 session, not one function. The release profile strips symbols
+  (`strip = true`); a symbolised run (`CARGO_PROFILE_RELEASE_STRIP=false
+  CARGO_PROFILE_RELEASE_DEBUG=1`) with `sample` is the next step; the hot
+  frames sit in one plugin function with heavy `realloc`.
+- Import thunks (32 per binary): `RenderedValueRequired` on the GOT load.
+- Per-parameter logical types (one unplaceable parameter type still costs
+  the function every parameter's type): `parameter_logical_values` should
+  become optional per parameter with a wire presence bit.
+- Local names still render as `stack_m16`; the declared name is in the
+  slot record and should travel like its type does.

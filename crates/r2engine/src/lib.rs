@@ -1831,6 +1831,13 @@ fn collect_external_struct_fields(
         let member_type = usize::try_from(member.type_id())
             .ok()
             .and_then(|id| graph.types().get(id));
+        // A union's members share one offset, so no single name is the name
+        // of a read at it; the field stays unnamed rather than guessed.
+        if let Some(source_type) = member_type
+            && matches!(source_type.kind(), r2ssa::SourceTypeKind::Union { .. })
+        {
+            continue;
+        }
         if let Some(source_type) = member_type
             && let r2ssa::SourceTypeKind::Struct { aggregate_id } = source_type.kind()
         {
@@ -1868,9 +1875,10 @@ fn source_member_type_spelling(
         r2ssa::SourceTypeKind::SignedInteger => format!("int{bits}_t"),
         r2ssa::SourceTypeKind::UnsignedInteger => format!("uint{bits}_t"),
         r2ssa::SourceTypeKind::Pointer { .. } => "void *".to_string(),
-        // An inline struct member has no scalar width to check an access against,
-        // and an opaque kind is never a member at all.
+        // An inline aggregate member has no scalar width to check an access
+        // against, and an opaque kind is never a member at all.
         r2ssa::SourceTypeKind::Struct { .. }
+        | r2ssa::SourceTypeKind::Union { .. }
         | r2ssa::SourceTypeKind::Void
         | r2ssa::SourceTypeKind::Code => return None,
     };
