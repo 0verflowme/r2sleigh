@@ -4648,6 +4648,10 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         );
     }
     let consumer_roots = prepared_render_consumer_occurrences(prepared, carrier_edge_roots);
+    // One propagation answers every read: how often a value is inlined does
+    // not depend on which read is asking.
+    let inline_multiplicity =
+        expression_inline_multiplicity(prepared.graph(), &consumer_roots, &carrier_identity_values);
     for effect in certified_memory_effects.values_mut() {
         let CertifiedEffect::Memory { fact, .. } = effect else {
             continue;
@@ -4658,26 +4662,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         if certificates.stack_slots.contains_key(&fact.object) {
             continue;
         }
-        // One settled table per value asked about: what a root sees below it is
-        // the same answer whichever root reached it.
-        let mut settled = BTreeMap::new();
-        let dependency_occurrences = consumer_roots.iter().copied().fold(0_u8, |count, root| {
-            if count > 1 {
-                return count;
-            }
-            count.saturating_add(
-                expression_dependency_occurrences(
-                    prepared.graph(),
-                    root,
-                    value,
-                    &carrier_identity_values,
-                    &mut BTreeSet::new(),
-                    &mut settled,
-                )
-                .0,
-            )
-        });
-        fact.materialize_result = dependency_occurrences > 1;
+        fact.materialize_result = inline_multiplicity.get(&value).copied().unwrap_or(0) > 1;
     }
     let mut certified_effects = certified_memory_effects;
     certified_effects.extend(certified_return_effects);
@@ -4731,64 +4716,67 @@ fn prepared_render_consumer_occurrences(
     roots
 }
 
-/// How often `target` occurs in the expression rooted at `current`, saturated at two.
+/// How many times each value is inlined into the expressions rooted at
+/// `roots`, saturated at two.
 ///
 /// Rendering inlines an expression, so a value reachable by two distinct
-/// dependency paths is printed twice, and the caller only needs to know whether
-/// that happens at all.
+/// dependency paths is printed twice, and the caller only needs to know
+/// whether that happens at all.
 ///
-/// Enumerating the paths costs one visit per path, which is exponential wherever
-/// a subexpression is shared. The same recurrence evaluated once per value is
-/// linear in the edges, because how many times `target` occurs below a value
-/// does not depend on how the walk arrived at that value. A value is settled
-/// only when nothing below it read a value still being computed, since that
-/// answer assumed the unfinished value contributes nothing and is true only on
-/// the path that made the assumption.
-fn expression_dependency_occurrences(
+/// This is one propagation for the whole function rather than one search per
+/// value asked about. The search it replaces enumerated paths and memoised a
+/// value only when nothing below it was still being computed -- which, on a
+/// cycle, is every value above the cycle, so the memo was defeated exactly
+/// where it was needed and the walk fell back to enumerating paths. Any
+/// function with a loop therefore cost time exponential in its shared
+/// subexpressions: `gz_decomp` in zlib built at -O2, eighteen blocks and
+/// eighty-two instructions, did not finish in two hundred seconds, and a
+/// sweep of that binary died on it.
+///
+/// Multiplicity flows the other way, from the roots down to the leaves, and is
+/// a least fixpoint over a lattice of three values. It is monotone, so a
+/// worklist settles it in one pass over each edge per increase, and a cycle is
+/// no longer a special case: a value a loop carries back into itself simply
+/// reaches two, which is what "printed more than once" means for it. A carrier
+/// identity is where inlining stops, so it neither counts nor propagates.
+fn expression_inline_multiplicity(
     graph: &r2ssa::SsaGraph,
-    current: r2ssa::ValueId,
-    target: r2ssa::ValueId,
+    roots: &[r2ssa::ValueId],
     carrier_identities: &BTreeSet<r2ssa::ValueId>,
-    visiting: &mut BTreeSet<r2ssa::ValueId>,
-    settled: &mut BTreeMap<r2ssa::ValueId, u8>,
-) -> (u8, bool) {
-    if current == target {
-        return (1, false);
-    }
-    if carrier_identities.contains(&current) {
-        return (0, false);
-    }
-    if let Some(known) = settled.get(&current) {
-        return (*known, false);
-    }
-    if !visiting.insert(current) {
-        return (0, true);
-    }
-    let mut count = 0_u8;
-    let mut saw_unfinished = false;
-    if let Some(inst) = graph.def_inst(current).and_then(|inst| graph.inst(inst)) {
-        for input in &inst.inputs {
-            if count > 1 {
-                break;
-            }
-            let (below, unfinished) = expression_dependency_occurrences(
-                graph,
-                *input,
-                target,
-                carrier_identities,
-                visiting,
-                settled,
-            );
-            count = count.saturating_add(below);
-            saw_unfinished |= unfinished;
+) -> BTreeMap<r2ssa::ValueId, u8> {
+    let mut multiplicity = BTreeMap::<r2ssa::ValueId, u8>::new();
+    let mut worklist = Vec::new();
+    for root in roots {
+        if carrier_identities.contains(root) {
+            continue;
+        }
+        let slot = multiplicity.entry(*root).or_insert(0);
+        let raised = slot.saturating_add(1).min(2);
+        if raised != *slot {
+            *slot = raised;
+            worklist.push(*root);
         }
     }
-    visiting.remove(&current);
-    let count = count.min(2);
-    if !saw_unfinished {
-        settled.insert(current, count);
+    while let Some(value) = worklist.pop() {
+        let Some(share) = multiplicity.get(&value).copied() else {
+            continue;
+        };
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            continue;
+        };
+        for input in &inst.inputs {
+            if carrier_identities.contains(input) {
+                continue;
+            }
+            let slot = multiplicity.entry(*input).or_insert(0);
+            let raised = slot.saturating_add(share).min(2);
+            if raised != *slot {
+                *slot = raised;
+                worklist.push(*input);
+            }
+        }
     }
-    (count, saw_unfinished)
+    multiplicity
 }
 
 fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts {
