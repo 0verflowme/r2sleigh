@@ -1316,17 +1316,16 @@ fn correlate_call_site_interfaces(
     let mut tail_calls = Vec::new();
     let mut interfaces = Vec::new();
     for call in source.advisory_calls() {
-        let identity = unique_call_site_identity(blocks, call);
-        r2il::refusal_evidence!(
-            "call-site-correlation",
-            "advisory {:?} at {:#x} target {:#x} prototype={} correlated={:?}",
-            call.transfer(),
-            call.instruction_address(),
-            call.target_address(),
-            call.prototype().is_some(),
-            identity.map(|identity| (identity.block_addr(), identity.op_index()))
-        );
-        let Some(identity) = identity else {
+        let Some(identity) = unique_call_site_identity(blocks, call) else {
+            // The source named a call the lift does not have exactly one
+            // operation for, so nothing here can carry its prototype.
+            r2il::refusal_evidence!(
+                "call-site-correlation",
+                "advisory {:?} at {:#x} target {:#x} matches no unique lifted operation",
+                call.transfer(),
+                call.instruction_address(),
+                call.target_address()
+            );
             continue;
         };
         if matches!(

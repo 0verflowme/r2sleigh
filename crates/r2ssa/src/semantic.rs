@@ -3863,28 +3863,58 @@ fn unique_entry_values_by_storage(
     values
 }
 
-/// Add source-declared entry parameters that implicit call reads alone expose.
+/// Add the entry carriers that implicit call reads alone expose.
 ///
 /// This is one pass over the existing graph plus one bounded pass over ABI
 /// slots. The graph value has no defining instruction; it is an exact boundary
 /// value whose eventual use is owned by a callsite certificate.
+///
+/// Two sets of storages need one: the source's declared formal parameters, and
+/// the convention's argument registers. The second is what a call reads
+/// implicitly. A function that hands its incoming first argument straight to a
+/// callee never reads that register explicitly, so nothing else materializes
+/// its entry carrier; the boundary then resolved the argument to
+/// `PreservedEntry` with no value to name, and the whole call's argument list
+/// was refused for it -- every argument, not just that one. It cost 100 call
+/// sites of minigzip at -O0 and 125 at -O2 their certificates. Recovery
+/// already treats such a carrier as a parameter, but a function whose captured
+/// prototype names fewer parameters than it passes through is not recovered at
+/// all, and that is where this bit.
+///
+/// The claim a materialized carrier makes is that the storage held some value
+/// on entry, which is true of every register; it becomes load-bearing only
+/// where something reads it, and a carrier nothing reads has no definition and
+/// no uses, so it is elided.
 pub(crate) fn ensure_source_formal_parameter_values(
     graph: &mut SsaGraph,
     machine_context: &SourceMachineContext,
 ) {
     let mut existing = unique_entry_values_by_storage(graph);
-    for parameter in source_formal_parameter_projections(machine_context) {
-        if existing.contains_key(&parameter.graph_storage) {
-            continue;
+    let materialize = |graph: &mut SsaGraph,
+                       existing: &mut BTreeMap<CanonicalStorageId, Option<ValueId>>,
+                       storage: CanonicalStorageId| {
+        if existing.contains_key(&storage) {
+            return;
         }
         let name = machine_context
-            .register_name(parameter.graph_storage)
-            .unwrap_or_else(|| format!("reg:{:x}", parameter.graph_storage.offset));
-        if let Some(value) = graph.ensure_entry_value(
-            SSAVar::initial(name, parameter.graph_storage.size),
-            parameter.graph_storage,
-        ) {
-            existing.insert(parameter.graph_storage, Some(value));
+            .register_name(storage)
+            .unwrap_or_else(|| format!("reg:{:x}", storage.offset));
+        if let Some(value) = graph.ensure_entry_value(SSAVar::initial(name, storage.size), storage)
+        {
+            existing.insert(storage, Some(value));
+        }
+    };
+    for parameter in source_formal_parameter_projections(machine_context) {
+        materialize(graph, &mut existing, parameter.graph_storage);
+    }
+    // The convention's own argument slots, not the interface's parameter list:
+    // what a call may read implicitly is fixed by the calling convention, and
+    // a function whose captured prototype declares fewer parameters than it
+    // passes through is exactly the case that needs this.
+    if let Some(slots) = machine_context.convention_slots() {
+        let argument_storages = slots.argument_slots().to_vec();
+        for storage in argument_storages {
+            materialize(graph, &mut existing, storage);
         }
     }
 }
@@ -4279,7 +4309,19 @@ fn reaching_abi_argument_in_block(
             .copied()
             .flatten()
             .map(SourceCallArgumentValue::Value)
-            .unwrap_or(SourceCallArgumentValue::PreservedEntry),
+            .unwrap_or_else(|| {
+                r2il::refusal_evidence!(
+                    "entry-value-lookup",
+                    "{:?} reaches a call unchanged from entry; entry value {}",
+                    storage,
+                    match entry_values.get(&storage) {
+                        None => "absent".to_string(),
+                        Some(None) => "ambiguous".to_string(),
+                        Some(Some(value)) => format!("{value:?}"),
+                    }
+                );
+                SourceCallArgumentValue::PreservedEntry
+            }),
         ReachingAbiState::Value(value) => SourceCallArgumentValue::Value(value),
     })
 }
@@ -9957,38 +9999,58 @@ fn exact_register_call_arguments(
     boundary: &SourceCallBoundaryFact,
     graph: &SsaGraph,
 ) -> (Vec<ValueId>, Vec<CallArgumentCertificate>) {
+    macro_rules! give_up {
+        ($reason:literal $(, $arg:expr)* $(,)?) => {{
+            r2il::refusal_evidence!(
+                "call-argument-coordinates",
+                concat!("call site {:?} at {:?}: ", $reason),
+                boundary.call_site,
+                boundary.at,
+                $($arg,)*
+            );
+            return (Vec::new(), Vec::new());
+        }};
+    }
     let mut by_index = BTreeMap::new();
     for argument in &boundary.arguments {
         let CallBoundarySlot::Register { index, storage } = argument.slot else {
-            return (Vec::new(), Vec::new());
+            give_up!("slot {:?} is not a register", argument.slot);
         };
         let SourceCallArgumentValue::Value(value) = argument.value else {
-            return (Vec::new(), Vec::new());
+            give_up!("slot {} at {:?} is {:?}", index, storage, argument.value);
         };
         let Ok(index) = usize::try_from(index) else {
-            return (Vec::new(), Vec::new());
+            give_up!("slot index {} is out of range", index);
         };
         let Some(graph_value) = graph.value(value) else {
-            return (Vec::new(), Vec::new());
+            give_up!("slot {} value {:?} is not in the graph", index, value);
         };
-        if graph_value.canonical_storage != Some(storage)
-            || by_index
-                .insert(
+        if graph_value.canonical_storage != Some(storage) {
+            give_up!(
+                "slot {} wants {:?} but {:?} is at {:?}",
+                index,
+                storage,
+                value,
+                graph_value.canonical_storage
+            );
+        }
+        if by_index
+            .insert(
+                index,
+                CallArgumentCertificate {
                     index,
-                    CallArgumentCertificate {
-                        index,
-                        value,
-                        location: CallArgumentLocation::Register { storage },
-                        source_inst: graph.def_inst(value),
-                    },
-                )
-                .is_some()
+                    value,
+                    location: CallArgumentLocation::Register { storage },
+                    source_inst: graph.def_inst(value),
+                },
+            )
+            .is_some()
         {
-            return (Vec::new(), Vec::new());
+            give_up!("slot {} is claimed twice", index);
         }
     }
     if by_index.keys().copied().ne(0..by_index.len()) {
-        return (Vec::new(), Vec::new());
+        give_up!("slots {:?} are not contiguous", by_index.keys());
     }
     let certificates = by_index.into_values().collect::<Vec<_>>();
     let values = certificates.iter().map(|argument| argument.value).collect();
