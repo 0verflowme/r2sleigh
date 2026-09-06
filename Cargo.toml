@@ -31,7 +31,7 @@ libsla = "=1.2.0"
 sleigh-config = "=1.0.1"
 serde_json = "1"
 hex = "0.4"
-z3 = "0.20.0"
+z3 = "0.21.0"
 
 [profile.dev]
 # Line tables rather than full debug info. A backtrace still names the file and
